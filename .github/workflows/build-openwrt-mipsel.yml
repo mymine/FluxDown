@@ -99,6 +99,10 @@ jobs:
           cp -f "$LIBATOMIC" "$SHIM/"
           export RUSTFLAGS="$RUSTFLAGS -L native=$SHIM -l static=atomic -C link-arg=-l:libatomic.a"
 
+          # 预取依赖，并给「第三方 crate 源码」（git/registry）也打 mips32 补丁
+          cargo +nightly fetch --target "$TARGET" || true
+          python3 patch-mips32.py "${CARGO_HOME:-$HOME/.cargo}" || true
+
           cargo +nightly build --release -p fluxdown_agent --features web-ui \
             --target "$TARGET" -Z build-std=std,panic_unwind
           cargo +nightly build --release -p fluxdown_daemon \
