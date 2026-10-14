@@ -53,7 +53,9 @@ def ensure_dep(manifest: Path) -> bool:
 
 def main() -> int:
     root = Path(sys.argv[1] if len(sys.argv) > 1 else '.').resolve()
-    assert (root / 'Cargo.toml').exists(), f'{root} 不是仓库根'
+    if not root.is_dir():
+        print(f'[patch-mips32] 目录不存在，跳过: {root}')
+        return 0
 
     changed_rs, crates, deps_added = [], set(), []
 
