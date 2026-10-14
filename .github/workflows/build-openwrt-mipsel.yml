@@ -88,6 +88,13 @@ jobs:
           export CXXFLAGS_${CC_TRIPLE}="-msoft-float"
           export RUSTFLAGS="-C link-self-contained=no -C target-feature=+crt-static"
 
+          # Tier-3 musl 无 Rust 自带 libunwind：用工具链 libgcc/libgcc_eh 合成一个
+          SHIM="$PWD/.unwind-shim"; mkdir -p "$SHIM"
+          LIBGCC_DIR="$(dirname "$("$GCC" -print-libgcc-file-name)")"
+          printf 'create %s/libunwind.a\naddlib %s/libgcc.a\naddlib %s/libgcc_eh.a\nsave\nend\n' \
+            "$SHIM" "$LIBGCC_DIR" "$LIBGCC_DIR" | "$TC/bin/mipsel-openwrt-linux-musl-ar" -M
+          export RUSTFLAGS="$RUSTFLAGS -L native=$SHIM"
+
           cargo +nightly build --release -p fluxdown_agent --features web-ui \
             --target "$TARGET" -Z build-std=std,panic_unwind
           cargo +nightly build --release -p fluxdown_daemon \
