@@ -105,6 +105,19 @@ jobs:
           cargo +nightly fetch --target "$TARGET" || true
           python3 patch-mips32.py "${CARGO_HOME:-$HOME/.cargo}" || true
 
+          # rquickjs-sys 无 mipsel 预生成 bindings → 借用 32 位小端的 armv7/i686 bindings
+          for d in "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/rquickjs-sys-*; do
+            [ -d "$d/src/bindings" ] || continue
+            [ -f "$d/src/bindings/mipsel-unknown-linux-musl.rs" ] && continue
+            for cand in armv7-unknown-linux-gnueabihf.rs i686-unknown-linux-gnu.rs; do
+              if [ -f "$d/src/bindings/$cand" ]; then
+                cp "$d/src/bindings/$cand" "$d/src/bindings/mipsel-unknown-linux-musl.rs"
+                echo "rquickjs-sys bindings <- $cand"
+                break
+              fi
+            done
+          done
+
           cargo +nightly build --release -p fluxdown_agent --features web-ui \
             --target "$TARGET" -Z build-std=std,panic_unwind
           cargo +nightly build --release -p fluxdown_daemon \
