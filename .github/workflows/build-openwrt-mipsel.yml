@@ -99,7 +99,9 @@ jobs:
           cp -f "$LIBATOMIC" "$SHIM/"
           export RUSTFLAGS="$RUSTFLAGS -L native=$SHIM -l static=atomic -C link-arg=-l:libatomic.a"
 
-          # 预取依赖，并给「第三方 crate 源码」（git/registry）也打 mips32 补丁
+          # 清理依赖源码（确保补丁从干净源码开始），预取依赖，再打补丁
+          CARGO="${CARGO_HOME:-$HOME/.cargo}"
+          rm -rf "$CARGO/registry/src" "$CARGO/git/checkouts"
           cargo +nightly fetch --target "$TARGET" || true
           python3 patch-mips32.py "${CARGO_HOME:-$HOME/.cargo}" || true
 
