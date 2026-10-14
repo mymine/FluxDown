@@ -93,7 +93,7 @@ jobs:
           LIBGCC_DIR="$(dirname "$("$GCC" -print-libgcc-file-name)")"
           printf 'create %s/libunwind.a\naddlib %s/libgcc.a\naddlib %s/libgcc_eh.a\nsave\nend\n' \
             "$SHIM" "$LIBGCC_DIR" "$LIBGCC_DIR" | "$TC/bin/mipsel-openwrt-linux-musl-ar" -M
-          export RUSTFLAGS="$RUSTFLAGS -L native=$SHIM"
+          export RUSTFLAGS="$RUSTFLAGS -L native=$SHIM -l static=atomic -C link-arg=-l:libatomic.a"
 
           cargo +nightly build --release -p fluxdown_agent --features web-ui \
             --target "$TARGET" -Z build-std=std,panic_unwind
