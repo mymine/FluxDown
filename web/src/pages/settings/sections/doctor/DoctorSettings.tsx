@@ -20,6 +20,7 @@ const DESKTOP_ONLY_CHECKS: ReadonlySet<string> = new Set([
   'nmh_relay',
   'nmh_launch',
   'nmh_policy',
+  'nmh_comspec',
   'nmh_ownership',
   'url_protocol',
   'torrent_association',
@@ -37,6 +38,7 @@ const DESKTOP_ONLY_ACTIONS: ReadonlySet<string> = new Set([
   'fix_dir_access',
   'enable_autostart',
   'open_settings',
+  'fix_comspec',
 ])
 
 /** 修复失败的可操作说明（同 GPUI `doctor::repair_outcome`）；其余错误回退通用文案。 */

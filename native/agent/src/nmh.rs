@@ -12,6 +12,8 @@ use tokio_util::sync::CancellationToken;
 use crate::capture::CaptureService;
 use crate::daemon_client::DaemonClient;
 
+pub mod comspec;
+
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 const MAX_BATCH_ITEMS: usize = 1000;
 const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
@@ -648,6 +650,29 @@ pub mod registry {
         /// Windows：Chrome 与 Edge 都开启了 `NativeHostsExecutablesLaunchDirectly`，浏览器直接
         /// 启动中继、不经 `cmd.exe`。
         pub direct_launch: bool,
+        /// Windows 且仍有浏览器经 `%ComSpec% /d /c` 启动主机时：`ComSpec` 的配置值与本进程值。
+        pub comspec: Option<super::comspec::ComSpecState>,
+    }
+
+    impl NmhDiagnosis {
+        /// 浏览器启动原生消息主机所执行的入口（诊断详情用）：类 Unix 为启动脚本；Windows 为
+        /// `<ComSpec> /d /c <中继>`，直接启动或 `ComSpec` 不可用时为中继本身。
+        #[must_use]
+        pub fn launch_entry(&self) -> String {
+            if !cfg!(windows) {
+                return self.relay_location.clone();
+            }
+            match self
+                .comspec
+                .as_ref()
+                .and_then(super::comspec::ComSpecState::launcher)
+            {
+                Some(launcher) if !self.direct_launch => {
+                    format!("{launcher} /d /c {}", self.registered_relay)
+                }
+                _ => self.registered_relay.clone(),
+            }
+        }
     }
 
     /// 让浏览器拉不起 FluxDown 原生消息主机的组织策略（Windows 组策略 / 注册表）。
@@ -940,9 +965,11 @@ pub mod registry {
     }
 
     /// 像浏览器那样拉起当前生效的注册并经它 `ping`：类 Unix 执行清单指向的启动脚本，Windows
-    /// 与 Chrome / Edge 一样经 `cmd.exe /d /c` 启动中继（浏览器都开了
-    /// `NativeHostsExecutablesLaunchDirectly` 时直接启动）。注册缺失 / 失效，或本进程 IPC 端点
-    /// 不在线（由监听检查报告，重新注册修不好）时返回 `None`。
+    /// 与 Chrome / Edge 一样经 `%ComSpec% /d /c` 启动中继（浏览器都开了
+    /// `NativeHostsExecutablesLaunchDirectly` 时直接启动）。`ComSpec` 取注册表配置值——即重启后
+    /// 的浏览器会拿到的值；本进程环境可能还是修改前继承的旧值。注册缺失 / 失效、`ComSpec` 不可用
+    /// （由 `nmh_comspec` 检查报告），或本进程 IPC 端点不在线（由监听检查报告，重新注册修不好）
+    /// 时返回 `None`。
     pub async fn probe_browser_launch(
         diagnosis: &NmhDiagnosis,
     ) -> Option<Result<(), RelayLaunchError>> {
@@ -965,13 +992,11 @@ pub mod registry {
             command.arg(CHROME_EXTENSION_ID);
             command
         } else {
-            let cmd = std::env::var_os("ComSpec")
-                .filter(|value| !value.is_empty())
-                .map_or_else(
-                    || PathBuf::from(r"C:\Windows\System32\cmd.exe"),
-                    PathBuf::from,
-                );
-            let mut command = tokio::process::Command::new(cmd);
+            let launcher = diagnosis
+                .comspec
+                .as_ref()
+                .and_then(super::comspec::ComSpecState::launcher)?;
+            let mut command = tokio::process::Command::new(launcher);
             command.raw_arg(cmd_launch_line(
                 &diagnosis.registered_relay,
                 CHROME_EXTENSION_ID,
@@ -2295,6 +2320,10 @@ pub mod registry {
                 });
             }
             (diagnosis.policy_blocks, diagnosis.direct_launch) = read_policies();
+            // 只要还有浏览器经 cmd.exe 启动主机，ComSpec 就决定扩展能否连上。
+            if !diagnosis.direct_launch {
+                diagnosis.comspec = Some(crate::nmh::comspec::inspect());
+            }
             diagnosis
         }
 

@@ -37,6 +37,7 @@ use gpui_component::{
 use activity::ActivityFeed;
 
 use crate::{
+    UserStartIntent,
     components::{
         segment_progress::render_segment_progress,
         task_table::{progress_bar_color, progress_track_color, task_status_color},
@@ -558,17 +559,33 @@ impl TaskDetailView {
             return;
         }
         let task_id = self.task_id.clone();
+        let on_user_started = self.host.on_user_started.clone();
+        if let Some(hook) = &on_user_started {
+            hook(
+                UserStartIntent::RestartRequested {
+                    task_id: task_id.clone(),
+                    replaces_task: false,
+                },
+                cx,
+            );
+        }
         let future = self.port.execute(DownloadsCommand::Resume {
             task_id: task_id.clone(),
         });
         cx.spawn(async move |this, cx| {
             let failed = future.await.is_err();
+            if let Some(hook) = on_user_started {
+                let intent = if failed {
+                    UserStartIntent::RestartFailed(task_id)
+                } else {
+                    UserStartIntent::RestartSucceeded(task_id)
+                };
+                cx.update(|cx| hook(intent, cx));
+            }
 
             let Ok(()) = this.update(cx, |this, cx| {
                 if failed {
                     this.last_error = Some(this.strings.action_failed.clone());
-                } else if let Some(hook) = this.host.on_user_started.clone() {
-                    hook(task_id, cx);
                 }
                 cx.notify();
             }) else {

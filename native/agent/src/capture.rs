@@ -94,8 +94,8 @@ pub struct CaptureService {
     daemon: Arc<DaemonClient>,
     events: AgentEventHub,
     pending: Mutex<VecDeque<CaptureTransaction>>,
-    /// 静默建成单个任务且没有 UI 时按需拉起官方 UI 承载进度窗口（待确认捕获的拉起由外壳
-    /// 控制循环按快照电平触发，见 `shell::prompt_launch`）。
+    /// 静默建成单个任务且没有就绪 UI 时按需拉起官方 UI 承载进度 / 完成提示（待确认捕获的
+    /// 拉起由外壳控制循环按快照电平触发，见 `shell::prompt_launch`）。
     shell: Arc<ShellState>,
 }
 
@@ -155,13 +155,14 @@ impl CaptureService {
     }
 
     /// 直接建任务（不经确认）。建成的任务随后以 [`AgentEvent::CaptureTasksStarted`] 通知官方
-    /// UI（进度窗口）；单个任务且当前没有 UI 连接时按需拉起界面承载进度窗口。
+    /// UI；单任务按两个窗口开关登记冷启动意图，批量请求不自动拉起下载提示窗口。
     async fn create_all(
         &self,
         requests: Vec<DownloadRequest>,
         fallback_save_dir: Option<&str>,
         unattended: bool,
     ) -> Result<Value, CaptureError> {
+        let single_request = requests.len() == 1;
         let mut task_ids = Vec::with_capacity(requests.len());
         let mut started = Vec::with_capacity(requests.len());
         let mut outcome = Ok(());
@@ -183,9 +184,10 @@ impl CaptureService {
             }
             task_ids.push(task_id);
         }
-        if !started.is_empty() {
-            if let [task_id] = started.as_slice() {
-                self.shell.launch_for_progress(task_id);
+        // 批量只成功首项后失败，也不能被 UI 误认为单任务用户意图。
+        if !started.is_empty() && (single_request || started.len() > 1) {
+            if single_request && let [task_id] = started.as_slice() {
+                self.shell.launch_for_task_windows(task_id);
             }
             self.events
                 .publish(AgentEvent::CaptureTasksStarted(started));
@@ -1340,6 +1342,95 @@ mod tests {
             stop,
             server,
         )
+    }
+
+    #[tokio::test]
+    async fn capture_notifications_preserve_single_intents_and_batch_boundaries() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (capture, mut calls, daemon_events, stop, server) = daemon_service().await;
+            let (mut events, _) = capture.events.subscribe_and_snapshot();
+            let single = {
+                let capture = Arc::clone(&capture);
+                tokio::spawn(
+                    async move { capture.submit(get_capture(), CaptureOrigin::Direct).await },
+                )
+            };
+            let (request, reply) = calls.recv().await.expect("single create");
+            assert_eq!(
+                request.method,
+                fluxdown_protocol::method::DAEMON_TASK_CREATE
+            );
+            reply
+                .send(Ok(json!({ "taskId": "single" })))
+                .expect("created single");
+            single
+                .await
+                .expect("single caller")
+                .expect("single capture");
+            assert!(matches!(
+                events.try_recv().expect("single notification").event,
+                ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids)) if ids == ["single"]
+            ));
+
+            for fail_second in [false, true] {
+                let batch = {
+                    let capture = Arc::clone(&capture);
+                    tokio::spawn(async move {
+                        capture
+                            .submit_many(vec![get_capture(), get_capture()], CaptureOrigin::Direct)
+                            .await
+                    })
+                };
+                let (request, reply) = calls.recv().await.expect("batch first create");
+                assert_eq!(
+                    request.method,
+                    fluxdown_protocol::method::DAEMON_TASK_CREATE
+                );
+                reply
+                    .send(Ok(json!({ "taskId": "first" })))
+                    .expect("first created");
+                let (request, reply) = calls.recv().await.expect("batch second create");
+                assert_eq!(
+                    request.method,
+                    fluxdown_protocol::method::DAEMON_TASK_CREATE
+                );
+                if fail_second {
+                    reply
+                        .send(Err(RpcErrorData::new(
+                            ApplicationErrorCode::InvalidArgument,
+                            false,
+                        )))
+                        .expect("second rejected");
+                    assert!(matches!(
+                        batch.await.expect("batch caller"),
+                        Err(CaptureError::Daemon(_))
+                    ));
+                    assert!(
+                        matches!(
+                            events.try_recv(),
+                            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                        ),
+                        "partial batch must not become a single-task window intent"
+                    );
+                } else {
+                    reply
+                        .send(Ok(json!({ "taskId": "second" })))
+                        .expect("second created");
+                    batch.await.expect("batch caller").expect("batch capture");
+                    assert!(matches!(
+                        events.try_recv().expect("batch notification").event,
+                        ServiceEvent::Agent(AgentEvent::CaptureTasksStarted(ids))
+                            if ids == ["first", "second"]
+                    ));
+                }
+            }
+            stop.send(()).expect("stop test daemon");
+            drop(capture);
+            drop(daemon_events);
+            server.await.expect("daemon server");
+        })
+        .await
+        .expect("capture notification lifecycle");
     }
 
     #[tokio::test]

@@ -1,25 +1,26 @@
 <?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- 窗口底色 = Flux Lumen canvas，避免首帧白闪；外观全部由 Compose 的 FluxTheme 绘制 -->
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- 窗口底色 = Flux Lumen canvas，避免首帧白闪；外观全部由 Compose 的 FluxTheme 绘制。
+         windowSplashScreen*（API 31）/ windowLightNavigationBar（API 27）在更低版本系统上被忽略。 -->
     <style name="Theme.FluxDown" parent="android:Theme.DeviceDefault.Light.NoActionBar">
         <item name="android:windowBackground">@color/flux_canvas</item>
-        <item name="android:windowSplashScreenBackground">@color/flux_canvas</item>
-        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_mark</item>
+        <item name="android:windowSplashScreenBackground" tools:targetApi="31">@color/flux_canvas</item>
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="31">@drawable/splash_mark</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar">true</item>
-        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="27">true</item>
     </style>
 
-    <!-- App 内强制明 / 暗时的启动画面（HomeActivity 经 SplashScreen.setSplashScreenTheme 持久化，下次冷启动生效） -->
+    <!-- App 内强制明 / 暗时的启动画面（HomeActivity 经 SplashScreen.setSplashScreenTheme 持久化，下次冷启动生效；仅 API 33+） -->
     <style name="Theme.FluxDown.Splash.Light" parent="android:Theme.DeviceDefault.Light.NoActionBar">
-        <item name="android:windowSplashScreenBackground">@color/flux_canvas_paper</item>
-        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_mark</item>
+        <item name="android:windowSplashScreenBackground" tools:targetApi="31">@color/flux_canvas_paper</item>
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="31">@drawable/splash_mark</item>
     </style>
 
     <style name="Theme.FluxDown.Splash.Dark" parent="android:Theme.DeviceDefault.NoActionBar">
-        <item name="android:windowSplashScreenBackground">@color/flux_canvas_ink</item>
-        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_mark</item>
+        <item name="android:windowSplashScreenBackground" tools:targetApi="31">@color/flux_canvas_ink</item>
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="31">@drawable/splash_mark</item>
     </style>
 
     <!-- 外部下载唤起（ExternalDownloadActivity）：透明窗口，弹窗下方透出来源应用；深浅色沿用父主题的夜间变体 -->

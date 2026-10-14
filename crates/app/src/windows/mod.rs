@@ -46,6 +46,8 @@ pub enum WindowKey {
     Selection(String),
     /// 所有待确认的「文件已存在」请求聚合在这一个窗口里。
     FileConflicts,
+    /// 自动完成提醒复用进度窗口，一个窗口内导航有界完成集合。
+    Completion,
     TaskDetail(String),
     GroupDetail(String),
     /// 独立下载进度 / 完成窗口（每任务一个）。
@@ -97,14 +99,18 @@ impl WindowRegistry {
     }
 
     fn on_window_closed(cx: &mut App, window_id: WindowId) {
-        let last_closed = {
+        let (last_closed, completion_closed) = {
             let registry = cx.global_mut::<Self>();
-            if let Some(key) = registry.ids.remove(&window_id) {
-                registry.open.remove(&key);
+            let key = registry.ids.remove(&window_id);
+            if let Some(key) = key.as_ref() {
+                registry.open.remove(key);
             }
             registry.confirming.remove(&window_id);
-            registry.open.is_empty()
+            (registry.open.is_empty(), key == Some(WindowKey::Completion))
         };
+        if completion_closed {
+            crate::completion_windows::window_closed(cx);
+        }
         if last_closed {
             crate::lifecycle::quit_ui(cx);
         }

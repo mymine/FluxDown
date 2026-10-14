@@ -4,10 +4,15 @@
 //! 由 app 经 `session::attach` 驱动（[`SessionConsumer`] 三个同名 `pub fn`），自带私有
 //! [`DownloadsController`] 维护任务状态。窗口尺寸由宿主恢复并交给用户调整，内容区可滚动，
 //! 操作栏固定在底部；进度刷新和完成视图切换不改变窗口边界。
-//! 开窗与关窗策略由宿主决定（见 [`crate::ProgressWindowTracker`]），本视图只在任务被删除、
-//! 用户点「停止」、确认删除任务或打开文件 / 文件夹后发出 [`ProgressWindowEvent::Close`]。
+//! 开窗与关窗策略由宿主决定（见 [`crate::ProgressWindowTracker`]）。自动完成提示也复用本视图，
+//! 多项通过上一项 / 下一项浏览；删除或打开一项仅移除该项，最后一项处理完再请求关窗。
 
 use std::sync::Arc;
+
+mod completions;
+
+pub use completions::COMPLETION_WINDOW_LIMIT;
+use completions::CompletedTasks;
 
 use fluxdown_protocol::{AgentEvent, AgentSnapshot, DaemonEvent, ServiceEvent, TaskRuntimeDto};
 use fluxdown_ui_components::{
@@ -76,12 +81,11 @@ pub enum ProgressWindowEvent {
 }
 
 /// 命令成功后的窗口去留。
-#[derive(Clone, Copy)]
 enum AfterSuccess {
     /// 立即关窗（停止 / 删除）。
-    Close,
+    Close(String),
     /// 交给系统程序后关窗（打开文件 / 文件夹）。
-    HandOff,
+    HandOff(String),
 }
 
 pub struct ProgressWindowView {
@@ -93,6 +97,7 @@ pub struct ProgressWindowView {
     runtime: Option<TaskRuntimeDto>,
     show_completion: bool,
     parts_expanded: bool,
+    completed: Option<CompletedTasks>,
     closed: bool,
     /// 删除确认框里「同时删除已下载的文件」的勾选状态（每次打开确认框重置为不删）。
     delete_files: bool,
@@ -125,6 +130,7 @@ impl ProgressWindowView {
             runtime: None,
             show_completion,
             parts_expanded: false,
+            completed: None,
             closed: false,
             delete_files: false,
             last_error: None,
@@ -177,6 +183,10 @@ impl ProgressWindowView {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.refresh_completed() {
+            self.close(cx);
+            return;
+        }
         self.runtime = self.controller.task_runtime(&self.task_id).cloned();
         if self.row().is_none() {
             self.close(cx);
@@ -201,6 +211,7 @@ impl ProgressWindowView {
 
     pub fn apply_event(&mut self, event: &ServiceEvent, cx: &mut Context<Self>) {
         if let ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::TaskDeleted { task_id })) = event
+            && self.completed.is_none()
             && *task_id == self.task_id
         {
             self.close(cx);
@@ -241,12 +252,18 @@ impl ProgressWindowView {
                     return;
                 }
                 match then {
-                    Some(AfterSuccess::Close) => this.close(cx),
-                    Some(AfterSuccess::HandOff) if !this.closed => {
-                        this.closed = true;
-                        cx.emit(ProgressWindowEvent::HandedOff);
+                    Some(AfterSuccess::Close(task_id)) => {
+                        if !this.finish_completed_action(&task_id, cx) {
+                            this.close(cx);
+                        }
                     }
-                    Some(AfterSuccess::HandOff) | None => {}
+                    Some(AfterSuccess::HandOff(task_id)) if !this.closed => {
+                        if !this.finish_completed_action(&task_id, cx) {
+                            this.closed = true;
+                            cx.emit(ProgressWindowEvent::HandedOff);
+                        }
+                    }
+                    Some(AfterSuccess::HandOff(_)) | None => {}
                 }
             }) else {
                 // 视图已释放，结束回调而不再更新状态。
@@ -276,15 +293,22 @@ impl ProgressWindowView {
     fn stop(&mut self, cx: &mut Context<Self>) {
         let task_id = self.task_id.clone();
         self.run(
-            DownloadsCommand::Pause { task_id },
-            Some(AfterSuccess::Close),
+            DownloadsCommand::Pause {
+                task_id: task_id.clone(),
+            },
+            Some(AfterSuccess::Close(task_id)),
             cx,
         );
     }
 
     /// 删除：二次确认，由用户勾选是否同时删除已下载的文件（默认保留）。
-    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(name) = self.row().map(|row| row.name.clone()) else {
+    fn confirm_delete(&mut self, task_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self
+            .controller
+            .store()
+            .get(&RowKey::Local(task_id.clone()))
+            .map(|row| row.name.clone())
+        else {
             return;
         };
         self.delete_files = false;
@@ -305,6 +329,7 @@ impl ProgressWindowView {
             });
             let toggle = this.clone();
             let submit = this.clone();
+            let task_id = task_id.clone();
             dialog
                 .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
                 .description(description)
@@ -332,10 +357,10 @@ impl ProgressWindowView {
                     submit
                         .update(cx, |this, cx| {
                             let command = DownloadsCommand::Delete {
-                                task_id: this.task_id.clone(),
+                                task_id: task_id.clone(),
                                 delete_files: this.delete_files,
                             };
-                            this.run(command, Some(AfterSuccess::Close), cx);
+                            this.run(command, Some(AfterSuccess::Close(task_id.clone())), cx);
                         })
                         .is_ok()
                 })
@@ -343,28 +368,33 @@ impl ProgressWindowView {
     }
 
     fn render_delete_button(&self, cx: &mut Context<Self>) -> Button {
+        let task_id = self.task_id.clone();
         Button::new("progress-delete")
             .outline()
             .control_icon(cx)
             .icon(FluxIcon::Trash2)
             .tooltip(self.strings.delete_task.clone())
-            .on_click(cx.listener(|this, _, window, cx| this.confirm_delete(window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.confirm_delete(task_id.clone(), window, cx);
+            }))
     }
 
-    fn open_file(&mut self, cx: &mut Context<Self>) {
-        let task_id = self.task_id.clone();
+    fn open_file(&mut self, task_id: String, cx: &mut Context<Self>) {
         self.run(
-            DownloadsCommand::OpenTask { task_id },
-            Some(AfterSuccess::HandOff),
+            DownloadsCommand::OpenTask {
+                task_id: task_id.clone(),
+            },
+            Some(AfterSuccess::HandOff(task_id)),
             cx,
         );
     }
 
-    fn reveal(&mut self, cx: &mut Context<Self>) {
-        let task_id = self.task_id.clone();
+    fn reveal(&mut self, task_id: String, cx: &mut Context<Self>) {
         self.run(
-            DownloadsCommand::RevealTask { task_id },
-            Some(AfterSuccess::HandOff),
+            DownloadsCommand::RevealTask {
+                task_id: task_id.clone(),
+            },
+            Some(AfterSuccess::HandOff(task_id)),
             cx,
         );
     }
@@ -1040,6 +1070,8 @@ impl ProgressWindowView {
     }
 
     fn render_completed_footer(&self, missing: bool, cx: &mut Context<Self>) -> AnyElement {
+        let folder_id = self.task_id.clone();
+        let file_id = self.task_id.clone();
         Self::footer(cx)
             .justify_end()
             .child(div().flex_1().child(self.render_delete_button(cx)))
@@ -1049,7 +1081,9 @@ impl ProgressWindowView {
                     .control(cx)
                     .icon(FluxIcon::FolderOpen)
                     .label(self.strings.open_folder.clone())
-                    .on_click(cx.listener(|this, _, _, cx| this.reveal(cx))),
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.reveal(folder_id.clone(), cx)),
+                    ),
             )
             .child(
                 Button::new("progress-open-file")
@@ -1058,7 +1092,9 @@ impl ProgressWindowView {
                     .icon(FluxIcon::File)
                     .label(self.strings.open_file.clone())
                     .disabled(missing)
-                    .on_click(cx.listener(|this, _, _, cx| this.open_file(cx))),
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.open_file(file_id.clone(), cx)),
+                    ),
             )
             .into_any_element()
     }
@@ -1086,7 +1122,7 @@ impl gpui::Render for ProgressWindowView {
                     self.render_completed_footer(row.file_missing, cx),
                 )
             }
-            Some(row) => {
+            Some(row) if self.completed.is_none() => {
                 let row = row.clone();
                 let icon = Self::render_icon_tile(&row, window, cx);
                 let active = matches!(row.state, TaskState::Downloading | TaskState::Pending);
@@ -1095,8 +1131,9 @@ impl gpui::Render for ProgressWindowView {
                     self.render_progress_footer(active, cx),
                 )
             }
-            None => (div().into_any_element(), div().into_any_element()),
+            Some(_) | None => (div().into_any_element(), div().into_any_element()),
         };
+        let navigation = self.render_completion_navigation(cx);
         v_flex()
             .size_full()
             .bg(surface)
@@ -1109,6 +1146,7 @@ impl gpui::Render for ProgressWindowView {
                     .overflow_y_scroll()
                     .child(content),
             )
+            .when_some(navigation, |view, navigation| view.child(navigation))
             .child(footer)
     }
 }

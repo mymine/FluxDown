@@ -775,6 +775,13 @@ fn registry_executable(executable: Option<&Path>) -> Result<String, PlatformErro
     Ok(text.strip_prefix(r"\\?\").unwrap_or(&*text).to_owned())
 }
 
+/// 通知资源管理器重新读取注册表里的环境变量：之后由它启动的程序（开始菜单 / 任务栏打开的
+/// 浏览器）才拿到新值；已在运行的进程（包括本进程）仍沿用启动时继承的环境块。
+#[cfg(windows)]
+pub fn notify_environment_changed() -> Result<(), PlatformError> {
+    windows_shell::notify_environment_changed().map_err(PlatformError::Io)
+}
+
 #[cfg(windows)]
 mod windows_shell {
     /// `SHChangeNotify(SHCNE_ASSOCCHANGED)` 通知资源管理器关联已变化。
@@ -790,6 +797,36 @@ mod windows_shell {
                 std::ptr::null(),
             );
         }
+    }
+
+    /// 广播 `WM_SETTINGCHANGE("Environment")`；失败返回系统错误。
+    pub fn notify_environment_changed() -> std::io::Result<()> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+        };
+
+        /// 每个顶层窗口的等待上限；已挂起的窗口由 `SMTO_ABORTIFHUNG` 直接跳过。
+        const PER_WINDOW_TIMEOUT_MS: u32 = 2000;
+        let area = windows_sys::w!("Environment") as isize;
+        let mut reply = 0usize;
+        // SAFETY: HWND_BROADCAST 是文档定义的广播伪句柄；lParam 指向 `w!` 生成的 'static、
+        // NUL 结尾 UTF-16 常量，接收方只读取它（系统负责跨进程封送）；lpdwResult 指向本栈上
+        // 存活到调用返回的 usize。调用同步完成，不保留任何指针。
+        let sent = unsafe {
+            SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                area,
+                SMTO_ABORTIFHUNG,
+                PER_WINDOW_TIMEOUT_MS,
+                &mut reply,
+            )
+        };
+        if sent == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 

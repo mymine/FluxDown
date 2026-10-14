@@ -244,6 +244,7 @@ pub(crate) fn repair_outcome(
             match action {
                 "test_notification" => "doctorTestNotificationSent",
                 "open_settings" => "doctorSettingsOpened",
+                "fix_comspec" => "doctorComspecFixed",
                 _ => "doctorRepairSucceeded",
             },
             true,

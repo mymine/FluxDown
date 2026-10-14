@@ -130,8 +130,8 @@ android {
 
     defaultConfig {
         applicationId = "com.fluxdown.app"
-        // API 31：RenderEffect 背景模糊为材质基线（docs/mobile-ui README §0），无低于 31 的分支
-        minSdk = 31
+        // API 26（Android 8.0）：模糊材质 / 系统启动画面 / 字体回退链等高版本能力按 SDK_INT 分支降级（见 :fluxui FluxPerf）
+        minSdk = 26
         targetSdk = 37
         versionCode = Release.versionCode(appVersionName)
         versionName = appVersionName

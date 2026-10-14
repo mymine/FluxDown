@@ -1047,6 +1047,13 @@ impl Db {
         // 队列内启动顺序（0 = 未显式排序，按 created_at 先来先启动）。
         self.add_column_if_missing("tasks", "queue_order", "INTEGER NOT NULL DEFAULT 0")
             .await?;
+        // 新任务追加顺序与队列内排序共用覆盖索引；否则每次 MAX 都会扫描
+        // 已有任务，大量逐条导入会在数据库层退化为 O(N²)。
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_queue_order ON tasks(queue_id, queue_order)",
+        )
+        .execute(&self.pool)
+        .await?;
         // 队列启停状态与每日定时计划（IDM 式队列控制）。
         self.add_column_if_missing("queues", "is_running", "INTEGER NOT NULL DEFAULT 1")
             .await?;
@@ -7416,6 +7423,26 @@ mod tests {
         assert_eq!(main.schedule_stop, "23:00");
         assert_eq!(main.schedule_days, 0b001_1111);
         close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn appended_queue_order_uses_covering_index() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("memory database");
+        let plan = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT CAST(COALESCE(MAX(queue_order), 0) + 1 AS BIGINT) FROM tasks WHERE queue_id = $1",
+        )
+        .bind(MAIN_QUEUE_ID)
+        .fetch_all(&db.pool)
+        .await
+        .expect("queue append query plan");
+        assert!(
+            plan.iter().any(|row| row
+                .get::<String, _>("detail")
+                .contains("COVERING INDEX idx_tasks_queue_order")),
+            "appending a task must not scan all historical task rows"
+        );
     }
 
     /// 插入任务自动追加 queue_order；startable 顺序 = queue_order → created_at；

@@ -8,6 +8,7 @@ import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
 import android.os.Build
 import android.util.Log
+import androidx.core.content.pm.PackageInfoCompat
 import com.fluxdown.app.FluxApplication
 import com.fluxdown.core.update.UpdateFailure
 import com.fluxdown.core.update.UpdatePolicy
@@ -75,8 +76,10 @@ internal class ApkInstaller(private val context: Context, private val env: Insta
         if (!sameSigners) {
             return InstallOutcome.Rejected(UpdateFailure.Verify, "${UpdatePolicy.SIGNATURE_MISMATCH}: installed=$installedSigners package=$archiveSigners")
         }
-        if (archive.longVersionCode < installed.longVersionCode) {
-            return InstallOutcome.Rejected(UpdateFailure.Verify, "version downgrade: ${archive.longVersionCode} < ${installed.longVersionCode}")
+        val archiveCode = PackageInfoCompat.getLongVersionCode(archive)
+        val installedCode = PackageInfoCompat.getLongVersionCode(installed)
+        if (archiveCode < installedCode) {
+            return InstallOutcome.Rejected(UpdateFailure.Verify, "version downgrade: $archiveCode < $installedCode")
         }
         return null
     }
@@ -87,7 +90,10 @@ internal class ApkInstaller(private val context: Context, private val env: Insta
             setAppPackageName(context.packageName)
             setSize(file.length())
             setInstallReason(PackageManager.INSTALL_REASON_USER)
-            setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+            // Android 12 以下不支持免确认更新，系统安装器总会弹确认（会话结果走同一 STATUS_PENDING_USER_ACTION 分支）
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 setPackageSource(PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE)
             }

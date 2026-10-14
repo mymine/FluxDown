@@ -9,7 +9,7 @@ use fluxdown_ui_theme::active_theme;
 use gpui::{App, ParentElement, SharedString, Styled, Window};
 use gpui_component::h_flex;
 
-use super::{SectionContext, rate_limit, user_agent};
+use super::{SectionContext, auto_quantity, rate_limit, user_agent};
 use crate::ui::{Control, Explain, SettingsPage, SettingsSection, body_text, meta_text};
 
 pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
@@ -214,7 +214,7 @@ fn connection_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
             ctx.item(
                 "defaultThreads",
                 Some("defaultThreadsDesc"),
-                ctx.daemon_number("default_segments"),
+                auto_quantity::control(ctx, "default_segments", "default_segments_custom", 16),
             )
             .footer(threads_risk_footer(ctx)),
         );
@@ -234,7 +234,7 @@ fn connection_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
         section = section.row(ctx.item(
             "cdnMaxNodes",
             Some("cdnMaxNodesDesc"),
-            ctx.daemon_number("cdn_max_nodes"),
+            auto_quantity::control(ctx, "cdn_max_nodes", "cdn_max_nodes_custom", 2),
         ));
     }
     section = section.row(

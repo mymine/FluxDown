@@ -4,6 +4,8 @@ import android.graphics.ColorMatrix as AndroidColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.RenderEffect as AndroidRenderEffect
 import android.graphics.Shader
+import android.os.Build
+import androidx.annotation.RequiresApi
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
@@ -53,6 +55,7 @@ import java.util.EnumMap
 enum class FluxBlur(val sigma: Dp, val saturation: Float) {
     Thin(20.dp, 1.00f), Regular(28.dp, 1.40f), Thick(38.dp, 1.55f);
 
+    @RequiresApi(Build.VERSION_CODES.S)
     internal fun renderEffect(density: Density): RenderEffect {
         val px = with(density) { sigma.toPx() }
         val blur = AndroidRenderEffect.createBlurEffect(px, px, Shader.TileMode.CLAMP)
@@ -119,7 +122,8 @@ private class BackdropSourceNode(var b: FluxBackdrop) : Modifier.Node(), DrawMod
         src.record(this, layoutDirection, sz) { this@draw.drawContent() }
         drawLayer(src)
         // 读取 version 以便新变体被请求时重绘；副本只引用源 RenderNode，内容变化自动传播。
-        if (b.version >= 0) {
+        // Android 12 以下 FluxPerf 恒为 Solid，不会有变体被请求。
+        if (b.version >= 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             for (blur in b.requested) {
                 val existing = b.blurred[blur]
                 val layer = existing ?: gc.createGraphicsLayer().also {
@@ -254,6 +258,7 @@ private class GlassNode(var spec: GlassElement) : Modifier.Node(), DrawModifierN
 /**
  * 辉光 / 软阴影（§5.5 的有限例外）：在内容之后画一个被高斯模糊的形状。
  * [radius] = 模糊 σ；[spread] 向外扩（负值内缩）；[dy] 为 Y 偏移。
+ * Android 12 以下图层不支持 `RenderEffect`（会画出未模糊的实心形状），整体不画。
  */
 fun Modifier.fluxGlow(
     color: Color,
@@ -261,7 +266,7 @@ fun Modifier.fluxGlow(
     shape: Shape,
     spread: Dp = 0.dp,
     dy: Dp = 0.dp,
-): Modifier = drawWithCache {
+): Modifier = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) this else drawWithCache {
     val pad = radius.toPx() * 3 + kotlin.math.abs(spread.toPx())
     val layer = obtainGraphicsLayer()
     val sp = spread.toPx()

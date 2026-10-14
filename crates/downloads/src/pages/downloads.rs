@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::{
+    UserStartIntent,
     actions::{
         ClearFinished, ClearSelection, CopySelectedUrl, CycleDensity, CycleGroupBy, CycleSort,
         DeleteSelected, DeleteSelectedWithFiles, FocusSearch, KEY_CONTEXT, NewDownload,
@@ -83,9 +84,8 @@ pub type IdOpener = Rc<dyn Fn(String, &mut Window, &mut App)>;
 pub type PlainOpener = Rc<dyn Fn(&mut Window, &mut App)>;
 /// 分类编辑入口：`Some(id)` 编辑现有分类，`None` 新建。
 pub type CategoryEditorOpener = Rc<dyn Fn(Option<String>, &mut Window, &mut App)>;
-/// 用户在场亲手开始了一个任务（单任务继续 / 重新下载 / 新建单任务成功）；宿主据此弹
-/// 独立进度窗口。
-pub type UserStartHook = Rc<dyn Fn(String, &mut App)>;
+/// 单任务交互式开始的生命周期。新建成功直接通知；已有任务须在执行命令前通知 Requested。
+pub type UserStartHook = Rc<dyn Fn(UserStartIntent, &mut App)>;
 
 /// app 注入的跨窗口 / 跨能力入口；未注入的入口对应按钮无动作。
 #[derive(Clone, Default)]
@@ -104,7 +104,7 @@ pub struct DownloadHostActions {
     pub shutdown_status: Option<crate::model::shutdown::SharedShutdownStatus>,
     /// 状态栏发起关机请求的端口。
     pub shutdown: Option<crate::model::shutdown::ShutdownPort>,
-    /// 单任务交互式开始成功后回调（批量操作不回调）。
+    /// 单任务交互式开始回调（批量操作不回调）。
     pub on_user_started: Option<UserStartHook>,
 }
 
@@ -345,16 +345,16 @@ impl DownloadView {
         submission: NewDownloadSubmission,
         cx: &mut Context<Self>,
     ) -> gpui::Task<SubmitNotice> {
-        if self.controller.is_stale() {
-            return gpui::Task::ready(SubmitNotice {
-                ok: false,
-                message: self.strings.disconnected.to_string(),
-            });
-        }
         let starts_immediately = submission.starts_immediately();
         let port = Arc::clone(&self.port);
+        let on_user_started = self.host.on_user_started.clone();
         cx.spawn(async move |this, cx| {
             let report = run_submission(submission, move |command| port.execute(command)).await;
+            if starts_immediately
+                && let ([task_id], Some(hook)) = (report.created_task_ids(), on_user_started)
+            {
+                cx.update(|cx| hook(UserStartIntent::Created(task_id.clone()), cx));
+            }
             let fallback = SubmitNotice {
                 ok: !report.failed(),
                 message: String::new(),
@@ -364,9 +364,6 @@ impl DownloadView {
                 this.last_error = report
                     .failed()
                     .then(|| SharedString::from(notice.message.clone()));
-                if starts_immediately {
-                    this.notify_user_started(report.created_task_ids(), cx);
-                }
                 cx.notify();
                 notice
             })
@@ -378,13 +375,6 @@ impl DownloadView {
     pub(crate) fn open_file_conflicts(&self, window: &mut Window, cx: &mut App) {
         if let Some(open) = self.host.open_file_conflicts.as_ref() {
             open(window, cx);
-        }
-    }
-
-    /// 只有恰好一个任务被交互式开始时通知宿主（批量不逐个弹窗）。
-    pub(crate) fn notify_user_started(&self, task_ids: &[String], cx: &mut App) {
-        if let ([task_id], Some(hook)) = (task_ids, self.host.on_user_started.as_ref()) {
-            hook(task_id.clone(), cx);
         }
     }
 

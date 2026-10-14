@@ -94,6 +94,9 @@ impl AgentSession {
         for event in events {
             match event {
                 AgentClientEvent::Snapshot(snapshot) => {
+                    self._client
+                        .submissions
+                        .set_ready(agent_body(&snapshot).is_some_and(|body| body.daemon_connected));
                     let snapshot = Arc::new(*snapshot);
                     self.latest = Some(Arc::clone(&snapshot));
                     self.stale = false;
@@ -108,6 +111,15 @@ impl AgentSession {
                         .map(|snapshot| apply_frame(Arc::make_mut(snapshot), &mut frame))
                     {
                         Some(Ok(true)) if !self.stale => {
+                            match &frame.event {
+                                ServiceEvent::Agent(AgentEvent::DaemonConnectionChanged(ready)) => {
+                                    self._client.submissions.set_ready(*ready);
+                                }
+                                ServiceEvent::Agent(AgentEvent::DaemonSnapshotReplaced(_)) => {
+                                    self._client.submissions.set_ready(true);
+                                }
+                                _ => {}
+                            }
                             cx.emit(SessionSignal::Event(Arc::new(*frame)));
                         }
                         Some(Ok(_)) => {}
@@ -141,6 +153,7 @@ impl AgentSession {
 
     /// 连接中断：立即停止并帧，但只在宽限内仍未恢复时才告知视图。
     fn go_stale(&mut self, cx: &mut Context<Self>) {
+        self._client.submissions.set_ready(false);
         if self.stale {
             return;
         }
@@ -172,6 +185,7 @@ impl AgentSession {
 
     /// 视图即将进入离线态：快照中的运行态作废（晚打开的视图也不显示过期速度）。
     fn notify_offline_now(&mut self) {
+        self._client.submissions.set_ready(false);
         self.stale = true;
         self.offline_notified = true;
         self.offline_generation = self.offline_generation.wrapping_add(1);

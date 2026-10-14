@@ -10,6 +10,7 @@ import android.window.SplashScreenView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.annotation.RequiresApi
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
@@ -40,8 +41,11 @@ class HomeActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val container = (application as FluxApplication).container
         // 启动揭幕只在新建界面时播放（恢复实例 / 系统关闭动画时直接呈现，系统画面按默认方式退场）。
+        // Android 12 以下没有系统启动画面：窗口底色即 canvas，揭幕按默认居中位置自行开始。
         val reveal = if (savedInstanceState == null && ValueAnimator.areAnimatorsEnabled()) LaunchRevealState() else null
-        if (reveal != null) splashScreen.setOnExitAnimationListener { splash -> handOff(splash, reveal) }
+        if (reveal != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            splashScreen.setOnExitAnimationListener { splash -> handOff(splash, reveal) }
+        }
         if (savedInstanceState == null) handleIntent(intent)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) followThemeModeInSplash(container)
         setContent {
@@ -57,6 +61,7 @@ class HomeActivity : ComponentActivity() {
      * 系统启动画面只认静态主题：App 内强制明 / 暗时把对应启动主题持久化给系统（下次冷启动生效），
      * 跟随系统时清除，回到 `Theme.FluxDown` 的随系统资源。强调色无法这样传递，由揭幕吸气段过渡。
      */
+    @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     private fun followThemeModeInSplash(container: AppContainer) {
         lifecycleScope.launch {
             container.appearance.state.map { it.mode }.distinctUntilChanged().collect { mode ->
@@ -72,6 +77,7 @@ class HomeActivity : ComponentActivity() {
     }
 
     /** 系统启动画面在首帧绘制后回调：读出其中 logo 画框的窗口坐标与底色交给揭幕，由揭幕决定何时移除系统画面。 */
+    @RequiresApi(Build.VERSION_CODES.S)
     private fun handOff(splash: SplashScreenView, reveal: LaunchRevealState) {
         val icon = splash.iconView
         val mark = if (icon != null && icon.width > 0 && icon.height > 0) {

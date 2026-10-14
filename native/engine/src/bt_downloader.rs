@@ -4685,6 +4685,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         .send(ProgressUpdate {
             task_id: task_id.clone(),
             downloaded_bytes: init_progress,
+            download_baseline: Some(init_progress),
             total_bytes,
             status: STATUS_DOWNLOADING,
             error_message: String::new(),
@@ -5513,6 +5514,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 .send(ProgressUpdate {
                     task_id: task_id.clone(),
                     downloaded_bytes: final_total,
+                    download_baseline: None,
                     total_bytes: final_total,
                     status: STATUS_COMPLETED,
                     error_message: String::new(),

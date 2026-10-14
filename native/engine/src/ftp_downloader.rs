@@ -1096,6 +1096,7 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
             downloaded_bytes: initial_downloaded,
+            download_baseline: Some(initial_downloaded),
             total_bytes: info.total_bytes,
             status: 1,
             error_message: String::new(),
@@ -1587,6 +1588,24 @@ async fn ftp_download_single(
         } else {
             tokio::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, File::create(&dest).await?)
         };
+        // The actual file offset can differ from tasks.downloaded_bytes, and
+        // REST fallback retries may have truncated it since the outer probe.
+        // Establish this attempt's starting point before consuming body data.
+        if progress_tx
+            .send(ProgressUpdate {
+                task_id: task_id.clone(),
+                downloaded_bytes: downloaded,
+                download_baseline: Some(downloaded),
+                total_bytes,
+                status: 1,
+                ..Default::default()
+            })
+            .await
+            .is_err()
+        {
+            tracing::debug!("FTP progress receiver closed");
+            return Err(DownloadError::Cancelled);
+        }
         let mut last_report = std::time::Instant::now();
         let mut last_db_save = std::time::Instant::now();
         loop {
@@ -1824,6 +1843,25 @@ async fn ftp_download_multi_segment(
         if file.metadata().await?.len() < total_bytes as u64 {
             file.set_len(total_bytes as u64).await?;
         }
+    }
+
+    // Use repaired segment checkpoints, not the independently persisted task
+    // counter. No worker has started, so this contains restored bytes only.
+    let baseline = total_downloaded.load(Ordering::Relaxed);
+    if progress_tx
+        .send(ProgressUpdate {
+            task_id: task_id.to_owned(),
+            downloaded_bytes: baseline,
+            download_baseline: Some(baseline),
+            total_bytes,
+            status: 1,
+            ..Default::default()
+        })
+        .await
+        .is_err()
+    {
+        tracing::debug!("FTP progress receiver closed");
+        return Err(DownloadError::Cancelled);
     }
 
     // Limit concurrent FTP connections to avoid server-side per-IP limits
@@ -2980,6 +3018,58 @@ mod tests {
         assert_eq!(tokio::fs::read(&path).await?, b"old");
         drop(writer);
         tokio::fs::remove_file(path).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_ftp_partial_file_emits_zero_baseline_before_new_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PAYLOAD: &[u8] = b"ftp-baseline-payload";
+        let db = crate::db::Db::connect("sqlite::memory:").await?;
+        db.insert_task(
+            "baseline-reset",
+            "ftp://localhost/f",
+            "f",
+            "",
+            1,
+            PAYLOAD.len() as i64,
+            "",
+            "",
+            "",
+            1,
+        )
+        .await?;
+        db.update_task_progress("baseline-reset", 8).await?;
+        let dir =
+            std::env::temp_dir().join(format!("fluxdown_ftp_baseline_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await?;
+        let dest = dir.join("missing-partial");
+        let (port, _, _) = spawn_fake_ftp(false, false, PAYLOAD)?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::ftp_download_single(
+                "baseline-reset",
+                &fake_ftp_url(port),
+                &dest,
+                PAYLOAD.len() as i64,
+                true,
+                &db,
+                &tx,
+                &tokio_util::sync::CancellationToken::new(),
+                &crate::speed_limiter::SpeedLimiter::new(0),
+                &crate::proxy_config::ProxyConfig::default(),
+                &crate::transfer_activity::TransferTracker::new(),
+            ),
+        )
+        .await??;
+        let baseline = rx
+            .try_recv()
+            .expect("actual baseline precedes body progress");
+        assert_eq!(baseline.download_baseline, Some(0));
+        assert_eq!(baseline.downloaded_bytes, 0);
+        assert_eq!(tokio::fs::read(&dest).await?, PAYLOAD);
+        remove_test_dir(&dir).await;
         Ok(())
     }
 

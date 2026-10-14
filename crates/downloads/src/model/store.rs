@@ -156,6 +156,23 @@ impl TaskStore {
         ix
     }
 
+    /// Preserve authoritative snapshot order without replacing unchanged views.
+    pub(crate) fn swap_local(&self, left: usize, right: usize) {
+        let mut rows = self.local.borrow_mut();
+        rows.swap(left, right);
+        let mut index = self.index.borrow_mut();
+        for position in [left, right] {
+            let task_id = rows[position].key.task_id();
+            if let Some(indexed) = index.get_mut(task_id) {
+                *indexed = position;
+            } else {
+                eprintln!("repairing missing local task index during snapshot reorder");
+                index.insert(task_id.to_owned(), position);
+            }
+        }
+        self.bump_structure();
+    }
+
     /// `swap_remove` 并修正被换入行的索引。
     pub(crate) fn swap_remove_local(&self, ix: usize) {
         let mut rows = self.local.borrow_mut();

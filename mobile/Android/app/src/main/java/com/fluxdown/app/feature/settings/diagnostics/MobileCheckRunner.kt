@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.os.PowerManager
 import android.os.StatFs
 import android.text.format.Formatter
@@ -82,7 +83,8 @@ internal object MobileCheckRunner {
         val power = context.getSystemService(PowerManager::class.java)
         val activity = context.getSystemService(ActivityManager::class.java)
         return MobileChecks.background(
-            backgroundRestricted = activity.isBackgroundRestricted,
+            // Android 9 以下没有「后台限制」开关，视为未限制
+            backgroundRestricted = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && activity.isBackgroundRestricted,
             batteryUnrestricted = power.isIgnoringBatteryOptimizations(context.packageName),
             powerSave = power.isPowerSaveMode,
         )

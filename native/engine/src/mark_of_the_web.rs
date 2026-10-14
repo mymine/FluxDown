@@ -13,6 +13,11 @@
 //!
 //! 标记不改变文件内容，对 BT 做种 / 续传无影响。所有失败（FAT/exFAT 不支持
 //! ADS、只读介质、`xattr` 缺失）只记日志，绝不影响任务完成状态。
+//!
+//! NTFS 时间戳属于文件而非流：写 `Zone.Identifier` 会把主文件修改时间刷成当前
+//! 时间。开启「使用服务器文件时间」的任务由调用方传 `keep_mtime`，写流后在同一
+//! 句柄上回写原修改时间（显式设置后句柄关闭也不会再刷新）；未开启时不多做任何
+//! 系统调用，大量小文件 / BT 目录不受影响。macOS 扩展属性只改 ctime，无需处理。
 
 use std::path::{Path, PathBuf};
 
@@ -25,8 +30,9 @@ const MAX_MARKED_FILES: usize = 50_000;
 /// 后台为 `path`（文件或目录）写入来源标记；立即返回，不阻塞调用方。
 ///
 /// `host_url` 为下载源地址、`referrer` 为来源页（均可为空）。目录会被递归展开，
-/// 符号链接不跟随。
-pub fn spawn_mark_downloaded(path: PathBuf, host_url: String, referrer: String) {
+/// 符号链接不跟随。`keep_mtime` 为 `true` 时标记不得改变文件修改时间（已设为
+/// 服务器时间的产物）；仅 Windows 需要额外回写。
+pub fn spawn_mark_downloaded(path: PathBuf, host_url: String, referrer: String, keep_mtime: bool) {
     if !cfg!(any(windows, target_os = "macos")) {
         return;
     }
@@ -48,7 +54,7 @@ pub fn spawn_mark_downloaded(path: PathBuf, host_url: String, referrer: String) 
         if files.is_empty() {
             return;
         }
-        platform::apply(files, host_url, referrer).await;
+        platform::apply(files, host_url, referrer, keep_mtime).await;
     });
 }
 
@@ -158,6 +164,7 @@ fn quarantine_value(now_secs: u64) -> String {
 #[cfg(windows)]
 mod platform {
     use super::{Path, PathBuf, log_info, zone_identifier_content, zone_information_allowed};
+    use std::io::Write;
     use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
@@ -195,11 +202,16 @@ mod platform {
         }
     }
 
-    pub(super) async fn apply(files: Vec<PathBuf>, host_url: String, referrer: String) {
+    pub(super) async fn apply(
+        files: Vec<PathBuf>,
+        host_url: String,
+        referrer: String,
+        keep_mtime: bool,
+    ) {
         let result = tokio::task::spawn_blocking(move || {
             let content = zone_identifier_content(&host_url, &referrer);
             for file in &files {
-                if let Err(e) = write_zone_identifier(file, &content) {
+                if let Err(e) = write_zone_identifier(file, &content, keep_mtime) {
                     log_info!("[motw] Zone.Identifier failed for {}: {e}", file.display());
                 }
             }
@@ -210,10 +222,40 @@ mod platform {
         }
     }
 
-    fn write_zone_identifier(file: &Path, content: &str) -> std::io::Result<()> {
+    /// 写入 `<file>:Zone.Identifier`；`keep_mtime` 时写前取主文件修改时间，写后在
+    /// 同一流句柄上回写。修改时间读取 / 回写失败只记日志：来源标记优先于时间戳。
+    pub(super) fn write_zone_identifier(
+        file: &Path,
+        content: &str,
+        keep_mtime: bool,
+    ) -> std::io::Result<()> {
+        let original = if keep_mtime {
+            match std::fs::metadata(file).and_then(|meta| meta.modified()) {
+                Ok(modified) => Some(modified),
+                Err(e) => {
+                    log_info!(
+                        "[motw] read mtime of {} failed, server time may be lost: {e}",
+                        file.display()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut stream = file.as_os_str().to_owned();
         stream.push(":Zone.Identifier");
-        std::fs::write(PathBuf::from(stream), content)
+        let mut ads = std::fs::File::create(PathBuf::from(stream))?;
+        ads.write_all(content.as_bytes())?;
+        if let Some(modified) = original
+            && let Err(e) = ads.set_times(std::fs::FileTimes::new().set_modified(modified))
+        {
+            log_info!(
+                "[motw] restore mtime of {} failed, server time lost: {e}",
+                file.display()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -229,7 +271,12 @@ mod platform {
     /// 单次 `xattr` 调用处理的文件数（避免超长命令行，又不为每个文件起一个进程）。
     const BATCH: usize = 200;
 
-    pub(super) async fn apply(files: Vec<PathBuf>, _host_url: String, _referrer: String) {
+    pub(super) async fn apply(
+        files: Vec<PathBuf>,
+        _host_url: String,
+        _referrer: String,
+        _keep_mtime: bool,
+    ) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -263,7 +310,13 @@ mod platform {
         false
     }
 
-    pub(super) async fn apply(_files: Vec<PathBuf>, _host_url: String, _referrer: String) {}
+    pub(super) async fn apply(
+        _files: Vec<PathBuf>,
+        _host_url: String,
+        _referrer: String,
+        _keep_mtime: bool,
+    ) {
+    }
 }
 
 #[cfg(test)]
@@ -309,6 +362,50 @@ mod tests {
     #[test]
     fn quarantine_value_is_hex_timestamped() {
         assert_eq!(quarantine_value(255), "0081;ff;FluxDown;");
+    }
+
+    /// NTFS 写 ADS 会刷新主文件修改时间：开启服务器时间（keep_mtime）必须原样保留
+    /// 已设好的服务器时间；未开启时不回写，修改时间为标记时刻。
+    #[cfg(windows)]
+    #[test]
+    fn zone_identifier_keeps_mtime_only_when_requested() -> std::io::Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "fluxdown_motw_mtime_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root)?;
+        // 2020-01-01T00:00:00Z，模拟已落地的服务器 Last-Modified。
+        let server_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800);
+        for (keep_mtime, name) in [(true, "keep.bin"), (false, "plain.bin")] {
+            let file = root.join(name);
+            std::fs::write(&file, b"payload")?;
+            std::fs::File::options()
+                .write(true)
+                .open(&file)?
+                .set_times(std::fs::FileTimes::new().set_modified(server_time))?;
+
+            platform::write_zone_identifier(&file, "[ZoneTransfer]\r\nZoneId=3\r\n", keep_mtime)?;
+
+            let mtime = std::fs::metadata(&file)?.modified()?;
+            if keep_mtime {
+                assert_eq!(mtime, server_time, "keep_mtime 必须保留服务器时间");
+            } else {
+                assert!(mtime > server_time, "未开启时不得回写服务器时间");
+            }
+            let mut stream = file.as_os_str().to_owned();
+            stream.push(":Zone.Identifier");
+            assert!(std::fs::read_to_string(PathBuf::from(stream))?.contains("ZoneId=3"));
+        }
+        if let Err(error) = std::fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
+        Ok(())
     }
 
     #[test]

@@ -387,7 +387,8 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             // 窗口注册表退出。启动链接提交完成后若首个快照里已无待确认项，直接退出。
             quit_when_nothing_to_confirm(launch_submissions, cx);
         } else if launch.minimized {
-            // 开机自启（agent 判定需要界面时才拉起）：会话就绪后开最小化主窗口。
+            // 开机自启且托盘不可见（agent 判定没有其它入口时才拉起）：会话就绪后开最小化主窗口，
+            // 新窗口不抢焦点。
             after_session_settled(cx, open_main_minimized);
         } else if launch.is_plain() {
             // 普通启动：本进程冷启动了服务时按「启动时最小化到托盘」决定；agent 早已驻留时
@@ -497,7 +498,7 @@ fn desktop_application() -> gpui::Application {
 }
 
 fn open_main_minimized(cx: &mut App) {
-    if let Some(handle) = crate::windows::main::open(cx)
+    if let Some(handle) = crate::windows::main::open_unfocused(cx)
         && let Err(error) = handle.update(cx, |_, window, _| window.minimize_window())
     {
         log::debug!("view or window released before lifecycle update: {error:#}");

@@ -95,6 +95,45 @@ pub fn open(cx: &mut App, context: NewDownloadContext) {
 /// 订阅会话：待确认捕获出现 → 追加进新建下载表单（必要时打开）；启动时回放快照。
 pub fn install_captures(cx: &mut App) {
     cx.set_global(CaptureDispatch::default());
+    let mut interruptions = Desktop::global(cx)
+        .client
+        .submissions
+        .interruption
+        .subscribe();
+    cx.spawn(async move |cx| {
+        loop {
+            if interruptions.changed().await.is_err() {
+                log::debug!("download import notification channel closed");
+                break;
+            }
+            let Some(source) = interruptions.borrow_and_update().clone() else {
+                continue;
+            };
+            cx.update(|cx| {
+                crate::windows::main::reveal(cx);
+                let Some(main) = WindowRegistry::handle(cx, &WindowKey::Main) else {
+                    return;
+                };
+                let translator = Desktop::global(cx).translator.read(cx);
+                let message = format!("{}\n{source}", translator.text("downloadImportInterrupted"));
+                let copy_label = translator.text("copyUrl").to_owned();
+                let notification = Notification::error(message).action(move |_, _, _| {
+                    let source = source.clone();
+                    gpui_component::button::Button::new("copy-interrupted-download")
+                        .label(copy_label.clone())
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(source.clone()));
+                        })
+                });
+                if let Err(error) = main.update(cx, |_, window, cx| {
+                    window.push_notification(notification, cx);
+                }) {
+                    log::error!("could not display download import interruption: {error:#}");
+                }
+            });
+        }
+    })
+    .detach();
     let session = Desktop::global(cx).session.clone();
     let initial = session.read(cx).agent_snapshot().map(|body| {
         (
@@ -432,7 +471,12 @@ fn submit(submission: NewDownloadSubmission, port: &Arc<AgentDownloadsPort>, cx:
                 // 与主窗口下载页同一规则：恰好一个任务立即开始才弹进度窗口。
                 if let ([task_id], true) = (report.created_task_ids(), starts_immediately) {
                     let task_id = task_id.clone();
-                    cx.update(|cx| crate::progress_windows::user_started(task_id, cx));
+                    cx.update(|cx| {
+                        crate::progress_windows::user_started(
+                            fluxdown_ui_downloads::UserStartIntent::Created(task_id),
+                            cx,
+                        );
+                    });
                 }
                 cx.update(|cx| report.notice(translator.read(cx)))
             })

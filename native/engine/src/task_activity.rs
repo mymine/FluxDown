@@ -218,112 +218,121 @@ async fn persist_overflows(
 
 impl EventSink for JournalSink {
     fn emit(&self, event: EngineEvent) {
-        let activity = match &event {
+        let state_change = match &event {
             EngineEvent::TaskProgress {
                 task_id,
                 status,
                 error_message,
                 ..
-            } => {
-                let changed = {
-                    let mut previous = self.last_state.lock().unwrap_or_else(|e| e.into_inner());
-                    if previous
-                        .get(task_id)
-                        .is_some_and(|(old_status, old_error)| {
-                            old_status == status && old_error == error_message
-                        })
-                    {
-                        false
-                    } else {
-                        previous.insert(task_id.clone(), (*status, error_message.clone()));
-                        true
-                    }
-                };
-                if changed {
-                    let message = error_message.clone();
-                    Some((
-                        task_id,
-                        if error_message.is_empty() {
-                            "status"
-                        } else {
-                            "error"
-                        },
-                        message,
-                        Some(*status),
-                    ))
-                } else {
-                    None
-                }
-            }
-            EngineEvent::TasksSnapshot(tasks) => {
-                let retained: HashSet<_> = tasks.iter().map(|task| task.task_id.as_str()).collect();
-                self.last_state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .retain(|task_id, _| retained.contains(task_id.as_str()));
-                None
-            }
-            EngineEvent::SegmentSplit {
-                task_id,
-                parent_index,
-                child_index,
-                child_start,
-                child_end,
-                ..
-            } => Some((
-                task_id,
-                "split",
-                format!(
-                    "segment {parent_index} split child={child_index} range={child_start}..={child_end}"
-                ),
-                None,
-            )),
-            EngineEvent::TaskCdnEvent {
-                task_id,
-                kind,
-                host,
-                nodes,
-                ip,
-                reason,
-                candidates,
-                alive,
-                cap,
-                auto_cap,
-            } if kind != "leases" => {
-                let nodes = if kind == "pool" || kind == "summary" || kind == "links" {
-                    nodes
-                        .iter()
-                        .map(|node| {
-                            format!(
-                                "{}({}) bytes={} bps={}",
-                                node.ip, node.origin, node.bytes, node.ewma_bps
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(";")
-                } else {
-                    String::new()
-                };
-                let message = format!(
-                    "CDN {kind} host={host} ip={ip} reason={reason} candidates={candidates} alive={alive} cap={cap} auto_cap={auto_cap} nodes=[{nodes}]"
-                );
-                Some((
-                    task_id,
-                    match kind.as_str() {
-                        "pool" => "cdn_pool",
-                        "kick" => "cdn_kick",
-                        "breaker" => "cdn_breaker",
-                        "fallback" => "cdn_fallback",
-                        "summary" => "cdn_summary",
-                        "links" => "nic_links",
-                        "links_off" => "nic_off",
-                        _ => "cdn",
-                    },
-                    message,
-                    None,
-                ))
+            } => Some((task_id, status, error_message)),
+            EngineEvent::TaskChanged(task) => {
+                Some((&task.task_id, &task.status, &task.error_message))
             }
             _ => None,
+        };
+        let activity = if let Some((task_id, status, error_message)) = state_change {
+            let changed = {
+                let mut previous = self.last_state.lock().unwrap_or_else(|e| e.into_inner());
+                if previous
+                    .get(task_id)
+                    .is_some_and(|(old_status, old_error)| {
+                        old_status == status && old_error == error_message
+                    })
+                {
+                    false
+                } else {
+                    previous.insert(task_id.clone(), (*status, error_message.clone()));
+                    true
+                }
+            };
+            if changed {
+                let message = error_message.clone();
+                Some((
+                    task_id,
+                    if error_message.is_empty() {
+                        "status"
+                    } else {
+                        "error"
+                    },
+                    message,
+                    Some(*status),
+                ))
+            } else {
+                None
+            }
+        } else {
+            match &event {
+                EngineEvent::TasksSnapshot(tasks) => {
+                    let retained: HashSet<_> =
+                        tasks.iter().map(|task| task.task_id.as_str()).collect();
+                    self.last_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .retain(|task_id, _| retained.contains(task_id.as_str()));
+                    None
+                }
+                EngineEvent::SegmentSplit {
+                    task_id,
+                    parent_index,
+                    child_index,
+                    child_start,
+                    child_end,
+                    ..
+                } => Some((
+                    task_id,
+                    "split",
+                    format!(
+                        "segment {parent_index} split child={child_index} range={child_start}..={child_end}"
+                    ),
+                    None,
+                )),
+                EngineEvent::TaskCdnEvent {
+                    task_id,
+                    kind,
+                    host,
+                    nodes,
+                    ip,
+                    reason,
+                    candidates,
+                    alive,
+                    cap,
+                    auto_cap,
+                } if kind != "leases" => {
+                    let nodes = if kind == "pool" || kind == "summary" || kind == "links" {
+                        nodes
+                            .iter()
+                            .map(|node| {
+                                format!(
+                                    "{}({}) bytes={} bps={}",
+                                    node.ip, node.origin, node.bytes, node.ewma_bps
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(";")
+                    } else {
+                        String::new()
+                    };
+                    let message = format!(
+                        "CDN {kind} host={host} ip={ip} reason={reason} candidates={candidates} alive={alive} cap={cap} auto_cap={auto_cap} nodes=[{nodes}]"
+                    );
+                    Some((
+                        task_id,
+                        match kind.as_str() {
+                            "pool" => "cdn_pool",
+                            "kick" => "cdn_kick",
+                            "breaker" => "cdn_breaker",
+                            "fallback" => "cdn_fallback",
+                            "summary" => "cdn_summary",
+                            "links" => "nic_links",
+                            "links_off" => "nic_off",
+                            _ => "cdn",
+                        },
+                        message,
+                        None,
+                    ))
+                }
+                _ => None,
+            }
         };
         if let Some((task_id, kind, message, status)) = activity {
             let entry = TaskActivity {

@@ -1041,6 +1041,10 @@ impl FileSyncGate {
             // panic 也必须清掉 `syncing`，否则 sync_covering 会永远等这次 fsync。
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| file.sync_data()))
                 .unwrap_or_else(|_| Err(std::io::Error::other("background fdatasync panicked")));
+            // 先释放复制句柄再通知：Windows 上它与写入句柄共享同一文件对象，最后一个
+            // 句柄关闭时 NTFS 会把修改时间刷成当前时间。若晚于完成期 apply_server_mtime
+            // 才关闭，会覆盖服务器文件时间；等待者被唤醒前释放即排除该时序。
+            drop(file);
             {
                 let mut st = gate.inner.lock().unwrap_or_else(|e| e.into_inner());
                 st.syncing = false;
@@ -1898,6 +1902,29 @@ pub async fn run_coordinated_download(
     let total_downloaded = Arc::new(AtomicI64::new(
         segments.values().map(|s| s.downloaded_bytes).sum::<i64>(),
     ));
+    // Segment restoration/coverage repair can move the real starting counter
+    // in either direction relative to tasks.downloaded_bytes. Establish it
+    // before spawning workers, through the same ordered progress channel.
+    let baseline = total_downloaded.load(Ordering::Relaxed) + scope.base;
+    if progress_tx
+        .send(ProgressUpdate {
+            task_id: task_id.to_owned(),
+            downloaded_bytes: baseline,
+            download_baseline: Some(baseline),
+            total_bytes: if scope.total_override > 0 {
+                scope.total_override
+            } else {
+                effective_total_bytes
+            },
+            status: 1,
+            ..Default::default()
+        })
+        .await
+        .is_err()
+    {
+        tracing::debug!("segment progress receiver closed");
+        return Err(DownloadError::Cancelled);
+    }
     let generation_evidence = Arc::new(GenerationEvidence::default());
     let request_path = Arc::new(RequestPath::default());
 

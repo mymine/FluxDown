@@ -34,12 +34,12 @@ import com.fluxdown.app.nav.LocalNavigator
 import com.fluxdown.app.nav.SettingsPage
 import com.fluxdown.app.shell.LocalAppContainer
 import com.fluxdown.app.shell.hostState
-import com.fluxdown.app.ui.allFilesAccessIntent
-import com.fluxdown.app.ui.canRequestAllFilesAccess
 import com.fluxdown.app.ui.defaultLocalSaveDir
 import com.fluxdown.app.ui.isLocalDirWritable
 import com.fluxdown.app.ui.label
+import com.fluxdown.app.ui.canRequestStorageAccess
 import com.fluxdown.app.ui.publicDownloadSaveDir
+import com.fluxdown.app.ui.rememberStorageAccessPrompt
 import com.fluxdown.app.ui.treeUriToPath
 import com.fluxdown.core.host.HostException
 import com.fluxdown.core.protocol.ConnPolicySummary
@@ -434,10 +434,9 @@ private fun LocalSaveDirPicker(ctx: SettingsCtx) {
     val publicDir = remember { publicDownloadSaveDir().path }
     val notWritable = str(R.string.mobileSaveDirNotWritable)
     val unmappable = str(R.string.mobilePickDirUnmappable)
-    val grantTitle = str(R.string.mobileAllFilesTitle)
-    val grantDesc = str(R.string.mobileAllFilesDescNative)
-    val grantAction = str(R.string.mobileGoGrant)
-    val cancel = str(R.string.cancel)
+    // 授权后以同一目录重试：已授权时 canRequestStorageAccess 为 false，仍不可写只提示，不会循环弹授权
+    var retry: (String) -> Unit = {}
+    val promptAccess = rememberStorageAccessPrompt { retry(it) }
 
     fun apply(dir: String) {
         when {
@@ -445,21 +444,9 @@ private fun LocalSaveDirPicker(ctx: SettingsCtx) {
                 haptics.tick()
                 ctx.editor.set("default_save_dir", dir)
             }
-            canRequestAllFilesAccess(dir) -> {
+            canRequestStorageAccess(context, dir) -> {
                 haptics.reject()
-                overlays.showDialog(
-                    FluxDialogSpec(
-                        title = grantTitle,
-                        message = grantDesc,
-                        icon = FluxIcons.FolderOpen,
-                        buttons = listOf(
-                            FluxDialogButton(cancel),
-                            FluxDialogButton(grantAction, FluxDialogButtonStyle.Primary) {
-                                context.startActivity(allFilesAccessIntent(context))
-                            },
-                        ),
-                    ),
-                )
+                promptAccess(dir)
             }
             else -> {
                 haptics.reject()
@@ -467,6 +454,7 @@ private fun LocalSaveDirPicker(ctx: SettingsCtx) {
             }
         }
     }
+    retry = ::apply
 
     val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult

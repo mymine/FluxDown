@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.foundation.LocalIndication
@@ -31,6 +32,8 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import androidx.annotation.RequiresApi
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 
 /** 强调色来源：只填 accent 一个槽位（§2.4）。优先级 Wallpaper > Custom > Preset。 */
@@ -151,8 +154,11 @@ fun FluxTheme(
 
 private val CJK = setOf("zh", "ja", "ko")
 
-fun wallpaperAccent(ctx: Context): Color? =
-    Color(ctx.getColor(android.R.color.system_accent1_500)).takeIf { it.oklabChroma() >= 0.04f }
+/** 壁纸取色（Material You 系统调色板）：Android 12 以下没有该调色板，返回 null。 */
+fun wallpaperAccent(ctx: Context): Color? {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return null
+    return Color(ctx.getColor(android.R.color.system_accent1_500)).takeIf { it.oklabChroma() >= 0.04f }
+}
 
 private tailrec fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
@@ -170,13 +176,13 @@ fun rememberSystemReduceMotion(): Boolean {
     }
 }
 
-/** 省电 / 过热（≥ SEVERE）/ 低内存 → 玻璃降级实色（§5.6）。 */
+/** 省电 / 过热（≥ SEVERE）/ 低内存 → 玻璃降级实色（§5.6）；Android 12 以下没有 `RenderEffect`，恒为实色。 */
 @Composable
 fun rememberFluxPerf(ctx: Context): FluxPerf {
     val pm = remember(ctx) { ctx.getSystemService(PowerManager::class.java) }
     val am = remember(ctx) { ctx.getSystemService(android.app.ActivityManager::class.java) }
     var powerSave by remember { mutableStateOf(pm?.isPowerSaveMode == true) }
-    var thermal by remember { mutableStateOf(pm?.currentThermalStatus ?: PowerManager.THERMAL_STATUS_NONE) }
+    var thermal by remember { mutableStateOf(pm?.let(::thermalStatus) ?: PowerManager.THERMAL_STATUS_NONE) }
     DisposableEffect(pm) {
         if (pm == null) return@DisposableEffect onDispose { }
         val receiver = object : BroadcastReceiver() {
@@ -184,16 +190,33 @@ fun rememberFluxPerf(ctx: Context): FluxPerf {
                 powerSave = pm.isPowerSaveMode
             }
         }
-        val listener = PowerManager.OnThermalStatusChangedListener { thermal = it }
-        ctx.registerReceiver(receiver, IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED), Context.RECEIVER_NOT_EXPORTED)
-        pm.addThermalStatusListener(listener)
+        ContextCompat.registerReceiver(
+            ctx,
+            receiver,
+            IntentFilter(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+        val stopThermal = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) watchThermal(pm) { thermal = it } else null
         onDispose {
             ctx.unregisterReceiver(receiver)
-            pm.removeThermalStatusListener(listener)
+            stopThermal?.invoke()
         }
     }
-    val degraded = powerSave || thermal >= PowerManager.THERMAL_STATUS_SEVERE || am?.isLowRamDevice == true
+    val degraded = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+        powerSave || thermal >= PowerManager.THERMAL_STATUS_SEVERE || am?.isLowRamDevice == true
     return remember(degraded) {
         if (degraded) FluxPerf(FluxGlassMode.Solid) else FluxPerf(FluxGlassMode.Blur)
     }
+}
+
+/** 温控状态：Android 10 以下无该接口，视为正常。 */
+private fun thermalStatus(pm: PowerManager): Int =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) pm.currentThermalStatus else PowerManager.THERMAL_STATUS_NONE
+
+/** 温控状态监听（API 29+）；返回注销函数。 */
+@RequiresApi(Build.VERSION_CODES.Q)
+private fun watchThermal(pm: PowerManager, onChange: (Int) -> Unit): () -> Unit {
+    val listener = PowerManager.OnThermalStatusChangedListener(onChange)
+    pm.addThermalStatusListener(listener)
+    return { pm.removeThermalStatusListener(listener) }
 }

@@ -8,13 +8,13 @@ nonisolated enum DiagnosticsLogic {
     /// 桌面专属检查项（NMH、协议 / 文件关联、自启、系统通知、root 运行）：iOS 与 Web 一样隐藏（`parity.md` §2.16）。
     static let desktopOnlyChecks: Set<String> = [
         "nmh_binary", "nmh_manifest", "nmh_browser", "nmh_relay", "nmh_launch", "nmh_policy", "nmh_ownership",
-        "url_protocol", "torrent_association", "autostart", "notifications", "elevated_run",
+        "nmh_comspec", "url_protocol", "torrent_association", "autostart", "notifications", "elevated_run",
     ]
 
     /// 需要桌面会话的修复动作：不提供按钮。
     static let desktopOnlyActions: Set<String> = [
         "reregister", "use_this_install", "register", "open_log_dir", "openLogDir", "test_notification",
-        "fix_dir_access", "enable_autostart", "open_settings",
+        "fix_dir_access", "enable_autostart", "open_settings", "fix_comspec",
     ]
 
     /// `delete_files` → `DeleteFiles`（同 Web `camel`）：拼 `doctorCheck{Camel(id)}` 等文案键。

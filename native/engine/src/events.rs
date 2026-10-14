@@ -60,6 +60,21 @@ pub enum EngineEvent {
     /// 响应“请求全部任务”——全部持久化任务快照。
     TasksSnapshot(Vec<TaskInfo>),
 
+    /// 完整持久化单任务事实；创建配置全部落库后、任何下载或探测帧之前发送。
+    TaskChanged(Box<TaskInfo>),
+
+    /// Authoritative download counter baseline, ordered through the progress
+    /// reporter before the corresponding progress frame. Restored bytes are
+    /// not traffic; an explicit lower baseline starts a new transfer interval.
+    /// Host-local accounting only: this is not a wire event.
+    TaskTransferBaseline {
+        task_id: String,
+        downloaded_bytes: i64,
+        /// Last raw counter before the new baseline. The reporter may have
+        /// coalesced this sample; settle it before replacing the interval.
+        previous_downloaded_bytes: Option<i64>,
+    },
+
     /// 分段级进度，用于下载可视化（IDM 风格）。
     SegmentProgress {
         task_id: String,

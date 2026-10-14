@@ -13,9 +13,9 @@ use fluxdown_protocol::{
 use serde_json::{Value, json};
 
 use super::{
-    ACTION_ENABLE_AUTOSTART, ACTION_FIX_DIR_ACCESS, ACTION_OPEN_SETTINGS, ACTION_REREGISTER,
-    DiagnosticsError, DiagnosticsService, PERMISSION_PROBE_TIMEOUT, category_probe_targets,
-    join_error, spawn_blocking_platform,
+    ACTION_ENABLE_AUTOSTART, ACTION_FIX_COMSPEC, ACTION_FIX_DIR_ACCESS, ACTION_OPEN_SETTINGS,
+    ACTION_REREGISTER, DiagnosticsError, DiagnosticsService, PERMISSION_PROBE_TIMEOUT,
+    category_probe_targets, join_error, spawn_blocking_platform,
 };
 use crate::permission::{
     self, DirFacts, DirPlan, DirScope, Os, PermissionError, ReleaseOp, ScopeRules,
@@ -136,6 +136,16 @@ impl DiagnosticsService {
             }
         }
         Ok(json!({ "ok": true }))
+    }
+
+    /// `fix_comspec`：只改 `HKCU\Environment`（无需管理员）让新启动的程序拿到可用的 `ComSpec`，
+    /// 再广播 `WM_SETTINGCHANGE` 让资源管理器刷新环境块——否则之后从开始菜单 / 任务栏打开的
+    /// 浏览器仍拿到旧值。注册表已正确时只重新广播（用户用注册表编辑器或脚本改过、没有通知
+    /// 资源管理器）。最后按注册表配置值像浏览器那样拉起一次确认；已在运行的浏览器与本进程
+    /// 仍沿用旧值，只能由用户重启浏览器解决，诊断里另以 `nmh_comspec_restart` 提示。
+    pub(super) async fn repair_comspec(&self) -> Result<Value, DiagnosticsError> {
+        self.require_desktop(ACTION_FIX_COMSPEC)?;
+        apply_comspec_fix().await
     }
 
     /// 把写入被拒的 NMH 目录还给当前用户：类 Unix 先以普通权限给本就属于自己的目录补上
@@ -369,6 +379,43 @@ async fn register() -> Result<crate::nmh::registry::RegisterIssues, DiagnosticsE
     Ok(tokio::task::spawn_blocking(crate::nmh::registry::register)
         .await
         .map_err(join_error)??)
+}
+
+#[cfg(windows)]
+async fn apply_comspec_fix() -> Result<Value, DiagnosticsError> {
+    let change = tokio::task::spawn_blocking(crate::nmh::comspec::repair)
+        .await
+        .map_err(join_error)??;
+    let broadcast = tokio::task::spawn_blocking(crate::platform::notify_environment_changed)
+        .await
+        .map_err(join_error)?;
+    // 注册表已改好；广播失败只影响资源管理器何时刷新（注销后必然生效），不算修复失败。
+    if let Err(error) = &broadcast {
+        tracing::warn!(error = %error, "could not broadcast the environment change");
+    }
+    let diagnosis = tokio::task::spawn_blocking(crate::nmh::registry::diagnose)
+        .await
+        .map_err(join_error)?;
+    if let Some(issue) = diagnosis
+        .comspec
+        .as_ref()
+        .and_then(|state| state.configured_issue)
+    {
+        return Err(DiagnosticsError::RepairIncomplete(format!(
+            "ComSpec is still unusable: {issue}"
+        )));
+    }
+    if let Some(Err(error)) = crate::nmh::registry::probe_browser_launch(&diagnosis).await {
+        return Err(DiagnosticsError::RepairIncomplete(error.to_string()));
+    }
+    Ok(json!({ "ok": true, "change": change.name(), "broadcast": broadcast.is_ok() }))
+}
+
+#[cfg(not(windows))]
+async fn apply_comspec_fix() -> Result<Value, DiagnosticsError> {
+    Err(DiagnosticsError::InvalidAction(format!(
+        "{ACTION_FIX_COMSPEC} only applies to Windows"
+    )))
 }
 
 fn join_paths<'a>(paths: impl Iterator<Item = &'a Path>) -> String {

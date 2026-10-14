@@ -189,7 +189,8 @@ internal fun AppearancePage() {
                 }
             }
         }
-        flowItem(3, gate, "ambience") {
+        // 跟随壁纸取色依赖 Android 12 的系统调色板
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) flowItem(3, gate, "ambience") {
             GlassSection(animateSize, title = str(R.string.mobileGroupAmbience)) {
                 row(hasIcon = true) {
                     FluxSwitchRow(

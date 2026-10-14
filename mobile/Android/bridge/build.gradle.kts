@@ -249,7 +249,7 @@ android {
     }
 
     defaultConfig {
-        minSdk = 31
+        minSdk = 26
         consumerProguardFiles("consumer-rules.pro")
     }
 
@@ -271,7 +271,8 @@ fun CargoNdkBuild.configureCommon() {
             exclude("**/target/**")
         },
     )
-    platform.set(31)
+    // 引擎库按 minSdk 链接 NDK 桩：高于 minSdk 会在旧系统上加载时报符号缺失
+    platform.set(android.defaultConfig.minSdk ?: error("minSdk 未设置"))
     localProperties.set(
         providers.fileContents(rootProject.layout.projectDirectory.file("local.properties")).asText,
     )

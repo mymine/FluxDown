@@ -37,9 +37,18 @@ internal class InstallEnvironment(private val context: Context) {
         return null
     }
 
+    @Suppress("DEPRECATION") // getInstallerPackageName：Android 11 以下没有 InstallSourceInfo
     private fun installedByStore(): Boolean = try {
-        pm.getInstallSourceInfo(context.packageName).installingPackageName in STORE_PACKAGES
+        val installer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            pm.getInstallSourceInfo(context.packageName).installingPackageName
+        } else {
+            pm.getInstallerPackageName(context.packageName)
+        }
+        installer in STORE_PACKAGES
     } catch (e: PackageManager.NameNotFoundException) {
+        Log.w(TAG, "install source unavailable: ${e.message}")
+        false
+    } catch (e: IllegalArgumentException) {
         Log.w(TAG, "install source unavailable: ${e.message}")
         false
     }
@@ -57,7 +66,7 @@ internal class InstallEnvironment(private val context: Context) {
     }
 
     /** 已安装包的信息（含签名）。 */
-    @Suppress("DEPRECATION") // PackageInfoFlags 重载自 API 33；minSdk 31 需要 Int 版本
+    @Suppress("DEPRECATION") // PackageInfoFlags 重载自 API 33；更低版本需要 Int 版本
     fun installedInfo(): PackageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         pm.getPackageInfo(context.packageName, PackageManager.PackageInfoFlags.of(SIGNING_FLAGS.toLong()))
     } else {
@@ -74,7 +83,11 @@ internal class InstallEnvironment(private val context: Context) {
 
     companion object {
         private const val TAG = "FluxDown.update"
-        private const val SIGNING_FLAGS = PackageManager.GET_SIGNING_CERTIFICATES
+
+        /** API 28+ 取含轮换历史的签名信息；更低版本只有 `GET_SIGNATURES`（无轮换链）。 */
+        @Suppress("DEPRECATION")
+        private val SIGNING_FLAGS =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
 
         /** 官方发布签名证书的 SHA-256（小写十六进制）。 */
         const val OFFICIAL_CERT_SHA256 = "10f775efddc748a03bf690033fe830c4f72631504b8f8c88e132fdf765f83d50"
@@ -93,12 +106,20 @@ internal class InstallEnvironment(private val context: Context) {
             "com.amazon.venezia",
         )
 
-        /** 当前签名集合（`apkContentsSigners`）的证书 SHA-256；无签名信息为空集。 */
-        fun signerDigests(info: PackageInfo): Set<String> =
-            info.signingInfo?.apkContentsSigners.orEmpty().map(::sha256).toSet()
+        /** 当前签名集合（API 28+ 为 `apkContentsSigners`）的证书 SHA-256；无签名信息为空集。 */
+        @Suppress("DEPRECATION")
+        fun signerDigests(info: PackageInfo): Set<String> {
+            val signers = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                info.signingInfo?.apkContentsSigners
+            } else {
+                info.signatures
+            }
+            return signers.orEmpty().map(::sha256).toSet()
+        }
 
-        /** 单签名者的签名历史（轮换链，含当前证书）；多签名者无历史 → 空集。 */
+        /** 单签名者的签名历史（轮换链，含当前证书）；多签名者或 API 28 以下无历史 → 空集。 */
         fun signerHistory(info: PackageInfo): Set<String> {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return emptySet()
             val signing = info.signingInfo ?: return emptySet()
             if (signing.hasMultipleSigners()) return emptySet()
             return signing.signingCertificateHistory.orEmpty().map(::sha256).toSet()

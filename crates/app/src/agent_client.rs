@@ -1,6 +1,6 @@
 //! GPUI composition root 唯一 agent JSON-RPC 会话。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -54,10 +54,50 @@ struct ClientCommand {
     ack: oneshot::Sender<Result<Value, RpcErrorData>>,
 }
 
+impl ClientCommand {
+    fn is_submission(&self) -> bool {
+        match self.method.as_str() {
+            method::DAEMON_TASK_CREATE
+            | method::DAEMON_GROUP_CREATE
+            | method::AGENT_CAPTURE_CREATE_GROUP
+            | method::AGENT_CAPTURE_SUBMIT_TORRENT_FILE => true,
+            method::AGENT_CAPTURE_RESOLVE => {
+                self.params
+                    .as_ref()
+                    .and_then(|params| params.get("accepted"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Unsent creates survive reconnect without becoming ambiguous requests.
+struct SubmissionTransport {
+    gate: Arc<crate::downloads_port::SubmissionGate>,
+    unsent: VecDeque<ClientCommand>,
+}
+
+impl SubmissionTransport {
+    fn new(gate: Arc<crate::downloads_port::SubmissionGate>) -> Self {
+        Self {
+            gate,
+            unsent: VecDeque::new(),
+        }
+    }
+}
+
+struct PendingCommand {
+    ack: oneshot::Sender<Result<Value, RpcErrorData>>,
+    _admission: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
 pub struct AgentClient {
     commands: mpsc::Sender<ClientCommand>,
     runtime: Arc<tokio::runtime::Runtime>,
     bootstrap: Arc<ServiceBootstrap>,
+    pub(crate) submissions: Arc<crate::downloads_port::SubmissionGate>,
 }
 
 impl AgentClient {
@@ -77,12 +117,20 @@ impl AgentClient {
         );
         let (commands, command_rx) = mpsc::channel(64);
         let (events, event_rx) = mpsc::channel(1024);
-        runtime.spawn(run_client(config, bootstrap.clone(), command_rx, events));
+        let submissions = Arc::new(crate::downloads_port::SubmissionGate::default());
+        runtime.spawn(run_client(
+            config,
+            bootstrap.clone(),
+            command_rx,
+            events,
+            submissions.clone(),
+        ));
         Ok((
             Arc::new(Self {
                 commands,
                 runtime,
                 bootstrap,
+                submissions,
             }),
             event_rx,
         ))
@@ -133,12 +181,15 @@ async fn run_client(
     bootstrap: Arc<ServiceBootstrap>,
     mut commands: mpsc::Receiver<ClientCommand>,
     events: mpsc::Sender<AgentClientEvent>,
+    submissions: Arc<crate::downloads_port::SubmissionGate>,
 ) {
     let mut attempt = 0_usize;
     // 每个桌面进程只尝试替换一次协议不兼容的 agent，避免同目录二进制错配时反复互杀。
     let mut replaced_incompatible = false;
     let mut link_log = ConnectionLog::default();
+    let mut submission_transport = SubmissionTransport::new(submissions.clone());
     loop {
+        submissions.set_ready(false);
         let rpc_url = match crate::agent_endpoint::discover_rpc_url(
             config.rpc_url.as_deref(),
             &config.bearer_path,
@@ -181,6 +232,7 @@ async fn run_client(
                     cursor,
                     buffered,
                     PreferenceWrites::new(preferences_revision),
+                    &mut submission_transport,
                 )
                 .await
                 {
@@ -433,9 +485,10 @@ async fn run_connected(
     snapshot_cursor: (String, u64),
     buffered: Vec<EventFrame>,
     mut preference_writes: PreferenceWrites,
+    submissions: &mut SubmissionTransport,
 ) -> Result<SessionEnd, ()> {
     let mut next_id = 10_i64;
-    let mut pending = HashMap::<i64, oneshot::Sender<Result<Value, RpcErrorData>>>::new();
+    let mut pending = HashMap::<i64, PendingCommand>::new();
     let mut cursor = snapshot_cursor;
     for mut frame in buffered {
         if frame.epoch == cursor.0 {
@@ -445,15 +498,28 @@ async fn run_connected(
     }
     loop {
         tokio::select! {
-            command = commands.recv() => {
-                let Some(command) = command else { return Ok(SessionEnd::ClientDropped); };
+            admission = submissions.gate.admit(), if !submissions.unsent.is_empty() => {
+                let admission = admission.map_err(|error| {
+                    log::error!("submission transport admission failed: {:?}", error.code);
+                })?;
+                let Some(command) = submissions.unsent.pop_front() else { continue; };
                 let id = next_id;
                 next_id = next_id.saturating_add(1);
-                preference_writes.stage(id, &command.method, command.params.as_ref());
-                let request = RpcRequest::new(RequestId::Integer(id), command.method, command.params);
-                let text = serde_json::to_string(&request).map_err(|_| ())?;
-                pending.insert(id, command.ack);
-                if socket.send(Message::Text(text.into())).await.is_err() { break; }
+                if send_command(&mut socket, &mut pending, &mut preference_writes, id, command, Some(admission)).await.is_err() {
+                    break;
+                }
+            }
+            command = commands.recv() => {
+                let Some(command) = command else { return Ok(SessionEnd::ClientDropped); };
+                if command.is_submission() {
+                    submissions.unsent.push_back(command);
+                    continue;
+                }
+                let id = next_id;
+                next_id = next_id.saturating_add(1);
+                if send_command(&mut socket, &mut pending, &mut preference_writes, id, command, None).await.is_err() {
+                    break;
+                }
             }
             incoming = socket.next() => {
                 let text = match incoming {
@@ -461,8 +527,8 @@ async fn run_connected(
                     Some(Ok(Message::Close(Some(frame))))
                         if frame.reason.as_str() == CLOSE_REASON_SERVICE_QUIT =>
                     {
-                        for (_, ack) in pending.drain() {
-                            if ack.send(Err(unavailable_error())).is_err() {
+                        for (_, command) in pending.drain() {
+                            if command.ack.send(Err(unavailable_error())).is_err() {
                                 log::trace!("agent request receiver released before service shutdown");
                             }
                         }
@@ -485,8 +551,8 @@ async fn run_connected(
                     RpcResponse::Success(success) => {
                         if let RequestId::Integer(id) = success.id {
                             preference_writes.settle(id, Some(&success.result));
-                            if let Some(ack) = pending.remove(&id)
-                                && ack.send(Ok(success.result)).is_err()
+                            if let Some(command) = pending.remove(&id)
+                                && command.ack.send(Ok(success.result)).is_err()
                             {
                                 log::trace!("agent request receiver released before success reply");
                             }
@@ -495,8 +561,8 @@ async fn run_connected(
                     RpcResponse::Failure(failure) => {
                         if let Some(RequestId::Integer(id)) = failure.id {
                             preference_writes.settle(id, None);
-                            if let Some(ack) = pending.remove(&id)
-                                && ack.send(Err(failure.error.data.unwrap_or_else(internal_error))).is_err()
+                            if let Some(command) = pending.remove(&id)
+                                && command.ack.send(Err(failure.error.data.unwrap_or_else(internal_error))).is_err()
                             {
                                 log::trace!("agent request receiver released before failure reply");
                             }
@@ -506,12 +572,40 @@ async fn run_connected(
             }
         }
     }
-    for (_, ack) in pending {
-        if ack.send(Err(unavailable_error())).is_err() {
+    for (_, command) in pending {
+        if command.ack.send(Err(unavailable_error())).is_err() {
             log::trace!("agent request response receiver already released");
         }
     }
     Err(())
+}
+
+async fn send_command(
+    socket: &mut Socket,
+    pending: &mut HashMap<i64, PendingCommand>,
+    preference_writes: &mut PreferenceWrites,
+    id: i64,
+    command: ClientCommand,
+    admission: Option<tokio::sync::OwnedMutexGuard<()>>,
+) -> Result<(), ()> {
+    preference_writes.stage(id, &command.method, command.params.as_ref());
+    let request = RpcRequest::new(RequestId::Integer(id), command.method, command.params);
+    let text = serde_json::to_string(&request).map_err(|error| {
+        log::error!("could not encode agent command: {error}");
+    })?;
+    pending.insert(
+        id,
+        PendingCommand {
+            ack: command.ack,
+            _admission: admission,
+        },
+    );
+    socket
+        .send(Message::Text(text.into()))
+        .await
+        .map_err(|error| {
+            log::debug!("agent command send failed: {error}");
+        })
 }
 
 async fn forward_event(
@@ -652,3 +746,7 @@ pub enum AgentClientError {
     #[error("could not create agent client runtime: {0}")]
     Runtime(std::io::Error),
 }
+
+#[cfg(test)]
+#[path = "agent_client_submission_tests.rs"]
+mod submission_tests;

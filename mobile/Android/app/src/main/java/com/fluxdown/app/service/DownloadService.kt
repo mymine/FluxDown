@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import com.fluxdown.app.AppContainer
 import com.fluxdown.app.FluxApplication
@@ -102,10 +103,10 @@ class DownloadService : Service() {
         super.onDestroy()
     }
 
-    /** 重复调用 `startForeground` 即更新通知，且不受通知权限影响。 */
+    /** 重复调用 `startForeground` 即更新通知，且不受通知权限影响；服务类型参数 Android 10 以下由 ServiceCompat 忽略。 */
     private fun show(activity: LocalActivity) {
         lastShownAtMs = SystemClock.elapsedRealtime()
-        startForeground(NOTIFICATION_ID, buildNotification(this, activity), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(this, activity), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
     }
 }
 

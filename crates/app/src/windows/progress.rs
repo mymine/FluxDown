@@ -1,6 +1,6 @@
-//! 独立下载进度 / 完成窗口：每个任务一个，FluxDown 辅助窗口标题栏；标题随进度刷新，
-//! 可调整大小、可最小化，所有任务共用一份设备本地的尺寸、位置与显示器记忆。
-//! 开关时机由 [`crate::progress_windows`] 决定。
+//! 独立下载进度 / 完成窗口：任务进度与自动完成集合共用 FluxDown 辅助窗口和业务视图。
+//! 标题随进度与导航刷新，可调整大小、可最小化；共用设备本地的尺寸、位置与显示器记忆。
+//! 开关时机由 [`crate::progress_windows`] 与 [`crate::completion_windows`] 决定。
 //!
 //! 层级：界面常是后台应用（下载由浏览器捕获 / 静默建成时浏览器在前台），只在本应用内排序
 //! 的窗口会压在浏览器下面。
@@ -16,7 +16,7 @@ use fluxdown_ui_downloads::{
     ProgressWindowEvent, ProgressWindowPrefs, ProgressWindowView,
 };
 use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_window_options};
-use gpui::{App, AppContext as _, Context, SharedString, Window, WindowKind, px, size};
+use gpui::{App, AppContext as _, Context, Entity, SharedString, Window, WindowKind, px, size};
 use gpui_component::Root;
 
 use crate::{
@@ -31,6 +31,42 @@ const HANDOFF_CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// 打开（或置前）任务的进度窗口。`activate = false` 时不抢焦点（后台完成弹窗）。
 pub fn open(cx: &mut App, task_id: String, activate: bool) {
+    // The root owns the view; manual progress callers do not retain another handle.
+    drop(open_window(
+        cx,
+        WindowKey::Progress(task_id.clone()),
+        task_id,
+        activate,
+        None,
+    ));
+}
+
+/// 自动完成复用原有进度窗口，不激活应用，也不聚焦已存在的完成窗口。
+pub(crate) fn open_completion(
+    cx: &mut App,
+    task_ids: Vec<String>,
+    total: usize,
+) -> Option<Entity<ProgressWindowView>> {
+    if WindowRegistry::is_open(cx, &WindowKey::Completion) {
+        return None;
+    }
+    let first = task_ids.first()?.clone();
+    open_window(
+        cx,
+        WindowKey::Completion,
+        first,
+        false,
+        Some((task_ids, total)),
+    )
+}
+
+fn open_window(
+    cx: &mut App,
+    key: WindowKey,
+    task_id: String,
+    activate: bool,
+    completed: Option<(Vec<String>, usize)>,
+) -> Option<Entity<ProgressWindowView>> {
     let desktop = Desktop::global(cx);
     let translator = desktop.translator.clone();
     let session = desktop.session.clone();
@@ -54,8 +90,9 @@ pub fn open(cx: &mut App, task_id: String, activate: bool) {
         options.kind = WindowKind::PopUp;
     }
 
-    let key = WindowKey::Progress(task_id.clone());
-    let opened = WindowRegistry::open_or_focus(cx, key.clone(), options, move |window, cx| {
+    let mut opened_view = None;
+    let completion = key == WindowKey::Completion;
+    let opened = WindowRegistry::open_or_focus(cx, key.clone(), options, |window, cx| {
         let port = Arc::new(AgentDownloadsPort::new(client.clone()));
         let view = cx.new(|cx| {
             cx.observe(&settings, |view: &mut ProgressWindowView, settings, cx| {
@@ -74,6 +111,9 @@ pub fn open(cx: &mut App, task_id: String, activate: bool) {
             )
         });
         attach(&session, &view, cx);
+        if let Some((task_ids, total)) = completed {
+            view.update(cx, |view, cx| view.append_completed(task_ids, total, cx));
+        }
         let window_view = cx.new(|cx| {
             AuxiliaryWindowView::new(
                 translator.clone(),
@@ -82,6 +122,12 @@ pub fn open(cx: &mut App, task_id: String, activate: bool) {
                 cx,
             )
         });
+        if let Some(title) = view.read(cx).title() {
+            window.set_window_title(&title);
+            window_view.update(cx, |chrome, cx| {
+                chrome.set_title(Some(SharedString::from(title)), cx);
+            });
+        }
 
         let root = cx.new(|cx| {
             let root = Root::new(window_view.clone(), window, cx);
@@ -97,7 +143,12 @@ pub fn open(cx: &mut App, task_id: String, activate: bool) {
             .detach();
             cx.subscribe_in(&view, window, move |_, _, event, window, cx| match event {
                 ProgressWindowEvent::Close => window.remove_window(),
-                ProgressWindowEvent::HandedOff => close_after_handoff(window, cx),
+                ProgressWindowEvent::HandedOff => {
+                    if completion {
+                        crate::completion_windows::window_closing(cx);
+                    }
+                    close_after_handoff(window, cx);
+                }
                 ProgressWindowEvent::ShowCompletionChanged(value) => {
                     Desktop::set_pref(cx, COMPLETION_WINDOW_PREF, (*value).into());
                 }
@@ -106,6 +157,7 @@ pub fn open(cx: &mut App, task_id: String, activate: bool) {
             root
         });
         WindowRegistry::persist_bounds(RememberedWindow::Progress, client, &root, window, cx);
+        opened_view = Some(view);
         root
     });
     let handle = opened
@@ -123,6 +175,7 @@ pub fn open(cx: &mut App, task_id: String, activate: bool) {
     {
         log::debug!("view or window released before lifecycle update: {error:#}");
     }
+    opened_view
 }
 
 /// 打开的文件 / 文件夹接管前台后再关窗。本应用仍在前台时直接关闭当前窗口，系统会把本应用

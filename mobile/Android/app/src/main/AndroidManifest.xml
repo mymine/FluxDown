@@ -10,10 +10,14 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- 打开已下载的 .apk：系统安装器要求调用方声明此权限，否则静默关闭（无任何提示） -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-    <!-- 用户把保存目录指向 Download/ 以外的共享存储时，按需引导系统“所有文件访问”授权（可选） -->
+    <!-- 用户把保存目录指向应用专属目录以外的共享存储时按需授权：Android 11+ 引导系统“所有文件访问”，
+         Android 10 及以下申请存储运行时权限（Android 10 另需 application 的 requestLegacyExternalStorage） -->
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
 
     <!-- 诊断页检查 magnet / ed2k / .torrent 的默认处理者：Android 11+ 默认看不到其它应用，需声明要探测的 Intent -->
     <queries>
@@ -38,6 +42,7 @@
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:enableOnBackInvokedCallback="true"
+        android:requestLegacyExternalStorage="true"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"

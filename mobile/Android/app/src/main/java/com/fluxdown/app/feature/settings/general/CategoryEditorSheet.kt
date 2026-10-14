@@ -35,8 +35,8 @@ import com.fluxdown.app.feature.settings.RemoteDirectoryPickerSheet
 import com.fluxdown.app.feature.settings.rememberLastNonNull
 import com.fluxdown.app.i18n.fill
 import com.fluxdown.app.i18n.str
-import com.fluxdown.app.ui.canRequestAllFilesAccess
-import com.fluxdown.app.ui.allFilesAccessIntent
+import com.fluxdown.app.ui.canRequestStorageAccess
+import com.fluxdown.app.ui.rememberStorageAccessPrompt
 import com.fluxdown.app.ui.isLocalDirWritable
 import com.fluxdown.app.ui.treeUriToPath
 import com.fluxdown.core.protocol.CategoryBuild
@@ -103,10 +103,10 @@ internal fun CategoryEditorSheet(
     val title = str(if (existing == null) R.string.addCategory else R.string.editCategory)
     val notWritable = str(R.string.mobileSaveDirNotWritable)
     val unmappable = str(R.string.mobilePickDirUnmappable)
-    val grantTitle = str(R.string.mobileAllFilesTitle)
-    val grantDesc = str(R.string.mobileAllFilesDescNative)
-    val grantAction = str(R.string.mobileGoGrant)
     val cancel = str(R.string.cancel)
+    // 授权后以同一目录重试（已授权时不会再弹授权）
+    var retryDir: (String) -> Unit = {}
+    val promptAccess = rememberStorageAccessPrompt { retryDir(it) }
 
     fun change(next: CategoryDraft) {
         draft = next
@@ -173,21 +173,9 @@ internal fun CategoryEditorSheet(
                 haptics.tick()
                 change(draft.copy(saveDir = dir))
             }
-            canRequestAllFilesAccess(dir) -> {
+            canRequestStorageAccess(context, dir) -> {
                 haptics.reject()
-                overlays.showDialog(
-                    FluxDialogSpec(
-                        title = grantTitle,
-                        message = grantDesc,
-                        icon = FluxIcons.FolderOpen,
-                        buttons = listOf(
-                            FluxDialogButton(cancel),
-                            FluxDialogButton(grantAction, FluxDialogButtonStyle.Primary) {
-                                context.startActivity(allFilesAccessIntent(context))
-                            },
-                        ),
-                    ),
-                )
+                promptAccess(dir)
             }
             else -> {
                 haptics.reject()
@@ -195,6 +183,7 @@ internal fun CategoryEditorSheet(
             }
         }
     }
+    retryDir = ::applyLocalDir
 
     val treePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult

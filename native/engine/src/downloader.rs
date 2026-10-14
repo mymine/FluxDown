@@ -290,6 +290,9 @@ pub struct ProgressUpdate {
     /// Observed active reads and byte-range geometry; absent when not sampled.
     pub runtime: Option<crate::transfer_activity::TaskRuntime>,
     pub downloaded_bytes: i64,
+    /// Restored/truncated counter before body reads. Unlike an ordinary lower
+    /// progress sample, this explicitly resets host traffic measurement.
+    pub download_baseline: Option<i64>,
     pub total_bytes: i64,
     pub status: i32,
     pub error_message: String,
@@ -2992,6 +2995,7 @@ async fn run_download_inner(
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
             downloaded_bytes: resume_downloaded,
+            download_baseline: Some(resume_downloaded),
             total_bytes: resume_total,
             status: 5,
             error_message: String::new(),
@@ -3318,6 +3322,7 @@ async fn run_download_inner(
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
             downloaded_bytes: initial_downloaded,
+            download_baseline: Some(initial_downloaded),
             total_bytes: effective_total_bytes,
             status: 1,
             error_message: String::new(),
@@ -4081,9 +4086,20 @@ pub(crate) async fn apply_server_mtime(dest: &Path, last_modified: &str, task_id
         return;
     };
     let path = dest.to_path_buf();
-    // set_times 是同步系统调用，且 Windows 上需要以写权限打开句柄。
+    // set_times 是同步系统调用，放阻塞线程池。
     let result = tokio::task::spawn_blocking(move || {
-        let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        // Windows 只申请 FILE_WRITE_ATTRIBUTES：仅含属性权限的打开不参与共享模式
+        // 检查，刚 rename 完时杀软 / 索引服务以拒绝共享写的方式打开文件也不会
+        // ERROR_SHARING_VIOLATION（完整写权限会因此失败、退回本地完成时间）。
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::access_mode(
+            &mut options,
+            windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES,
+        );
+        #[cfg(not(windows))]
+        options.write(true);
+        let file = options.open(&path)?;
         file.set_times(std::fs::FileTimes::new().set_modified(mtime))
     })
     .await;
@@ -4720,24 +4736,26 @@ async fn download_single_once(
     // and the final integrity check is skipped.
     let total_bytes = if encoding.is_some() { 0 } else { total_bytes };
     let reading = TransferTracker::new().start(0);
-    // Do not park a validated response behind a full UI progress channel before
-    // its first body read. The periodic sample or final frame will follow.
-    match progress_tx.try_send(ProgressUpdate {
-        task_id: task_id.to_owned(),
-        downloaded_bytes: downloaded,
-        total_bytes,
-        status: 1,
-        segment_details: single_segment_progress(downloaded, total_bytes, true),
-        runtime: Some(single_runtime(task_id, downloaded, total_bytes, true)),
-        ..Default::default()
-    }) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            tracing::trace!("HTTP progress sample coalesced");
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            tracing::debug!("HTTP progress receiver closed");
-        }
+    // This is an authoritative baseline, not a lossy UI sample: the actual
+    // response may have rejected Range and truncated the old partial file.
+    // Queue it before reading the body so stale queued progress cannot follow
+    // the reset, and the reporter cannot mistake restored bytes for traffic.
+    if progress_tx
+        .send(ProgressUpdate {
+            task_id: task_id.to_owned(),
+            downloaded_bytes: downloaded,
+            download_baseline: Some(downloaded),
+            total_bytes,
+            status: 1,
+            segment_details: single_segment_progress(downloaded, total_bytes, true),
+            runtime: Some(single_runtime(task_id, downloaded, total_bytes, true)),
+            ..Default::default()
+        })
+        .await
+        .is_err()
+    {
+        tracing::debug!("HTTP progress receiver closed");
+        return Err(DownloadError::Cancelled);
     }
 
     let mut last_report = std::time::Instant::now();

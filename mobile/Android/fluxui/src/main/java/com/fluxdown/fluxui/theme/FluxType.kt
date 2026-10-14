@@ -4,7 +4,9 @@ import android.content.Context
 import android.graphics.Typeface
 import android.graphics.fonts.Font as PlatformFont
 import android.graphics.fonts.FontFamily as PlatformFamily
+import android.os.Build
 import android.util.Log
+import androidx.annotation.RequiresApi
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
@@ -19,6 +21,7 @@ import java.io.IOException
  * 字体：拉丁 Geist / Geist Mono（可变 wght），中文 MiSans（三档静态字重），其余交给系统。
  * Compose 的 FontFamily 不是逐字形回退链，必须用平台 [Typeface.CustomFallbackBuilder] 组装（§3.1）。
  * 每个字重一个已加载族；`TextStyle.fontWeight` 对已加载族无效，故字重由族本身决定。
+ * Android 10 以下没有自定义回退链：只加载拉丁可变字体，中文等交给系统默认回退。
  */
 object FluxFonts {
     private const val TAG = "FluxFonts"
@@ -37,7 +40,22 @@ object FluxFonts {
     }
 
     private fun build(ctx: Context, mono: Boolean, weight: Int): FontFamily = try {
-        val latinFont = PlatformFont.Builder(ctx.assets, if (mono) "fonts/GeistMono.ttf" else "fonts/Geist.ttf")
+        val latinFile = if (mono) "fonts/GeistMono.ttf" else "fonts/Geist.ttf"
+        val system = if (mono) "monospace" else "sans-serif"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            FontFamily(withCjkFallback(ctx, latinFile, system, weight))
+        } else {
+            FontFamily(latinOnly(ctx, latinFile, system, weight))
+        }
+    } catch (e: IOException) {
+        // 资源缺失只降级为系统字体，不崩溃（§3.1）
+        Log.e(TAG, "font load failed (mono=$mono, w=$weight): $e")
+        if (mono) FontFamily.Monospace else FontFamily.SansSerif
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun withCjkFallback(ctx: Context, latinFile: String, system: String, weight: Int): Typeface {
+        val latinFont = PlatformFont.Builder(ctx.assets, latinFile)
             .setWeight(weight)
             .setFontVariationSettings("'wght' $weight")
             .build()
@@ -47,16 +65,22 @@ object FluxFonts {
             else -> "fonts/MiSans-Regular.ttf"
         }
         val cjkFont = PlatformFont.Builder(ctx.assets, cjkFile).setWeight(weight).build()
-        val tf = Typeface.CustomFallbackBuilder(PlatformFamily.Builder(latinFont).build())
+        return Typeface.CustomFallbackBuilder(PlatformFamily.Builder(latinFont).build())
             .addCustomFallback(PlatformFamily.Builder(cjkFont).build())
-            .setSystemFallback(if (mono) "monospace" else "sans-serif")
+            .setSystemFallback(system)
             .build()
-        FontFamily(tf)
-    } catch (e: IOException) {
-        // 资源缺失只降级为系统字体，不崩溃（§3.1）
-        Log.e(TAG, "font load failed (mono=$mono, w=$weight): $e")
-        if (mono) FontFamily.Monospace else FontFamily.SansSerif
     }
+
+    /**
+     * API 26–28：`Typeface.Builder` 同样支持可变字重，但没有自定义回退链；
+     * 字体文件读取失败时按 [system] 回退系统字体（`setFallback` 保证 `build()` 不返回 null）。
+     */
+    private fun latinOnly(ctx: Context, latinFile: String, system: String, weight: Int): Typeface =
+        Typeface.Builder(ctx.assets, latinFile)
+            .setWeight(weight)
+            .setFontVariationSettings("'wght' $weight")
+            .setFallback(system)
+            .build()
 
     private val WEIGHTS = intArrayOf(400, 450, 500, 600, 700)
 }

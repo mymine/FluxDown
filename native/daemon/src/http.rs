@@ -1,6 +1,7 @@
 //! loopback-only daemon HTTP 与鉴权 WebSocket 传输。
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -12,7 +13,7 @@ use axum::extract::{Path as AxumPath, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use fluxdown_protocol::{CLOSE_REASON_SERVICE_QUIT, EventFrame, RpcNotification};
+use fluxdown_protocol::{CLOSE_REASON_SERVICE_QUIT, EventFrame, RpcNotification, RpcResponse};
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
@@ -272,9 +273,9 @@ async fn download_export(
     (StatusCode::OK, bytes).into_response()
 }
 
-/// 单条 WebSocket 连接的主循环：握手 / 内联调用 / 慢调用响应 / 事件推送都在这里统一
-/// 读写 socket。慢方法在后台执行，响应经 [`SlowCalls`] 回到本循环再写出，事件分支因此
-/// 不会被长调用饿住（否则广播缓冲溢出、连接以 4009 被关闭）。
+/// 一条连接只有此循环写 socket。普通调用保持 FIFO，但等待 actor/DB 时仍推送事件；
+/// 慢调用沿用有界后台执行。不能把普通 create 改为慢方法，否则 agent 的独立通道会
+/// 破坏 create/pause 等命令的串行顺序。
 async fn run_socket(
     mut socket: WebSocket,
     state: HttpState,
@@ -295,6 +296,7 @@ async fn run_socket(
     tokio::pin!(auth_deadline);
     let mut events = None;
     let mut slow = SlowCalls::new(MAX_SLOW_CALLS);
+    let mut ordered = std::pin::pin!(None);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -322,7 +324,7 @@ async fn run_socket(
                 }
                 break;
             }
-            incoming = socket.next() => {
+            incoming = socket.next(), if ordered.as_ref().get_ref().is_none() => {
                 let Some(Ok(message)) = incoming else { break; };
                 match message {
                     Message::Text(text) => {
@@ -344,7 +346,10 @@ async fn run_socket(
                                     Err(rejection) => SessionReply::reply(*rejection),
                                 }
                             }
-                            Step::Call(call) => SessionReply::reply(call.run().await),
+                            Step::Call(call) => {
+                                ordered.as_mut().set(Some(call.run()));
+                                continue;
+                            }
                         };
                         if reply.became_ready {
                             let (receiver, _) = service.events().subscribe_and_snapshot();
@@ -405,6 +410,11 @@ async fn run_socket(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            response = receive_ordered(ordered.as_mut()), if ordered.as_ref().get_ref().is_some() => {
+                ordered.as_mut().set(None);
+                let Ok(json) = serde_json::to_string(&response) else { break; };
+                if socket.send(Message::Text(json.into())).await.is_err() { break; }
+            }
             finished = slow.next(), if !slow.is_empty() => {
                 let Some(response) = finished else { continue; };
                 let Ok(json) = serde_json::to_string(&response) else { break; };
@@ -413,8 +423,18 @@ async fn run_socket(
         }
     }
     // 先中止在途调用，再释放连接所有权的选择订阅。
+    ordered.as_mut().set(None);
     drop(slow);
     session.disconnect();
+}
+
+async fn receive_ordered<F: Future<Output = RpcResponse>>(
+    call: Pin<&mut Option<F>>,
+) -> RpcResponse {
+    match call.as_pin_mut() {
+        Some(call) => call.await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn receive_event(
@@ -478,6 +498,9 @@ async fn set_private_file_permissions(path: &Path) -> Result<(), std::io::Error>
 async fn set_private_file_permissions(path: &Path) -> Result<(), std::io::Error> {
     crate::private_fs::restrict_to_current_user(path, false).await
 }
+
+#[cfg(test)]
+mod dispatch_tests;
 
 #[cfg(test)]
 mod tests {

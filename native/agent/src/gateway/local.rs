@@ -3,7 +3,7 @@
 //! 全部复用 [`run_socket`](super::run_socket) 的同一套实现。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use fluxdown_protocol::{
@@ -41,6 +41,7 @@ pub struct LocalConnection {
     events: tokio::sync::Mutex<broadcast::Receiver<EventFrame>>,
     cancel: CancellationToken,
     ui_client: bool,
+    snapshot_ready: AtomicBool,
     /// `Drop` 可能发生在任意线程（如 FFI 对象被宿主语言的 GC 线程释放）：收尾任务投递到创建
     /// 连接的 runtime。
     runtime: tokio::runtime::Handle,
@@ -71,6 +72,7 @@ impl GatewayService {
             events: tokio::sync::Mutex::new(events),
             cancel,
             ui_client,
+            snapshot_ready: AtomicBool::new(false),
             runtime: tokio::runtime::Handle::current(),
         })
     }
@@ -86,6 +88,8 @@ impl LocalConnection {
     /// 与 WebSocket 相同的通道语义：同一通道内按到达顺序处理，慢通道不阻塞其它通道。
     /// 响应的 `id` 恒为调用方给出的 `id`（同一连接上并发的重复 `id` 也不会串线）。
     pub async fn call(&self, mut request: RpcRequest) -> RpcResponse {
+        let initial_snapshot =
+            self.ui_client && request.method == fluxdown_protocol::method::SYSTEM_SNAPSHOT;
         let wire_id = RequestId::Integer(self.next_id.fetch_add(1, Ordering::Relaxed));
         let caller_id = std::mem::replace(&mut request.id, wire_id.clone());
         let (waiter, response) = oneshot::channel();
@@ -99,7 +103,16 @@ impl LocalConnection {
             return with_id(rejected, caller_id);
         }
         match response.await {
-            Ok(response) => with_id(response, caller_id),
+            Ok(response) => {
+                if initial_snapshot
+                    && matches!(&response, RpcResponse::Success(_))
+                    && !self.snapshot_ready.swap(true, Ordering::AcqRel)
+                {
+                    // 事件订阅早于快照请求，重放晚于快照生成；与 WebSocket 路径相同。
+                    self.service.local.shell.ui_snapshot_ready();
+                }
+                with_id(response, caller_id)
+            }
             Err(_) => with_id(unavailable(wire_id), caller_id),
         }
     }
@@ -123,7 +136,9 @@ impl LocalConnection {
         let ui_client = self.ui_client;
         self.ui_client = false;
         if ui_client {
-            self.service.ui_disconnected().await;
+            self.service
+                .ui_disconnected(self.snapshot_ready.load(Ordering::Acquire))
+                .await;
         }
         if let Some(lanes) = lanes {
             lanes.shutdown().await;
@@ -135,13 +150,14 @@ impl Drop for LocalConnection {
     fn drop(&mut self) {
         let lanes = self.lanes.take();
         let ui_client = self.ui_client;
+        let was_ready = self.snapshot_ready.load(Ordering::Acquire);
         if lanes.is_none() && !ui_client {
             return;
         }
         let service = Arc::clone(&self.service);
         self.runtime.spawn(async move {
             if ui_client {
-                service.ui_disconnected().await;
+                service.ui_disconnected(was_ready).await;
             }
             if let Some(lanes) = lanes {
                 lanes.shutdown().await;

@@ -49,7 +49,7 @@ repeatGap: 2
 |`native/engine/src/disk_space.rs`|64 位/饱和空间计算与 Windows 目录语义|
 |`native/engine/src/bt_sparse.rs`、`bt_downloader.rs`|置 sparse / HIDDEN 属性；读取属性用 std|
 |`native/agent/src/platform/macos_cf.rs`|CF/LaunchServices 单一所有权边界；调用方不得操作裸 CF 引用|
-|`native/agent/src/platform/`|系统图标、Shell 定位/关联变更、COM 生命周期；每项遵守上述约束|
+|`native/agent/src/platform/`|系统图标、Shell 定位/关联变更、环境变量变更广播（`WM_SETTINGCHANGE`）、COM 生命周期；每项遵守上述约束|
 |`native/agent/src/notification/`|macOS UserNotifications ABI 与 Windows WinRT apartment；已有安全接口优先|
 
 `native/{api,protocol,daemon,server,mobile}`、`crates/*`（GPUI）、`native/nmh`、`scripts/desktop-dev` 的项目源码保持零 unsafe；冻结 server 不改动。测试不自动豁免：先用安全 API，确需独立平台 oracle 才保留最小 FFI 并检查失败。

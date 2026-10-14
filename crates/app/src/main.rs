@@ -13,6 +13,7 @@ mod app_icon;
 mod assets;
 mod capability_ports;
 mod command_palette;
+mod completion_windows;
 mod downloads_port;
 mod instance_ipc;
 mod launch;

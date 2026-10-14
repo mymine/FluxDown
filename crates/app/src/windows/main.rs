@@ -30,6 +30,15 @@ pub fn reveal(cx: &mut App) {
 
 /// 打开或聚焦主窗口。返回新建窗口句柄（已开时 `None`）。
 pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
+    open_with(cx, true)
+}
+
+/// 开机自启（托盘不可见时）：新建的主窗口不抢焦点，随后由调用方最小化。
+pub fn open_unfocused(cx: &mut App) -> Option<WindowHandle<Root>> {
+    open_with(cx, false)
+}
+
+fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
     let desktop = Desktop::global(cx);
     let translator = desktop.translator.clone();
     let session = desktop.session.clone();
@@ -37,6 +46,7 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
     let settings_store = desktop.settings_store.clone();
     let menu_bar = desktop.menu_bar.clone();
     let mut options = main_window_options();
+    options.focus = focus;
     WindowRegistry::restore_bounds(RememberedWindow::Main, &mut options, MAIN_WINDOW_SIZE, cx);
 
     let handle = WindowRegistry::open_or_focus(cx, WindowKey::Main, options, move |window, cx| {

@@ -322,8 +322,14 @@ private fun GlassSectionScope.linkHandlingRows(ctx: SettingsCtx) {
             subtitle = str(R.string.mobileGeneralOpenByDefaultDesc),
             chevron = true,
             onClick = {
-                val intent = Intent(Settings.ACTION_APP_OPEN_BY_DEFAULT_SETTINGS, Uri.parse("package:${context.packageName}"))
-                startSettingsIntent(context, overlays, intent, noApp)
+                val pkg = Uri.parse("package:${context.packageName}")
+                // 「默认打开」独立设置页为 Android 12 新增；更低版本该入口位于应用详情页
+                val action = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    Settings.ACTION_APP_OPEN_BY_DEFAULT_SETTINGS
+                } else {
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS
+                }
+                startSettingsIntent(context, overlays, Intent(action, pkg), noApp)
             },
         )
     }

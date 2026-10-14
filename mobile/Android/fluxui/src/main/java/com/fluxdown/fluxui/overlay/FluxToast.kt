@@ -1,6 +1,7 @@
 package com.fluxdown.fluxui.overlay
 
 import android.content.Context
+import android.os.Build
 import android.view.accessibility.AccessibilityManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -58,7 +59,9 @@ internal class ToastEntry(
     val durationMs: Long,
 )
 
+/** 无障碍推荐停留时长（Android 10+）；更低版本沿用默认时长。 */
 private fun recommendedTimeout(ctx: Context, e: ToastEntry): Long {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return e.durationMs
     val am = ctx.getSystemService(AccessibilityManager::class.java) ?: return e.durationMs
     val flags = AccessibilityManager.FLAG_CONTENT_TEXT or
         (if (e.action != null) AccessibilityManager.FLAG_CONTENT_CONTROLS else 0)

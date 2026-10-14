@@ -29,6 +29,7 @@ import {
 import { RateLimitRow } from './RateLimitField'
 import { DirPickerDialog } from './DirPickerDialog'
 import { UserAgentRow } from './UserAgentField'
+import { AutoCountRow } from './AutoCountRow'
 
 const NO_QUEUES: readonly QueueDto[] = []
 const selectQueues = (daemon: { queues: readonly QueueDto[] }) => daemon.queues
@@ -161,15 +162,16 @@ function ConnectionSection() {
   const cdnMulti = useDaemonBool('cdn_multi_enabled')
   return (
     <SettingsSection title={t('settingsGroupConnection')}>
-      <DaemonNumberRow
+      <AutoCountRow
         configKey="default_segments"
+        customDefault={16}
         titleKey="defaultThreads"
         descKey="defaultThreadsDesc"
         footer={(segments) => <ThreadsRiskCallout segments={segments} contentClassName="pb-3" />}
       />
       {autoSegments ? <DaemonNumberRow configKey="auto_max_connections" titleKey="autoMaxConnections" descKey="autoMaxConnectionsDesc" /> : null}
       <DaemonSwitchRow configKey="cdn_multi_enabled" titleKey="cdnMultiEnabled" descKey="cdnMultiEnabledDesc" />
-      {cdnMulti ? <DaemonNumberRow configKey="cdn_max_nodes" titleKey="cdnMaxNodes" descKey="cdnMaxNodesDesc" /> : null}
+      {cdnMulti ? <AutoCountRow configKey="cdn_max_nodes" customDefault={2} titleKey="cdnMaxNodes" descKey="cdnMaxNodesDesc" /> : null}
       <MultiNicRow />
       <ConnPolicyRow />
       <DaemonNumberRow configKey="max_concurrent_tasks" titleKey="maxConcurrent" descKey="maxConcurrentDesc" />

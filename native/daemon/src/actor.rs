@@ -333,6 +333,11 @@ impl DaemonActorHandle {
         drop(receiver);
         Self { commands }
     }
+
+    pub(crate) fn test_channel() -> (Self, mpsc::Receiver<DaemonCommand>) {
+        let (commands, receiver) = mpsc::channel(1);
+        (Self { commands }, receiver)
+    }
 }
 
 /// actor 调用失败。
@@ -400,6 +405,8 @@ async fn run_actor(
     rss_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut seeding = tokio::time::interval(fluxdown_engine::bt_seeding::SEEDING_EVAL_INTERVAL);
     seeding.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut queue_positions = tokio::time::interval(Duration::from_millis(250));
+    queue_positions.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -456,6 +463,7 @@ async fn run_actor(
                 }
             }
             _ = queue_schedule.tick() => engine.manager.tick_queue_schedules().await,
+            _ = queue_positions.tick() => engine.manager.flush_queue_positions(),
             _ = rss_poll.tick() => engine.manager.tick_rss_sources(),
             event = receive_rss_event(&mut rss_events), if rss_events.is_some() => {
                 if let Some(event) = event { engine.manager.on_rss_event(event).await; }
@@ -786,7 +794,6 @@ async fn execute_operation(
                 })
                 .await
                 .ok_or_else(|| ActorError::Operation("failed to persist task".to_owned()))?;
-            engine.manager.send_tasks_snapshot().await;
             return Ok(ActorResult::Created(task_id));
         }
         ActorOperation::PauseTask { task_id } => engine.manager.pause_task(&task_id).await,

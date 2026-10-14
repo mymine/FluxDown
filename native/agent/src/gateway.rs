@@ -1265,8 +1265,8 @@ impl GatewayService {
         self.local.shell.ui_connected().await;
     }
 
-    async fn ui_disconnected(&self) {
-        self.local.shell.ui_disconnected().await;
+    async fn ui_disconnected(&self, was_ready: bool) {
+        self.local.shell.ui_disconnected(was_ready).await;
     }
 }
 
@@ -1751,6 +1751,7 @@ async fn run_socket(
 ) {
     let mut ready = false;
     let mut ui_client = false;
+    let mut ui_snapshot_ready = false;
     let mut events = None;
     // 请求按「通道」并发处理：同一通道内严格按到达顺序，慢的云端 RPC 不再阻塞事件转发
     // 与 daemon 命令（否则事件积压溢出广播容量 → 4009 event-gap 重连）。
@@ -1814,6 +1815,18 @@ async fn run_socket(
                     }
                     continue;
                 }
+                // CaptureTasksStarted 是不进快照的瞬时事件。官方 UI 已订阅后，先成功应答
+                // 首个快照，再补投冷启动意图；提前在 hello 时发布会被快照的 sequence 吞掉。
+                if ui_client && !ui_snapshot_ready && request.method == method::SYSTEM_SNAPSHOT {
+                    let response = service.call_with(allow_local_platform, request).await;
+                    let succeeded = matches!(&response, RpcResponse::Success(_));
+                    if send_response(&mut socket, response).await.is_err() { break; }
+                    if succeeded {
+                        service.local.shell.ui_snapshot_ready();
+                        ui_snapshot_ready = true;
+                    }
+                    continue;
+                }
                 if let Some(lanes) = &lanes
                     && let Some(rejected) = lanes.submit(request)
                     && send_response(&mut socket, rejected).await.is_err()
@@ -1856,7 +1869,7 @@ async fn run_socket(
         }
     }
     if ui_client {
-        service.ui_disconnected().await;
+        service.ui_disconnected(ui_snapshot_ready).await;
     }
     drop(responses);
     if let Some(lanes) = lanes {
@@ -1968,6 +1981,7 @@ fn server_mode_denies(request: &RpcRequest, local_log_export: bool) -> bool {
                         | crate::diagnostics::ACTION_ENABLE_AUTOSTART
                         | crate::diagnostics::ACTION_OPEN_SETTINGS
                         | crate::diagnostics::ACTION_TEST_NOTIFICATION
+                        | crate::diagnostics::ACTION_FIX_COMSPEC
                 )
             }),
         _ => false,
@@ -3584,6 +3598,7 @@ mod tests {
             }),
             serde_json::json!({ "action": crate::diagnostics::ACTION_REREGISTER }),
             serde_json::json!({ "action": crate::diagnostics::ACTION_USE_THIS_INSTALL }),
+            serde_json::json!({ "action": crate::diagnostics::ACTION_FIX_COMSPEC }),
         ];
         for association in ["fluxdown", "magnet", "ed2k", "torrent"] {
             denied_repairs.push(serde_json::json!({

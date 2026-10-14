@@ -27,6 +27,7 @@ use gpui_component::{
 };
 
 use crate::{
+    UserStartIntent,
     batch::{MAX_IN_FLIGHT, coalesce_commands, retry_copy, retry_delay},
     components::{
         conflict_badge::conflict_badge, file_icon::task_file_icon, task_drag::DraggedTasks,
@@ -3221,6 +3222,29 @@ impl DownloadView {
     }
 
     pub(crate) fn execute_toolbar(&mut self, action: ToolbarCommand, cx: &mut Context<Self>) {
+        if matches!(action, ToolbarCommand::PauseAll | ToolbarCommand::ResumeAll) {
+            let command = if matches!(action, ToolbarCommand::PauseAll) {
+                DownloadsCommand::PauseAll
+            } else {
+                DownloadsCommand::ResumeAll
+            };
+            // The host must close import admission during the click handler,
+            // not after another async submission has been scheduled.
+            let future = self.port.execute(command);
+            cx.spawn(async move |this, cx| {
+                let result = future.await;
+                if let Err(error) = this.update(cx, |this, cx| {
+                    this.last_error = result.as_ref().err().map(|error| {
+                        SharedString::from(error_text(this.translator.read(cx), error))
+                    });
+                    cx.notify();
+                }) {
+                    eprintln!("download view released before global command reply: {error:#}");
+                }
+            })
+            .detach();
+            return;
+        }
         let commands = self.commands_for_selection(action, cx);
         self.execute_commands(commands, cx);
     }
@@ -3229,18 +3253,31 @@ impl DownloadView {
     /// （见 [`coalesce_commands`]），其余命令按 [`MAX_IN_FLIGHT`] 限制并发；幂等命令被
     /// agent 以可重试的 `Unavailable` 拒绝时退避重试。任一失败在页面横幅提示（按错误
     /// `reason` 给出原因，同一批里先失败的错误一直保留，后完成的成功不会冲掉它）。
-    /// 只含一条单任务「继续」/「重新下载」时，成功后通知宿主这是一次交互式开始
-    /// （批量选择不逐个弹进度窗口）。
+    /// 单任务「继续」/「重新下载」在命令前登记旧状态、成功后确认开始；
+    /// 批量选择不逐个弹进度窗口。
     pub(crate) fn execute_commands(
         &mut self,
         commands: Vec<DownloadsCommand>,
         cx: &mut Context<Self>,
     ) {
         let interactive_start = match commands.as_slice() {
-            [DownloadsCommand::Resume { task_id }] => Some(Some(task_id.clone())),
-            [DownloadsCommand::Redownload(request, _)] if !request.start_paused => Some(None),
+            [DownloadsCommand::Resume { task_id }] => Some((task_id.clone(), false)),
+            [DownloadsCommand::Redownload(request, task_id)] if !request.start_paused => {
+                Some((task_id.clone(), true))
+            }
             _ => None,
         };
+        let on_user_started = self.host.on_user_started.clone();
+        if let (Some((task_id, replaces_task)), Some(hook)) = (&interactive_start, &on_user_started)
+        {
+            hook(
+                UserStartIntent::RestartRequested {
+                    task_id: task_id.clone(),
+                    replaces_task: *replaces_task,
+                },
+                cx,
+            );
+        }
         let queue = Rc::new(RefCell::new(VecDeque::from(coalesce_commands(commands))));
         let batch = Rc::new(RefCell::new(DispatchSummary::default()));
         let workers = queue.borrow().len().min(MAX_IN_FLIGHT);
@@ -3248,6 +3285,7 @@ impl DownloadView {
             let queue = Rc::clone(&queue);
             let batch = Rc::clone(&batch);
             let interactive_start = interactive_start.clone();
+            let on_user_started = on_user_started.clone();
             cx.spawn(async move |this, cx| {
                 loop {
                     let Some(mut command) = queue.borrow_mut().pop_front() else {
@@ -3261,6 +3299,13 @@ impl DownloadView {
                         let Ok((future, stale)) = this.update(cx, |this, _| {
                             (this.controller.execute(command), this.controller.is_stale())
                         }) else {
+                            if let (Some((task_id, _)), Some(hook)) =
+                                (&interactive_start, &on_user_started)
+                            {
+                                cx.update(|cx| {
+                                    hook(UserStartIntent::RestartFailed(task_id.clone()), cx)
+                                });
+                            }
                             return;
                         };
                         let result = future.await;
@@ -3278,7 +3323,30 @@ impl DownloadView {
                         retries += 1;
                     };
                     batch.borrow_mut().record(&result);
-                    let interactive_start = interactive_start.clone();
+                    if let (Some((task_id, creates_new)), Some(hook)) =
+                        (&interactive_start, &on_user_started)
+                    {
+                        cx.update(|cx| match &result {
+                            Ok(result) if *creates_new => {
+                                let created = result.created_task_ids();
+                                if let [created_id] = created.as_slice() {
+                                    if created_id == task_id {
+                                        hook(
+                                            UserStartIntent::RestartSucceeded(task_id.clone()),
+                                            cx,
+                                        );
+                                    } else {
+                                        hook(UserStartIntent::Created(created_id.clone()), cx);
+                                        hook(UserStartIntent::RestartFailed(task_id.clone()), cx);
+                                    }
+                                } else {
+                                    hook(UserStartIntent::RestartFailed(task_id.clone()), cx);
+                                }
+                            }
+                            Ok(_) => hook(UserStartIntent::RestartSucceeded(task_id.clone()), cx),
+                            Err(_) => hook(UserStartIntent::RestartFailed(task_id.clone()), cx),
+                        });
+                    }
                     let batch = Rc::clone(&batch);
 
                     let Ok(()) = this.update(cx, |this, cx| {
@@ -3288,12 +3356,6 @@ impl DownloadView {
                         this.last_error = batch.borrow().first_error.as_ref().map(|error| {
                             SharedString::from(error_text(this.translator.read(cx), error))
                         });
-                        if let (Ok(result), Some(resumed)) = (&result, interactive_start) {
-                            // 继续：原任务 ID；重新下载：响应里的新任务 ID。
-                            let started =
-                                resumed.map_or_else(|| result.created_task_ids(), |id| vec![id]);
-                            this.notify_user_started(&started, cx);
-                        }
                         cx.notify();
                     }) else {
                         // 视图已释放，结束这次回调而不再更新状态。

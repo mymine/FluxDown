@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     future::Future,
     pin::Pin,
     rc::Rc,
@@ -684,16 +684,52 @@ impl DownloadsController {
                 true
             }
             DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks }) => {
-                self.local.clone_from(tasks);
+                let ids: HashSet<&str> = tasks.iter().map(|task| task.task_id.as_str()).collect();
                 self.live_speeds
-                    .retain(|task_id, _| tasks.iter().any(|task| task.task_id == *task_id));
+                    .retain(|task_id, _| ids.contains(task_id.as_str()));
                 self.task_runtime
-                    .retain(|task_id, _| tasks.iter().any(|task| task.task_id == *task_id));
-                for task in tasks.iter().filter(|task| !matches!(task.status, 1 | 5)) {
-                    self.stop_runtime(&task.task_id);
+                    .retain(|task_id, _| ids.contains(task_id.as_str()));
+                let mut changed = false;
+                for ix in (0..self.local.len()).rev() {
+                    if !ids.contains(self.local[ix].task_id.as_str()) {
+                        self.local.swap_remove(ix);
+                        self.store.swap_remove_local(ix);
+                        changed = true;
+                    }
                 }
-                self.rebuild_all();
-                true
+                // Apply every snapshot in order: deleting then reintroducing an ID
+                // must not resurrect its runtime, even within one event batch.
+                for (target, task) in tasks.iter().enumerate() {
+                    let runtime_changed = if !matches!(task.status, 1 | 5) {
+                        self.live_speeds.remove(&task.task_id).is_some()
+                            | self.stop_runtime(&task.task_id)
+                    } else {
+                        false
+                    };
+                    match self.store.find_local(&task.task_id) {
+                        Some(ix) => {
+                            if self.local[ix] != *task || runtime_changed {
+                                self.upsert(task.clone());
+                                changed = true;
+                            }
+                            if ix != target {
+                                self.local.swap(ix, target);
+                                self.store.swap_local(ix, target);
+                                changed = true;
+                            }
+                        }
+                        None => {
+                            self.upsert(task.clone());
+                            let ix = self.local.len() - 1;
+                            if ix != target {
+                                self.local.swap(ix, target);
+                                self.store.swap_local(ix, target);
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+                changed
             }
             DaemonEvent::Engine(WsServerMsg::TaskQueueChanged { task_id, queue_id }) => {
                 let Some(ix) = self.store.find_local(task_id) else {
@@ -842,7 +878,7 @@ impl DownloadsController {
         view
     }
 
-    fn stop_runtime(&mut self, task_id: &str) {
+    fn stop_runtime(&mut self, task_id: &str) -> bool {
         if let Some(runtime) = self.task_runtime.get_mut(task_id) {
             if runtime.active_transfers == Some(0)
                 && runtime.connected_peers == Some(0)
@@ -851,7 +887,7 @@ impl DownloadsController {
                     .iter()
                     .all(|segment| segment.active == Some(false))
             {
-                return;
+                return false;
             }
             let runtime = Rc::make_mut(runtime);
             runtime.active_transfers = Some(0);
@@ -859,7 +895,9 @@ impl DownloadsController {
             for segment in &mut runtime.segments {
                 segment.active = Some(false);
             }
+            return true;
         }
+        false
     }
 
     fn upsert(&mut self, task: TaskDto) {
@@ -985,6 +1023,86 @@ mod tests {
             "errorMessage":"","createdAt":"1","proxyUrl":"","queueId":"main","checksum":""
         }))
         .expect("task")
+    }
+
+    #[test]
+    fn snapshots_preserve_order_deletion_and_terminal_runtime_boundaries() {
+        let mut controller = DownloadsController::new(Arc::new(NullPort));
+        let mut active = task("a");
+        active.status = 1;
+        let snapshot = |tasks| DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks });
+        controller.apply_daemon_event(&snapshot(vec![active.clone(), task("b")]));
+        controller.apply_daemon_event(&DaemonEvent::TaskRuntimeChanged(
+            fluxdown_protocol::TaskRuntimeDto {
+                task_id: "a".to_owned(),
+                active_transfers: Some(2),
+                connected_peers: Some(2),
+                ..Default::default()
+            },
+        ));
+        controller.live_speeds.insert("a".to_owned(), 100);
+        let generation = controller.store.generation();
+        assert!(!controller.apply_daemon_event(&snapshot(vec![active.clone(), task("b")])));
+        assert_eq!(controller.store.generation(), generation);
+        let mut paused = active.clone();
+        paused.status = 2;
+        controller.apply_daemon_event(&snapshot(vec![task("b"), paused]));
+        assert_eq!(
+            controller
+                .task_runtime("a")
+                .expect("runtime")
+                .active_transfers,
+            Some(0)
+        );
+        assert!(!controller.live_speeds.contains_key("a"));
+        assert_eq!(controller.store.find_local("a"), Some(1));
+        controller.apply_daemon_event(&snapshot(vec![task("b")]));
+        assert!(controller.task_runtime("a").is_none());
+        controller.apply_daemon_event(&snapshot(vec![active, task("b")]));
+        assert_eq!(controller.store.find_local("a"), Some(0));
+        assert!(controller.store.local()[0].runtime.is_none());
+        assert!(controller.task_runtime("a").is_none());
+    }
+
+    #[test]
+    fn twenty_thousand_incremental_tasks_and_snapshots_keep_view_generations_local() {
+        let mut controller = DownloadsController::new(Arc::new(NullPort));
+        let mut tasks: Vec<_> = (0..20_000).map(|ix| task(&format!("task-{ix}"))).collect();
+        let start = std::time::Instant::now();
+        for task in &tasks {
+            controller.apply_daemon_event(&DaemonEvent::TaskChanged(task.clone()));
+        }
+        let create_time = start.elapsed();
+        assert_eq!(controller.store.local().len(), 20_000);
+        let generation = controller.store.generation();
+        let snapshot = DaemonEvent::Engine(WsServerMsg::TasksSnapshot {
+            tasks: tasks.clone(),
+        });
+        let start = std::time::Instant::now();
+        for _ in 0..5 {
+            assert!(!controller.apply_daemon_event(&snapshot));
+        }
+        let snapshot_time = start.elapsed();
+        assert_eq!(controller.store.generation(), generation);
+        let start = std::time::Instant::now();
+        for task in &mut tasks {
+            task.status = 3;
+            task.downloaded_bytes = 128 * 1024;
+            task.total_bytes = 128 * 1024;
+            controller.apply_daemon_event(&DaemonEvent::TaskChanged(task.clone()));
+        }
+        assert_eq!(controller.store.generation(), generation + 20_000);
+        assert!(
+            controller
+                .store
+                .local()
+                .iter()
+                .all(|row| row.progress == 1.0)
+        );
+        eprintln!(
+            "controller 20000 creates={create_time:?}, five snapshots={snapshot_time:?}, 20000 completions={:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

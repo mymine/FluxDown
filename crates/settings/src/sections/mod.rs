@@ -6,6 +6,7 @@
 pub(crate) mod about;
 pub(crate) mod api;
 pub(crate) mod appearance;
+mod auto_quantity;
 pub(crate) mod bt;
 pub(crate) mod categories;
 pub(crate) mod category_dialog;
