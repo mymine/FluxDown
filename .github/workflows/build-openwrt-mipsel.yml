@@ -93,6 +93,10 @@ jobs:
           LIBGCC_DIR="$(dirname "$("$GCC" -print-libgcc-file-name)")"
           printf 'create %s/libunwind.a\naddlib %s/libgcc.a\naddlib %s/libgcc_eh.a\nsave\nend\n' \
             "$SHIM" "$LIBGCC_DIR" "$LIBGCC_DIR" | "$TC/bin/mipsel-openwrt-linux-musl-ar" -M
+          # libatomic.a 也放进 -L 目录（供 -l static=atomic 在编译 std/core 时解析）
+          LIBATOMIC="$("$GCC" -print-file-name=libatomic.a 2>/dev/null || true)"
+          [ -f "$LIBATOMIC" ] || LIBATOMIC="$TC/mipsel-openwrt-linux-musl/lib/libatomic.a"
+          cp -f "$LIBATOMIC" "$SHIM/"
           export RUSTFLAGS="$RUSTFLAGS -L native=$SHIM -l static=atomic -C link-arg=-l:libatomic.a"
 
           cargo +nightly build --release -p fluxdown_agent --features web-ui \
