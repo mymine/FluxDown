@@ -59,7 +59,7 @@ jobs:
         working-directory: web
         run: bun install --frozen-lockfile && bun run build
 
-      - name: 应用 mips32 兼容补丁（64 位原子 → portable-atomic）
+      - name: 应用 mips32 兼容补丁（64 位原子 → 注入 crate 内 shim）
         run: |
           if [ -f patch-mips32.py ]; then
             python3 patch-mips32.py "$PWD"
@@ -125,6 +125,33 @@ jobs:
 
           "$GCC" --version | head -1
           file "target/$TARGET/release/fluxdown-agent" "target/$TARGET/release/fluxdownd"
+
+      - name: strip（如需）+ UPX 压缩二进制
+        run: |
+          set -euo pipefail
+          TC="$HOME/${SDK_BASE}/staging_dir/toolchain-mipsel_24kc_gcc-12.3.0_musl"
+          STRIP="$TC/bin/mipsel-openwrt-linux-musl-strip"
+          rel="target/${TARGET}/release"
+          # 仓库 [profile.release] 已 strip=true；这里仅在「未 stripped」时兜底 strip 一次
+          for b in fluxdown-agent fluxdownd; do
+            [ -f "$rel/$b" ] || continue
+            if file "$rel/$b" | grep -q 'not stripped'; then
+              echo "strip $b"; "$STRIP" --strip-all "$rel/$b" || true
+            else
+              echo "$b 已是 stripped（profile strip=true）"
+            fi
+          done
+          # UPX（主机 x86_64 工具）压缩 mipsel 静态二进制
+          curl -fsSL -o /tmp/upx.tar.xz \
+            "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-amd64_linux.tar.xz"
+          tar xJf /tmp/upx.tar.xz -C /tmp --strip-components=1
+          for b in fluxdown-agent fluxdownd; do
+            [ -f "$rel/$b" ] || continue
+            before=$(stat -c%s "$rel/$b")
+            /tmp/upx --best --no-backup -- "$rel/$b"
+            after=$(stat -c%s "$rel/$b")
+            echo "$b: $before -> $after bytes"
+          done
 
       - name: 打包 ipk + tar.gz
         run: |
