@@ -58,6 +58,7 @@ impl ClientCommand {
     fn is_submission(&self) -> bool {
         match self.method.as_str() {
             method::DAEMON_TASK_CREATE
+            | method::DAEMON_TASK_CREATE_MANY
             | method::DAEMON_GROUP_CREATE
             | method::AGENT_CAPTURE_CREATE_GROUP
             | method::AGENT_CAPTURE_SUBMIT_TORRENT_FILE => true,
@@ -503,6 +504,11 @@ async fn run_connected(
                     log::error!("submission transport admission failed: {:?}", error.code);
                 })?;
                 let Some(command) = submissions.unsent.pop_front() else { continue; };
+                if command.ack.is_closed() {
+                    // 调用方已取消（future 被丢弃）：未发出的提交不再发送，释放准入。
+                    log::debug!("skipping cancelled unsent submission {}", command.method);
+                    continue;
+                }
                 let id = next_id;
                 next_id = next_id.saturating_add(1);
                 if send_command(&mut socket, &mut pending, &mut preference_writes, id, command, Some(admission)).await.is_err() {

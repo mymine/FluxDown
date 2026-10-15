@@ -13,6 +13,10 @@ import android.os.Bundle
  *
  * 独立亲和性（`taskAffinity=""`）让它永远是自身任务的唯一 Activity；用 `finish()` 会在最近任务里
  * 留下一张空卡，所以必须 [finishAndRemoveTask]，manifest 另以 `excludeFromRecents` 防止截到空白快照。
+ *
+ * 系统会把 manifest 的 `excludeFromRecents` 写成本 Activity intent 上的
+ * [Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS]；转发时复制了原 intent，必须去掉该标志，
+ * 否则以它为根 intent 新建的主界面任务也会从最近任务里消失。
  */
 class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -31,7 +35,9 @@ class MainActivity : Activity() {
             Intent.ACTION_SEND, Intent.ACTION_SEND_MULTIPLE, Intent.ACTION_VIEW -> ExternalDownloadActivity::class.java
             else -> HomeActivity::class.java
         }
-        startActivity(Intent(source).setClass(this, target))
+        val forwarded = Intent(source).setClass(this, target)
+        forwarded.removeFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS)
+        startActivity(forwarded)
         finishAndRemoveTask()
     }
 }

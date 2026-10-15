@@ -55,6 +55,9 @@ pub struct SeedLimits {
 /// `SeedLimits` 各限制字段的「跟随全局」哨兵（与 `native/protocol` 一致）。
 pub(crate) const SEED_LIMIT_FOLLOW_GLOBAL: i64 = -2;
 
+/// 引擎单任务删除时广播的 `TaskProgress` 哨兵（`status == 4` 且 `error_message` 为此值）。
+const DELETED_SENTINEL: &str = "deleted";
+
 impl SeedLimits {
     /// 全部跟随全局（上传限速 0 = 未设置）。
     #[must_use]
@@ -85,6 +88,9 @@ pub enum DownloadsCommand {
     /// 分页读取 daemon 持久活动历史。
     TaskActivity(TaskActivityQuery),
     Create(Box<fluxdown_protocol::DaemonCreateTaskParams>),
+    /// 批量建任务（`daemon.task.createMany`）：整块一个事务、按 `batch_id` 幂等，
+    /// 结果不确定时可原样重发。
+    CreateMany(Box<fluxdown_protocol::DaemonCreateTasksParams>),
     Pause {
         task_id: String,
     },
@@ -94,6 +100,18 @@ pub enum DownloadsCommand {
     Rename {
         task_id: String,
         file_name: String,
+    },
+    /// 更换下载源地址（`daemon.task.changeUrl`）：仅非活跃、未完成、非 BT 任务；
+    /// 失败为引擎稳定错误码（`invalid-url` / `task-active` / `protocol-mismatch` …）。
+    ChangeUrl {
+        task_id: String,
+        url: String,
+    },
+    /// 修改线程数（`daemon.task.setSegments`）：`<= 0` = 自动，已下进度保留；
+    /// 下载中任务由引擎静默暂停 → 改配置 → 恢复。
+    SetSegments {
+        task_id: String,
+        segments: i32,
     },
     Delete {
         task_id: String,
@@ -186,6 +204,11 @@ pub enum DownloadsCommand {
     SiteAuthMatch {
         url: String,
     },
+    /// 新建下载表单的只读元信息预探测（`daemon.link.probe`，只发一次 HEAD，不消耗
+    /// 一次性令牌）；结果为 [`fluxdown_protocol::LinkProbeResult`]。
+    ProbeLink {
+        url: String,
+    },
     /// 经 FluxCloud 把链接下发到账号内另一台设备（`agent.remote.dispatch`）。
     RemoteDispatch(RemoteDispatchParams),
     /// 下发到局域网已配对设备（`agent.link.dispatch`）。
@@ -247,6 +270,8 @@ pub enum DownloadsResult {
     Preview(fluxdown_protocol::ResolvePreviewResponse),
     /// `FileIcon` 的 PNG 字节。
     FileIcon(Vec<u8>),
+    /// `CreateMany` 的逐条结果（与请求条目同序）。
+    CreateMany(fluxdown_protocol::DaemonCreateTasksResult),
 }
 
 impl DownloadsResult {
@@ -275,6 +300,17 @@ impl DownloadsResult {
 
 pub trait DownloadsPort: Send + Sync {
     fn execute(&self, command: DownloadsCommand) -> PortFuture<DownloadsResult>;
+}
+
+/// 「全部开始」能恢复哪些暂停任务（见 [`DownloadsController::resume_targets`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeTargets {
+    /// 有运行中队列里的暂停任务。
+    Some,
+    /// 暂停任务全在已停止的队列里：全部开始不会动它们，需先启动队列。
+    OnlyInStoppedQueues,
+    /// 没有暂停任务。
+    None,
 }
 
 /// 任务组聚合（由任务行 + `snapshot.daemon.groups` 计算）。
@@ -528,6 +564,39 @@ impl DownloadsController {
         &self.runtime_stats
     }
 
+    /// 状态栏「全部暂停」是否有作用对象：与 daemon `PauseAll` 同判定（等待 / 下载中 /
+    /// 准备中，即 status 0 / 1 / 5 的本地任务）。
+    #[must_use]
+    pub(crate) fn has_pausable_tasks(&self) -> bool {
+        self.local
+            .iter()
+            .any(|task| matches!(task.status, 0 | 1 | 5))
+    }
+
+    /// 状态栏「全部开始」的作用对象：与引擎 `eligible_resume_task_ids` 同判定——
+    /// 已暂停（status 2）且所在队列运行中；队列不在快照里（孤儿）视作运行中。
+    /// 停止队列内的暂停任务由「启动队列」恢复，不计入，但单独报告以便界面说明原因。
+    #[must_use]
+    pub(crate) fn resume_targets(&self) -> ResumeTargets {
+        let mut held = false;
+        for task in self.local.iter().filter(|task| task.status == 2) {
+            let running = self
+                .queues
+                .iter()
+                .find(|queue| queue.queue_id == task.queue_id)
+                .is_none_or(|queue| queue.is_running);
+            if running {
+                return ResumeTargets::Some;
+            }
+            held = true;
+        }
+        if held {
+            ResumeTargets::OnlyInStoppedQueues
+        } else {
+            ResumeTargets::None
+        }
+    }
+
     /// daemon 公开配置（字符串编码）。
     #[must_use]
     pub(crate) fn config(&self) -> &BTreeMap<String, String> {
@@ -646,6 +715,16 @@ impl DownloadsController {
                 self.upsert(task.clone());
                 true
             }
+            DaemonEvent::TasksChanged(tasks) => {
+                for task in tasks {
+                    if !matches!(task.status, 1 | 5) {
+                        self.live_speeds.remove(&task.task_id);
+                        self.stop_runtime(&task.task_id);
+                    }
+                }
+                self.upsert_many(tasks);
+                !tasks.is_empty()
+            }
             DaemonEvent::TaskRuntimeChanged(runtime) => {
                 let task_id = &runtime.task_id;
                 if self.task_runtime.get(task_id).is_some_and(|previous| {
@@ -675,13 +754,12 @@ impl DownloadsController {
             }
             DaemonEvent::TaskActivityAdded(_) => false,
             DaemonEvent::TaskDeleted { task_id } => {
-                self.live_speeds.remove(task_id);
-                self.task_runtime.remove(task_id);
-                if let Some(ix) = self.store.find_local(task_id) {
-                    self.local.swap_remove(ix);
-                    self.store.swap_remove_local(ix);
-                }
+                self.remove_tasks(std::slice::from_ref(task_id));
                 true
+            }
+            DaemonEvent::TasksDeleted { task_ids } => {
+                self.remove_tasks(task_ids);
+                !task_ids.is_empty()
             }
             DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks }) => {
                 let ids: HashSet<&str> = tasks.iter().map(|task| task.task_id.as_str()).collect();
@@ -751,6 +829,11 @@ impl DownloadsController {
                 seeding_status,
                 ..
             }) => {
+                // 单任务删除沿用 status=4 + "deleted" 哨兵：按删除处理，不能把行改成失败。
+                if *status == 4 && error_message == DELETED_SENTINEL {
+                    self.remove_tasks(std::slice::from_ref(task_id));
+                    return true;
+                }
                 self.live_speeds
                     .insert(task_id.clone(), if *status == 1 { *speed } else { 0 });
                 let Some(ix) = self.store.find_local(task_id) else {
@@ -878,6 +961,23 @@ impl DownloadsController {
         view
     }
 
+    /// 按序移除一批本地任务（语义等同逐条 `TaskDeleted`）：每行 `swap_remove` 为 O(1)，
+    /// 整批只登记一次结构变化。
+    fn remove_tasks(&mut self, task_ids: &[String]) {
+        let mut removed = false;
+        for task_id in task_ids {
+            self.live_speeds.remove(task_id);
+            self.task_runtime.remove(task_id);
+            if let Some(ix) = self.store.find_local(task_id) {
+                self.local.swap_remove(ix);
+                removed |= self.store.swap_remove_local_quiet(ix);
+            }
+        }
+        if removed {
+            self.store.commit_removals();
+        }
+    }
+
     fn stop_runtime(&mut self, task_id: &str) -> bool {
         if let Some(runtime) = self.task_runtime.get_mut(task_id) {
             if runtime.active_transfers == Some(0)
@@ -909,6 +1009,26 @@ impl DownloadsController {
             let view = self.view_of(&task);
             self.local.push(task);
             self.store.push_local(view);
+        }
+    }
+
+    /// 按序批量 upsert（语义等同逐条 [`Self::upsert`]），新增行只登记一次结构变化。
+    fn upsert_many(&mut self, tasks: &[TaskDto]) {
+        let mut appended = false;
+        self.local.reserve(tasks.len());
+        for task in tasks {
+            let view = self.view_of(task);
+            if let Some(ix) = self.store.find_local(&task.task_id) {
+                self.local[ix].clone_from(task);
+                self.store.set_local(ix, view);
+            } else {
+                self.local.push(task.clone());
+                self.store.append_local(view);
+                appended = true;
+            }
+        }
+        if appended {
+            self.store.commit_appends();
         }
     }
 
@@ -1005,7 +1125,7 @@ mod tests {
 
     use super::{
         AgentEvent, DaemonEvent, DownloadsCommand, DownloadsController, DownloadsPort,
-        DownloadsResult, PortFuture, ServiceEvent, WsServerMsg,
+        DownloadsResult, PortFuture, ResumeTargets, ServiceEvent, WsServerMsg,
     };
 
     struct NullPort;
@@ -1062,6 +1182,107 @@ mod tests {
         assert_eq!(controller.store.find_local("a"), Some(0));
         assert!(controller.store.local()[0].runtime.is_none());
         assert!(controller.task_runtime("a").is_none());
+    }
+
+    #[test]
+    fn tasks_changed_batch_equals_sequential_task_changed_with_one_structure_bump() {
+        let mut batched = DownloadsController::new(Arc::new(NullPort));
+        let mut sequential = DownloadsController::new(Arc::new(NullPort));
+        let mut running = task("a");
+        running.status = 1;
+        for controller in [&mut batched, &mut sequential] {
+            controller.apply_daemon_event(&DaemonEvent::TaskChanged(running.clone()));
+            controller.apply_daemon_event(&DaemonEvent::TaskRuntimeChanged(
+                fluxdown_protocol::TaskRuntimeDto {
+                    task_id: "a".to_owned(),
+                    active_transfers: Some(2),
+                    ..Default::default()
+                },
+            ));
+        }
+        // 已有任务进入终态 + 两个新任务 + 同批里对新任务的再次更新。
+        let mut finished = running.clone();
+        finished.status = 3;
+        let mut updated = task("c");
+        updated.downloaded_bytes = 7;
+        let events = vec![finished, task("b"), task("c"), updated];
+
+        let structure = batched.store.structure_generation();
+        assert!(batched.apply_daemon_event(&DaemonEvent::TasksChanged(events.clone())));
+        assert_eq!(
+            batched.store.structure_generation(),
+            structure.wrapping_add(1)
+        );
+        for event in events {
+            sequential.apply_daemon_event(&DaemonEvent::TaskChanged(event));
+        }
+        assert_eq!(batched.local, sequential.local);
+        assert_eq!(
+            batched.store.find_local("c"),
+            sequential.store.find_local("c")
+        );
+        let rows = |controller: &DownloadsController| {
+            controller
+                .store
+                .local()
+                .iter()
+                .map(|row| {
+                    (
+                        row.key.clone(),
+                        row.progress.to_bits(),
+                        row.active_transfers(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&batched), rows(&sequential));
+        // 终态任务的运行时在批内同样被收口。
+        assert_eq!(
+            batched.task_runtime("a").expect("runtime").active_transfers,
+            Some(0)
+        );
+        assert!(!batched.apply_daemon_event(&DaemonEvent::TasksChanged(Vec::new())));
+    }
+
+    #[test]
+    fn bulk_pause_and_resume_availability_follows_daemon_targets() {
+        let mut controller = DownloadsController::new(Arc::new(NullPort));
+        assert!(!controller.has_pausable_tasks());
+        assert_eq!(controller.resume_targets(), ResumeTargets::None);
+        let with_status = |id: &str, status: i32, queue: &str| {
+            let mut dto = task(id);
+            dto.status = status;
+            queue.clone_into(&mut dto.queue_id);
+            dto
+        };
+        let snapshot = |tasks| DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks });
+        controller.queues = vec![
+            serde_json::from_value(json!({
+                "queueId":"stopped","name":"s","speedLimitKbps":0,"maxConcurrent":0,
+                "defaultSaveDir":"","position":1,"defaultSegments":0,"defaultUserAgent":"",
+                "isRunning":false
+            }))
+            .expect("queue"),
+        ];
+        // 完成 / 失败不是任何一侧的对象；停止队列里的暂停任务只由「启动队列」恢复。
+        controller.apply_daemon_event(&snapshot(vec![
+            with_status("done", 3, "main"),
+            with_status("failed", 4, "main"),
+            with_status("held", 2, "stopped"),
+        ]));
+        assert!(!controller.has_pausable_tasks());
+        assert_eq!(
+            controller.resume_targets(),
+            ResumeTargets::OnlyInStoppedQueues
+        );
+        // 准备中（5）可暂停；快照里没有的队列（孤儿）视作运行中，可恢复。
+        controller.apply_daemon_event(&snapshot(vec![
+            with_status("held", 2, "stopped"),
+            with_status("preparing", 5, "main"),
+            with_status("orphan", 2, "gone"),
+        ]));
+        assert!(controller.has_pausable_tasks());
+        assert_eq!(controller.resume_targets(), ResumeTargets::Some);
     }
 
     #[test]
@@ -1329,6 +1550,131 @@ mod tests {
         assert_eq!(controller.local[0].task_id, "c");
         assert_eq!(controller.store().local()[0].key.task_id(), "c");
     }
+
+    fn progress_event(id: &str, status: i32, error_message: &str) -> DaemonEvent {
+        DaemonEvent::Engine(WsServerMsg::TaskProgress {
+            task_id: id.to_owned(),
+            status,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            speed: 5,
+            upload_speed: 0,
+            file_name: String::new(),
+            save_dir: "/tmp".to_owned(),
+            url: "https://example.com/download".to_owned(),
+            error_message: error_message.to_owned(),
+            uploaded_bytes: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
+            seeding_time_secs: 0,
+        })
+    }
+
+    fn controller_with_running(ids: &[&str]) -> DownloadsController {
+        let mut controller = DownloadsController::new(Arc::new(NullPort));
+        for id in ids {
+            let mut running = task(id);
+            running.status = 1;
+            controller.apply_daemon_event(&DaemonEvent::TaskChanged(running));
+            controller.apply_daemon_event(&progress_event(id, 1, ""));
+            controller.apply_daemon_event(&DaemonEvent::TaskRuntimeChanged(
+                fluxdown_protocol::TaskRuntimeDto {
+                    task_id: (*id).to_owned(),
+                    active_transfers: Some(1),
+                    ..Default::default()
+                },
+            ));
+        }
+        controller
+    }
+
+    #[test]
+    fn tasks_deleted_batch_equals_sequential_task_deleted_with_one_structure_bump() {
+        let ids = ["a", "b", "c", "d", "e"];
+        let mut batched = controller_with_running(&ids);
+        let mut sequential = controller_with_running(&ids);
+        // 未知 id 被忽略；顺序与重复 id 都按逐条语义处理。
+        let deleted: Vec<String> = ["b", "missing", "d", "a", "b"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        let structure = batched.store.structure_generation();
+        assert!(batched.apply_daemon_event(&DaemonEvent::TasksDeleted {
+            task_ids: deleted.clone(),
+        }));
+        assert_eq!(
+            batched.store.structure_generation(),
+            structure.wrapping_add(1)
+        );
+        for task_id in deleted {
+            sequential.apply_daemon_event(&DaemonEvent::TaskDeleted { task_id });
+        }
+
+        assert_eq!(batched.local, sequential.local);
+        let keys = |controller: &DownloadsController| {
+            controller
+                .store
+                .local()
+                .iter()
+                .map(|row| row.key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&batched), keys(&sequential));
+        assert_eq!(batched.local.len(), 2);
+        // 下标索引与行一致，被删任务的运行时与实时速度一并清掉。
+        for (ix, row) in batched.local.iter().enumerate() {
+            assert_eq!(batched.store.find_local(&row.task_id), Some(ix));
+        }
+        for gone in ["a", "b", "d"] {
+            assert_eq!(batched.store.find_local(gone), None);
+            assert!(batched.task_runtime(gone).is_none());
+            assert!(!batched.live_speeds.contains_key(gone));
+        }
+        for kept in ["c", "e"] {
+            assert!(batched.task_runtime(kept).is_some());
+            assert!(batched.live_speeds.contains_key(kept));
+        }
+        // 空批次不报告变化；只含未知 id 的批次不动结构计数。
+        let structure = batched.store.structure_generation();
+        assert!(!batched.apply_daemon_event(&DaemonEvent::TasksDeleted {
+            task_ids: Vec::new(),
+        }));
+        assert!(batched.apply_daemon_event(&DaemonEvent::TasksDeleted {
+            task_ids: vec!["missing".to_owned()],
+        }));
+        assert_eq!(batched.store.structure_generation(), structure);
+    }
+
+    #[test]
+    fn delete_sentinel_progress_removes_the_row_instead_of_marking_it_failed() {
+        let mut controller = controller_with_running(&["a", "b", "c"]);
+
+        // 真实的失败进度仍把行标成失败，保留错误信息。
+        controller.apply_daemon_event(&progress_event("a", 4, "disk full"));
+        assert_eq!(controller.store.local().len(), 3);
+        assert_eq!(controller.task_dto("a").unwrap().error_message, "disk full");
+
+        let structure = controller.store.structure_generation();
+        assert!(controller.apply_daemon_event(&progress_event("b", 4, "deleted")));
+        assert_eq!(
+            controller.store.structure_generation(),
+            structure.wrapping_add(1)
+        );
+        assert_eq!(controller.store.find_local("b"), None);
+        assert!(controller.task_dto("b").is_none());
+        assert!(controller.task_runtime("b").is_none());
+        assert!(!controller.live_speeds.contains_key("b"));
+        assert_eq!(controller.store.local().len(), 2);
+        for (ix, row) in controller.local.iter().enumerate() {
+            assert_eq!(controller.store.find_local(&row.task_id), Some(ix));
+        }
+
+        // 对未知任务的哨兵不留下实时速度残留。
+        controller.apply_daemon_event(&progress_event("ghost", 4, "deleted"));
+        assert!(!controller.live_speeds.contains_key("ghost"));
+    }
+
     #[test]
     fn late_snapshot_contains_segments_and_pausing_clears_active_without_erasing_bytes() {
         let mut snapshot = fluxdown_protocol::AgentSnapshot {

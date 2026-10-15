@@ -14,6 +14,8 @@ import type {
   CreatedTask,
   DaemonConfigPatch,
   DaemonConfigSnapshot,
+  DaemonCreateTasksParams,
+  DaemonCreateTasksResult,
   DaemonCreateTaskParams,
   DaemonDiagnosticsDescribe,
   DaemonRuntimeStatsDto,
@@ -71,6 +73,7 @@ import type {
   TaskDeleteManyParams,
   TaskDeleteParams,
   TaskChangeUrlParams,
+  TaskSetSegmentsParams,
   TaskDto,
   TaskIdParams,
   TaskIdsParams,
@@ -91,11 +94,17 @@ const task = {
   activity: (params: TaskActivityQuery) =>
     call<TaskActivityPage>(METHOD.DAEMON_TASK_ACTIVITY, params),
   create: (params: DaemonCreateTaskParams) => call<CreatedTask>(METHOD.DAEMON_TASK_CREATE, params),
+  /** 批量建任务：一块（≤512 条）共享同一份选项，整块一个事务，按 `batchId` 幂等。 */
+  createMany: (params: DaemonCreateTasksParams) =>
+    call<DaemonCreateTasksResult>(METHOD.DAEMON_TASK_CREATE_MANY, params),
   pause: (params: TaskIdParams) => call<OkResult>(METHOD.DAEMON_TASK_PAUSE, params),
   resume: (params: TaskIdParams) => call<OkResult>(METHOD.DAEMON_TASK_RESUME, params),
   rename: (params: TaskRenameParams) => call<OkResult>(METHOD.DAEMON_TASK_RENAME, params),
   changeUrl: (params: TaskChangeUrlParams) =>
     call<OkResult>(METHOD.DAEMON_TASK_CHANGE_URL, params),
+  /** 修改线程数：已下进度保留；下载中任务由引擎静默暂停 → 改配置 → 恢复。 */
+  setSegments: (params: TaskSetSegmentsParams) =>
+    call<OkResult>(METHOD.DAEMON_TASK_SET_SEGMENTS, params),
   delete: (params: TaskDeleteParams) => call<OkResult>(METHOD.DAEMON_TASK_DELETE, params),
   pauseAll: () => call<OkResult>(METHOD.DAEMON_TASK_PAUSE_ALL),
   resumeAll: () => call<OkResult>(METHOD.DAEMON_TASK_RESUME_ALL),

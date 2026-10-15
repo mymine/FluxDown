@@ -13,7 +13,8 @@ use fluxdown_protocol::{
 };
 use fluxdown_ui_downloads::{
     DownloadsCommand, DownloadsPort, NewDownloadContext, NewDownloadSubmission, NewDownloadView,
-    SubmitNotice, new_download_context_from_snapshot, new_download_targets, run_submission,
+    SubmissionHooks, SubmitNotice, new_download_context_from_snapshot, new_download_targets,
+    run_submission,
 };
 use fluxdown_ui_i18n::keys;
 use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_window_options};
@@ -453,10 +454,18 @@ fn ignore_captures(captures: Vec<PendingCaptureDto>, port: &AgentDownloadsPort, 
 /// toast（成功 / 失败 / 下发汇总文案由下载能力按 `reason` 生成）。界面退出前等提交送达
 ///（外部捕获拉起的界面没有主窗口，关表单即最后一个窗口）。
 fn submit(submission: NewDownloadSubmission, port: &Arc<AgentDownloadsPort>, cx: &mut App) {
-    let main = Desktop::global(cx)
+    let mut main = Desktop::global(cx)
         .main_downloads
         .as_ref()
         .and_then(WeakEntity::upgrade);
+    // 超过一块的导入有进度条与取消入口，只在主窗口下载页显示：没有主窗口时先打开它。
+    if main.is_none() && submission.exceeds_one_chunk() {
+        crate::windows::main::reveal(cx);
+        main = Desktop::global(cx)
+            .main_downloads
+            .as_ref()
+            .and_then(WeakEntity::upgrade);
+    }
     let translator = Desktop::global(cx).translator.clone();
     let notice = match main {
         Some(downloads) => downloads.update(cx, |downloads, cx| {
@@ -466,8 +475,14 @@ fn submit(submission: NewDownloadSubmission, port: &Arc<AgentDownloadsPort>, cx:
             let starts_immediately = submission.starts_immediately();
             let port = Arc::clone(port);
             let translator = translator.clone();
+            let timer = cx.background_executor().clone();
             cx.spawn(async move |cx| {
-                let report = run_submission(submission, move |command| port.execute(command)).await;
+                let report = run_submission(
+                    submission,
+                    move |command| port.execute(command),
+                    SubmissionHooks::new(move |delay| timer.timer(delay)),
+                )
+                .await;
                 // 与主窗口下载页同一规则：恰好一个任务立即开始才弹进度窗口。
                 if let ([task_id], true) = (report.created_task_ids(), starts_immediately) {
                     let task_id = task_id.clone();

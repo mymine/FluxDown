@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use fluxdown_mobile::{
     CreateTaskRequestDto, ErrorCodeDto, FluxCore, FluxError, HostEventDto, HostSession,
-    HostSignalDto, HostSnapshotDto, LocalHostConfig, TaskDto,
+    HostSignalDto, HostSnapshotDto, ImportBatchDto, ImportItemDto, ImportUpdateDto,
+    LocalHostConfig, TaskDto,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -492,6 +493,81 @@ async fn local_host_downloads_then_pauses_resumes_and_deletes() {
     assert_file(&dirs.save().join("fast.bin"), &body(FAST_LEN));
 
     reopened.disconnect();
+    core.shutdown_local().await;
+}
+
+/// 真实本机主机：`start_import` 跨两块（256 + 44）经 `daemon.task.createMany` 建任务，单条非法校验值被逐条拒绝，
+/// 其余全部落库并经事件到达 UI。任务以「暂停」创建，不触发下载。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_host_imports_chunked_batches_with_per_item_rejection() {
+    let dirs = Dirs::new("import");
+    let server = HttpServer::start().await;
+    let core = FluxCore::new().expect("core");
+    let session = core.open_local(dirs.config()).await.expect("open local");
+    first_snapshot(&session).await;
+
+    let mut common = create_request(String::new());
+    common.start_paused = true;
+    let items: Vec<ImportItemDto> = (0..300)
+        .map(|index| ImportItemDto {
+            url: server.url(&format!("import-{index}.bin")),
+            file_name: String::new(),
+            // 第 7 条的校验值非法：只拒绝它，不影响同块其余条目。
+            checksum: if index == 7 {
+                "not-a-checksum".to_owned()
+            } else {
+                String::new()
+            },
+        })
+        .collect();
+    let handle = session.start_import(vec![ImportBatchDto { common, items }]);
+    let summary = tokio::time::timeout(STEP, async {
+        loop {
+            match handle.next_update().await.expect("update before Finished") {
+                ImportUpdateDto::Progress { progress } => assert_eq!(progress.total, 300),
+                ImportUpdateDto::Finished { summary } => break summary,
+            }
+        }
+    })
+    .await
+    .expect("import finished in time");
+    assert_eq!(summary.total, 300);
+    assert_eq!((summary.succeeded, summary.failed), (299, 1), "{summary:?}");
+    assert_eq!(summary.not_submitted, 0);
+    assert!(!summary.cancelled);
+    let error = summary.first_error.expect("rejection is reported");
+    assert_eq!(error.code, ErrorCodeDto::InvalidArgument);
+    assert_eq!(error.message, "checksum");
+    assert_eq!(
+        summary.unfinished,
+        [7],
+        "only the rejected item is left over"
+    );
+    assert!(handle.next_update().await.is_none());
+
+    // 事件 / 重同步快照最终覆盖全部 299 个新任务。
+    let mut seen = std::collections::HashSet::new();
+    tokio::time::timeout(STEP, async {
+        while seen.len() < 299 {
+            match next(&session).await {
+                HostSignalDto::Snapshot { snapshot } => {
+                    seen.extend(snapshot.tasks.into_iter().map(|task| task.task_id));
+                }
+                HostSignalDto::Event {
+                    event: HostEventDto::TaskChanged { task },
+                } => {
+                    seen.insert(task.task_id);
+                }
+                HostSignalDto::Fatal { error } => panic!("session went fatal: {error:?}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("all created tasks reach the UI");
+    assert_eq!(seen.len(), 299);
+
+    session.disconnect();
     core.shutdown_local().await;
 }
 

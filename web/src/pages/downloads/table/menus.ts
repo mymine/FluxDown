@@ -4,13 +4,17 @@
 import {
   AppWindow,
   CircleAlert,
+  CircleCheck,
   Copy,
   Download,
+  Layers,
+  Link2,
   FolderOpen,
   Pause,
   PanelRight,
   Pen,
   Play,
+  SquareCheck,
   RotateCw,
   Rows3,
   Trash2,
@@ -44,11 +48,22 @@ import {
   toggleBoost,
 } from '../model/actions'
 import { remoteCan } from '../model/batchPlan'
+import { canChangeSegments, canChangeUrl } from '../model/taskEdit'
 import type { DownloadTaskView } from '../model/task'
 import type { GroupSummary } from '../state'
-import { openGroupDetail, openRename } from '../dialogs'
+import { openChangeSegments, openChangeUrl, openGroupDetail, openRename } from '../dialogs'
 
 type Translate = (key: string, params?: Record<string, string | number>) => string
+
+const IS_MAC = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent)
+
+/** 多选模式的右键入口（桌面表格专用；卡片视图有自己的点选方式，不传）。 */
+interface SelectionEntries {
+  /** 已处于显式多选模式时不再显示「选择 / 全选」。 */
+  multiSelect: boolean
+  enterMultiSelect: () => void
+  selectAll: () => void
+}
 
 interface TaskMenuContext {
   t: Translate
@@ -56,10 +71,11 @@ interface TaskMenuContext {
   queues: readonly QueueDto[]
   queueName: (queueId: string) => string
   showDetail: (taskId: string) => void
+  selection?: SelectionEntries
 }
 
 /** 任务行右键菜单：多选时每一项都要求对全部选中任务成立（交集语义），resume/pause 例外。 */
-export function buildTaskMenu({ t, views, queues, queueName, showDetail }: TaskMenuContext): MenuEntry[] {
+export function buildTaskMenu({ t, views, queues, queueName, showDetail, selection }: TaskMenuContext): MenuEntry[] {
   if (views.length === 0) return []
   const entries: MenuEntry[] = []
   const only = views.length === 1 ? views[0] : undefined
@@ -121,6 +137,18 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail }: TaskM
   if (only && only.source === 'local') {
     entries.push({ type: 'item', key: 'rename', label: t('renameTask'), icon: Pen, onSelect: () => openRename(only.taskId) })
   }
+  if (only && canChangeUrl(only)) {
+    entries.push({ type: 'item', key: 'change-url', label: t('webChangeUrl'), icon: Link2, onSelect: () => openChangeUrl(only.taskId) })
+  }
+  if (only && canChangeSegments(only)) {
+    entries.push({
+      type: 'item',
+      key: 'change-segments',
+      label: t('editThreads'),
+      icon: Layers,
+      onSelect: () => openChangeSegments(only.taskId),
+    })
+  }
   if (views.every(canRedownload)) {
     entries.push({
       type: 'item',
@@ -143,6 +171,19 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail }: TaskM
         label: queueName(queue.queueId),
         onSelect: () => void moveViewsToQueue(views, queue.queueId),
       })),
+    })
+  }
+  // 与 GPUI `task_menu_entries` 对齐：未处于多选模式时在删除组前插入「选择 / 全选」。
+  if (selection && !selection.multiSelect) {
+    entries.push({ type: 'separator', key: 'sep-select' })
+    entries.push({ type: 'item', key: 'select', label: t('selectTasks'), icon: CircleCheck, onSelect: selection.enterMultiSelect })
+    entries.push({
+      type: 'item',
+      key: 'select-all',
+      label: t('selectAll'),
+      icon: SquareCheck,
+      shortcut: IS_MAC ? '⌘A' : 'Ctrl+A',
+      onSelect: selection.selectAll,
     })
   }
   entries.push({ type: 'separator', key: 'sep-delete' })

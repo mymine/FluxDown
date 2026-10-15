@@ -49,6 +49,22 @@ impl DispatchSummary {
         }
     }
 
+    /// 批量成功：`count` 条已确认。
+    pub(crate) fn record_succeeded(&mut self, count: usize) {
+        self.succeeded += count;
+    }
+
+    /// 批量失败：`count` 条，首个错误只记一次。
+    pub(crate) fn record_failed(&mut self, count: usize, error: &RpcErrorData) {
+        if count == 0 {
+            return;
+        }
+        self.failed += count;
+        if self.first_error.is_none() {
+            self.first_error = Some(error.clone());
+        }
+    }
+
     pub(crate) fn has_failure(&self) -> bool {
         self.failed > 0
     }

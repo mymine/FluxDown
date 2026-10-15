@@ -93,11 +93,13 @@ final class QueueEditorModel {
             do throws(HostError) {
                 if let queueId {
                     try await session.callVoid(HostMethod.daemonQueueUpdate, params: QueueUpdateParams(queueId: queueId, input: input))
-                    try await session.callVoid(HostMethod.daemonQueueSchedule, params: form.schedule(queueId: queueId))
+                    if form.needsScheduleCall(queueId: queueId) {
+                        try await session.callVoid(HostMethod.daemonQueueSchedule, params: form.schedule(queueId: queueId))
+                    }
                 } else {
                     try await session.callVoid(HostMethod.daemonQueueCreate, params: input)
                     // create 不回 id：需要定时时按名称取最新创建的队列再补发。
-                    if form.needsScheduleCall {
+                    if form.needsScheduleCall(queueId: "") {
                         let list: [QueueDetail] = try await session.call(HostMethod.daemonQueueList)
                         if let created = QueueLookup.created(named: input.name, in: list) {
                             try await session.callVoid(HostMethod.daemonQueueSchedule, params: form.schedule(queueId: created.queueId))

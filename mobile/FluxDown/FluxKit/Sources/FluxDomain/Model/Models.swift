@@ -213,6 +213,11 @@ public struct TaskQueue: Sendable, Hashable, Identifiable {
     /// bit0 = 周一 … bit6 = 周日；127 = 每天。
     public var scheduleDays: Int32
 
+    /// 主队列始终运行：运行中不能停止（停止态异常时仍可启动）。
+    public var canStop: Bool { QueueIds.canStop(queueId) }
+    /// 主队列不可定时。
+    public var canSchedule: Bool { QueueIds.canSchedule(queueId) }
+
     public init(
         queueId: String,
         name: String,

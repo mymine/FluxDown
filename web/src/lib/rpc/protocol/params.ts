@@ -25,6 +25,12 @@ export interface TaskChangeUrlParams {
   url: string;
 }
 
+/** `daemon.task.setSegments`：`segments <= 0` = 自动，上限 `MAX_TASK_SEGMENTS`（512）。 */
+export interface TaskSetSegmentsParams {
+  taskId: string;
+  segments: number;
+}
+
 export interface TaskDeleteParams {
   taskId: string;
   /** 同时删除磁盘文件，缺省 false。 */

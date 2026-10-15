@@ -108,12 +108,6 @@ impl WebhookEventKind {
         WebhookEventKind::QueueDrained,
     ];
 
-    /// 默认订阅集：完成 + 失败覆盖 80% 场景。
-    pub const DEFAULT_SUBSCRIPTION: [WebhookEventKind; 2] = [
-        WebhookEventKind::TaskCompleted,
-        WebhookEventKind::TaskFailed,
-    ];
-
     /// wire 名（payload `event` 字段与 `X-FluxDown-Event` 头）。
     pub fn wire(self) -> &'static str {
         match self {

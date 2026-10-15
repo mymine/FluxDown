@@ -94,10 +94,12 @@ struct DownloadsFilterBar: View {
                 .pickerStyle(.inline)
                 Section {
                     if let queue = scopedQueue(scoped) {
-                        Button(
-                            L(queue.isRunning ? "stopQueueAction" : "startQueueAction"),
-                            systemImage: queue.isRunning ? FluxSymbol.pause : FluxSymbol.resume
-                        ) { setRunning(!queue.isRunning, queue: queue) }
+                        if !queue.isRunning || queue.canStop {
+                            Button(
+                                L(queue.isRunning ? "stopQueueAction" : "startQueueAction"),
+                                systemImage: queue.isRunning ? FluxSymbol.pause : FluxSymbol.resume
+                            ) { setRunning(!queue.isRunning, queue: queue) }
+                        }
                     }
                     Button(L("manageQueueAction"), systemImage: FluxSymbol.queue) { container.router.sheet = .queues }
                 }

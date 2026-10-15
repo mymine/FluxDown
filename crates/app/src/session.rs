@@ -413,4 +413,40 @@ mod tests {
         };
         assert_eq!(body.daemon.task_runtime["task"].active_transfers, Some(4));
     }
+
+    #[test]
+    fn tasks_changed_batch_applies_like_task_changed_for_later_runtime_samples() {
+        let mut snapshot = source_snapshot("a", 5);
+        assert_eq!(
+            apply_frame(&mut snapshot, &mut runtime_frame("a", 6, 3)),
+            Ok(true)
+        );
+        let SnapshotBody::Agent(body) = &snapshot.body else {
+            panic!("agent snapshot")
+        };
+        let mut complete = body.daemon.tasks[0].clone();
+        complete.status = 3;
+        let mut added = complete.clone();
+        added.task_id = "added".into();
+        let mut batch = EventFrame {
+            epoch: "a".into(),
+            sequence: 7,
+            event: ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::TasksChanged(vec![
+                complete, added,
+            ]))),
+        };
+        assert_eq!(apply_frame(&mut snapshot, &mut batch), Ok(true));
+        let SnapshotBody::Agent(body) = &snapshot.body else {
+            panic!("agent snapshot")
+        };
+        assert_eq!(body.daemon.tasks.len(), 2);
+        let mut late = runtime_frame("a", 8, 4);
+        assert_eq!(apply_frame(&mut snapshot, &mut late), Ok(true));
+        let ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::TaskRuntimeChanged(runtime))) =
+            late.event
+        else {
+            panic!("runtime event")
+        };
+        assert_eq!(runtime.active_transfers, Some(0));
+    }
 }

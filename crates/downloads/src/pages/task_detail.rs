@@ -40,7 +40,9 @@ use crate::{
     UserStartIntent,
     components::{
         segment_progress::render_segment_progress,
-        task_table::{progress_bar_color, progress_track_color, task_status_color},
+        task_table::{
+            progress_bar_color, progress_track_color, task_menu_facts_for, task_status_color,
+        },
     },
     controller::{
         DownloadsCommand, DownloadsController, DownloadsPort, DownloadsResult,
@@ -50,7 +52,10 @@ use crate::{
         DownloadTaskView, RowKey, TaskProtocol, TaskState, TaskStore, format_bytes,
         source_composition::{SourceKind, compose, format_percent},
     },
-    pages::downloads::DownloadHostActions,
+    pages::{
+        downloads::DownloadHostActions,
+        task_edit::{TaskEditTarget, open_change_segments_dialog, open_change_url_dialog},
+    },
     strings::DownloadStrings,
 };
 
@@ -321,14 +326,16 @@ impl TaskDetailView {
         if queue_id.is_empty() {
             return None;
         }
-        match &self.controller {
-            Some(controller) => controller.queue_name(queue_id).map(str::to_owned),
+        let name = match &self.controller {
+            Some(controller) => controller.queue_name(queue_id),
             None => self
                 .queue_names
                 .iter()
                 .find(|(id, _)| id == queue_id)
-                .map(|(_, name)| name.clone()),
+                .map(|(_, name)| name.as_str()),
         }
+        .unwrap_or(queue_id);
+        Some(self.strings.queue_name(queue_id, name).to_string())
     }
 
     fn is_bt(&self) -> bool {
@@ -423,6 +430,10 @@ impl TaskDetailView {
         if let ServiceEvent::Agent(AgentEvent::Daemon(daemon_event)) = event {
             match daemon_event {
                 DaemonEvent::TaskDeleted { task_id } if *task_id == self.task_id => {
+                    self.close(cx);
+                    return;
+                }
+                DaemonEvent::TasksDeleted { task_ids } if task_ids.contains(&self.task_id) => {
                     self.close(cx);
                     return;
                 }
@@ -604,6 +615,17 @@ impl TaskDetailView {
         drop(row);
         cx.write_to_clipboard(ClipboardItem::new_string(url));
         window.push_notification(Notification::success(self.strings.url_copied.clone()), cx);
+    }
+
+    /// 详情「常规」页「更换链接 / 修改线程数」按钮的编辑上下文（与右键菜单同一对话框）。
+    fn edit_target(&self) -> TaskEditTarget {
+        TaskEditTarget {
+            key: RowKey::Local(self.task_id.clone()),
+            store: Rc::clone(&self.store),
+            port: Arc::clone(&self.port),
+            strings: self.strings.clone(),
+            translator: self.translator.clone(),
+        }
     }
 
     fn copy_error(&mut self, cx: &mut Context<Self>) {
@@ -1141,15 +1163,46 @@ impl TaskDetailView {
                 cx,
             ));
         }
+        let facts = task_menu_facts_for(&self.store, &RowKey::Local(self.task_id.clone()));
+        let can_change_url = facts.is_some_and(|facts| facts.can_change_url());
+        let can_change_segments = facts.is_some_and(|facts| facts.can_change_segments());
         let list = list.child(
-            h_flex().gap(tokens.spacing.sm).pt(tokens.spacing.md).child(
-                Button::new("detail-copy-link")
-                    .outline()
-                    .control(cx)
-                    .icon(FluxIcon::Copy)
-                    .label(self.strings.copy_url.clone())
-                    .on_click(cx.listener(|this, _, window, cx| this.copy_link(window, cx))),
-            ),
+            h_flex()
+                .flex_wrap()
+                .gap(tokens.spacing.sm)
+                .pt(tokens.spacing.md)
+                .child(
+                    Button::new("detail-copy-link")
+                        .outline()
+                        .control(cx)
+                        .icon(FluxIcon::Copy)
+                        .label(self.strings.copy_url.clone())
+                        .on_click(cx.listener(|this, _, window, cx| this.copy_link(window, cx))),
+                )
+                .when(can_change_url, |this| {
+                    this.child(
+                        Button::new("detail-change-url")
+                            .outline()
+                            .control(cx)
+                            .icon(FluxIcon::Globe)
+                            .label(self.strings.change_url.clone())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                open_change_url_dialog(this.edit_target(), window, cx);
+                            })),
+                    )
+                })
+                .when(can_change_segments, |this| {
+                    this.child(
+                        Button::new("detail-change-segments")
+                            .outline()
+                            .control(cx)
+                            .icon(FluxIcon::Layers)
+                            .label(self.strings.edit_threads.clone())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                open_change_segments_dialog(this.edit_target(), window, cx);
+                            })),
+                    )
+                }),
         );
         // 响应式：宽度够（横向底部面板 / 宽窗口）时信息列与来源构成并排，
         // 窄（右侧面板）时来源构成自动换到信息列下方——按实际可用宽度折行，

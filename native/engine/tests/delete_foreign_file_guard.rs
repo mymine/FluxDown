@@ -159,10 +159,12 @@ async fn batch_delete_files_on_never_started_tasks_keeps_foreign_files() {
         .await
         .expect("mark completed");
 
-    engine
+    let outcome = engine
         .manager
         .delete_tasks_batch(&[never_started, completed], true)
-        .await;
+        .await
+        .expect("batch delete");
+    assert_eq!((outcome.deleted, outcome.failed), (2, 0));
 
     let content = tokio::fs::read(&foreign)
         .await
@@ -249,10 +251,12 @@ async fn delete_files_keeps_file_named_by_another_task() {
         .update_task_status(&third, 3, "")
         .await
         .expect("mark completed");
-    engine
+    let outcome = engine
         .manager
         .delete_tasks_batch(&[other, third], true)
-        .await;
+        .await
+        .expect("batch delete");
+    assert_eq!((outcome.deleted, outcome.failed), (2, 0));
     assert!(
         !shared.exists(),
         "file named only by deleted tasks is removed with delete_files=true"

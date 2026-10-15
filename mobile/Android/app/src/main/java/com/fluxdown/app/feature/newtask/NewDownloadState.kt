@@ -252,12 +252,8 @@ internal class NewDownloadState(
         }
     }
 
-    /** 已成功创建的链接从文本框移除（部分失败时保留失败项以便重试，避免重复创建）。 */
-    fun removeUrls(done: Set<String>) {
-        if (done.isEmpty()) return
-        val remaining = entries.filter { it.url !in done }
-        urlText = remaining.joinToString("\n") { it.toText() }
-    }
+    /** 只保留这些链接（导入部分失败 / 未提交时留下它们以便重试；已创建的不会被重复创建）。 */
+    fun keepOnly(urls: Set<String>) = retain(entries.filter { it.url in urls })
 
     companion object {
         private const val USER_AGENT = "User-Agent"

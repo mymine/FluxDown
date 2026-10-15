@@ -196,6 +196,15 @@ public enum QueueIds {
         id == TaskQueue.main || id == TaskQueue.later
     }
 
+    /// 主队列：始终运行，不能停止，也不能定时。
+    public static func isMain(_ id: String) -> Bool { normalized(id) == TaskQueue.main }
+
+    /// 运行中的队列能否被「停止」（主队列不能；停止态永远走「启动」）。
+    public static func canStop(_ id: String) -> Bool { !isMain(id) }
+
+    /// 队列能否配置每日定时（主队列不能）。
+    public static func canSchedule(_ id: String) -> Bool { !isMain(id) }
+
     /// 任务的 `queueId` 为空串 = 隐式主队列。
     public static func normalized(_ id: String) -> String { id.isEmpty ? TaskQueue.main : id }
 }
@@ -379,9 +388,9 @@ public struct QueueDraft: Sendable, Hashable {
         )
     }
 
-    /// 新建队列后需要补发定时：任一定时字段有效。
-    public var needsScheduleCall: Bool {
-        scheduleEnabled || scheduleStart != nil || scheduleStop != nil
+    /// 需要发 `daemon.queue.schedule`：主队列永不；其余任一定时字段有效。
+    public func needsScheduleCall(queueId: String) -> Bool {
+        QueueIds.canSchedule(queueId) && (scheduleEnabled || scheduleStart != nil || scheduleStop != nil)
     }
 }
 

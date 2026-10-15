@@ -125,7 +125,7 @@ impl Projection {
 
     /// 应用事件并产出该帧的全部信号。
     fn process(&mut self, event: &AgentEvent) -> Vec<HostSignalDto> {
-        let mut signals: Vec<HostSignalDto> = self.translate(event).into_iter().collect();
+        let mut signals = self.translate(event);
         for section in sections::affected(event) {
             let json = section.json(&self.snapshot);
             let Some(sent) = self.sections.get_mut(section.index()) else {
@@ -145,19 +145,20 @@ impl Projection {
         signals
     }
 
-    /// 应用事件并归一为信号。无法逐项表达的整表替换直接下发新快照。
-    fn translate(&mut self, event: &AgentEvent) -> Option<HostSignalDto> {
+    /// 应用事件并归一为信号。无法逐项表达的整表替换直接下发新快照；
+    /// 批量事件（`TasksChanged`）展开为逐任务信号，Kotlin / Swift 端归约器无需感知批量。
+    fn translate(&mut self, event: &AgentEvent) -> Vec<HostSignalDto> {
         match event {
             AgentEvent::Daemon(daemon) => self.translate_daemon(event, daemon),
             AgentEvent::DaemonSnapshotReplaced(_) => {
                 apply_agent_event(&mut self.snapshot, event);
-                Some(self.snapshot_signal())
+                vec![self.snapshot_signal()]
             }
             AgentEvent::DaemonConnectionChanged(connected) => {
                 apply_agent_event(&mut self.snapshot, event);
-                Some(event_signal(HostEventDto::DaemonConnectionChanged {
+                vec![event_signal(HostEventDto::DaemonConnectionChanged {
                     connected: *connected,
-                }))
+                })]
             }
             AgentEvent::SessionChanged(_)
             | AgentEvent::CloudConnectionChanged(_)
@@ -165,36 +166,39 @@ impl Projection {
                 let before = self.snapshot.cloud_devices.clone();
                 apply_agent_event(&mut self.snapshot, event);
                 let explicit = matches!(event, AgentEvent::CloudDevicesChanged(_));
-                (explicit || before != self.snapshot.cloud_devices).then(|| {
-                    event_signal(HostEventDto::CloudDevicesChanged {
-                        devices: self
-                            .snapshot
-                            .cloud_devices
-                            .iter()
-                            .map(CloudDeviceDto::from)
-                            .collect(),
+                (explicit || before != self.snapshot.cloud_devices)
+                    .then(|| {
+                        event_signal(HostEventDto::CloudDevicesChanged {
+                            devices: self
+                                .snapshot
+                                .cloud_devices
+                                .iter()
+                                .map(CloudDeviceDto::from)
+                                .collect(),
+                        })
                     })
-                })
+                    .into_iter()
+                    .collect()
             }
             AgentEvent::LinkedDevicesChanged(_) => {
                 apply_agent_event(&mut self.snapshot, event);
-                Some(event_signal(HostEventDto::LinkedDevicesChanged {
+                vec![event_signal(HostEventDto::LinkedDevicesChanged {
                     devices: self
                         .snapshot
                         .linked_devices
                         .iter()
                         .map(LinkDeviceDto::from)
                         .collect(),
-                }))
+                })]
             }
             AgentEvent::PreferencesChanged(_) => {
                 apply_agent_event(&mut self.snapshot, event);
                 let categories = CategoryDto::from_preferences(&self.snapshot.preferences);
                 if categories == self.categories {
-                    return None;
+                    return Vec::new();
                 }
                 self.categories.clone_from(&categories);
-                Some(event_signal(HostEventDto::CategoriesChanged { categories }))
+                vec![event_signal(HostEventDto::CategoriesChanged { categories })]
             }
             // 无类型化 DTO 的 agent 状态（同步 / 网关 / 远程任务 / 捕获 / 外壳 / 电源 /
             // 局域网配对 / 一次性通知）：这里只推进投影，分区变化与通知由 `process` 经
@@ -212,21 +216,17 @@ impl Projection {
             | AgentEvent::CaptureTasksStarted(_)
             | AgentEvent::SessionRevoked(_) => {
                 apply_agent_event(&mut self.snapshot, event);
-                None
+                Vec::new()
             }
         }
     }
 
-    fn translate_daemon(
-        &mut self,
-        outer: &AgentEvent,
-        event: &DaemonEvent,
-    ) -> Option<HostSignalDto> {
+    fn translate_daemon(&mut self, outer: &AgentEvent, event: &DaemonEvent) -> Vec<HostSignalDto> {
         // 落后于已投影序号 / 未知任务的运行时采样不下发（与 GPUI 一致），游标照常推进。
         if let DaemonEvent::TaskRuntimeChanged(runtime) = event
             && accepted_runtime_status(&self.snapshot.daemon, runtime).is_none()
         {
-            return None;
+            return Vec::new();
         }
         // 分段几何只在没有真实采样时写入：用前后对比决定是否下发。
         let geometry_before = match event {
@@ -242,7 +242,7 @@ impl Projection {
         apply_agent_event(&mut self.snapshot, outer);
         let daemon = &self.snapshot.daemon;
 
-        match event {
+        let single = match event {
             DaemonEvent::TaskRuntimeChanged(runtime) => {
                 daemon.task_runtime.get(&runtime.task_id).map(|merged| {
                     event_signal(HostEventDto::TaskRuntimeChanged {
@@ -264,9 +264,27 @@ impl Projection {
             DaemonEvent::TaskChanged(task) => Some(event_signal(HostEventDto::TaskChanged {
                 task: task.into(),
             })),
+            // 与逐条 `TaskChanged` 等价：投影已整批应用，宿主端按任务归约。
+            DaemonEvent::TasksChanged(tasks) => {
+                return tasks
+                    .iter()
+                    .map(|task| event_signal(HostEventDto::TaskChanged { task: task.into() }))
+                    .collect();
+            }
             DaemonEvent::TaskDeleted { task_id } => Some(event_signal(HostEventDto::TaskDeleted {
                 task_id: task_id.clone(),
             })),
+            // 与逐条 `TaskDeleted` 等价：投影已整批移除，宿主端按任务归约。
+            DaemonEvent::TasksDeleted { task_ids } => {
+                return task_ids
+                    .iter()
+                    .map(|task_id| {
+                        event_signal(HostEventDto::TaskDeleted {
+                            task_id: task_id.clone(),
+                        })
+                    })
+                    .collect();
+            }
             DaemonEvent::QueuesChanged(queues) => Some(queues_signal(queues)),
             DaemonEvent::GroupsChanged(groups) => Some(groups_signal(groups)),
             DaemonEvent::ConfigChanged(config) => Some(event_signal(HostEventDto::ConfigChanged {
@@ -288,7 +306,8 @@ impl Projection {
                     request_id: request_id.clone(),
                 }))
             }
-        }
+        };
+        single.into_iter().collect()
     }
 
     fn translate_engine(
@@ -767,6 +786,58 @@ mod tests {
             }]
         ));
         assert!(task_dtos(&projection)[0].file_missing);
+    }
+
+    #[test]
+    fn tasks_changed_applies_the_batch_and_expands_to_per_task_events() {
+        let mut projection = projection(1, vec![task("a", 1)]);
+        let outcome = projection.accept(daemon_frame(
+            2,
+            DaemonEvent::TasksChanged(vec![task("a", 3), task("b", 0)]),
+        ));
+        let ids: Vec<String> = events(outcome)
+            .into_iter()
+            .map(|event| match event {
+                HostEventDto::TaskChanged { task } => task.task_id,
+                other => panic!("expected TaskChanged, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, ["a", "b"]);
+        let tasks = task_dtos(&projection);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(
+            tasks
+                .iter()
+                .find(|task| task.task_id == "a")
+                .map(|task| task.status),
+            Some(3)
+        );
+        assert_eq!(projection.sequence(), 2);
+    }
+
+    #[test]
+    fn tasks_deleted_removes_the_batch_and_expands_to_per_task_events_in_order() {
+        let mut projection = projection(1, vec![task("a", 1), task("b", 1), task("c", 1)]);
+        let outcome = projection.accept(daemon_frame(
+            2,
+            DaemonEvent::TasksDeleted {
+                task_ids: vec!["c".to_owned(), "a".to_owned()],
+            },
+        ));
+        let ids: Vec<String> = events(outcome)
+            .into_iter()
+            .map(|event| match event {
+                HostEventDto::TaskDeleted { task_id } => task_id,
+                other => panic!("expected TaskDeleted, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, ["c", "a"]);
+        let remaining: Vec<String> = task_dtos(&projection)
+            .into_iter()
+            .map(|task| task.task_id)
+            .collect();
+        assert_eq!(remaining, ["b"]);
+        assert_eq!(projection.sequence(), 2);
     }
 
     #[test]

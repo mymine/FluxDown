@@ -1,0 +1,9 @@
+#!/bin/sh
+# 只输出 FluxDown 当前生效的访问密钥（agent-state.json 的 gatewayUserToken）。
+# 状态文件含云端凭据等敏感字段，绝不整体返回给浏览器；文件缺失/字段为空时输出空。
+data_dir=$(uci -q get fluxdown.main.data_dir)
+[ -n "$data_dir" ] || data_dir=/etc/fluxdown
+state="$data_dir/agent-state.json"
+[ -r "$state" ] || exit 0
+jsonfilter -i "$state" -e '@.gatewayUserToken' 2>/dev/null
+exit 0

@@ -645,6 +645,13 @@ impl RemoteTaskService {
                 self.runtime.lock().await.local_speeds.remove(task_id);
                 false
             }
+            AgentEvent::Daemon(DaemonEvent::TasksDeleted { task_ids }) => {
+                let mut runtime = self.runtime.lock().await;
+                for task_id in task_ids {
+                    runtime.local_speeds.remove(task_id);
+                }
+                false
+            }
             _ => false,
         }
     }

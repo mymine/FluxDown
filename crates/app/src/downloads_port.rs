@@ -28,12 +28,19 @@ pub(crate) struct SubmissionGate {
 }
 
 #[derive(Clone, Copy, Default)]
-struct SubmissionState {
+pub(crate) struct SubmissionState {
     ready: bool,
     paused: bool,
     control_pending: bool,
     revision: u64,
     pause_generation: u64,
+}
+
+impl SubmissionState {
+    /// 导入被「全部暂停」或结果不确定的提交挂起，直到「全部开始」成功才解除。
+    pub(crate) fn suspended(self) -> bool {
+        self.paused
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -74,6 +81,11 @@ impl SubmissionGate {
 
     pub(crate) fn set_ready(&self, ready: bool) {
         self.state.send_modify(|state| state.ready = ready);
+    }
+
+    /// 订阅闸门状态（主窗口据此让「全部开始」在导入挂起时保持可点）。
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<SubmissionState> {
+        self.state.subscribe()
     }
 
     fn begin_control(&self, pause: bool) -> ControlRevision {
@@ -143,7 +155,9 @@ impl SubmissionGate {
     }
 }
 
-fn is_submission(command: &DownloadsCommand) -> bool {
+/// 失败后结果不确定的提交：服务端可能已落库，重发会造成重复，所以结果不确定时暂停整条导入。
+/// `CreateMany` 按 `batchId` 幂等，调用方可原样重发，不属于此类。
+fn is_non_idempotent_submission(command: &DownloadsCommand) -> bool {
     matches!(
         command,
         DownloadsCommand::Create(_)
@@ -167,7 +181,7 @@ fn queue_fields(fields: &fluxdown_ui_downloads::QueueFields) -> Value {
 
 impl DownloadsPort for AgentDownloadsPort {
     fn execute(&self, command: DownloadsCommand) -> PortFuture<DownloadsResult> {
-        let submission = is_submission(&command);
+        let submission = is_non_idempotent_submission(&command);
         let source = match &command {
             DownloadsCommand::Create(params) => Some(params.request.url.clone()),
             DownloadsCommand::CreateGroup { context, .. } => Some(context.url.clone()),
@@ -254,6 +268,12 @@ impl AgentDownloadsPort {
                         .map_err(|_| internal_error())?;
                     return Ok(DownloadsResult::FileIcon(png));
                 }
+                DownloadsCommand::CreateMany(params) => {
+                    let result = client
+                        .call(method::DAEMON_TASK_CREATE_MANY, Some(params))
+                        .await?;
+                    return Ok(DownloadsResult::CreateMany(result));
+                }
                 DownloadsCommand::Create(params) => {
                     (method::DAEMON_TASK_CREATE, serialize(params)?)
                 }
@@ -266,6 +286,14 @@ impl AgentDownloadsPort {
                 DownloadsCommand::Rename { task_id, file_name } => (
                     method::DAEMON_TASK_RENAME,
                     json!({ "taskId": task_id, "fileName": file_name }),
+                ),
+                DownloadsCommand::ChangeUrl { task_id, url } => (
+                    method::DAEMON_TASK_CHANGE_URL,
+                    serialize(fluxdown_protocol::ChangeTaskUrlParams { task_id, url })?,
+                ),
+                DownloadsCommand::SetSegments { task_id, segments } => (
+                    method::DAEMON_TASK_SET_SEGMENTS,
+                    serialize(fluxdown_protocol::SetTaskSegmentsParams { task_id, segments })?,
                 ),
                 DownloadsCommand::Delete {
                     task_id,
@@ -459,6 +487,10 @@ impl AgentDownloadsPort {
                 DownloadsCommand::SiteAuthMatch { url } => (
                     method::DAEMON_SITE_AUTH_MATCH,
                     serialize(fluxdown_protocol::SiteAuthMatchParams { url })?,
+                ),
+                DownloadsCommand::ProbeLink { url } => (
+                    method::DAEMON_LINK_PROBE,
+                    serialize(fluxdown_protocol::LinkProbeParams { url })?,
                 ),
                 DownloadsCommand::RemoteDispatch(params) => {
                     (method::AGENT_REMOTE_DISPATCH, serialize(params)?)

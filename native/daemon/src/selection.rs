@@ -288,8 +288,21 @@ impl DaemonSelection {
             DaemonEvent::TaskDeleted { task_id } => {
                 self.cancel_task(task_id);
             }
+            DaemonEvent::TasksDeleted { task_ids } => {
+                for task_id in task_ids {
+                    self.cancel_task(task_id);
+                }
+            }
             DaemonEvent::TaskChanged(task) if task.status == TASK_STATUS_PAUSED => {
                 self.cancel_task(&task.task_id);
+            }
+            DaemonEvent::TasksChanged(tasks) => {
+                for task in tasks
+                    .iter()
+                    .filter(|task| task.status == TASK_STATUS_PAUSED)
+                {
+                    self.cancel_task(&task.task_id);
+                }
             }
             DaemonEvent::Engine(WsServerMsg::TaskProgress {
                 task_id,

@@ -33,6 +33,11 @@
             <action android:name="android.intent.action.VIEW" />
             <data android:mimeType="application/x-bittorrent" />
         </intent>
+        <!-- 完成通知「打开」：判断精确 MIME 是否有应用可处理，否则退回 */* -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="content" android:mimeType="*/*" />
+        </intent>
     </queries>
 
     <!-- usesCleartextTraffic：局域网 server 模式主机多为 http://。RPC 本身由 Rust 原生 socket 连接（不受此限）；

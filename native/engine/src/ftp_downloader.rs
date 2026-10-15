@@ -1070,6 +1070,30 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     // p.file_name 即可，仅当为空时（兜底）使用 probe 结果。
     let actual_name = auto_name.clone();
 
+    // 换源结算（同 HTTP，见 `Db::settle_source_change`）：必须先于下面覆盖 total_bytes。
+    // 新链接大小与旧总大小不一致 = 换成了另一个文件，清空进度并删除旧临时文件。
+    if p.is_resume
+        && p.db
+            .settle_source_change(&p.task_id, info.total_bytes)
+            .await?
+    {
+        log_info!(
+            "[ftp-download] task {} 换源后大小与原文件不一致（新={}），丢弃已下进度从头下载",
+            p.task_id,
+            info.total_bytes
+        );
+        let stale = PathBuf::from(format!(
+            "{}{}",
+            save_dir.join(&actual_name).display(),
+            TEMP_EXT
+        ));
+        match tokio::fs::remove_file(&stale).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
     p.db.update_task_file_info(&p.task_id, &actual_name, info.total_bytes)
         .await?;
 
@@ -1181,7 +1205,7 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     let tracker = TransferTracker::new();
 
     if use_segments {
-        ftp_download_multi_segment(
+        let outcome = ftp_download_multi_segment(
             &p.task_id,
             &ftp_url,
             &temp_path,
@@ -1196,7 +1220,16 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             &p.sink,
             p.spawn_gen,
         )
-        .await?;
+        .await;
+        // 暂停终态帧读 tasks.downloaded_bytes：退出前按已落库分段对齐（同 HTTP 多段）。
+        if matches!(outcome, Err(DownloadError::Cancelled))
+            && let Err(error) =
+                p.db.sync_task_progress_from_segments(&p.task_id, p.spawn_gen)
+                    .await
+        {
+            crate::logger::report_warning("ftp-download", "sync paused progress", &error);
+        }
+        outcome?;
     } else {
         // Retry wrapper for single-thread FTP download.
         // ftp_download_single supports resume (checks existing file length),

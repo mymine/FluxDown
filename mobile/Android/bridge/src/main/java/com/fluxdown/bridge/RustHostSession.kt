@@ -2,6 +2,10 @@ package com.fluxdown.bridge
 
 import com.fluxdown.core.host.CreateTaskRequest
 import com.fluxdown.core.host.HostSignal
+import com.fluxdown.core.host.ImportBatch
+import com.fluxdown.core.host.ImportItem
+import com.fluxdown.core.host.ImportJob
+import com.fluxdown.core.host.ImportUpdate
 import com.fluxdown.core.model.SelectionOutcome
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -41,6 +45,10 @@ internal class RustHostSession(private val session: HostSession) : HostPort {
     override suspend fun rename(taskId: String, fileName: String) = guarded { session.rename(taskId, fileName) }
     override suspend fun changeUrl(taskId: String, url: String) = guarded { session.changeUrl(taskId, url) }
     override suspend fun rescan() = guarded { session.rescan() }
+
+    override fun startImport(batches: List<ImportBatch>): ImportJob =
+        RustImportJob(session.startImport(batches.map { it.toDto() }), batches.flatMap { it.items })
+
     override suspend fun moveToQueue(taskId: String, queueId: String) =
         guarded { session.moveToQueue(taskId, queueId) }
 
@@ -59,21 +67,30 @@ internal class RustHostSession(private val session: HostSession) : HostPort {
         guarded { session.call(method, paramsJson) }
 }
 
-private fun CreateTaskRequest.toDto() = CreateTaskRequestDto(
-    url = url,
-    fileName = fileName,
-    saveDir = saveDir,
-    segments = segments,
-    queueId = queueId,
-    startPaused = startPaused,
-    cookies = cookies,
-    referrer = referrer,
-    userAgent = userAgent,
-    proxyUrl = proxyUrl,
-    checksum = checksum,
-    ignoreTlsErrors = ignoreTlsErrors,
-    headers = headers,
-    httpUser = httpUser,
-    httpPassword = httpPassword,
-    saveSiteAuth = saveSiteAuth,
-)
+/**
+ * 一次导入：生成的 `ImportHandle`（拉取模型）适配成 [ImportJob]。[updates] 被收集时逐个拉取，`Finished` 后结束并释放句柄；
+ * 收集被取消只停止拉取，不取消导入（导入由 [cancel] 取消）。[items] = 各组条目按提交顺序拼接，
+ * 汇总里的 `unfinished` 序号据此还原成条目。
+ */
+private class RustImportJob(private val handle: ImportHandle, private val items: List<ImportItem>) : ImportJob {
+    override val updates: Flow<ImportUpdate> = flow {
+        try {
+            while (true) {
+                val update = guarded { handle.nextUpdate() }?.toCore(items) ?: break
+                emit(update)
+                if (update is ImportUpdate.Finished) break
+            }
+        } finally {
+            handle.destroy()
+        }
+    }
+
+    /** 导入已结束（句柄已释放）后的取消没有意义：生成的对象此时抛 [IllegalStateException]，直接忽略。 */
+    override fun cancel() {
+        try {
+            handle.cancel()
+        } catch (ignored: IllegalStateException) {
+            // 已结束：无事可取消
+        }
+    }
+}

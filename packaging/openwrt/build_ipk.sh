@@ -106,6 +106,7 @@ build_luci() {
 	staging="$work/pkg"
 	mkdir -p "$staging/control" "$staging/data"
 	cp -r "$SCRIPT_DIR/luci/." "$staging/data/"
+	chmod 755 "$staging/data/usr/libexec/fluxdown/luci-token"
 
 	size=$(du -sk "$staging/data" | cut -f1)
 

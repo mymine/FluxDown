@@ -8,14 +8,15 @@ use std::time::Duration;
 use fluxdown_protocol::method::{
     CAPABILITY_CLIENT_SELECTIONS, DAEMON_CONFIG_PATCH, DAEMON_QUEUE_BOOST, DAEMON_QUEUE_MOVE_TASK,
     DAEMON_RSS_LIST_SOURCES, DAEMON_RSS_REFRESH_SOURCE, DAEMON_RSS_UPDATE_SOURCE,
-    DAEMON_SELECTION_RESOLVE, DAEMON_TASK_CHANGE_URL, DAEMON_TASK_CREATE, DAEMON_TASK_DELETE,
-    DAEMON_TASK_DELETE_MANY, DAEMON_TASK_PAUSE, DAEMON_TASK_PAUSE_ALL, DAEMON_TASK_PAUSE_MANY,
-    DAEMON_TASK_RENAME, DAEMON_TASK_RESCAN, DAEMON_TASK_RESUME, DAEMON_TASK_RESUME_ALL,
-    DAEMON_TASK_RESUME_MANY, SYSTEM_HELLO,
+    DAEMON_SELECTION_RESOLVE, DAEMON_TASK_CHANGE_URL, DAEMON_TASK_CREATE, DAEMON_TASK_CREATE_MANY,
+    DAEMON_TASK_DELETE, DAEMON_TASK_DELETE_MANY, DAEMON_TASK_PAUSE, DAEMON_TASK_PAUSE_ALL,
+    DAEMON_TASK_PAUSE_MANY, DAEMON_TASK_RENAME, DAEMON_TASK_RESCAN, DAEMON_TASK_RESUME,
+    DAEMON_TASK_RESUME_ALL, DAEMON_TASK_RESUME_MANY, SYSTEM_HELLO,
 };
 use fluxdown_protocol::{
     APP_VERSION, ClientHello, CreatedTask, DaemonConfigPatch, DaemonCreateTaskParams,
-    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, RequestId, RpcRequest, RssSourceDto, ServiceRole,
+    DaemonCreateTasksParams, DaemonCreateTasksResult, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    RequestId, RpcRequest, RssSourceDto, ServiceRole,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -28,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 use crate::driver::{Driver, LinkState, Timing};
 use crate::dto::{CreateTaskRequestDto, HostSignalDto, SelectionOutcomeDto};
 use crate::error::FluxError;
+use crate::import::{ImportBatchDto, ImportHandle};
 use crate::link::{Caller, Connector};
 
 /// 向 UI 的信号队列容量。
@@ -67,6 +69,8 @@ pub struct HostSession {
     signals: Mutex<mpsc::Receiver<HostSignalDto>>,
     link: watch::Receiver<LinkState>,
     cancel: CancellationToken,
+    /// 导入等后台任务的执行器（与会话的驱动同一个 runtime）。
+    runtime: Handle,
 }
 
 /// 启动驱动并等待首次同步：连接 / 握手 / 鉴权 / 快照任一失败都作为错误返回，
@@ -96,11 +100,59 @@ pub(crate) async fn open_session(
                 signals: Mutex::new(signals_rx),
                 link: link_rx,
                 cancel,
+                runtime: runtime.clone(),
             }),
             task,
         )),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(FluxError::Closed),
+    }
+}
+
+/// 等待连接可用后取得调用端；重连期间排队（最长 [`COMMAND_WAIT`]），超时失败。
+pub(crate) async fn ready_caller(
+    link: &watch::Receiver<LinkState>,
+    cancel: &CancellationToken,
+) -> Result<Arc<dyn Caller>, FluxError> {
+    if cancel.is_cancelled() {
+        return Err(FluxError::Closed);
+    }
+    let mut link = link.clone();
+    let waited = timeout(
+        COMMAND_WAIT,
+        link.wait_for(|state| !matches!(state, LinkState::Connecting)),
+    )
+    .await;
+    match waited {
+        Err(_) => Err(FluxError::transport("host is unreachable")),
+        Ok(Err(_)) => Err(FluxError::Closed),
+        Ok(Ok(state)) => match &*state {
+            LinkState::Ready(caller) => Ok(Arc::clone(caller)),
+            LinkState::Closed | LinkState::Connecting => Err(FluxError::Closed),
+        },
+    }
+}
+
+/// 批量导入的发送端：经当前连接调用 `daemon.task.createMany`（本机进程内 / 远端 `/rpc` 同一路径）。
+pub(crate) struct SessionSender {
+    link: watch::Receiver<LinkState>,
+    cancel: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl crate::import::ChunkSender for SessionSender {
+    async fn send(
+        &self,
+        params: &DaemonCreateTasksParams,
+    ) -> Result<DaemonCreateTasksResult, FluxError> {
+        let caller = ready_caller(&self.link, &self.cancel).await?;
+        let value = caller
+            .call(
+                DAEMON_TASK_CREATE_MANY,
+                Some(encode(params, "create many")?),
+            )
+            .await?;
+        decode(value, "create many result")
     }
 }
 
@@ -113,22 +165,14 @@ impl Drop for HostSession {
 impl HostSession {
     /// 等待连接可用后取得调用端；重连期间排队，超时失败。
     async fn ready_caller(&self) -> Result<Arc<dyn Caller>, FluxError> {
-        if self.cancel.is_cancelled() {
-            return Err(FluxError::Closed);
-        }
-        let mut link = self.link.clone();
-        let waited = timeout(
-            COMMAND_WAIT,
-            link.wait_for(|state| !matches!(state, LinkState::Connecting)),
-        )
-        .await;
-        match waited {
-            Err(_) => Err(FluxError::transport("host is unreachable")),
-            Ok(Err(_)) => Err(FluxError::Closed),
-            Ok(Ok(state)) => match &*state {
-                LinkState::Ready(caller) => Ok(Arc::clone(caller)),
-                LinkState::Closed | LinkState::Connecting => Err(FluxError::Closed),
-            },
+        ready_caller(&self.link, &self.cancel).await
+    }
+
+    /// 批量导入用的发送端：只拿连接状态与取消信号，不持有会话本身（导入任务不延长会话寿命）。
+    pub(crate) fn chunk_sender(&self) -> SessionSender {
+        SessionSender {
+            link: self.link.clone(),
+            cancel: self.cancel.clone(),
         }
     }
 
@@ -383,6 +427,13 @@ impl HostSession {
     /// （停止它用 `FluxCore::shutdown_local`）。
     pub fn disconnect(&self) {
         self.cancel.cancel();
+    }
+
+    /// 批量导入（GPUI 同一套语义，见 `import.rs`）：按 256 条分块调用 `daemon.task.createMany`，
+    /// 结果不确定时同一 `batchId` 退避重发，可取消。立即返回句柄；经句柄拉取进度与最终汇总。
+    /// 本机主机与远端 `/rpc` 走同一路径。丢弃句柄不会取消导入。
+    pub fn start_import(&self, batches: Vec<ImportBatchDto>) -> Arc<ImportHandle> {
+        crate::import::start(&self.runtime, Arc::new(self.chunk_sender()), batches)
     }
 }
 
@@ -751,5 +802,58 @@ mod tests {
             Err(FluxError::Closed)
         ));
         assert!(session.next_signal().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn start_import_calls_create_many_through_the_session_with_item_wire() {
+        use crate::import::{ImportBatchDto, ImportItemDto, ImportUpdateDto};
+
+        let (session, recorder, _link) = ready().await;
+        recorder.reply(
+            "daemon.task.createMany",
+            Ok(json!({ "results": [
+                { "taskId": "t1" },
+                { "error": { "code": "invalidArgument", "retryable": false, "field": "url" } },
+            ] })),
+        );
+        let handle = session.start_import(vec![ImportBatchDto {
+            common: request(""),
+            items: vec![
+                ImportItemDto {
+                    url: "https://x/1".to_owned(),
+                    file_name: "one.bin".to_owned(),
+                    checksum: "sha256=ab".to_owned(),
+                },
+                ImportItemDto {
+                    url: "bad".to_owned(),
+                    ..ImportItemDto::default()
+                },
+            ],
+        }]);
+        let summary = loop {
+            if let ImportUpdateDto::Finished { summary } =
+                handle.next_update().await.expect("update before Finished")
+            {
+                break summary;
+            }
+        };
+        assert_eq!((summary.succeeded, summary.failed), (1, 1));
+        let error = summary.first_error.expect("first error");
+        assert_eq!(error.code, ErrorCodeDto::InvalidArgument);
+        assert_eq!(error.message, "url");
+        assert_eq!(summary.unfinished, [1]);
+
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1);
+        let (method, params) = &calls[0];
+        assert_eq!(method, "daemon.task.createMany");
+        assert!(params["batchId"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(params["common"]["url"], "");
+        assert_eq!(params["common"]["queueId"], "later");
+        assert_eq!(params["common"]["startPaused"], true);
+        assert_eq!(params["items"][0]["url"], "https://x/1");
+        assert_eq!(params["items"][0]["fileName"], "one.bin");
+        assert_eq!(params["items"][0]["checksum"], "sha256=ab");
+        assert_eq!(params["items"][1]["url"], "bad");
     }
 }

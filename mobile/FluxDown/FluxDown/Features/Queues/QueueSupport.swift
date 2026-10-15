@@ -34,7 +34,7 @@ enum QueueText {
 
     /// 定时摘要（未启用 = nil）：`09:00–18:00 · 周一–五`。
     static func scheduleSummary(_ queue: TaskQueue) -> String? {
-        guard queue.scheduleEnabled else { return nil }
+        guard QueueIds.canSchedule(queue.queueId), queue.scheduleEnabled else { return nil }
         let days = daysSummary(queue.scheduleDays)
         let range = timeRange(start: queue.scheduleStart, stop: queue.scheduleStop)
         return days.isEmpty ? range : range + " · " + days

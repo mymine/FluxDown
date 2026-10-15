@@ -83,6 +83,15 @@ fn host_macos_dir(agent_exe: &Path) -> Option<PathBuf> {
     Some(contents.join("MacOS"))
 }
 
+/// agent 位于辅助 bundle 布局时的外层 `<Host>.app`（用 `open -n` 重新拉起整个应用）；
+/// 其他位置（如未打包的开发布局）返回 `None`。
+#[cfg(target_os = "macos")]
+pub(crate) fn host_app_bundle() -> Option<PathBuf> {
+    let agent = std::env::current_exe().ok()?;
+    let contents = host_macos_dir(&agent)?.parent()?.to_path_buf();
+    contents.parent().map(Path::to_path_buf)
+}
+
 /// `.torrent` 关联与 URL scheme 的注册目标：外层 `FluxDown.app` 的 bundle id。
 ///
 /// 辅助 bundle 内由 Core Foundation 解析出的是辅助 bundle 自身的 id，按约定去掉

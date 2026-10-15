@@ -56,7 +56,11 @@ struct QueueEditorView: View {
                     nameSection(draft: $form.draft, running: running, displayName: name, issue: model.issue)
                     limitsSection(draft: $form.draft, issue: model.issue)
                     defaultsSection(draft: $form.draft)
-                    QueueScheduleSection(draft: $form.draft, issue: model.issue)
+                    if QueueIds.canSchedule(queueId ?? "") || model.isCreating {
+                        QueueScheduleSection(draft: $form.draft, issue: model.issue)
+                    } else {
+                        Section { Text(L("mainQueueAlwaysRunningHint")).font(.footnote).foregroundStyle(.secondary) }
+                    }
                     if !model.isCreating {
                         QueuePendingOrderSection(
                             serverTasks: pending,
@@ -207,17 +211,21 @@ struct QueueEditorView: View {
         }
     }
 
+    @ViewBuilder
     private func actionsSection(running: Bool, displayName: String) -> some View {
+        let canStop = QueueIds.canStop(queueId ?? "")
         Section {
-            Button {
-                Task { await setRunning(!running, name: displayName) }
-            } label: {
-                Label(
-                    L(running ? "stopQueueAction" : "startQueueAction"),
-                    systemImage: running ? FluxSymbol.pause : FluxSymbol.resume
-                )
+            if !running || canStop {
+                Button {
+                    Task { await setRunning(!running, name: displayName) }
+                } label: {
+                    Label(
+                        L(running ? "stopQueueAction" : "startQueueAction"),
+                        systemImage: running ? FluxSymbol.pause : FluxSymbol.resume
+                    )
+                }
+                .disabled(model.isWorking)
             }
-            .disabled(model.isWorking)
             if !model.isBuiltin {
                 Button(role: .destructive) {
                     confirmingDelete = true

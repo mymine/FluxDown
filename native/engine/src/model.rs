@@ -4,7 +4,8 @@
 //! 字段语义保持持久化数据与协议兼容。
 
 /// 内置「主队列」的固定 ID。所有未显式指定队列的新任务归入此队列；
-/// 不可删除、不可重命名（宿主 UI 按 ID 本地化显示名称）。
+/// 不可删除、不可重命名（宿主 UI 按 ID 本地化显示名称）；始终运行，
+/// 不可停止、不可定时（见 [`is_always_running_queue`]）。
 pub const MAIN_QUEUE_ID: &str = "main";
 
 /// 内置「稍后下载」队列的固定 ID。默认停止；「稍后下载」入口在未选
@@ -22,6 +23,21 @@ pub const LATER_QUEUE_ID: &str = "later";
 /// ```
 pub fn is_builtin_queue(queue_id: &str) -> bool {
     queue_id == MAIN_QUEUE_ID || queue_id == LATER_QUEUE_ID
+}
+
+/// 队列是否恒运行：主队列是新建下载的默认目标，停掉它会让新任务与
+/// 「全部恢复」静默失效，所以不可停止、不可设每日定时（启动时由
+/// [`crate::db::Db::seed_builtin_queues`] 迁移存量停止 / 定时状态）。
+///
+/// # Examples
+///
+/// ```
+/// use fluxdown_engine::model::{is_always_running_queue, LATER_QUEUE_ID, MAIN_QUEUE_ID};
+/// assert!(is_always_running_queue(MAIN_QUEUE_ID));
+/// assert!(!is_always_running_queue(LATER_QUEUE_ID));
+/// ```
+pub fn is_always_running_queue(queue_id: &str) -> bool {
+    queue_id == MAIN_QUEUE_ID
 }
 
 /// 持久化任务信息。

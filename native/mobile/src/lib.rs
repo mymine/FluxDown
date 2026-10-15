@@ -13,6 +13,7 @@ mod driver;
 mod dto;
 mod error;
 mod flux_core;
+mod import;
 mod link;
 mod local;
 mod projection;
@@ -34,6 +35,10 @@ pub use dto::{
 };
 pub use error::{ErrorCodeDto, FluxError, HostErrorDto};
 pub use flux_core::FluxCore;
+pub use import::{
+    CREATE_CHUNK_SIZE, ImportBatchDto, ImportHandle, ImportItemDto, ImportProgressDto,
+    ImportRetryDto, ImportSummaryDto, ImportUpdateDto, import_chunk_size,
+};
 pub use local::LocalHostConfig;
 pub use session::HostSession;
 pub use update::{

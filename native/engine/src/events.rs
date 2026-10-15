@@ -63,6 +63,16 @@ pub enum EngineEvent {
     /// 完整持久化单任务事实；创建配置全部落库后、任何下载或探测帧之前发送。
     TaskChanged(Box<TaskInfo>),
 
+    /// 一批新建任务的完整持久化事实（批量创建 `create_tasks_batch`）；语义 =
+    /// 按序对每个任务应用一次 [`EngineEvent::TaskChanged`]。整批先于任何
+    /// 单任务进度/元数据/启动帧发送，宿主据此一次处理整批而非逐任务广播。
+    TasksChanged(Vec<TaskInfo>),
+
+    /// 一批任务的记录已删除（批量删除 `delete_tasks_batch`）；语义 = 按序对每个任务
+    /// 应用一次删除。经 progress reporter 排序发出：先于它入队的这些任务的进度帧都已发出，
+    /// 宿主据此一次移除整批，而不是逐任务处理 `status=4` 删除哨兵。
+    TasksDeleted(Vec<String>),
+
     /// Authoritative download counter baseline, ordered through the progress
     /// reporter before the corresponding progress frame. Restored bytes are
     /// not traffic; an explicit lower baseline starts a new transfer interval.

@@ -44,6 +44,12 @@ interface HostSession {
     suspend fun changeUrl(taskId: String, url: String)
     suspend fun rescan()
 
+    /**
+     * 批量导入：分块 `daemon.task.createMany`（本机进程内 / 远端 `/rpc` 同一路径），立即返回；
+     * 进度与汇总经 [ImportJob.updates]。会话关闭时在途导入随之失败并放弃剩余分块。
+     */
+    fun startImport(batches: List<ImportBatch>): ImportJob
+
     // daemon.queue.*
     suspend fun moveToQueue(taskId: String, queueId: String)
     suspend fun boost(taskId: String)

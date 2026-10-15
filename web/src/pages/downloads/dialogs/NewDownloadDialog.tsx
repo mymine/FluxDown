@@ -10,7 +10,7 @@ import { ChevronDown, ChevronRight, FileText, FolderOpen, Plus, X } from 'lucide
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import { useT } from '../../../i18n'
-import { LATER_QUEUE_ID, MAIN_QUEUE_ID, METHOD, call, rpc, rpcStore, useAgent, useConfigValues, useConnection, useDaemon } from '../../../lib/rpc'
+import { LATER_QUEUE_ID, MAIN_QUEUE_ID, METHOD, RpcError, call, rpc, rpcStore, useAgent, useConfigValues, useConnection, useDaemon } from '../../../lib/rpc'
 import { cloudPresenceKnown } from '../../../lib/cloud-presence'
 import { describeUploadError } from '../../../lib/rpcErrorText'
 import { ThreadsRiskCallout } from '../../../lib/ThreadsRiskCallout'
@@ -22,7 +22,11 @@ import { ManifestSelectDialog } from './ManifestSelectDialog'
 import type { ManifestBaseOptions } from './ManifestSelectDialog'
 import { DEFAULT_HASH_ALGORITHM, HASH_ALGORITHMS, MAX_THREADS, PROXY_CHOICES, THREAD_PRESETS, UA_PRESET_CUSTOM, UA_PRESET_DEFAULT, UA_PRESET_KEYS } from './model'
 import type { DraftOptions, ProxyChoice, ThreadChoice, UrlEntry } from './model'
-import { appendEntries, buildRequests, captureEntry, checksumSpec, customSegments, detectUaPreset, entryToText, isHttpUrl, isMagnetUrl, manualProxyUrl, mergeImported, parseEntries, proxyWire, threadChoiceFromSegments, uaPresetValue } from './model'
+import { appendEntries, buildBatch, buildRequests, captureEntry, checksumSpec, customSegments, detectUaPreset, entryToText, isHttpUrl, isMagnetUrl, manualProxyUrl, parseEntries, parseInput, proxyWire, threadChoiceFromSegments, uaPresetValue } from './model'
+import { applyHints, emptyHints, emptyTracking, hintsEqual } from './aria2c'
+import type { FillTracking, RequestHints } from './aria2c'
+import { IMPORT_CHUNK_SIZE, importNotice, runImport } from './importRunner'
+import type { ImportProgress } from './importRunner'
 import { SplitButton } from './SplitButton'
 import { capturesShown, closeNewDownload } from './store'
 import type { NewDownloadSession } from './store'
@@ -35,6 +39,8 @@ import { queueLabel } from './utils'
 /** resolvePreview 探测超时（对齐桌面端 90s）：超时 / 异常 / 空清单 / error 均静默回退直接建任务。 */
 const RESOLVE_PREVIEW_TIMEOUT_MS = 90_000
 const SITE_AUTH_LOOKUP_DEBOUNCE_MS = 250
+/** 失败原因最多渲染的行数（超出的只显示计数，避免上万行 DOM）。 */
+const MAX_FAILURE_ROWS = 50
 
 const EMPTY_CAPTURES: readonly PendingCaptureDto[] = []
 const EMPTY_QUEUES: readonly QueueDto[] = []
@@ -110,6 +116,11 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
   const headerSeq = useRef(0)
   const [phase, setPhase] = useState<'idle' | 'resolving' | 'submitting'>('idle')
   const [failures, setFailures] = useState<{ url: string; message: string }[]>([])
+  const [failureOverflow, setFailureOverflow] = useState(0)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [progress, setProgress] = useState<ImportProgress | null>(null)
+  const [cancelling, setCancelling] = useState(false)
+  const importAbort = useRef<AbortController | null>(null)
   const [manifest, setManifest] = useState<{ preview: ResolvePreviewResponse; sourceUrl: string; base: ManifestBaseOptions } | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [busyFiles, setBusyFiles] = useState(false)
@@ -117,7 +128,30 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
   const txtInput = useRef<HTMLInputElement>(null)
   const resolveToken = useRef(0)
 
-  const entries = useMemo(() => parseEntries(text, false), [text])
+  const parsed = useMemo(() => parseInput(text, false), [text])
+  const entries = parsed.entries
+
+  // aria2c 命令带出的 Cookie / UA / 请求头回填到高级字段（规则同桌面端，见 `aria2c.ts`）：
+  // 与上次处理的 hints 相同则不处理；用户编辑过的字段 / 行不再覆盖。
+  const lastHints = useRef<RequestHints>(emptyHints())
+  const fillTracking = useRef<FillTracking>(emptyTracking())
+  useEffect(() => {
+    if (hintsEqual(parsed.hints, lastHints.current)) return
+    lastHints.current = parsed.hints
+    const result = applyHints({ cookie, userAgent, rows: headers }, fillTracking.current, parsed.hints, () => {
+      headerSeq.current += 1
+      return headerSeq.current
+    })
+    fillTracking.current = result.tracking
+    if (result.cookie !== cookie) setCookie(result.cookie)
+    if (result.userAgent !== userAgent) {
+      setUserAgent(result.userAgent)
+      setUaPreset(detectUaPreset(result.userAgent))
+    }
+    if (result.rows.length !== headers.length || result.rows.some((row, index) => row !== headers[index])) setHeaders(result.rows)
+    if (result.filled) setAdvancedOpen(true)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在命令头部信息变化时回填，表单当前值取渲染时快照
+  }, [parsed.hints])
   const count = entries.length
   const batch = count > 1
   const allMagnet = count > 0 && entries.every((entry) => isMagnetUrl(entry.url))
@@ -308,6 +342,8 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
       return
     }
     setFailures([])
+    setFailureOverflow(0)
+    setNotice(null)
     const options = draftOptions(later, queueOverride)
     const requests = buildRequests(entries, options)
 
@@ -355,32 +391,83 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
 
     setPhase('submitting')
     rememberSaveDir(options.saveDir)
-    const failed: { entry: UrlEntry; message: string }[] = []
+    // 保留在文本框里的条目（失败 / 未提交）及其错误；外部捕获逐条确认，其余走分块 createMany。
+    const retained: { index: number; error: unknown }[] = []
     const consumed = new Set<string>()
+    const plain: number[] = []
     for (const [index, request] of requests.entries()) {
       const capture = captures.find((item) => item.url === request.url)
+      if (!capture) {
+        plain.push(index)
+        continue
+      }
       try {
-        if (capture) {
-          await rpc.agent.capture.resolve({ transactionId: capture.transactionId, accepted: true, request })
-          consumed.add(capture.transactionId)
-        } else {
-          await rpc.daemon.task.create({ request })
-        }
+        await rpc.agent.capture.resolve({ transactionId: capture.transactionId, accepted: true, request })
+        consumed.add(capture.transactionId)
       } catch (error) {
-        failed.push({ entry: entries[index], message: describeUploadError(error, t) })
+        retained.push({ index, error })
       }
     }
     if (consumed.size > 0) {
       capturesRef.current = capturesRef.current.filter((capture) => !consumed.has(capture.transactionId))
       setCaptures(capturesRef.current)
     }
-    if (failed.length === 0) {
+
+    let noticeText: string | null = null
+    if (plain.length > 0) {
+      const { common, items } = buildBatch(
+        plain.map((index) => entries[index]),
+        options,
+        entries.length === 1,
+      )
+      const controller = new AbortController()
+      importAbort.current = controller
+      setCancelling(false)
+      const chunked = items.length > IMPORT_CHUNK_SIZE
+      setProgress(chunked ? { total: items.length, done: 0, failed: 0, retry: null } : null)
+      const report = await runImport({
+        common,
+        items,
+        call: rpc.daemon.task.createMany,
+        sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+        signal: controller.signal,
+        onProgress: chunked ? setProgress : undefined,
+      })
+      importAbort.current = null
+      setProgress(null)
+      report.outcomes.forEach((outcome, position) => {
+        if (outcome.status === 'created') return
+        // 失败 → 带原因；未提交（取消 / 重发用尽）→ 只放回文本框。
+        const error = outcome.status === 'failed' ? new RpcError({ code: -32000, message: '', data: outcome.error }) : null
+        retained.push({ index: plain[position], error })
+      })
+      const summary = importNotice(report)
+      const added = summary.added.toLocaleString()
+      const total = summary.total.toLocaleString()
+      const reason = summary.error ? describeUploadError(new RpcError({ code: -32000, message: '', data: summary.error }), t) : null
+      if (summary.kind === 'cancelled') {
+        const head = t('importCancelled', { added, total })
+        noticeText = reason ? `${head}: ${reason}` : head
+        if (retained.length === 0) toast.key('importCancelled', 'success', { added, total })
+      } else if (summary.kind === 'partial') {
+        const head = t('importPartial', { added, total, failed: summary.failed.toLocaleString() })
+        noticeText = reason ? `${head}: ${reason}` : head
+      } else if (summary.kind === 'failed') {
+        noticeText = reason
+      }
+    }
+
+    if (retained.length === 0) {
       closeNewDownload()
       return
     }
-    // 保留失败的行（含选项行），成功的从文本框移除。
-    setText(failed.map((item) => entryToText(item.entry)).join('\n'))
-    setFailures(failed.map((item) => ({ url: item.entry.url, message: item.message })))
+    // 保留未成功的行（含选项行），成功的从文本框移除；失败原因只渲染前若干条。
+    retained.sort((a, b) => a.index - b.index)
+    setText(retained.map((item) => entryToText(entries[item.index])).join('\n'))
+    const withReason = retained.filter((item) => item.error !== null)
+    setFailures(withReason.slice(0, MAX_FAILURE_ROWS).map((item) => ({ url: entries[item.index].url, message: describeUploadError(item.error, t) })))
+    setFailureOverflow(Math.max(0, withReason.length - MAX_FAILURE_ROWS))
+    setNotice(noticeText)
     setPhase('idle')
   }
 
@@ -418,7 +505,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
         toast.key('importTxtNoUrls', 'warning')
         return
       }
-      setText((current) => mergeImported(current, imported))
+      setText((current) => appendEntries(current, imported))
       toast.key('importTxtFound', 'success', { count: imported.length })
     } finally {
       setBusyFiles(false)
@@ -473,6 +560,18 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
   const showAuth = !batch && !allMagnet
   const startLabel = count > 1 ? t('startBatchDownload', { count }) : t('startDownload')
 
+  const cancelImport = () => {
+    setCancelling(true)
+    importAbort.current?.abort()
+  }
+  const progressLabel = !progress
+    ? ''
+    : cancelling
+      ? t('importCancelling')
+      : progress.retry
+        ? t('importRetrying', { seconds: progress.retry.delaySeconds, attempt: progress.retry.attempt, max: progress.retry.max })
+        : t('importProgress', { done: progress.done.toLocaleString(), total: progress.total.toLocaleString() })
+
   return (
     <>
       <Dialog
@@ -497,6 +596,24 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
                 }}
               >
                 {t('manifestResolvingCancel')}
+              </Button>
+            </div>
+          ) : progress ? (
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex min-w-0 flex-1 flex-col gap-1">
+                <span className="truncate text-sm text-muted-foreground tabular">{progressLabel}</span>
+                <div
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={progress.total}
+                  aria-valuenow={progress.done}
+                  className="h-1.5 w-full overflow-hidden rounded-full bg-hairline"
+                >
+                  <div className="h-full bg-primary transition-[width]" style={{ width: `${progress.total > 0 ? (progress.done / progress.total) * 100 : 0}%` }} />
+                </div>
+              </div>
+              <Button variant="outline" disabled={cancelling} onClick={cancelImport}>
+                {t('cancel')}
               </Button>
             </div>
           ) : (
@@ -558,11 +675,13 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
             />
             {text.trim() !== '' && count === 0 ? <FieldError>{t('newDownloadNoValidUrl')}</FieldError> : null}
             {captures.length > 0 ? <FieldHint>{t('newDownloadCaptureContextHint')}</FieldHint> : null}
-            {failures.map((failure) => (
-              <FieldError key={failure.url} className="break-all">
+            {notice ? <FieldError className="break-all">{notice}</FieldError> : null}
+            {failures.map((failure, index) => (
+              <FieldError key={`${index}:${failure.url}`} className="break-all">
                 {failure.url} — {failure.message}
               </FieldError>
             ))}
+            {failureOverflow > 0 ? <FieldHint>… +{failureOverflow.toLocaleString()}</FieldHint> : null}
             <div className="flex flex-wrap gap-2">
               <Button variant="ghost" icon={FolderOpen} disabled={busy || target !== null} onClick={() => torrentInput.current?.click()}>
                 {t('openTorrentFile')}

@@ -1,6 +1,6 @@
 //! 关于：版本、软件更新、日志导出、浏览器扩展与捐赠链接。
 
-use fluxdown_protocol::method;
+use fluxdown_protocol::{ReleaseNoteDto, method};
 use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button};
 use fluxdown_ui_theme::active_theme;
 use gpui::{App, IntoElement as _, ParentElement, SharedString, Styled, div, rems};
@@ -176,41 +176,45 @@ fn release_notes_item(ctx: &SectionContext) -> SettingsRow {
     // 跟随应用界面语言（设置里可手动切换），而不是系统 locale。
     let locale = ctx.translator.locale().to_owned();
     SettingsRow::custom(move |_, _, _, cx: &mut App| {
-        let tokens = active_theme(cx).tokens().clone();
         let notes = store.read(cx).update_status().notes.clone();
         if notes.is_empty() {
             return div().into_any_element();
         }
-        v_flex()
-            .w_full()
-            .gap(tokens.spacing.md)
-            .children(notes.into_iter().take(10).map(|note| {
-                let body = localized_release_body(&note.body, &locale).to_owned();
-                let markdown = TextView::markdown(
-                    SharedString::from(format!("release-notes-{}", note.version)),
-                    body,
-                )
-                .style(TextViewStyle::default().paragraph_gap(rems(0.5)))
-                .selectable(true)
-                .w_full();
-                v_flex()
-                    .w_full()
-                    .gap(tokens.spacing.xs)
-                    .child(body_text(cx).child(SharedString::from(format!(
-                        "v{} {}",
-                        note.version, note.published_at
-                    ))))
-                    .child(
-                        div()
-                            .w_full()
-                            .text_size(tokens.typography.sm.size)
-                            .line_height(tokens.typography.sm.line_height)
-                            .text_color(tokens.colors.foreground)
-                            .child(markdown),
-                    )
-            }))
-            .into_any_element()
+        release_notes(notes, &locale, cx).into_any_element()
     })
+}
+
+/// 更新说明列表（最多 10 个版本，按界面语言取对应段落）；关于页与新版本提醒窗口共用。
+pub(crate) fn release_notes(notes: Vec<ReleaseNoteDto>, locale: &str, cx: &App) -> gpui::Div {
+    let tokens = active_theme(cx).tokens().clone();
+    v_flex()
+        .w_full()
+        .gap(tokens.spacing.md)
+        .children(notes.into_iter().take(10).map(|note| {
+            let body = localized_release_body(&note.body, locale).to_owned();
+            let markdown = TextView::markdown(
+                SharedString::from(format!("release-notes-{}", note.version)),
+                body,
+            )
+            .style(TextViewStyle::default().paragraph_gap(rems(0.5)))
+            .selectable(true)
+            .w_full();
+            v_flex()
+                .w_full()
+                .gap(tokens.spacing.xs)
+                .child(body_text(cx).child(SharedString::from(format!(
+                    "v{} {}",
+                    note.version, note.published_at
+                ))))
+                .child(
+                    div()
+                        .w_full()
+                        .text_size(tokens.typography.sm.size)
+                        .line_height(tokens.typography.sm.line_height)
+                        .text_color(tokens.colors.foreground)
+                        .child(markdown),
+                )
+        }))
 }
 
 fn localized_release_body<'a>(body: &'a str, locale: &str) -> &'a str {

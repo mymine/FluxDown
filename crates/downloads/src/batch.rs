@@ -15,7 +15,7 @@ use crate::controller::DownloadsCommand;
 pub(crate) const MAX_IN_FLIGHT: usize = 16;
 
 /// 单个命令被拒绝（`Unavailable` 且可重试）后的最大重试次数。
-const MAX_RETRIES: u32 = 4;
+pub(crate) const MAX_RETRIES: u32 = 4;
 const RETRY_BASE: Duration = Duration::from_millis(200);
 
 /// 被拒绝后的退避时长；`None` 表示不再重试（错误不可重试，或次数用尽）。

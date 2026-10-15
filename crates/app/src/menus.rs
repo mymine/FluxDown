@@ -3,7 +3,6 @@
 use fluxdown_ui_downloads::actions as dl;
 use fluxdown_ui_i18n::Translator;
 use gpui::{App, Entity, KeyBinding, Menu, MenuItem, SharedString, Window};
-use gpui_component::{GlobalState, menu::AppMenuBar};
 
 use crate::{
     actions::{
@@ -120,6 +119,8 @@ pub fn build_menus(translator: &Translator) -> Vec<Menu> {
         MenuItem::action(t(translator, "openFolder"), dl::RevealSelected),
         MenuItem::action(t(translator, "copyUrl"), dl::CopySelectedUrl),
         MenuItem::action(t(translator, "renameTask"), dl::RenameSelected),
+        MenuItem::action(t(translator, "webChangeUrl"), dl::ChangeSelectedUrl),
+        MenuItem::action(t(translator, "editThreads"), dl::ChangeSelectedSegments),
         MenuItem::action(t(translator, "redownloadTask"), dl::RedownloadSelected),
         MenuItem::action(t(translator, "boostDownload"), dl::ToggleBoostSelected),
         MenuItem::action(t(translator, "menuOpenInWindow"), dl::OpenSelectedInWindow),
@@ -168,28 +169,18 @@ pub fn build_menus(translator: &Translator) -> Vec<Menu> {
     menus
 }
 
-/// 装配菜单：原生菜单 + 标题栏菜单栏；翻译变化时重建。
-pub fn install(cx: &mut App, translator: &Entity<Translator>) -> Entity<AppMenuBar> {
+/// 装配原生菜单（macOS 菜单栏）；翻译变化时重建。Windows / Linux 标题栏不渲染应用菜单。
+pub fn install(cx: &mut App, translator: &Entity<Translator>) {
     apply_menus(translator, cx);
-    let menu_bar = AppMenuBar::new(cx);
-    let observed_bar = menu_bar.clone();
     cx.observe(translator, move |translator, cx| {
         apply_menus(&translator, cx);
-        observed_bar.update(cx, |bar, cx| bar.reload(cx));
     })
     .detach();
-    menu_bar
 }
 
 fn apply_menus(translator: &Entity<Translator>, cx: &mut App) {
     let translator = translator.read(cx).clone();
     cx.set_menus(build_menus(&translator));
-    GlobalState::global_mut(cx).set_app_menus(
-        build_menus(&translator)
-            .into_iter()
-            .map(Menu::owned)
-            .collect(),
-    );
 }
 
 /// 应用级动作（不依赖具体窗口）。窗口级动作作用于当前活动窗口。

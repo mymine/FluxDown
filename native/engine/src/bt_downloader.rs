@@ -311,13 +311,6 @@ const PUBLIC_TRACKERS: &[&str] = &[
     "http://tracker.bt4g.com:2095/announce",
 ];
 
-/// Return the built-in public tracker list as a newline-separated string.
-/// Used to populate the default config value on first launch so users can
-/// see and edit the full list in Settings.
-pub fn default_tracker_list() -> String {
-    PUBLIC_TRACKERS.join("\n")
-}
-
 // ---------------------------------------------------------------------------
 // BT configuration — user-settable via the Settings page
 // ---------------------------------------------------------------------------
@@ -5531,6 +5524,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     seeding_status,
                     seeding_message: seeding_message.to_string(),
                     seeding_time_secs: seed_time_base,
+                    deleted_tasks: Vec::new(),
                 })
                 .await
                 .is_err()

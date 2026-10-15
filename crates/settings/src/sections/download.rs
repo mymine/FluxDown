@@ -157,10 +157,12 @@ fn behavior_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
 fn default_queue_control(ctx: &SectionContext, cx: &mut App) -> Control {
     let mut options = vec![(SharedString::from(""), ctx.t("defaultQueue"))];
     options.extend(ctx.store.read(cx).queues().iter().map(|queue| {
-        (
-            SharedString::from(queue.queue_id.clone()),
-            SharedString::from(queue.name.clone()),
-        )
+        let label = match queue.queue_id.as_str() {
+            fluxdown_protocol::MAIN_QUEUE_ID => ctx.t("mainQueue"),
+            fluxdown_protocol::LATER_QUEUE_ID => ctx.t("laterQueue"),
+            _ => SharedString::from(queue.name.clone()),
+        };
+        (SharedString::from(queue.queue_id.clone()), label)
     }));
     ctx.daemon_dropdown("default_queue_id", options)
 }

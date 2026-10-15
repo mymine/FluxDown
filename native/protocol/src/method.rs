@@ -17,6 +17,8 @@ pub const DAEMON_TASK_RESUME: &str = "daemon.task.resume";
 pub const DAEMON_TASK_RENAME: &str = "daemon.task.rename";
 /// 更换任务下载源地址（`{taskId, url}`，语义同旧 `PUT /api/v1/tasks/{id}/url`）。
 pub const DAEMON_TASK_CHANGE_URL: &str = "daemon.task.changeUrl";
+/// 修改任务线程数（`SetTaskSegmentsParams`），已下进度保留；完成或不存在的任务返回 `not-found`。
+pub const DAEMON_TASK_SET_SEGMENTS: &str = "daemon.task.setSegments";
 pub const DAEMON_TASK_DELETE: &str = "daemon.task.delete";
 pub const DAEMON_TASK_PAUSE_ALL: &str = "daemon.task.pauseAll";
 pub const DAEMON_TASK_RESUME_ALL: &str = "daemon.task.resumeAll";
@@ -27,6 +29,9 @@ pub const DAEMON_TASK_PAUSE_MANY: &str = "daemon.task.pauseMany";
 pub const DAEMON_TASK_RESUME_MANY: &str = "daemon.task.resumeMany";
 /// 批量删除（`{taskIds, deleteFiles}`）：语义同批量暂停。
 pub const DAEMON_TASK_DELETE_MANY: &str = "daemon.task.deleteMany";
+/// 批量建任务（`DaemonCreateTasksParams`）：整块一个事务、一次 `TasksChanged` 事件，
+/// 按 `batchId` 幂等；结果逐条对应（`DaemonCreateTasksResult`）。
+pub const DAEMON_TASK_CREATE_MANY: &str = "daemon.task.createMany";
 
 pub const DAEMON_QUEUE_LIST: &str = "daemon.queue.list";
 pub const DAEMON_QUEUE_CREATE: &str = "daemon.queue.create";
@@ -293,10 +298,12 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_TASK_GET,
     DAEMON_TASK_ACTIVITY,
     DAEMON_TASK_CREATE,
+    DAEMON_TASK_CREATE_MANY,
     DAEMON_TASK_PAUSE,
     DAEMON_TASK_RESUME,
     DAEMON_TASK_RENAME,
     DAEMON_TASK_CHANGE_URL,
+    DAEMON_TASK_SET_SEGMENTS,
     DAEMON_TASK_DELETE,
     DAEMON_TASK_PAUSE_ALL,
     DAEMON_TASK_RESUME_ALL,

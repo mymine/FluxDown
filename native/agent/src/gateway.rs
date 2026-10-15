@@ -3823,6 +3823,7 @@ mod tests {
             fluxdown_protocol::method::DAEMON_TASK_PAUSE,
             fluxdown_protocol::method::DAEMON_TASK_RESUME,
             fluxdown_protocol::method::DAEMON_TASK_CREATE,
+            fluxdown_protocol::method::DAEMON_TASK_CREATE_MANY,
             fluxdown_protocol::method::DAEMON_CONFIG_PATCH,
         ] {
             assert!(matches!(lane_for(name), Lane::Daemon), "{name}");

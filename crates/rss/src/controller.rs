@@ -151,8 +151,23 @@ impl RssController {
                 let value = (task.status, task.file_missing);
                 self.tasks.insert(task.task_id.clone(), value) != Some(value)
             }
+            AgentEvent::Daemon(DaemonEvent::TasksChanged(tasks)) => {
+                let mut changed = false;
+                for task in tasks {
+                    let value = (task.status, task.file_missing);
+                    changed |= self.tasks.insert(task.task_id.clone(), value) != Some(value);
+                }
+                changed
+            }
             AgentEvent::Daemon(DaemonEvent::TaskDeleted { task_id }) => {
                 self.tasks.remove(task_id).is_some()
+            }
+            AgentEvent::Daemon(DaemonEvent::TasksDeleted { task_ids }) => {
+                let mut changed = false;
+                for task_id in task_ids {
+                    changed |= self.tasks.remove(task_id).is_some();
+                }
+                changed
             }
             AgentEvent::Daemon(DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks })) => {
                 self.tasks = tasks
@@ -632,6 +647,25 @@ mod tests {
             },
         )));
         assert_eq!(controller.status_key(&linked), "rssTaskMissing");
+        Ok(())
+    }
+
+    #[test]
+    fn batched_task_facts_update_linked_item_status_like_single_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut snapshot = snapshot()?;
+        snapshot.daemon.tasks.push(task(1)?);
+        let mut controller = RssController::new(Arc::new(Port));
+        controller.replace_snapshot(&snapshot);
+        let linked = item("a", "guid", "Linked", 1, 1, "task");
+        assert_eq!(controller.status_key(&linked), "statusDownloading");
+        let batch = ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::TasksChanged(vec![task(
+            2,
+        )?])));
+        assert!(controller.apply_event(&batch));
+        assert_eq!(controller.status_key(&linked), "statusPaused");
+        // 内容未变的批次不重绘。
+        assert!(!controller.apply_event(&batch));
         Ok(())
     }
 }

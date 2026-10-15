@@ -506,7 +506,12 @@ async fn create_task_group_then_delete_group_cleans_up_rows() {
     }
 
     // 删组：批量删成员 + gc_empty_groups 回收组行。
-    engine.manager.delete_group(&group_id, false).await;
+    let outcome = engine
+        .manager
+        .delete_group(&group_id, false)
+        .await
+        .expect("delete group");
+    assert_eq!(outcome.failed, 0);
 
     assert!(
         engine

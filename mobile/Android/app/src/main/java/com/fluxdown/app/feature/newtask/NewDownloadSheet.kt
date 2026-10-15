@@ -47,7 +47,10 @@ import com.fluxdown.app.shell.LocalAppContainer
 import com.fluxdown.app.shell.hostState
 import com.fluxdown.app.ui.fileCategory
 import com.fluxdown.app.ui.label
-import com.fluxdown.core.host.HostException
+import com.fluxdown.core.host.ImportRules
+import com.fluxdown.core.host.groupImportBatches
+import com.fluxdown.core.host.isError
+import com.fluxdown.core.host.notice
 import com.fluxdown.core.model.CategoryIndex
 import com.fluxdown.core.model.HostRef
 import com.fluxdown.core.model.TaskProtocol
@@ -159,8 +162,6 @@ private fun NewDownloadSheetImpl(visible: Boolean, route: SheetRoute.NewDownload
         keepEditing = str(R.string.mobileKeepEditing),
         discard = str(R.string.mobileDiscard),
         readOnly = str(R.string.localServiceDisconnected),
-        started = str(R.string.mobileDownloadStarted),
-        added = str(R.string.taskCreatedToast),
     )
 
     fun requestClose() {
@@ -211,33 +212,31 @@ private fun NewDownloadSheetImpl(visible: Boolean, route: SheetRoute.NewDownload
             return
         }
         val requests = form.buildRequests(startPaused, queueId, manualProxyUrl(state.config))
+        val batches = groupImportBatches(requests)
+        if (requests.size > ImportRules.CHUNK_SIZE) {
+            // 多块导入：交给进程级导入中心，进度 / 取消在下载页顶部，关闭本 Sheet 不影响它；汇总提示由 ImportEffects 给出
+            container.imports.start(container.session, batches, startPaused, notify = true)
+            haptics.confirm()
+            submitted()
+            dismiss()
+            return
+        }
+        // 单块导入：Sheet 内联等待（提交中状态）；全部成功才关闭，失败 + 未提交的条目留在表单里供重试
         form.submitting = true
         container.appScope.launch {
-            val done = HashSet<String>()
-            var failure: HostException? = null
-            for (r in requests) {
-                try {
-                    container.session.createTask(r)
-                    done += r.url
-                } catch (e: HostException) {
-                    failure = e
-                }
-            }
+            val summary = container.imports.start(container.session, batches, startPaused, notify = false).await()
             form.submitting = false
-            if (failure == null) {
+            val notice = summary.notice()
+            val text = importNoticeText(context.resources, notice, summary.succeeded, startPaused) { actions.errorText(it) }
+            if (summary.succeeded > 0) submitted()
+            if (summary.unfinished.isEmpty()) {
                 haptics.confirm()
-                val msg = when {
-                    done.size > 1 -> context.str(R.string.mobileDownloadStartedN, "n" to done.size)
-                    startPaused -> s.added
-                    else -> s.started
-                }
-                overlays.toast(msg, FluxToastKind.Accent, if (startPaused) FluxIcons.Clock else FluxIcons.ArrowDown)
-                submitted()
+                overlays.toast(text, FluxToastKind.Accent, if (startPaused) FluxIcons.Clock else FluxIcons.ArrowDown)
                 dismiss()
             } else {
                 haptics.reject()
-                form.removeUrls(done)
-                overlays.toast(actions.errorText(failure), FluxToastKind.Error)
+                overlays.toast(text, FluxToastKind.Error)
+                form.keepOnly(summary.unfinished.mapTo(HashSet()) { it.url })
             }
         }
     }
@@ -339,8 +338,6 @@ private class Strings(
     val keepEditing: String,
     val discard: String,
     val readOnly: String,
-    val started: String,
-    val added: String,
 )
 
 private val HexLengths = setOf(32, 40, 64, 128)

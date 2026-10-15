@@ -233,6 +233,20 @@ hdiutil create -quiet -volname "FluxDown $VERSION" -srcfolder "$WORK/dmg_src" -o
 [ "$IDENTITY" != - ] && codesign --force --timestamp ${KC:+--keychain "$KC"} -s "$IDENTITY" "$DMG"
 
 # ── 公证 ──
+# stapler 经 api.apple-cloudkit.com 取公证票据，GitHub macOS runner 偶发断连
+# （NSURLErrorDomain -1005，退出码 68）：按 15s 递增退避，最多 5 次。
+stapler_retry() {
+  local attempt=1
+  until xcrun stapler "$@"; do
+    if [ "$attempt" -ge 5 ]; then
+      echo "stapler $1 failed after $attempt attempts" >&2
+      return 1
+    fi
+    echo "!! stapler $1 failed (attempt $attempt/5), retrying in $((attempt * 15))s" >&2
+    sleep $((attempt * 15))
+    attempt=$((attempt + 1))
+  done
+}
 if [ -n "${APPLE_API_KEY_PATH:-}" ]; then
   [ "$IDENTITY" != - ] || { echo "notarization requires Developer ID signing" >&2; exit 1; }
   echo "== notarize"
@@ -241,11 +255,11 @@ if [ -n "${APPLE_API_KEY_PATH:-}" ]; then
   SUB=$(plutil -extract id raw "$WORK/notary.json")
   xcrun notarytool log "$SUB" "${NOTARY[@]}" "$WORK/notary-log.json" || true
   [ "$(plutil -extract status raw "$WORK/notary.json")" = Accepted ] || { cat "$WORK/notary-log.json" >&2; exit 1; }
-  xcrun stapler staple "$DMG"
-  xcrun stapler validate "$DMG"
+  stapler_retry staple "$DMG"
+  stapler_retry validate "$DMG"
   spctl -a -t open --context context:primary-signature -vv "$DMG"
   # DMG 的公证票据覆盖其中 .app 的 cdhash：再给 .app 本体 staple，便携 tar.gz 离线也能过 Gatekeeper
-  xcrun stapler staple "$APP"
+  stapler_retry staple "$APP"
   spctl -a -t exec -vv "$APP"
 fi
 

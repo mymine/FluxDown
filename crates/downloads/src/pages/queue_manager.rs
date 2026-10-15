@@ -179,6 +179,11 @@ impl QueueForm {
         )
     }
 
+    /// 主队列恒运行：不可停止、不可定时（daemon 拒绝）。
+    fn is_main(&self) -> bool {
+        self.queue_id.as_deref() == Some(MAIN_QUEUE_ID)
+    }
+
     fn slot_mut(&mut self, slot: ScheduleSlot) -> &mut Option<u16> {
         match slot {
             ScheduleSlot::Start => &mut self.schedule_start,
@@ -416,6 +421,7 @@ impl QueueManagerView {
         };
         let schedule_enabled = form.schedule_enabled;
         let schedule_days = form.schedule_days;
+        let is_main = form.is_main();
         match form.queue_id.clone() {
             Some(queue_id) => {
                 self.run_command(
@@ -425,16 +431,19 @@ impl QueueManagerView {
                     },
                     cx,
                 );
-                self.run_command(
-                    DownloadsCommand::QueueSchedule {
-                        queue_id,
-                        enabled: schedule_enabled,
-                        start_time: start,
-                        stop_time: stop,
-                        days: schedule_days,
-                    },
-                    cx,
-                );
+                // 主队列不可定时：不提交定时，避免被 daemon 拒绝。
+                if !is_main {
+                    self.run_command(
+                        DownloadsCommand::QueueSchedule {
+                            queue_id,
+                            enabled: schedule_enabled,
+                            start_time: start,
+                            stop_time: stop,
+                            days: schedule_days,
+                        },
+                        cx,
+                    );
+                }
             }
             None => {
                 if schedule_enabled {
@@ -877,7 +886,11 @@ impl QueueManagerView {
     }
 
     /// 定时：分组卡片首行为开关；开启后同卡片内追加「开始 | 停止」时间与星期复选行。
+    /// 主队列恒运行、不可定时，只显示说明。
     fn render_schedule(&self, form: &QueueForm, cx: &mut Context<Self>) -> Div {
+        if form.is_main() {
+            return field_hint(self.t("mainQueueAlwaysRunningHint", cx), cx);
+        }
         let spacing = active_theme(cx).tokens().spacing;
         let enabled = form.schedule_enabled;
         let days = form.schedule_days;
@@ -1051,7 +1064,8 @@ impl QueueManagerView {
             );
         }
         footer = footer.child(div().flex_1());
-        if !is_creating {
+        // 主队列不可停止：运行中不给启停按钮（异常停止时仍可「启动」）。
+        if !is_creating && !(form.is_main() && form.is_running) {
             footer = footer.child(
                 Button::new("queue-manager-toggle-run")
                     .outline()

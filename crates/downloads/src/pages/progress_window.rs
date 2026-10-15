@@ -210,9 +210,13 @@ impl ProgressWindowView {
     }
 
     pub fn apply_event(&mut self, event: &ServiceEvent, cx: &mut Context<Self>) {
-        if let ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::TaskDeleted { task_id })) = event
+        if let ServiceEvent::Agent(AgentEvent::Daemon(daemon_event)) = event
             && self.completed.is_none()
-            && *task_id == self.task_id
+            && match daemon_event {
+                DaemonEvent::TaskDeleted { task_id } => *task_id == self.task_id,
+                DaemonEvent::TasksDeleted { task_ids } => task_ids.contains(&self.task_id),
+                _ => false,
+            }
         {
             self.close(cx);
             return;

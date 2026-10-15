@@ -32,6 +32,7 @@ pub mod queue_manager;
 pub mod selection;
 pub mod settings;
 pub mod task_detail;
+pub mod update_prompt;
 
 #[cfg(test)]
 mod tests;
@@ -52,6 +53,8 @@ pub enum WindowKey {
     GroupDetail(String),
     /// 独立下载进度 / 完成窗口（每任务一个）。
     Progress(String),
+    /// 「发现新版本」提醒（不依赖主窗口，托盘驻留时由 agent 拉起界面后单独弹出）。
+    UpdatePrompt,
 }
 
 pub struct WindowRegistry {
@@ -99,17 +102,19 @@ impl WindowRegistry {
     }
 
     fn on_window_closed(cx: &mut App, window_id: WindowId) {
-        let (last_closed, completion_closed) = {
+        let (last_closed, closed_key) = {
             let registry = cx.global_mut::<Self>();
             let key = registry.ids.remove(&window_id);
             if let Some(key) = key.as_ref() {
                 registry.open.remove(key);
             }
             registry.confirming.remove(&window_id);
-            (registry.open.is_empty(), key == Some(WindowKey::Completion))
+            (registry.open.is_empty(), key)
         };
-        if completion_closed {
-            crate::completion_windows::window_closed(cx);
+        match closed_key {
+            Some(WindowKey::Completion) => crate::completion_windows::window_closed(cx),
+            Some(WindowKey::UpdatePrompt) => crate::update_notices::prompt_closed(cx),
+            _ => {}
         }
         if last_closed {
             crate::lifecycle::quit_ui(cx);

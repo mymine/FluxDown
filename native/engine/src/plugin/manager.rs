@@ -224,13 +224,6 @@ struct FailedPlugin {
     error: String,
 }
 
-/// 安装来源判别（供 actor 分发规则表）。
-pub enum InstallSource {
-    Zip(Vec<u8>),
-    Dir(PathBuf),
-    Dev(PathBuf),
-}
-
 /// 插件管理器。
 pub struct PluginManager {
     runtime: Arc<dyn ScriptRuntime>,

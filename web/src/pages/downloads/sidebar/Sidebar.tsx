@@ -263,12 +263,10 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
     const run = (action: 'start' | 'stop') => () => {
       rpc.daemon.queue[action]({ queueId: queue.queueId }).catch(toastRpcError)
     }
-    const entries: MenuEntry[] = [
-      queue.isRunning
-        ? { type: 'item', key: 'stop', label: t('stopQueueAction'), onSelect: run('stop') }
-        : { type: 'item', key: 'start', label: t('startQueueAction'), onSelect: run('start') },
-      { type: 'item', key: 'manage', label: t('manageQueueAction'), onSelect: () => openQueueManager(queue.queueId) },
-    ]
+    const entries: MenuEntry[] = []
+    if (!queue.isRunning) entries.push({ type: 'item', key: 'start', label: t('startQueueAction'), onSelect: run('start') })
+    else if (queue.queueId !== MAIN_QUEUE_ID) entries.push({ type: 'item', key: 'stop', label: t('stopQueueAction'), onSelect: run('stop') })
+    entries.push({ type: 'item', key: 'manage', label: t('manageQueueAction'), onSelect: () => openQueueManager(queue.queueId) })
     if (queue.queueId !== MAIN_QUEUE_ID) {
       entries.push(
         { type: 'separator', key: 'sep' },
@@ -280,7 +278,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
           onSelect: () => {
             void confirmDialog({
               title: t('deleteQueueAction'),
-              description: t('queueDeleteConfirmDesc', { name: queue.name || queue.queueId }),
+              description: t('queueDeleteConfirmDesc', { name: queueLabel(queue) || queue.queueId }),
               intent: 'destructive',
               okLabel: t('delete'),
             }).then((ok) => {

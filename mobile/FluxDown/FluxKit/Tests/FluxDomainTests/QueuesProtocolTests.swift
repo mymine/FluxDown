@@ -134,7 +134,10 @@ struct QueuesProtocolTests {
         _ = try draft.validated(builtin: false).get()
         let schedule = draft.schedule(queueId: "q")
         #expect(schedule == QueueScheduleParams(queueId: "q", enabled: true, startTime: "", stopTime: "18:00", days: 127))
-        #expect(draft.needsScheduleCall)
+        #expect(draft.needsScheduleCall(queueId: "q"))
+        #expect(!draft.needsScheduleCall(queueId: "main"))
+        #expect(!draft.needsScheduleCall(queueId: ""))
+        #expect(draft.needsScheduleCall(queueId: "later"))
     }
 
     @Test func draftRoundTripsExistingQueue() {
@@ -143,7 +146,18 @@ struct QueuesProtocolTests {
         #expect(draft.scheduleStart == 510 && draft.scheduleStop == nil)
         #expect(draft.days == 127)
         #expect(draft.schedule(queueId: "q").startTime == "08:30")
-        #expect(!QueueDraft().needsScheduleCall)
+        #expect(!QueueDraft().needsScheduleCall(queueId: "q"))
+    }
+
+    @Test func mainQueueIsAlwaysRunningAndUnscheduled() {
+        #expect(!QueueIds.canStop("main"))
+        #expect(!QueueIds.canSchedule("main"))
+        #expect(!TaskQueue(queueId: "main", name: "").canStop)
+        #expect(!TaskQueue(queueId: "main", name: "").canSchedule)
+        #expect(TaskQueue(queueId: "later", name: "").canStop)
+        #expect(TaskQueue(queueId: "later", name: "").canSchedule)
+        #expect(TaskQueue(queueId: "custom", name: "x").canStop)
+        #expect(TaskQueue(queueId: "custom", name: "x").canSchedule)
     }
 
     @Test func createdQueueLookup_picksNewestByPosition() {

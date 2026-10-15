@@ -615,7 +615,8 @@ impl DownloadView {
         }
     }
 
-    /// 队列右键菜单：启动/停止、管理队列、删除（主队列不显示，删除前确认）。
+    /// 队列右键菜单：启动/停止（主队列恒运行，只在异常停止时给「启动」）、管理队列、
+    /// 删除（主队列不显示，删除前确认）。
     fn queue_item_context_menu(
         &self,
         queue: &QueueDto,
@@ -628,52 +629,60 @@ impl DownloadView {
         let delete_label = self.strings.delete_queue_action.clone();
         let delete_ok_label = self.strings.delete.clone();
         let cancel_label = self.strings.cancel.clone();
-        let description = SharedString::from(self.strings.queue_delete_confirm_desc.replace(
-            "{name}",
+        let queue_label = self.strings.queue_name(
+            &queue.queue_id,
             if queue.name.is_empty() {
                 &queue.queue_id
             } else {
                 &queue.name
             },
-        ));
+        );
+        let description = SharedString::from(
+            self.strings
+                .queue_delete_confirm_desc
+                .replace("{name}", &queue_label),
+        );
         let open_queue_manager = self.host.open_queue_manager.clone();
         let queue_id = queue.queue_id.clone();
         let is_running = queue.is_running;
         let is_main = queue.queue_id == fluxdown_protocol::MAIN_QUEUE_ID;
 
         move |menu, _window, _cx| {
-            let menu = menu.item({
-                let this = this.clone();
-                let queue_id = queue_id.clone();
-                if is_running {
-                    PopupMenuItem::new(stop_label.clone()).on_click(move |_, _window, cx| {
-                        let queue_id = queue_id.clone();
+            // 主队列不可停止：运行中时不给启停项（异常停止时仍可「启动」自救）。
+            let menu = menu.when(!(is_main && is_running), |menu| {
+                menu.item({
+                    let this = this.clone();
+                    let queue_id = queue_id.clone();
+                    if is_running {
+                        PopupMenuItem::new(stop_label.clone()).on_click(move |_, _window, cx| {
+                            let queue_id = queue_id.clone();
 
-                        let Ok(()) = this.update(cx, |this, cx| {
-                            this.execute_commands(
-                                vec![DownloadsCommand::QueueStop { queue_id }],
-                                cx,
-                            );
-                        }) else {
-                            // 视图已释放，结束这次回调而不再更新状态。
-                            return;
-                        };
-                    })
-                } else {
-                    PopupMenuItem::new(start_label.clone()).on_click(move |_, _window, cx| {
-                        let queue_id = queue_id.clone();
+                            let Ok(()) = this.update(cx, |this, cx| {
+                                this.execute_commands(
+                                    vec![DownloadsCommand::QueueStop { queue_id }],
+                                    cx,
+                                );
+                            }) else {
+                                // 视图已释放，结束这次回调而不再更新状态。
+                                return;
+                            };
+                        })
+                    } else {
+                        PopupMenuItem::new(start_label.clone()).on_click(move |_, _window, cx| {
+                            let queue_id = queue_id.clone();
 
-                        let Ok(()) = this.update(cx, |this, cx| {
-                            this.execute_commands(
-                                vec![DownloadsCommand::QueueStart { queue_id }],
-                                cx,
-                            );
-                        }) else {
-                            // 视图已释放，结束这次回调而不再更新状态。
-                            return;
-                        };
-                    })
-                }
+                            let Ok(()) = this.update(cx, |this, cx| {
+                                this.execute_commands(
+                                    vec![DownloadsCommand::QueueStart { queue_id }],
+                                    cx,
+                                );
+                            }) else {
+                                // 视图已释放，结束这次回调而不再更新状态。
+                                return;
+                            };
+                        })
+                    }
+                })
             });
             let menu = menu.item({
                 let open_queue_manager = open_queue_manager.clone();

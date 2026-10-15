@@ -680,19 +680,25 @@ impl WebhookDialog {
         }
     }
 
+    /// 队列显示名：内置队列本地化，自定义队列用用户命名。
+    fn queue_label(&self, queue_id: &str, name: &str) -> SharedString {
+        match queue_id {
+            fluxdown_protocol::MAIN_QUEUE_ID => self.t("mainQueue"),
+            fluxdown_protocol::LATER_QUEUE_ID => self.t("laterQueue"),
+            _ => SharedString::from(name.to_owned()),
+        }
+    }
+
     fn queue_name(&self, id: &str, cx: &App) -> SharedString {
         if id.is_empty() {
             return self.t("webhookQueueAll");
         }
-        self.store
-            .read(cx)
-            .queues()
+        let queues = self.store.read(cx).queues();
+        let name = queues
             .iter()
             .find(|queue| queue.queue_id == id)
-            .map_or_else(
-                || SharedString::from(id.to_owned()),
-                |queue| SharedString::from(queue.name.clone()),
-            )
+            .map_or(id, |queue| queue.name.as_str());
+        self.queue_label(id, name)
     }
 
     /// 队列下拉：与输入框同高、铺满字段宽度。
@@ -701,7 +707,7 @@ impl WebhookDialog {
         options.extend(self.store.read(cx).queues().iter().map(|queue| {
             (
                 queue.queue_id.clone(),
-                SharedString::from(queue.name.clone()),
+                self.queue_label(&queue.queue_id, &queue.name),
             )
         }));
         let current = self.queue_id.clone();

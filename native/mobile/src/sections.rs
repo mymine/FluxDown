@@ -214,7 +214,9 @@ pub(crate) fn affected(event: &AgentEvent) -> &'static [Section] {
             | DaemonEvent::TaskNotice(_)
             | DaemonEvent::SnapshotReplaced(_)
             | DaemonEvent::TaskChanged(_)
+            | DaemonEvent::TasksChanged(_)
             | DaemonEvent::TaskDeleted { .. }
+            | DaemonEvent::TasksDeleted { .. }
             | DaemonEvent::QueuesChanged(_)
             | DaemonEvent::GroupsChanged(_)
             | DaemonEvent::ConfigChanged(_)

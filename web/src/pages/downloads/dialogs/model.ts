@@ -1,7 +1,9 @@
 // 「新建下载」表单的纯模型：链接解析、代理 / UA / 线程预设与请求构建。
 // 与 crates/downloads/src/model/new_download.rs 的桌面端规则保持同步。
 
-import type { CreateTaskRequest } from '../../../lib/rpc'
+import { emptyHints, joinContinuations, parseCommand, rustTrim } from './aria2c'
+import type { ParsedInput, RequestHints } from './aria2c'
+import type { CreateTaskItem, CreateTaskRequest } from '../../../lib/rpc'
 import { MAX_TASK_SEGMENTS } from '../../../lib/threadsRisk'
 
 /** 一条解析出的下载条目（aria2 风格：URL + 可选 `out=` / `checksum=` 选项行）。 */
@@ -63,9 +65,20 @@ function trimUrlTail(url: string): string {
  * - 其余行：`loose` 时取行内首个 http(s)/ftp 链接并去掉尾部标点（TXT 导入），否则要求链接位于行首。
  */
 export function parseEntries(text: string, loose: boolean): UrlEntry[] {
+  return parseInput(text, loose).entries
+}
+
+/**
+ * `parseEntries` 的完整结果：条目 + 首条 aria2c 命令带出的请求信息（#299，见 `aria2c.ts`）。
+ * 行首为 `aria2c` 的命令（先合并其续行）按 shell 规则切词，提取链接 / `-o` / `--checksum`；
+ * 其余行的行为不变。
+ */
+export function parseInput(text: string, loose: boolean): ParsedInput {
+  const joined = joinContinuations(text)
   const entries: UrlEntry[] = []
+  let hints: RequestHints | null = null
   let current: UrlEntry | null = null
-  for (const line of text.split('\n')) {
+  for (const line of joined.split('\n')) {
     if (line.startsWith(' ') || line.startsWith('\t')) {
       if (!current) continue
       const trimmed = line.trim()
@@ -77,6 +90,14 @@ export function parseEntries(text: string, loose: boolean): UrlEntry[] {
     if (trimmed === '' || trimmed.startsWith('#')) continue
     if (current) entries.push(current)
     current = null
+    const command = parseCommand(rustTrim(line))
+    if (command) {
+      const produced = command.entries
+      if (produced.length > 0 && hints === null) hints = command.hints
+      current = produced.pop() ?? null
+      entries.push(...produced)
+      continue
+    }
     const lower = asciiLower(trimmed)
     const magnet = lower.indexOf('magnet:?')
     const ed2k = lower.indexOf('ed2k://')
@@ -96,7 +117,7 @@ export function parseEntries(text: string, loose: boolean): UrlEntry[] {
     }
   }
   if (current) entries.push(current)
-  return entries
+  return { entries, hints: hints ?? emptyHints() }
 }
 
 /** 条目 → aria2 风格文本（含 `out=` / `checksum=` 选项行）。 */
@@ -105,19 +126,6 @@ export function entryToText(item: UrlEntry): string {
   if (item.fileName !== '') text += `\n  out=${item.fileName}`
   if (item.checksum !== '') text += `\n  checksum=${item.checksum}`
   return text
-}
-
-/** 把导入条目追加到现有文本：按 URL 去重（保留已有条目），返回新的文本框内容。 */
-export function mergeImported(existingText: string, imported: UrlEntry[]): string {
-  const merged = parseEntries(existingText, false)
-  const seen = new Set(merged.map((item) => item.url))
-  for (const item of imported) {
-    if (!seen.has(item.url)) {
-      seen.add(item.url)
-      merged.push(item)
-    }
-  }
-  return merged.map(entryToText).join('\n')
 }
 
 /** 把条目追加到现有文本末尾：原文逐字保留（含注释 / 尚未输完的行），已存在的 URL 跳过。 */
@@ -285,6 +293,29 @@ export function buildRequests(entries: readonly UrlEntry[], options: DraftOption
     httpPassword: single ? options.httpPassword : '',
     saveSiteAuth: single && options.saveSiteAuth,
   }))
+}
+
+/**
+ * `daemon.task.createMany` 的整批共享选项 + 逐条条目（对齐 GPUI `build_requests` 的单条覆盖）。
+ * `common` 的 url / fileName / checksum 恒为空，由条目决定；`single` 默认按条目数判定，
+ * 外部捕获等拆分提交时由调用方按整个表单的条目数传入。
+ */
+export function buildBatch(entries: readonly UrlEntry[], options: DraftOptions, single = entries.length === 1): { common: CreateTaskRequest; items: CreateTaskItem[] } {
+  const [shared] = buildRequests([{ url: '', fileName: '', checksum: '' }], options)
+  const common: CreateTaskRequest = {
+    ...shared,
+    fileName: '',
+    checksum: '',
+    httpUser: single ? options.httpUser : '',
+    httpPassword: single ? options.httpPassword : '',
+    saveSiteAuth: single && options.saveSiteAuth,
+  }
+  const items = entries.map((entry) => ({
+    url: entry.url,
+    fileName: single && options.rename !== '' ? options.rename : entry.fileName,
+    checksum: single && options.checksum !== '' ? options.checksum : entry.checksum,
+  }))
+  return { common, items }
 }
 
 /** 是否单条 http(s) 链接（清单预解析 / 站点凭据回填的前置条件）。 */

@@ -11,7 +11,7 @@ use gpui::{
     IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
     StatefulInteractiveElement as _, Styled, Window, div, img, percentage, point, px, size,
 };
-use gpui_component::{Icon, TitleBar, h_flex, menu::AppMenuBar, tooltip::Tooltip, v_flex};
+use gpui_component::{Icon, TitleBar, h_flex, tooltip::Tooltip, v_flex};
 
 use crate::assets::APP_LOGO_PATH;
 use crate::window_controls::FixedSizeTitleBar;
@@ -312,8 +312,6 @@ pub struct ShellView {
     active_route: Option<RouteId>,
     routes: Vec<ShellRoute>,
     actions: Vec<ShellAction>,
-    /// Windows / Linux 标题栏内的应用菜单；macOS 走原生菜单不渲染。
-    menu_bar: Option<Entity<AppMenuBar>>,
     /// 已应用到 macOS 交通灯的纵向偏移；标题栏随文字放大撑高时重新居中。
     traffic_light_y: Pixels,
 }
@@ -324,7 +322,6 @@ impl ShellView {
         translator: Entity<Translator>,
         routes: Vec<ShellRoute>,
         actions: Vec<ShellAction>,
-        menu_bar: Option<Entity<AppMenuBar>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let active_route = routes.first().map(|route| route.id);
@@ -345,7 +342,6 @@ impl ShellView {
             active_route,
             routes,
             actions,
-            menu_bar,
             traffic_light_y: crate::initial_traffic_light_y(),
         }
     }
@@ -390,21 +386,13 @@ impl ShellView {
         let spacing = theme.tokens().spacing;
         let extended = theme.extended().colors;
         let is_macos = cfg!(target_os = "macos");
-        // macOS 走原生菜单且交通灯占据左侧，不渲染 logo 与应用内菜单。
+        // macOS 交通灯占据左侧，不渲染 logo。
         let leading = (!is_macos).then(|| {
             h_flex()
                 .h_full()
                 .flex_none()
                 .items_center()
-                .gap(spacing.sm)
                 .child(img(APP_LOGO_PATH).size(px(16.)))
-                .children(self.menu_bar.clone().map(|menu_bar| {
-                    h_flex()
-                        .h_full()
-                        .items_center()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(menu_bar)
-                }))
         });
         let slot = self.active_title_bar();
         let sidebar_toggle = self

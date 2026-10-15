@@ -43,6 +43,31 @@ pub enum ConfigPatchError {
     InvalidStoredRevision(String),
 }
 
+/// [`Db::load_deletion_facts`] 的结果：批量删除决定逐任务删哪些文件所需的全部库内事实。
+#[derive(Debug, Default)]
+pub struct DeletionFacts {
+    /// 任务 → 「文件已存在」决定原值（'' / rename / overwrite / skip）；缺失 = 任务不存在。
+    pub exists_decisions: HashMap<String, String>,
+    /// 带独立音轨（`audio_url` 非空）的任务。
+    pub has_audio_url: HashSet<String>,
+    /// 任务 → 已登记的衍生产物文件名。
+    pub artifacts: HashMap<String, Vec<String>>,
+    /// `(save_dir, file_name)` → 把该名字登记为自己 `file_name` 的全部任务 id。
+    pub file_owners: HashMap<(String, String), Vec<String>>,
+}
+
+/// 一条 `DELETE FROM config WHERE key IN (...)` 覆盖的任务数（每任务 3 个键，
+/// 参数个数保持在 SQLite 999 上限内）。
+const CONFIG_KEY_TASKS_PER_STATEMENT: usize = 300;
+
+/// `$1,$2,…,$n` 占位符列表（两后端共用的编号占位符）。
+fn numbered_placeholders(n: usize) -> String {
+    (1..=n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// 数据库后端类型，由连接 URL 的 scheme 决定。
 ///
 /// 仅在**无法统一 SQL 文本**的少数分支处使用（DDL 方言差异、
@@ -101,6 +126,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     name_inferred INTEGER NOT NULL DEFAULT 0,
     resp_name TEXT NOT NULL DEFAULT '',
     resp_mime TEXT NOT NULL DEFAULT '',
+    source_changed INTEGER NOT NULL DEFAULT 0,
     queue_order INTEGER NOT NULL DEFAULT 0,
     uploaded_bytes BIGINT NOT NULL DEFAULT 0,
     uploaded_at_completion BIGINT NOT NULL DEFAULT 0,
@@ -270,6 +296,14 @@ CREATE TABLE IF NOT EXISTS task_activity_retention (
     task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     pruned_through_id BIGINT NOT NULL
 );
+-- 批量建任务幂等表：同一 batch_id 重放时直接返回首次结果。
+-- 与任务插入同事务写入，超过保留期的记录在同一事务中顺带清理。
+CREATE TABLE IF NOT EXISTS task_create_batches (
+    batch_id TEXT PRIMARY KEY,
+    results TEXT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_create_batches_created ON task_create_batches(created_at);
 ";
 
 /// 建表 DDL（PostgreSQL 方言）。
@@ -304,6 +338,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     name_inferred INTEGER NOT NULL DEFAULT 0,
     resp_name TEXT NOT NULL DEFAULT '',
     resp_mime TEXT NOT NULL DEFAULT '',
+    source_changed INTEGER NOT NULL DEFAULT 0,
     queue_order INTEGER NOT NULL DEFAULT 0,
     uploaded_bytes BIGINT NOT NULL DEFAULT 0,
     uploaded_at_completion BIGINT NOT NULL DEFAULT 0,
@@ -473,6 +508,13 @@ CREATE TABLE IF NOT EXISTS task_activity_retention (
     task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     pruned_through_id BIGINT NOT NULL
 );
+-- 批量建任务幂等表（语义见 SQLITE_SCHEMA）。
+CREATE TABLE IF NOT EXISTS task_create_batches (
+    batch_id TEXT PRIMARY KEY,
+    results TEXT NOT NULL,
+    created_at BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_create_batches_created ON task_create_batches(created_at);
 ";
 
 /// SQLite 连接级 PRAGMA（在 after_connect 钩子中对每个新连接执行）。
@@ -480,7 +522,12 @@ CREATE TABLE IF NOT EXISTS task_activity_retention (
 /// busy_timeout 让撞上写锁的连接在 5s 内自旋重试而非立即抛
 /// SQLITE_BUSY（code 5, database is locked）——覆盖多任务并发落库 /
 /// WAL checkpoint / 删除事务之间的瞬时写-写冲突。
+/// synchronous=NORMAL（WAL 下的推荐档）：提交不再每次 fsync WAL，只在
+/// checkpoint 时同步；进程崩溃不丢已提交事务，仅整机掉电可能丢失最近
+/// 数秒的提交（数据库本身不会损坏）。下载进度/任务元数据可由续传重建，
+/// 换来批量导入与进度落库的 fsync 开销归零。
 const SQLITE_PRAGMAS: &str = "PRAGMA journal_mode=WAL;\
+ PRAGMA synchronous=NORMAL;\
  PRAGMA busy_timeout=5000;\
  PRAGMA cache_size=-512;\
  PRAGMA temp_store=MEMORY;\
@@ -636,6 +683,52 @@ fn task_from_row(row: &AnyRow) -> Result<TaskInfo, sqlx::Error> {
 }
 
 const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, segments, queue_order, uploaded_bytes, uploaded_at_completion, seeding_status, seeding_message, seeding_time_secs, seed_ratio_limit_milli, seed_post_ratio_limit_milli, seed_time_limit_minutes, seed_inactive_time_limit_minutes, seed_upload_limit_bps, referrer, group_id, rss_source_id, origin_url, auto_route, src_cdn_bytes, src_proxy_bytes, src_nic_bytes";
+
+/// 新建任务的完整落库行（[`Db::insert_new_tasks`]）。
+///
+/// 一行 INSERT 携带创建时已知的全部列，取代「INSERT + 多条 UPDATE」；
+/// 字段全部借用调用方的准备结果，避免批量创建时逐字段复制。
+pub struct NewTaskRow<'a> {
+    pub id: &'a str,
+    pub url: &'a str,
+    pub file_name: &'a str,
+    /// 文件名来源（见 `name_inferred` 迁移注释）。
+    pub name_inferred: bool,
+    pub save_dir: &'a str,
+    pub segments: i32,
+    /// 初始状态：0 pending / 2 paused / 4 error（创建即失败）。
+    pub status: i32,
+    pub error_message: &'a str,
+    pub proxy_url: &'a str,
+    pub queue_id: &'a str,
+    pub checksum: &'a str,
+    pub ignore_tls_errors: bool,
+    pub cookies: &'a str,
+    pub referrer: &'a str,
+    /// 请求头 JSON；空串 = 无。
+    pub extra_headers_json: &'a str,
+    pub origin_url: &'a str,
+    pub audio_url: &'a str,
+    pub resolver_plugin_id: &'a str,
+    pub group_id: &'a str,
+    pub resolver_item: &'a str,
+    pub unattended: bool,
+    /// `bt_selected_files` 列的编码值（`""` / `"all"` / `"0,2,5"`）。
+    pub bt_selected_files: &'a str,
+    /// `.torrent` 字节；非空时同事务写入 `torrent_files`。
+    pub torrent_file_bytes: &'a [u8],
+}
+
+/// 批量建任务的幂等记录（[`Db::insert_new_tasks`] 与任务行同事务写入）。
+pub struct CreateBatchRecord<'a> {
+    pub batch_id: &'a str,
+    /// 序列化后的逐项结果。
+    pub results: &'a str,
+}
+
+/// 批量建任务幂等记录的保留期（秒）。过期记录在写入新记录的同一事务中清理，
+/// 不设周期任务（空闲零唤醒）。
+const CREATE_BATCH_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// 文件跟踪扫描的最小任务投影（[`Db::load_file_tracking_rows`]）。扫描只需
 /// 要判定「目标路径是否被活跃任务占用」和「已完成任务的产物是否还在盘上」，
@@ -1163,6 +1256,10 @@ impl Db {
             .await?;
         self.add_column_if_missing("tasks", "src_nic_bytes", "BIGINT NOT NULL DEFAULT 0")
             .await?;
+        // 换源标记：`change_task_url` 置 1，下次续传探测后由 `settle_source_change`
+        // 按零容差比对新旧大小（不一致即清空进度）并清回 0。
+        self.add_column_if_missing("tasks", "source_changed", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
         Ok(())
     }
 
@@ -1273,6 +1370,151 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// 读取批量建任务的幂等记录；`None` = 该 `batch_id` 尚未提交过。
+    pub async fn load_create_batch_results(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        let results: Option<String> =
+            sqlx::query_scalar("SELECT results FROM task_create_batches WHERE batch_id = $1")
+                .bind(batch_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(results)
+    }
+
+    /// 单事务落库一批新任务（单个与批量创建共用同一路径）。
+    ///
+    /// - `queue_order`：每个目标队列只读一次 `MAX+1`，其后在内存递增；
+    ///   与逐条追加得到的序列一致。
+    /// - 每行一条携带全部列的 INSERT（不再 INSERT 后补 UPDATE），`.torrent`
+    ///   字节同事务写入。
+    /// - `batch` 非空时幂等记录与任务行同事务提交，并顺带清理过期记录；
+    ///   `rows` 为空也会写入记录（全部被去重/拒绝的批次重放结果必须稳定）。
+    /// - 返回与 `rows` 同序的持久化任务事实（事务内单次 `IN` 查询读回）。
+    ///
+    /// 任一步失败整个事务回滚，不留半成品。
+    pub async fn insert_new_tasks(
+        &self,
+        rows: &[NewTaskRow<'_>],
+        batch: Option<CreateBatchRecord<'_>>,
+    ) -> Result<Vec<TaskInfo>, DbError> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let created_at = now_secs.to_string();
+        let mut tx = self.begin_write().await?;
+        // 进程内建任务串行（单线程 actor）；跨进程并发（CLI --local 与 App
+        // 同库）由 BEGIN IMMEDIATE 串行化写入，撞序仍由
+        // (queue_order, created_at) 复合排序容忍。
+        let mut next_order: HashMap<&str, i64> = HashMap::new();
+        for row in rows {
+            let order = match next_order.get_mut(row.queue_id) {
+                Some(next) => {
+                    let order = *next;
+                    *next += 1;
+                    order
+                }
+                None => {
+                    let first: i64 = sqlx::query_scalar(
+                        "SELECT CAST(COALESCE(MAX(queue_order), 0) + 1 AS BIGINT) FROM tasks WHERE queue_id = $1",
+                    )
+                    .bind(row.queue_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    next_order.insert(row.queue_id, first + 1);
+                    first
+                }
+            };
+            sqlx::query(
+                "INSERT INTO tasks (id, url, file_name, name_inferred, save_dir, segments, status, error_message, \
+                 created_at, proxy_url, queue_id, checksum, ignore_tls_errors, queue_order, cookies, referrer, \
+                 extra_headers, origin_url, audio_url, resolver_plugin_id, group_id, resolver_item, unattended, \
+                 bt_selected_files) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, \
+                 $20, $21, $22, $23, $24)",
+            )
+            .bind(row.id)
+            .bind(row.url)
+            .bind(row.file_name)
+            .bind(i32::from(row.name_inferred))
+            .bind(row.save_dir)
+            .bind(row.segments)
+            .bind(row.status)
+            .bind(row.error_message)
+            .bind(created_at.as_str())
+            .bind(row.proxy_url)
+            .bind(row.queue_id)
+            .bind(row.checksum)
+            .bind(i32::from(row.ignore_tls_errors))
+            .bind(order as i32)
+            .bind(row.cookies)
+            .bind(row.referrer)
+            .bind(row.extra_headers_json)
+            .bind(row.origin_url)
+            .bind(row.audio_url)
+            .bind(row.resolver_plugin_id)
+            .bind(row.group_id)
+            .bind(row.resolver_item)
+            .bind(i32::from(row.unattended))
+            .bind(row.bt_selected_files)
+            .execute(&mut *tx)
+            .await?;
+            if !row.torrent_file_bytes.is_empty() {
+                sqlx::query(
+                    "INSERT INTO torrent_files (task_id, file_bytes) VALUES ($1, $2)
+                     ON CONFLICT (task_id) DO UPDATE SET file_bytes = excluded.file_bytes",
+                )
+                .bind(row.id)
+                .bind(row.torrent_file_bytes)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        let mut loaded: HashMap<String, TaskInfo> = HashMap::with_capacity(rows.len());
+        // SQLite 绑定变量上限 999；与 `load_tasks_by_ids` 同样分块。
+        const CHUNK: usize = 500;
+        for chunk in rows.chunks(CHUNK) {
+            let placeholders: String = (1..=chunk.len())
+                .map(|i| format!("${i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(AssertSqlSafe(sql));
+            for row in chunk {
+                query = query.bind(row.id);
+            }
+            let fetched = query.fetch_all(&mut *tx).await?;
+            for fetched_row in &fetched {
+                let task = task_from_row(fetched_row)?;
+                loaded.insert(task.task_id.clone(), task);
+            }
+        }
+        let mut tasks = Vec::with_capacity(rows.len());
+        for row in rows {
+            tasks.push(loaded.remove(row.id).ok_or(sqlx::Error::RowNotFound)?);
+        }
+
+        if let Some(batch) = batch {
+            sqlx::query(
+                "INSERT INTO task_create_batches (batch_id, results, created_at) VALUES ($1, $2, $3)",
+            )
+            .bind(batch.batch_id)
+            .bind(batch.results)
+            .bind(now_secs as i64)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM task_create_batches WHERE created_at < $1")
+                .bind(now_secs as i64 - CREATE_BATCH_RETENTION_SECS)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(tasks)
     }
 
     /// 持久化任务的浏览器请求上下文（cookies / referrer / extra_headers JSON），
@@ -1418,6 +1660,58 @@ impl Db {
         Ok(())
     }
 
+    /// 以已落库的分段进度回写任务级 `downloaded_bytes`（单调，只前进）。
+    ///
+    /// 多段下载在运行期只按 `DB_SAVE_INTERVAL_SECS` 周期写任务级进度，而暂停 /
+    /// 取消时 worker 会 fsync 后把每段最终偏移写进 `task_segments`。暂停终态帧与
+    /// 重启后的列表都读 `tasks.downloaded_bytes`，若不在下载器退出前对齐，就会
+    /// 显示上一个周期的旧值（开始几秒内暂停即为 0%）。
+    ///
+    /// 一条语句内聚合 + 写入（主键前缀索引，≤ 512 行），不把段行搬进内存；
+    /// `segments_epoch` 守卫使被新 spawn 夺权后的旧下载器 0 行生效。与
+    /// `restart_task` 的 `delete_segments`（同事务删段 + 进度归零）并发时不得
+    /// 出现「读到删前段和、写在归零之后」：SQLite 单语句天然原子；pg 读已提交
+    /// 下子查询快照早于行锁，故先 `FOR UPDATE` 锁任务行，再以锁后的新快照聚合。
+    pub async fn sync_task_progress_from_segments(
+        &self,
+        id: &str,
+        epoch: i64,
+    ) -> Result<(), DbError> {
+        match self.backend {
+            Backend::Sqlite => {
+                sqlx::query(
+                    "UPDATE tasks SET downloaded_bytes = MAX(downloaded_bytes,
+                         (SELECT COALESCE(SUM(downloaded_bytes), 0)
+                            FROM task_segments WHERE task_id = $1))
+                     WHERE id = $1 AND segments_epoch = $2",
+                )
+                .bind(id)
+                .bind(epoch)
+                .execute(&self.pool)
+                .await?;
+            }
+            Backend::Postgres => {
+                let mut tx = self.pool.begin().await?;
+                sqlx::query("SELECT 1 FROM tasks WHERE id = $1 FOR UPDATE")
+                    .bind(id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "UPDATE tasks SET downloaded_bytes = GREATEST(downloaded_bytes,
+                         (SELECT COALESCE(SUM(downloaded_bytes), 0)::BIGINT
+                            FROM task_segments WHERE task_id = $1))
+                     WHERE id = $1 AND segments_epoch = $2",
+                )
+                .bind(id)
+                .bind(epoch)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+            }
+        }
+        Ok(())
+    }
+
     /// 更新任务状态与错误信息，并同步维护 `completed_at`（任务结束时间）：
     /// - `status = 3`（下载完成）且尚未记录 → 写入当前 Unix 秒。此写入发生在
     ///   下载数据落盘完成之时，早于插件 onDone 等 hook 后处理，故结束时间
@@ -1528,9 +1822,10 @@ impl Db {
 
     /// 批量落库文件跟踪标志：语义与 [`Self::update_task_file_missing`] 完全
     /// 一致（逐行 `WHERE id AND status = 3`），但整批在**同一个事务**里提交。
-    /// SQLite 默认 `synchronous=FULL`，逐条独立 UPDATE 意味着每条一次 fsync；
-    /// 外置盘掉线这类「上万条同时翻转」的场景下那是分钟级的阻塞，还会和下载
-    /// 落库抢 `busy_timeout`。整批一次 commit 把 N 次 fsync 压成 1 次。
+    /// SQLite 在 WAL + `synchronous=NORMAL` 下提交不再逐次 fsync，但每条独立
+    /// UPDATE 仍是一次隐式事务（一次 WAL 写入与写锁往返）；
+    /// 外置盘掉线这类「上万条同时翻转」的场景下那是显著阻塞，还会和下载
+    /// 落库抢 `busy_timeout`。整批一次 commit 把 N 次事务压成 1 次。
     ///
     /// 返回实际写入的条目（跳过扫描期间已离开 status=3 的行），供调用方据此
     /// 下发事件与自动清理。任一条出错则整批回滚——文件跟踪是幂等的，下一轮
@@ -2103,13 +2398,20 @@ impl Db {
             }
 
             // 任务级 config 行(哨兵/HLS 视频与音轨断点)随任务清理,防孤儿行累积。
-            for id in chunk {
-                sqlx::query("DELETE FROM config WHERE key IN ($1, $2, $3)")
-                    .bind(format!("bt_completion_top_{id}"))
-                    .bind(format!("hls_resume_{id}"))
-                    .bind(format!("hls_audio_resume_{id}"))
-                    .execute(&mut *tx)
-                    .await?;
+            // 每个任务 3 个键：再分小块，参数个数保持在 SQLite 999 上限内。
+            for keys_chunk in chunk.chunks(CONFIG_KEY_TASKS_PER_STATEMENT) {
+                let sql = format!(
+                    "DELETE FROM config WHERE key IN ({})",
+                    numbered_placeholders(keys_chunk.len() * 3)
+                );
+                let mut query = sqlx::query(AssertSqlSafe(sql));
+                for id in keys_chunk {
+                    query = query
+                        .bind(format!("bt_completion_top_{id}"))
+                        .bind(format!("hls_resume_{id}"))
+                        .bind(format!("hls_audio_resume_{id}"));
+                }
+                query.execute(&mut *tx).await?;
             }
             let rss_sql = format!(
                 "UPDATE rss_items SET status = CASE WHEN status = {downloaded} THEN {ignored} ELSE status END, task_id = '' WHERE task_id IN ({placeholders}) RETURNING source_id",
@@ -2184,6 +2486,74 @@ impl Db {
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows)
+    }
+
+    /// 批量删除前一次读出整批任务的删除上下文，替代逐任务查询
+    /// （`get_exists_decision` / `load_audio_url` / `load_task_artifacts` /
+    /// `list_task_ids_by_file`）。
+    ///
+    /// `save_dirs` 是批内任务涉及的保存目录：`file_owners` 只覆盖这些目录下登记的产物名，
+    /// 足以回答「某目录下某名字还归不归批外任务」。
+    pub async fn load_deletion_facts(
+        &self,
+        ids: &[String],
+        save_dirs: &[String],
+    ) -> Result<DeletionFacts, DbError> {
+        const CHUNK: usize = 500;
+        let mut facts = DeletionFacts::default();
+        for chunk in ids.chunks(CHUNK) {
+            let placeholders = numbered_placeholders(chunk.len());
+            let sql = format!(
+                "SELECT id, exists_decision, audio_url FROM tasks WHERE id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id.as_str());
+            }
+            for row in query.fetch_all(&self.pool).await? {
+                let id: String = row.try_get("id")?;
+                let audio_url: String = row.try_get("audio_url")?;
+                if !audio_url.is_empty() {
+                    facts.has_audio_url.insert(id.clone());
+                }
+                facts
+                    .exists_decisions
+                    .insert(id, row.try_get("exists_decision")?);
+            }
+
+            let sql = format!(
+                "SELECT task_id, file_name FROM task_artifacts WHERE task_id IN ({placeholders})"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id.as_str());
+            }
+            for row in query.fetch_all(&self.pool).await? {
+                facts
+                    .artifacts
+                    .entry(row.try_get("task_id")?)
+                    .or_default()
+                    .push(row.try_get("file_name")?);
+            }
+        }
+        for chunk in save_dirs.chunks(CHUNK) {
+            let placeholders = numbered_placeholders(chunk.len());
+            let sql = format!(
+                "SELECT id, save_dir, file_name FROM tasks WHERE save_dir IN ({placeholders})"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql));
+            for dir in chunk {
+                query = query.bind(dir.as_str());
+            }
+            for row in query.fetch_all(&self.pool).await? {
+                facts
+                    .file_owners
+                    .entry((row.try_get("save_dir")?, row.try_get("file_name")?))
+                    .or_default()
+                    .push(row.try_get("id")?);
+            }
+        }
+        Ok(facts)
     }
 
     /// Persist the user's BT file selection so it survives app restart.
@@ -3630,13 +4000,34 @@ impl Db {
     }
 
     /// 播种内置队列（幂等、进程间安全）：
-    /// - `main` 主队列（运行中，无限制）——未指定队列的任务的归属；
+    /// - `main` 主队列（恒运行，无限制）——未指定队列的任务的归属；
     /// - `later` 稍后下载（默认停止）——「稍后下载」的默认落点。
     ///
     /// 同时把存量 `queue_id = ''` 任务迁入主队列，并在 `default_queue_id`
     /// 配置缺失时设为主队列。以 config 键 `builtin_queues_seeded` 的原子
     /// `INSERT … DO NOTHING` 作跨进程互斥：抢不到该行写入的进程直接跳过。
+    ///
+    /// 每次调用（每次启动）还会把主队列收敛到「运行中、无定时」
+    /// （[`crate::model::is_always_running_queue`]），迁移旧版本允许的停止 / 定时状态。
     pub async fn seed_builtin_queues(&self) -> Result<(), DbError> {
+        self.seed_builtin_queue_rows().await?;
+        self.normalize_main_queue().await
+    }
+
+    /// 主队列恒运行且无定时：只在状态不符时写这一行（`WHERE` 过滤），已收敛的库
+    /// 启动时零行写入。暂停中的任务保持暂停，不在升级时自动开下。
+    async fn normalize_main_queue(&self) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE queues SET is_running = 1, schedule_enabled = 0, schedule_start = '', schedule_stop = '', schedule_days = 127 \
+             WHERE id = $1 AND (is_running <> 1 OR schedule_enabled <> 0 OR schedule_start <> '' OR schedule_stop <> '' OR schedule_days <> 127)",
+        )
+        .bind(MAIN_QUEUE_ID)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn seed_builtin_queue_rows(&self) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
         // 第一条语句即写入：SQLite 取得写锁、PostgreSQL 锁定冲突行，
         // 并发的第二个进程在此阻塞，提交后读到 rows_affected == 0 即退出。
@@ -4614,15 +5005,80 @@ impl Db {
         Ok(())
     }
 
-    /// 更新任务的下载源地址（换链接续传等场景）；不触碰分段/进度行，
-    /// `task_segments` 按 `task_id` 索引，与 `url` 无关。
+    /// 更换任务下载源地址（`change_task_url` 专用）并标记 `source_changed`；不触碰
+    /// 分段/进度行（`task_segments` 按 `task_id` 索引，与 `url` 无关）。续传时由
+    /// [`Self::settle_source_change`] 决定已下进度能否沿用。
     pub async fn update_task_url(&self, task_id: &str, url: &str) -> Result<(), DbError> {
-        sqlx::query("UPDATE tasks SET url = $1 WHERE id = $2")
+        sqlx::query("UPDATE tasks SET url = $1, source_changed = 1 WHERE id = $2")
             .bind(url)
             .bind(task_id)
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// 任务是否带未结算的换源标记（见 [`Self::settle_source_change`]）；任务不存在为 `false`。
+    pub async fn task_source_changed(&self, task_id: &str) -> Result<bool, DbError> {
+        let flag: Option<i32> =
+            sqlx::query_scalar("SELECT source_changed FROM tasks WHERE id = $1")
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(flag.is_some_and(|flag| flag != 0))
+    }
+
+    /// 换源后的首次续传探测结算（单事务读-判-写）。仅当任务带 `source_changed` 时生效：
+    /// - 新旧总大小都已知且**不完全相等**（零容差，不套用 CDN 漂移容差）→ 视为已换成
+    ///   另一个文件：删除分段行、已下字节与来源计数清零、`total_bytes` 改为新值，返回
+    ///   `true`（调用方须删除旧临时文件后从头下载）；
+    /// - 其余（大小一致或任一方未知，无证据判定换了文件）→ 沿用进度，返回 `false`。
+    ///
+    /// 两种情形都清除标记：此后的续传恢复常规容差。
+    pub async fn settle_source_change(
+        &self,
+        task_id: &str,
+        probed_total_bytes: i64,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.begin_write().await?;
+        let row = sqlx::query("SELECT source_changed, total_bytes FROM tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let flagged: i32 = row.try_get("source_changed")?;
+        if flagged == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let stored_total: i64 = row.try_get("total_bytes")?;
+        let replaced =
+            stored_total > 0 && probed_total_bytes > 0 && stored_total != probed_total_bytes;
+        if replaced {
+            sqlx::query("DELETE FROM task_segments WHERE task_id = $1")
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "UPDATE tasks SET downloaded_bytes = 0, total_bytes = $1,
+                     src_cdn_bytes = 0, src_proxy_bytes = 0, src_nic_bytes = 0,
+                     source_changed = 0
+                 WHERE id = $2",
+            )
+            .bind(probed_total_bytes)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query("UPDATE tasks SET source_changed = 0 WHERE id = $1")
+                .bind(task_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(replaced)
     }
 
     /// 写入 `ProxyMode::Auto` 的任务级最终链路标签（wire 值见
@@ -4899,6 +5355,67 @@ mod tests {
         )
         .await
         .expect("insert task");
+    }
+
+    /// 换源结算：仅换源后首次生效；大小（零容差）不一致即清空进度并改用新大小，
+    /// 一致则沿用进度；结算后标记清除，未换源任务不受影响。
+    #[tokio::test]
+    async fn settle_source_change_resets_only_after_url_change_with_size_mismatch() {
+        let (db, dir) = open_test_db().await;
+        for id in ["swapped", "same", "untouched"] {
+            insert_task(&db, id).await;
+            db.update_task_total_bytes(id, 1_000_000)
+                .await
+                .expect("total");
+            db.insert_segments(id, &[(0, 0, 499_999), (1, 500_000, 999_999)])
+                .await
+                .expect("segments");
+        }
+        db.update_task_url("swapped", "http://example.com/other.bin")
+            .await
+            .expect("swap url");
+        db.update_task_url("same", "http://cdn.example.com/file.bin?sig=new")
+            .await
+            .expect("refresh url");
+
+        // 新文件只大 1 KB：在 CDN 漂移容差内，换源后仍必须判为另一个文件。
+        assert!(
+            db.settle_source_change("swapped", 1_001_024)
+                .await
+                .expect("settle")
+        );
+        assert!(db.load_segments("swapped").await.expect("segs").is_empty());
+        let swapped = db
+            .load_task_by_id("swapped")
+            .await
+            .expect("load")
+            .expect("exists");
+        assert_eq!(
+            (swapped.total_bytes, swapped.downloaded_bytes),
+            (1_001_024, 0)
+        );
+        // 标记已清除：后续续传回到常规容差路径。
+        assert!(
+            !db.settle_source_change("swapped", 2_000_000)
+                .await
+                .expect("settle")
+        );
+
+        assert!(
+            !db.settle_source_change("same", 1_000_000)
+                .await
+                .expect("settle")
+        );
+        assert_eq!(db.load_segments("same").await.expect("segs").len(), 2);
+
+        assert!(
+            !db.settle_source_change("untouched", 2_000_000)
+                .await
+                .expect("settle")
+        );
+        assert_eq!(db.load_segments("untouched").await.expect("segs").len(), 2);
+
+        close_test_db(&db, dir).await;
     }
     fn activity(
         task_id: &str,
@@ -6574,6 +7091,76 @@ mod tests {
         close_test_db(&db, dir).await;
     }
 
+    /// 暂停时分段已落库而任务级进度仍是旧周期值：回写后必须等于分段之和，
+    /// 且不会把更大的已有值拉低（暂停帧不能显示 0% / 倒退）。
+    #[tokio::test]
+    async fn task_progress_syncs_from_segments_monotonically() {
+        let (db, dir) = open_test_db().await;
+        insert_task_with_size(&db, "seg-sync", 2000).await;
+        db.insert_segments("seg-sync", &[(0, 0, 999), (1, 1000, 1999)])
+            .await
+            .expect("insert segments");
+        db.set_segments_epoch("seg-sync", 1)
+            .await
+            .expect("set epoch");
+        db.update_segment_progress_bounded("seg-sync", 0, 600, 0, 1)
+            .await
+            .expect("segment 0");
+        db.update_segment_progress_bounded("seg-sync", 1, 300, 1000, 1)
+            .await
+            .expect("segment 1");
+
+        // 已被新 spawn 夺权的旧下载器：0 行生效。
+        db.sync_task_progress_from_segments("seg-sync", 0)
+            .await
+            .expect("stale sync");
+        let task = db
+            .load_task_by_id("seg-sync")
+            .await
+            .expect("load")
+            .expect("task exists");
+        assert_eq!(task.downloaded_bytes, 0, "旧世代回写必须被 epoch 拦截");
+
+        db.sync_task_progress_from_segments("seg-sync", 1)
+            .await
+            .expect("sync");
+        let task = db
+            .load_task_by_id("seg-sync")
+            .await
+            .expect("load")
+            .expect("task exists");
+        assert_eq!(task.downloaded_bytes, 900, "任务进度必须对齐分段之和");
+
+        db.update_task_progress("seg-sync", 1500)
+            .await
+            .expect("newer progress");
+        db.sync_task_progress_from_segments("seg-sync", 1)
+            .await
+            .expect("sync again");
+        let task = db
+            .load_task_by_id("seg-sync")
+            .await
+            .expect("load")
+            .expect("task exists");
+        assert_eq!(task.downloaded_bytes, 1500, "回写不得拉低已有进度");
+
+        // restart 的删段归零之后，迟到回写不得复活旧进度。
+        db.delete_segments("seg-sync")
+            .await
+            .expect("delete segments");
+        db.sync_task_progress_from_segments("seg-sync", 1)
+            .await
+            .expect("sync after delete");
+        let task = db
+            .load_task_by_id("seg-sync")
+            .await
+            .expect("load")
+            .expect("task exists");
+        assert_eq!(task.downloaded_bytes, 0, "删段后回写必须保持 0");
+
+        close_test_db(&db, dir).await;
+    }
+
     // -----------------------------------------------------------------------
     // ED2K blocks / hashset
     // -----------------------------------------------------------------------
@@ -7402,26 +7989,32 @@ mod tests {
         close_test_db(&db, dir).await;
     }
 
+    /// 旧版本允许停止 / 定时主队列：升级后再次播种必须把主队列收敛为运行中、无定时，
+    /// 其他队列的启停与定时原样保留。
     #[tokio::test]
-    async fn queue_running_and_schedule_roundtrip() {
+    async fn reseeding_migrates_stopped_or_scheduled_main_queue() {
         let (db, dir) = open_test_db().await;
         db.seed_builtin_queues().await.expect("seed");
-        db.set_queue_running(MAIN_QUEUE_ID, false)
-            .await
-            .expect("stop");
-        db.set_queue_schedule(MAIN_QUEUE_ID, true, "08:30", "23:00", 0b001_1111)
-            .await
-            .expect("schedule");
+        for id in [MAIN_QUEUE_ID, crate::model::LATER_QUEUE_ID] {
+            db.set_queue_running(id, false).await.expect("stop");
+            db.set_queue_schedule(id, true, "08:30", "23:00", 0b001_1111)
+                .await
+                .expect("schedule");
+        }
+        db.seed_builtin_queues().await.expect("reseed");
         let queues = db.load_all_queues().await.expect("load");
-        let main = queues
-            .iter()
-            .find(|q| q.queue_id == MAIN_QUEUE_ID)
-            .expect("main row");
-        assert!(!main.is_running);
-        assert!(main.schedule_enabled);
-        assert_eq!(main.schedule_start, "08:30");
-        assert_eq!(main.schedule_stop, "23:00");
-        assert_eq!(main.schedule_days, 0b001_1111);
+        let find = |id: &str| queues.iter().find(|q| q.queue_id == id).expect("queue row");
+        let main = find(MAIN_QUEUE_ID);
+        assert!(main.is_running);
+        assert!(!main.schedule_enabled);
+        assert!(main.schedule_start.is_empty() && main.schedule_stop.is_empty());
+        assert_eq!(main.schedule_days, 127);
+        let later = find(crate::model::LATER_QUEUE_ID);
+        assert!(!later.is_running);
+        assert!(later.schedule_enabled);
+        assert_eq!(later.schedule_start, "08:30");
+        assert_eq!(later.schedule_stop, "23:00");
+        assert_eq!(later.schedule_days, 0b001_1111);
         close_test_db(&db, dir).await;
     }
 
@@ -7581,6 +8174,139 @@ mod tests {
             db.get_config("speed_limit_bytes").await.expect("read"),
             None
         );
+        close_test_db(&db, dir).await;
+    }
+
+    fn new_row<'a>(id: &'a str, queue_id: &'a str) -> NewTaskRow<'a> {
+        NewTaskRow {
+            id,
+            url: "http://example.test/a.bin",
+            file_name: "a.bin",
+            name_inferred: false,
+            save_dir: "/tmp",
+            segments: 0,
+            status: 2,
+            error_message: "",
+            proxy_url: "",
+            queue_id,
+            checksum: "",
+            ignore_tls_errors: false,
+            cookies: "",
+            referrer: "",
+            extra_headers_json: "",
+            origin_url: "",
+            audio_url: "",
+            resolver_plugin_id: "",
+            group_id: "",
+            resolver_item: "",
+            unattended: false,
+            bt_selected_files: "",
+            torrent_file_bytes: &[],
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_new_tasks_appends_order_per_queue_and_keeps_input_order() {
+        let (db, dir) = open_test_db().await;
+        let rows = [new_row("a", "q1"), new_row("b", "q2"), new_row("c", "q1")];
+        let tasks = db.insert_new_tasks(&rows, None).await.expect("insert");
+        let order: Vec<_> = tasks
+            .iter()
+            .map(|task| (task.task_id.as_str(), task.queue_order))
+            .collect();
+        assert_eq!(order, [("a", 1), ("b", 1), ("c", 2)]);
+        let more = db
+            .insert_new_tasks(&[new_row("d", "q1")], None)
+            .await
+            .expect("append");
+        assert_eq!(more[0].queue_order, 3, "a later call continues the tail");
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn insert_new_tasks_rolls_back_rows_when_the_batch_record_conflicts() {
+        let (db, dir) = open_test_db().await;
+        let record = || {
+            Some(CreateBatchRecord {
+                batch_id: "dup",
+                results: "[]",
+            })
+        };
+        db.insert_new_tasks(&[new_row("a", "q")], record())
+            .await
+            .expect("first");
+        assert_eq!(
+            db.load_create_batch_results("dup").await.expect("read"),
+            Some("[]".to_owned())
+        );
+        let err = db.insert_new_tasks(&[new_row("b", "q")], record()).await;
+        assert!(
+            err.is_err(),
+            "a committed batch id cannot be recorded twice"
+        );
+        assert!(
+            db.load_task_by_id("b").await.expect("load").is_none(),
+            "the whole transaction rolled back"
+        );
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn create_batch_records_expire_after_retention_in_the_same_transaction() {
+        let (db, dir) = open_test_db().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        for (batch_id, age) in [
+            ("old", CREATE_BATCH_RETENTION_SECS + 60),
+            ("fresh", CREATE_BATCH_RETENTION_SECS - 3600),
+        ] {
+            sqlx::query(
+                "INSERT INTO task_create_batches (batch_id, results, created_at) VALUES ($1, '[]', $2)",
+            )
+            .bind(batch_id)
+            .bind(now - age)
+            .execute(&db.pool)
+            .await
+            .expect("seed record");
+        }
+        db.insert_new_tasks(
+            &[],
+            Some(CreateBatchRecord {
+                batch_id: "new",
+                results: "[]",
+            }),
+        )
+        .await
+        .expect("record only");
+        assert_eq!(
+            db.load_create_batch_results("old").await.expect("read"),
+            None
+        );
+        assert!(
+            db.load_create_batch_results("fresh")
+                .await
+                .expect("read")
+                .is_some()
+        );
+        assert!(
+            db.load_create_batch_results("new")
+                .await
+                .expect("read")
+                .is_some()
+        );
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_connections_use_synchronous_normal() {
+        let (db, dir) = open_test_db().await;
+        let level: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read pragma");
+        assert_eq!(level, 1, "NORMAL = 1");
         close_test_db(&db, dir).await;
     }
 

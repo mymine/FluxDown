@@ -243,6 +243,7 @@ struct MenuIds {
     pause: MenuId,
     resume: MenuId,
     cancel_shutdown: MenuId,
+    restart: MenuId,
     quit: MenuId,
 }
 
@@ -258,6 +259,8 @@ impl MenuIds {
             Some(TrayAction::ResumeAll)
         } else if *id == self.cancel_shutdown {
             Some(TrayAction::CancelShutdown)
+        } else if *id == self.restart {
+            Some(TrayAction::Restart)
         } else if *id == self.quit {
             Some(TrayAction::Quit)
         } else {
@@ -275,6 +278,7 @@ struct TrayUi {
     resume: MenuItem,
     cancel_shutdown: MenuItem,
     cancel_inserted: bool,
+    restart: MenuItem,
     quit: MenuItem,
     applied: Option<TrayModel>,
     #[cfg(windows)]
@@ -307,6 +311,7 @@ impl TrayUi {
             pause: ui.pause.id().clone(),
             resume: ui.resume.id().clone(),
             cancel_shutdown: ui.cancel_shutdown.id().clone(),
+            restart: ui.restart.id().clone(),
             quit: ui.quit.id().clone(),
         };
         let menu_actions = actions.clone();
@@ -338,6 +343,7 @@ impl TrayUi {
         let pause = MenuItem::new("Pause All", true, None);
         let resume = MenuItem::new("Resume All", true, None);
         let cancel_shutdown = MenuItem::new("Cancel Shutdown", true, None);
+        let restart = MenuItem::new("Restart", true, None);
         let quit = MenuItem::new("Exit", true, None);
         let menu = Menu::with_items(&[
             &show,
@@ -346,6 +352,7 @@ impl TrayUi {
             &resume,
             &PredefinedMenuItem::separator(),
             &settings,
+            &restart,
             &quit,
         ])
         .map_err(|error| error.to_string())?;
@@ -378,6 +385,7 @@ impl TrayUi {
             resume,
             cancel_shutdown,
             cancel_inserted: false,
+            restart,
             quit,
             applied: None,
             #[cfg(windows)]
@@ -393,6 +401,7 @@ impl TrayUi {
         self.settings.set_text(&model.settings);
         self.pause.set_text(&model.pause_all);
         self.resume.set_text(&model.resume_all);
+        self.restart.set_text(&model.restart);
         self.quit.set_text(&model.quit);
         match (&model.cancel_shutdown, self.cancel_inserted) {
             (Some(label), inserted) => {

@@ -354,6 +354,11 @@ fn on_event(event: &ServiceEvent, cx: &mut App) {
         AgentEvent::Daemon(DaemonEvent::TaskChanged(task)) => {
             record_status(&task.task_id, task.status, cx)
         }
+        AgentEvent::Daemon(DaemonEvent::TasksChanged(tasks)) => {
+            for task in tasks {
+                record_status(&task.task_id, task.status, cx);
+            }
+        }
         AgentEvent::Daemon(DaemonEvent::Engine(WsServerMsg::TaskProgress {
             task_id,
             status,
@@ -374,6 +379,20 @@ fn on_event(event: &ServiceEvent, cx: &mut App) {
                 restart.deleted();
                 if !restart.replaces_task {
                     state.restarting.remove(task_id);
+                }
+            }
+            sync_keep_alive(cx);
+        }
+        AgentEvent::Daemon(DaemonEvent::TasksDeleted { task_ids }) => {
+            let state = cx.global_mut::<ProgressWindows>();
+            for task_id in task_ids {
+                state.statuses.remove(task_id);
+                state.tracker.forget(task_id);
+                if let Some(restart) = state.restarting.get_mut(task_id) {
+                    restart.deleted();
+                    if !restart.replaces_task {
+                        state.restarting.remove(task_id);
+                    }
                 }
             }
             sync_keep_alive(cx);

@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
@@ -63,6 +64,7 @@ import com.fluxdown.app.nav.AppNavigator
 import com.fluxdown.app.nav.LocalNavigator
 import com.fluxdown.app.nav.SheetRoute
 import com.fluxdown.app.shell.LocalAppContainer
+import com.fluxdown.app.feature.newtask.ImportProgressBanner
 import com.fluxdown.app.ui.fileCategory
 import com.fluxdown.app.ui.label
 import com.fluxdown.core.format.Format
@@ -288,6 +290,7 @@ private fun DownloadsListBody(
     filtersHeightPx: () -> Int,
 ) {
     val view = LocalDownloadsView.current
+    val imports = LocalAppContainer.current.imports
     val nav = LocalNavigator.current
     val swipe = LocalSwipeRevealCoordinator.current
     val density = LocalDensity.current
@@ -353,6 +356,12 @@ private fun DownloadsListBody(
                     modifier = Modifier.padding(start = margin, end = margin, bottom = 14.dp),
                 )
             }
+        }
+
+        // 进行中的批量导入（多于一块才有进度）：跨「新建下载」Sheet 的关闭存活，每个导入各自可取消
+        val importRuns = imports.runs.filter { it.showsProgress }
+        items(importRuns, key = { "import-${it.id}" }, contentType = { ContentType.Banner }) { run ->
+            ImportProgressBanner(run, Modifier.padding(start = margin, end = margin, bottom = 14.dp))
         }
 
         if (!expanded) {

@@ -465,30 +465,40 @@ impl DownloadView {
             .into_any_element()
     }
 
-    /// 状态栏里的小图标按钮（全部暂停 / 全部开始）。
+    /// 状态栏里的小图标按钮（全部暂停 / 全部开始）；`blocker` 为不可用原因：有值时置灰
+    /// 禁用，tooltip 改为说明原因（tooltip 挂在外层，禁用时仍可悬停）。
     fn render_status_action(
         &self,
         id: &'static str,
         label: SharedString,
         icon: FluxIcon,
         command: ToolbarCommand,
+        blocker: Option<SharedString>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = active_theme(cx);
         let icon_size = theme.extended().icon.sm;
         let control_size = theme.density().status_control;
-        let tooltip_label = label.clone();
+        let disabled = blocker.is_some();
+        let tooltip_label = blocker.unwrap_or_else(|| label.clone());
+        // 禁用的按钮不派发点击（`toolbar_action_button` 经 `Button::disabled`）。
+        let button = toolbar_action_button(
+            id,
+            label,
+            Icon::new(icon).size(icon_size),
+            false,
+            disabled,
+            cx,
+        )
+        .size(control_size)
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.execute_toolbar(command, cx);
+        }));
         div()
             .id(SharedString::from(format!("{id}-tooltip")))
             .flex_none()
             .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
-            .child(
-                toolbar_action_button(id, label, Icon::new(icon).size(icon_size), false, false, cx)
-                    .size(control_size)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.execute_toolbar(command, cx);
-                    })),
-            )
+            .child(button)
     }
 
     /// 状态栏：左 = 全局速度 + 全部暂停 / 全部开始；右 = 限速、代理、完成后关机、剩余空间。
@@ -519,6 +529,7 @@ impl DownloadView {
             self.strings.pause_all.clone(),
             FluxIcon::Pause,
             ToolbarCommand::PauseAll,
+            self.pause_all_blocker(),
             cx,
         );
         let resume_all = self.render_status_action(
@@ -526,6 +537,7 @@ impl DownloadView {
             self.strings.resume_all.clone(),
             FluxIcon::Play,
             ToolbarCommand::ResumeAll,
+            self.resume_all_blocker(),
             cx,
         );
         let download_limit = self.render_speed_limit_control(

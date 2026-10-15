@@ -12,6 +12,7 @@ import com.fluxdown.app.data.DeviceSettings
 import com.fluxdown.app.data.HostRepo
 import com.fluxdown.app.data.SecretBox
 import com.fluxdown.app.data.ViewPrefsRepo
+import com.fluxdown.app.feature.newtask.ImportCenter
 import com.fluxdown.app.service.LocalActivity
 import com.fluxdown.bridge.FluxBridge
 import com.fluxdown.core.host.CreateTaskRequest
@@ -19,6 +20,10 @@ import com.fluxdown.core.host.HostErrorCode
 import com.fluxdown.core.host.HostException
 import com.fluxdown.core.host.HostSession
 import com.fluxdown.core.host.HostSignal
+import com.fluxdown.core.host.ImportBatch
+import com.fluxdown.core.host.ImportJob
+import com.fluxdown.core.host.ImportSummary
+import com.fluxdown.core.host.ImportUpdate
 import com.fluxdown.core.model.HostRef
 import com.fluxdown.core.model.SelectionOutcome
 import com.fluxdown.core.store.HostState
@@ -90,6 +95,9 @@ class AppContainer(context: Context) {
 
     val appearance = AppearanceRepo(context.prefs)
     val viewPrefs = ViewPrefsRepo(context.prefs)
+
+    /** 批量导入（进程级：关闭「新建下载」Sheet 后仍继续，进度显示在下载页）。 */
+    val imports = ImportCenter(appScope)
     val store = HostStore(storeScope)
 
     /** 应用自更新（惰性创建：首次用到才加载更新器；与当前主机无关）。 */
@@ -378,6 +386,18 @@ private class UnavailableSession(private val error: HostException) : HostSession
     override suspend fun rename(taskId: String, fileName: String): Unit = throw error
     override suspend fun changeUrl(taskId: String, url: String): Unit = throw error
     override suspend fun rescan(): Unit = throw error
+
+    override fun startImport(batches: List<ImportBatch>): ImportJob {
+        val total = batches.sumOf { it.items.size }
+        return object : ImportJob {
+            // 没有连接：整批失败（原因即会话不可用的原因），不产生进度；条目全部留给重试。
+            override val updates: Flow<ImportUpdate> =
+                flowOf(ImportUpdate.Finished(ImportSummary(total, 0, total, 0, false, error, batches.flatMap { it.items })))
+
+            override fun cancel() = Unit
+        }
+    }
+
     override suspend fun moveToQueue(taskId: String, queueId: String): Unit = throw error
     override suspend fun boost(taskId: String): Unit = throw error
     override suspend fun resolveSelection(requestId: String, outcome: SelectionOutcome): Unit = throw error

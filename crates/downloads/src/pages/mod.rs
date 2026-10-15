@@ -7,3 +7,4 @@ pub mod progress_window;
 pub mod queue_manager;
 pub mod selection;
 pub mod task_detail;
+pub(crate) mod task_edit;

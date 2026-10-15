@@ -22,6 +22,8 @@ object HostMethod {
     const val daemonTaskRename = "daemon.task.rename"
     /** 更换任务下载源地址（`{taskId, url}`，语义同旧 `PUT /api/v1/tasks/{id}/url`）。 */
     const val daemonTaskChangeUrl = "daemon.task.changeUrl"
+    /** 修改任务线程数（`SetTaskSegmentsParams`），已下进度保留；完成或不存在的任务返回 `not-found`。 */
+    const val daemonTaskSetSegments = "daemon.task.setSegments"
     const val daemonTaskDelete = "daemon.task.delete"
     const val daemonTaskPauseAll = "daemon.task.pauseAll"
     const val daemonTaskResumeAll = "daemon.task.resumeAll"
@@ -32,6 +34,8 @@ object HostMethod {
     const val daemonTaskResumeMany = "daemon.task.resumeMany"
     /** 批量删除（`{taskIds, deleteFiles}`）：语义同批量暂停。 */
     const val daemonTaskDeleteMany = "daemon.task.deleteMany"
+    /** 批量建任务（`DaemonCreateTasksParams`）：整块一个事务、一次 `tasksChanged` 事件，按 `batchId` 幂等。 */
+    const val daemonTaskCreateMany = "daemon.task.createMany"
     const val daemonQueueList = "daemon.queue.list"
     const val daemonQueueCreate = "daemon.queue.create"
     const val daemonQueueUpdate = "daemon.queue.update"

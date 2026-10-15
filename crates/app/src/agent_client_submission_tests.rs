@@ -11,7 +11,7 @@ use super::{
 };
 use crate::downloads_port::AgentDownloadsPort;
 use fluxdown_ui_downloads::{
-    DownloadsCommand, DownloadsPort, NewDownloadSubmission, run_submission,
+    DownloadsCommand, DownloadsPort, NewDownloadSubmission, SubmissionHooks, run_submission,
 };
 use serde_json::{Value, json};
 
@@ -99,21 +99,19 @@ fn rpc_import_pause_failure_disconnect_and_resume_preserve_unsent_order() {
                 assert!(result.is_err(), "peer deliberately disconnects");
                 (command_rx, transport)
             });
-            let tasks = ["one", "uncertain", "three"]
-                .map(|name| {
-                    serde_json::from_value(json!({"url": format!("https://example.test/{name}")}))
-                        .expect("create request")
-                })
-                .into_iter()
-                .collect();
+            // Non-idempotent creates: an uncertain one is never retried and suspends the rest.
             let submit_port = port.clone();
-            let submission = tokio::spawn(run_submission(
-                NewDownloadSubmission::Tasks {
-                    tasks,
-                    captures: Vec::new(),
-                },
-                move |command| submit_port.execute(command),
-            ));
+            let submission = tokio::spawn(async move {
+                let mut created = Vec::new();
+                let mut failed = false;
+                for name in ["one", "uncertain", "three"] {
+                    match submit_port.execute(create_command(name)).await {
+                        Ok(result) => created.extend(result.created_task_ids()),
+                        Err(_) => failed = true,
+                    }
+                }
+                (created, failed)
+            });
             let first = request(&mut peer, method::DAEMON_TASK_CREATE).await;
             assert_eq!(
                 first["params"]["request"]["url"],
@@ -182,13 +180,9 @@ fn rpc_import_pause_failure_disconnect_and_resume_preserve_unsent_order() {
                 "https://example.test/three"
             );
             reply(&mut peer, &last, json!({"taskId": "three"})).await;
-            for _ in 0..2 {
-                let preference = request(&mut peer, method::AGENT_PREFERENCES_PATCH).await;
-                reply(&mut peer, &preference, json!({"ok": true})).await;
-            }
-            let report = submission.await.expect("submission completes");
-            assert!(report.failed());
-            assert_eq!(report.created_task_ids(), ["one", "three"]);
+            let (created, failed) = submission.await.expect("submission completes");
+            assert!(failed);
+            assert_eq!(created, ["one", "three"]);
             second_connection.abort();
             match second_connection.await {
                 Err(error) => assert!(error.is_cancelled()),
@@ -457,5 +451,168 @@ fn overlapping_resume_success_then_failure_keeps_successful_resume() {
         })
         .await
         .expect("overlapping resume test deadline");
+    });
+}
+
+fn many_params(count: usize, batch_id: &str) -> Box<fluxdown_protocol::DaemonCreateTasksParams> {
+    Box::new(fluxdown_protocol::DaemonCreateTasksParams {
+        batch_id: batch_id.to_owned(),
+        common: serde_json::from_value(json!({"url": ""})).expect("common request"),
+        items: (0..count)
+            .map(|index| fluxdown_protocol::CreateTaskItem {
+                url: format!("https://example.test/{index}"),
+                ..Default::default()
+            })
+            .collect(),
+    })
+}
+
+fn many_reply(count: usize) -> Value {
+    json!({
+        "results": (0..count)
+            .map(|index| json!({"taskId": format!("t{index}")}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+#[test]
+fn create_many_resends_same_batch_after_disconnect_without_pausing_the_gate() {
+    let runtime = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (client, mut command_rx) = test_client(&runtime);
+            let port = Arc::new(AgentDownloadsPort::new(client.clone()));
+            let (events, _event_rx) = mpsc::channel(1024);
+            client.submissions.set_ready(true);
+            let (socket, mut peer) = connected_pair().await;
+            let mut transport = SubmissionTransport::new(client.submissions.clone());
+            let first_events = events.clone();
+            let first_connection = tokio::spawn(async move {
+                let result = run_connected(
+                    socket,
+                    &mut command_rx,
+                    &first_events,
+                    ("first".to_owned(), 0),
+                    Vec::new(),
+                    PreferenceWrites::new(0),
+                    &mut transport,
+                )
+                .await;
+                assert!(result.is_err(), "peer deliberately disconnects");
+                (command_rx, transport)
+            });
+            let submit_port = port.clone();
+            let submission = tokio::spawn(run_submission(
+                NewDownloadSubmission::Tasks {
+                    common: Box::new(
+                        serde_json::from_value(json!({"url": ""})).expect("common request"),
+                    ),
+                    items: (0..257)
+                        .map(|index| fluxdown_protocol::CreateTaskItem {
+                            url: format!("https://example.test/{index}"),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    captures: Vec::new(),
+                },
+                move |command| submit_port.execute(command),
+                SubmissionHooks::new(|_| tokio::time::sleep(Duration::from_millis(1))),
+            ));
+            let first = request(&mut peer, method::DAEMON_TASK_CREATE_MANY).await;
+            let batch_id = first["params"]["batchId"].clone();
+            assert_eq!(first["params"]["items"].as_array().map(Vec::len), Some(256));
+            // The server may have committed this chunk; the answer never arrives.
+            drop(peer);
+            let (mut command_rx, mut transport) = first_connection.await.expect("first connection");
+            client.submissions.set_ready(false);
+            // Idempotent chunks are resent by the caller: no pause, no interruption notice.
+            assert!(client.submissions.interruption.borrow().is_none());
+            let (socket, mut peer) = connected_pair().await;
+            let second_connection = tokio::spawn(async move {
+                run_connected(
+                    socket,
+                    &mut command_rx,
+                    &events,
+                    ("second".to_owned(), 0),
+                    Vec::new(),
+                    PreferenceWrites::new(0),
+                    &mut transport,
+                )
+                .await
+            });
+            client.submissions.set_ready(true);
+            let resend = request(&mut peer, method::DAEMON_TASK_CREATE_MANY).await;
+            assert_eq!(resend["params"]["batchId"], batch_id);
+            assert_eq!(
+                resend["params"]["items"].as_array().map(Vec::len),
+                Some(256)
+            );
+            reply(&mut peer, &resend, many_reply(256)).await;
+            let last = request(&mut peer, method::DAEMON_TASK_CREATE_MANY).await;
+            assert_ne!(last["params"]["batchId"], batch_id);
+            assert_eq!(last["params"]["items"].as_array().map(Vec::len), Some(1));
+            reply(&mut peer, &last, many_reply(1)).await;
+            for _ in 0..2 {
+                let preference = request(&mut peer, method::AGENT_PREFERENCES_PATCH).await;
+                reply(&mut peer, &preference, json!({"ok": true})).await;
+            }
+            let report = submission.await.expect("submission completes");
+            assert!(!report.failed() && !report.cancelled());
+            assert_eq!(report.created_task_ids().len(), 257);
+            assert!(client.submissions.interruption.borrow().is_none());
+            second_connection.abort();
+            match second_connection.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("connection should be cancelled"),
+            }
+        })
+        .await
+        .expect("createMany resend test deadline");
+    });
+}
+
+#[test]
+fn cancelled_unsent_create_many_is_skipped_by_the_transport() {
+    let runtime = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (client, mut command_rx) = test_client(&runtime);
+            let port = AgentDownloadsPort::new(client.clone());
+            let (events, _event_rx) = mpsc::channel(1024);
+            // Queued while the gate is closed, then abandoned by the caller.
+            let mut cancelled = port.execute(DownloadsCommand::CreateMany(many_params(3, "gone")));
+            assert!(futures_util::poll!(&mut cancelled).is_pending());
+            drop(cancelled);
+            let (socket, mut peer) = connected_pair().await;
+            let mut transport = SubmissionTransport::new(client.submissions.clone());
+            let connection = tokio::spawn(async move {
+                run_connected(
+                    socket,
+                    &mut command_rx,
+                    &events,
+                    ("cancelled".to_owned(), 0),
+                    Vec::new(),
+                    PreferenceWrites::new(0),
+                    &mut transport,
+                )
+                .await
+            });
+            let mut kept = port.execute(DownloadsCommand::CreateMany(many_params(2, "kept")));
+            assert!(futures_util::poll!(&mut kept).is_pending());
+            client.submissions.set_ready(true);
+            // The abandoned chunk is dropped unsent; the next request on the wire is the live one.
+            let live = request(&mut peer, method::DAEMON_TASK_CREATE_MANY).await;
+            assert_eq!(live["params"]["batchId"], "kept");
+            reply(&mut peer, &live, many_reply(2)).await;
+            assert!(kept.await.is_ok());
+            assert_no_request(&mut peer).await;
+            connection.abort();
+            match connection.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("connection should be cancelled"),
+            }
+        })
+        .await
+        .expect("cancelled createMany test deadline");
     });
 }

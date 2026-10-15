@@ -7,6 +7,7 @@ pub mod actions;
 mod batch;
 mod components;
 mod controller;
+mod deletion;
 mod model;
 mod pages;
 mod strings;

@@ -4,7 +4,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.webkit.MimeTypeMap
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -245,14 +244,20 @@ class TaskActions(
             return
         }
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
-        val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
-        val view = Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime)
+        val mime = mimeForFile(file.name)
+        fun view(type: String) = Intent(Intent.ACTION_VIEW).setDataAndType(uri, type)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         try {
-            context.startActivity(view)
+            context.startActivity(view(mime))
         } catch (e: android.content.ActivityNotFoundException) {
             android.util.Log.i("FluxDown", "no viewer for $mime: ${e.message}")
-            overlays.toast(s(R.string.mobileNoAppToOpen), FluxToastKind.Warn)
+            // 指定类型无人处理时退回 */*，保持此前能打开的文件仍可打开
+            try {
+                if (mime == "*/*") throw e
+                context.startActivity(view("*/*"))
+            } catch (e2: android.content.ActivityNotFoundException) {
+                overlays.toast(s(R.string.mobileNoAppToOpen), FluxToastKind.Warn)
+            }
         }
     }
 

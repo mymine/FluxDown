@@ -4,7 +4,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use fluxdown_protocol::{CreateTaskRequest, MAX_TASK_SEGMENTS};
+use fluxdown_protocol::{CreateTaskItem, CreateTaskRequest, MAX_TASK_SEGMENTS};
+
+use super::aria2c::{RequestHints, join_continuations, parse_command};
 
 /// 一条解析出的下载条目（aria2 风格：URL + 可选 `out=` / `checksum=` 选项行）。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -84,8 +86,27 @@ fn url_file_segment(url: &str) -> Option<&str> {
 /// - 其余行：`loose` 为 true 时取行内首个 `http(s)/ftp/thunder` 链接并去掉尾部标点
 ///   （TXT 导入），否则要求链接位于行首（手动输入）。`thunder://` 原样保留，由引擎
 ///   建任务时解出真实地址（#696）。
+/// - 行首为 `aria2c` 的命令（可带路径 / 引号，续行已合并）提取其中的链接与 `-o` /
+///   `--checksum`（#299，见 [`crate::model::aria2c`]）；不是 aria2c 的行不受影响。
 pub(crate) fn parse_entries(text: &str, loose: bool) -> Vec<UrlEntry> {
+    parse_input(text, loose).entries
+}
+
+/// [`parse_entries`] 的完整结果：条目 + 首条 aria2c 命令带出的请求信息。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ParsedInput {
+    pub(crate) entries: Vec<UrlEntry>,
+    /// 第一条产出了条目的 aria2c 命令的头部信息（其余命令的不采用）；没有时为空。
+    pub(crate) hints: RequestHints,
+}
+
+/// 解析规则见 [`parse_entries`]。行首为 `aria2c` 的命令（先合并其续行）按 shell 规则切词，
+/// 提取链接 / `-o` / `--checksum`（#299，详见 [`crate::model::aria2c`]），头部信息随结果
+/// 返回；其余行的行为不变。
+pub(crate) fn parse_input(text: &str, loose: bool) -> ParsedInput {
+    let text = join_continuations(text);
     let mut entries = Vec::new();
+    let mut hints: Option<RequestHints> = None;
     let mut current: Option<UrlEntry> = None;
     for line in text.split('\n') {
         if line.starts_with(' ') || line.starts_with('\t') {
@@ -107,6 +128,15 @@ pub(crate) fn parse_entries(text: &str, loose: bool) -> Vec<UrlEntry> {
         if let Some(entry) = current.take() {
             entries.push(entry);
         }
+        if let Some(command) = parse_command(trimmed) {
+            let mut produced = command.entries;
+            if !produced.is_empty() && hints.is_none() {
+                hints = Some(command.hints);
+            }
+            current = produced.pop();
+            entries.extend(produced);
+            continue;
+        }
         let lower = trimmed.to_ascii_lowercase();
         if let Some(index) = lower.find("magnet:?") {
             current = Some(UrlEntry::with_url(&trimmed[index..]));
@@ -126,7 +156,10 @@ pub(crate) fn parse_entries(text: &str, loose: bool) -> Vec<UrlEntry> {
     if let Some(entry) = current {
         entries.push(entry);
     }
-    entries
+    ParsedInput {
+        entries,
+        hints: hints.unwrap_or_default(),
+    }
 }
 
 /// `^(https?|ftp|thunder)://\S+`（忽略大小写）。
@@ -162,7 +195,7 @@ fn leading_manual_url(text: &str) -> Option<&str> {
 
 /// 是否以可建任务的链接开头（`http(s)://` / `ftp://` / `thunder://` / `magnet:?` /
 /// `ed2k://`，忽略大小写）。
-fn starts_with_link(text: &str) -> bool {
+pub(super) fn starts_with_link(text: &str) -> bool {
     [
         "https://",
         "http://",
@@ -203,27 +236,8 @@ pub(crate) fn entry_to_text(entry: &UrlEntry) -> String {
     text
 }
 
-/// 把导入条目追加到现有文本：按 URL 去重（保留已有条目），返回新的文本框内容。
-pub(crate) fn merge_imported(existing_text: &str, imported: Vec<UrlEntry>) -> String {
-    let mut merged = parse_entries(existing_text, false);
-    let mut seen = merged
-        .iter()
-        .map(|entry| entry.url.clone())
-        .collect::<HashSet<_>>();
-    merged.extend(
-        imported
-            .into_iter()
-            .filter(|entry| seen.insert(entry.url.clone())),
-    );
-    merged
-        .iter()
-        .map(entry_to_text)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// 把条目追加到现有文本末尾：原文逐字保留（含注释 / 尚未输完的行），已存在的 URL
-/// 跳过。用于外部捕获陆续进入正在编辑的表单。
+/// 把条目追加到现有文本末尾：原文逐字保留（含注释 / 尚未输完的行 / aria2c 命令），已存在
+/// 的 URL 跳过。用于外部捕获与 TXT 导入陆续进入正在编辑的表单。
 pub(crate) fn append_entries(
     existing_text: &str,
     entries: impl IntoIterator<Item = UrlEntry>,
@@ -445,60 +459,99 @@ pub(crate) struct DraftOptions {
     pub(crate) save_site_auth: bool,
 }
 
-/// 每条条目一个 [`CreateTaskRequest`]，共享字段来自 [`DraftOptions`]。
+/// 一次提交的建任务请求：整批共享的 `common`（`url` / `fileName` / `checksum` 为空）+
+/// 逐条链接。共享选项只存一份，不随条目复制。
+#[derive(Clone, Debug)]
+pub(crate) struct BuiltRequests {
+    pub(crate) common: CreateTaskRequest,
+    pub(crate) items: Vec<CreateTaskItem>,
+}
+
+impl BuiltRequests {
+    /// 条目还原成完整的单条请求（单条预解析 / 外部捕获确认需要完整请求）。
+    pub(crate) fn request_for(&self, item: &CreateTaskItem) -> CreateTaskRequest {
+        compose_request(&self.common, item.clone())
+    }
+
+    /// 把一条完整请求拆回「共享选项 + 单条」（预解析后沿普通任务路径提交）。
+    pub(crate) fn from_single(mut request: CreateTaskRequest) -> Self {
+        let item = CreateTaskItem {
+            url: std::mem::take(&mut request.url),
+            file_name: std::mem::take(&mut request.file_name),
+            checksum: std::mem::take(&mut request.checksum),
+        };
+        Self {
+            common: request,
+            items: vec![item],
+        }
+    }
+}
+
+/// 共享选项 + 一条链接 → 完整请求。
+pub(crate) fn compose_request(
+    common: &CreateTaskRequest,
+    item: CreateTaskItem,
+) -> CreateTaskRequest {
+    let mut request = common.clone();
+    request.url = item.url;
+    request.file_name = item.file_name;
+    request.checksum = item.checksum;
+    request
+}
+
+/// 每条条目一个 [`CreateTaskItem`]，共享字段来自 [`DraftOptions`]。
 ///
 /// 单条时重命名优先于 `out=`、高级面板校验值优先于
 /// `checksum=`、附带 HTTP 认证；多条时仅使用条目自带的文件名 / 校验值。
-pub(crate) fn build_requests(
-    entries: &[UrlEntry],
-    options: &DraftOptions,
-) -> Vec<CreateTaskRequest> {
+pub(crate) fn build_requests(entries: &[UrlEntry], options: &DraftOptions) -> BuiltRequests {
     let single = entries.len() == 1;
-    entries
+    let items = entries
         .iter()
-        .map(|entry| {
-            let file_name = if single && !options.rename.is_empty() {
+        .map(|entry| CreateTaskItem {
+            url: entry.url.clone(),
+            file_name: if single && !options.rename.is_empty() {
                 options.rename.clone()
             } else {
                 entry.file_name.clone()
-            };
-            let checksum = if single && !options.checksum.is_empty() {
+            },
+            checksum: if single && !options.checksum.is_empty() {
                 options.checksum.clone()
             } else {
                 entry.checksum.clone()
-            };
-            CreateTaskRequest {
-                url: entry.url.clone(),
-                file_name,
-                save_dir: options.save_dir.clone(),
-                segments: options.segments,
-                cookies: options.cookies.clone(),
-                referrer: String::new(),
-                proxy_url: options.proxy_url.clone(),
-                user_agent: options.user_agent.clone(),
-                queue_id: options.queue_id.clone(),
-                checksum,
-                ignore_tls_errors: options.ignore_tls_errors,
-                headers: (!options.headers.is_empty()).then(|| options.headers.clone()),
-                torrent_b64: None,
-                method: None,
-                body: None,
-                audio_url: None,
-                start_paused: options.start_paused,
-                http_user: if single {
-                    options.http_user.clone()
-                } else {
-                    String::new()
-                },
-                http_password: if single {
-                    options.http_password.clone()
-                } else {
-                    String::new()
-                },
-                save_site_auth: single && options.save_site_auth,
-            }
+            },
         })
-        .collect()
+        .collect();
+    let common = CreateTaskRequest {
+        url: String::new(),
+        file_name: String::new(),
+        save_dir: options.save_dir.clone(),
+        segments: options.segments,
+        cookies: options.cookies.clone(),
+        referrer: String::new(),
+        proxy_url: options.proxy_url.clone(),
+        user_agent: options.user_agent.clone(),
+        queue_id: options.queue_id.clone(),
+        checksum: String::new(),
+        ignore_tls_errors: options.ignore_tls_errors,
+        headers: (!options.headers.is_empty()).then(|| options.headers.clone()),
+        torrent_b64: None,
+        method: None,
+        body: None,
+        audio_url: None,
+        start_paused: options.start_paused,
+        http_user: if single {
+            options.http_user.clone()
+        } else {
+            String::new()
+        },
+        http_password: if single {
+            options.http_password.clone()
+        } else {
+            String::new()
+        },
+        save_site_auth: single && options.save_site_auth,
+    };
+    BuiltRequests { common, items }
 }
 
 #[cfg(test)]
@@ -508,7 +561,7 @@ mod tests {
     use super::{
         DraftOptions, ProxyChoice, ThreadChoice, UrlEntry, append_entries, build_requests,
         capture_entry, checksum_spec, custom_segments, detect_ua_preset, manual_proxy_url,
-        merge_imported, parse_entries,
+        parse_entries, parse_input,
     };
 
     #[test]
@@ -655,8 +708,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_imported_dedupes_by_url_and_keeps_option_lines() {
-        let merged = merge_imported(
+    fn import_appends_by_url_and_keeps_option_lines() {
+        let merged = append_entries(
             "https://a.example/x\n  out=x.bin",
             vec![
                 UrlEntry {
@@ -675,6 +728,32 @@ mod tests {
             merged,
             "https://a.example/x\n  out=x.bin\nhttps://b.example/y\n  checksum=md5=ff"
         );
+    }
+
+    /// TXT 导入不得改写已有文本：aria2c 命令（及其 Cookie 等头部信息）原样保留。
+    #[test]
+    fn import_keeps_existing_aria2c_command_and_its_hints() {
+        let existing = "aria2c -x16 \\\n  --header 'Cookie: sid=abc' \\\n  -o a.zip 'https://a.example/a?t=1&u=2'";
+        let imported = vec![
+            UrlEntry {
+                url: "https://b.example/b.zip".to_owned(),
+                ..UrlEntry::default()
+            },
+            UrlEntry {
+                url: "https://a.example/a?t=1&u=2".to_owned(),
+                ..UrlEntry::default()
+            },
+        ];
+        let text = append_entries(existing, imported);
+        assert_eq!(text, format!("{existing}\nhttps://b.example/b.zip"));
+        let parsed = parse_input(&text, false);
+        assert_eq!(parsed.hints.cookie, "sid=abc");
+        let urls: Vec<_> = parsed.entries.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            ["https://a.example/a?t=1&u=2", "https://b.example/b.zip"]
+        );
+        assert_eq!(parsed.entries[0].file_name, "a.zip");
     }
 
     #[test]
@@ -746,25 +825,33 @@ mod tests {
             checksum: "md5=ff".to_owned(),
         };
         let single = build_requests(std::slice::from_ref(&entry), &options);
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0].file_name, "renamed.bin");
-        assert_eq!(single[0].checksum, "sha-256=deadbeef");
-        assert_eq!(single[0].http_user, "u");
-        assert!(single[0].save_site_auth);
-        assert!(single[0].start_paused);
-        assert_eq!(single[0].queue_id, "later");
+        assert_eq!(single.items.len(), 1);
+        assert_eq!(single.items[0].file_name, "renamed.bin");
+        assert_eq!(single.items[0].checksum, "sha-256=deadbeef");
+        assert_eq!(single.common.http_user, "u");
+        assert!(single.common.save_site_auth);
+        assert!(single.common.start_paused);
+        assert_eq!(single.common.queue_id, "later");
         assert_eq!(
-            single[0].headers.as_ref().and_then(|h| h.get("X-Test")),
+            single.common.headers.as_ref().and_then(|h| h.get("X-Test")),
             Some(&"1".to_owned())
         );
+        // 共享选项里不带逐条字段，条目还原后才是完整请求。
+        assert!(single.common.url.is_empty());
+        assert!(single.common.file_name.is_empty());
+        assert!(single.common.checksum.is_empty());
+        let full = single.request_for(&single.items[0]);
+        assert_eq!(full.url, "https://a.example/x");
+        assert_eq!(full.file_name, "renamed.bin");
+        assert_eq!(full.checksum, "sha-256=deadbeef");
 
         let batch = build_requests(&[entry.clone(), entry], &options);
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch[0].file_name, "out.bin");
-        assert_eq!(batch[0].checksum, "md5=ff");
-        assert_eq!(batch[0].http_user, "");
-        assert!(!batch[0].save_site_auth);
-        assert_eq!(batch[0].segments, 8);
+        assert_eq!(batch.items.len(), 2);
+        assert_eq!(batch.items[0].file_name, "out.bin");
+        assert_eq!(batch.items[0].checksum, "md5=ff");
+        assert_eq!(batch.common.http_user, "");
+        assert!(!batch.common.save_site_auth);
+        assert_eq!(batch.common.segments, 8);
     }
 
     #[test]
@@ -776,6 +863,6 @@ mod tests {
             }],
             &DraftOptions::default(),
         );
-        assert!(requests[0].headers.is_none());
+        assert!(requests.common.headers.is_none());
     }
 }

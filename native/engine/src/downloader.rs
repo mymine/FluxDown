@@ -319,6 +319,9 @@ pub struct ProgressUpdate {
     pub seeding_message: String,
     /// 累计做种秒数（发帧时刻；排队/暂停不计）。仅 BT 做种帧非零。
     pub seeding_time_secs: i64,
+    /// 非空 = 批量删除通知（其余字段无意义）：reporter 清理这些任务的内部状态，
+    /// 并按入队顺序发出一条 `EngineEvent::TasksDeleted`。
+    pub deleted_tasks: Vec<String>,
 }
 
 /// Snapshot of a single segment's progress, sent from downloader to progress_reporter.
@@ -3210,6 +3213,27 @@ async fn run_download_inner(
     // Keep ownership through mode changes, stale-data cleanup, verification and final rename.
     let _temp_file_guard = TempFileGuard::acquire(&temp_path, &p.task_id).await?;
 
+    // 换源结算（见 `Db::settle_source_change`）：`change_task_url` 后首次续传按零容差
+    // 比对新链接大小与旧总大小。不一致 = 换成了另一个文件——旧前缀若沿用会与新文件
+    // 尾部静默拼接（CDN 漂移容差恰好覆盖「新版本只大几百 KB」），故清空分段并删掉
+    // 旧临时文件，从头下载新文件。大小一致（如 CDN 签名过期换新链接）照常续传。
+    let source_replaced = p.is_resume
+        && p.db
+            .settle_source_change(&p.task_id, info.total_bytes)
+            .await?;
+    if source_replaced {
+        log_info!(
+            "[download] task {} 换源后大小与原文件不一致（新={}），丢弃已下进度从头下载",
+            p.task_id,
+            info.total_bytes
+        );
+        match tokio::fs::remove_file(&temp_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+
     // For resume tasks we must NOT blindly overwrite total_bytes with the
     // freshly-probed value.  CDN servers frequently return a slightly different
     // Content-Length on each request (transfer-encoding overhead, dynamic header
@@ -3317,7 +3341,11 @@ async fn run_download_inner(
     // Immediately notify the host: status=1 with resolved file name & total size.
     // For resume tasks, send persisted downloaded bytes as baseline so speed
     // smoothing doesn't treat resumed bytes as a fresh in-interval delta.
-    let initial_downloaded = resume_downloaded;
+    let initial_downloaded = if source_replaced {
+        0
+    } else {
+        resume_downloaded
+    };
     if p.progress_tx
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
@@ -4929,7 +4957,7 @@ async fn download_multi_segment(
     //   • db_total >  probe_total  → file genuinely shrank, rebuild segments
 
     // Delegate to the IDM-style dynamic segment coordinator.
-    crate::segment_coordinator::run_coordinated_download(
+    let outcome = crate::segment_coordinator::run_coordinated_download(
         task_id,
         url,
         dest,
@@ -4951,7 +4979,18 @@ async fn download_multi_segment(
         auto_proxy,
         multi_nic,
     )
-    .await
+    .await;
+    // 暂停终态帧在 TaskDone 后读 tasks.downloaded_bytes：退出前按已落库分段对齐，
+    // 否则显示上一个周期写入的旧值（开头几秒内暂停即为 0%）。只在活跃下载器被
+    // 取消时执行一次（并发上限内），排队 / 已暂停任务不经过此处。
+    if matches!(outcome, Err(DownloadError::Cancelled))
+        && let Err(error) = db
+            .sync_task_progress_from_segments(task_id, spawn_gen)
+            .await
+    {
+        crate::logger::report_warning("http-download", "sync paused progress", &error);
+    }
+    outcome
 }
 
 // ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ import { isDynamicSortKey } from './model/rowOrder'
 import { buildLocalView, buildRemoteView, isLocalKey, sourceSite, STATE_RANK } from './model/task'
 import type { DownloadTaskView, RowKey } from './model/task'
 import { useStableRowOrder } from './model/useStableRowOrder'
+import { queueLabelById } from './dialogs/utils'
 import { compareViews, dateBucketOf, DATE_BUCKET_ORDER, matchesQuery, parseViewPrefs, VIEW_PREFS_KEY } from './model/viewPrefs'
 import type { ViewPrefs } from './model/viewPrefs'
 
@@ -111,12 +112,16 @@ export interface DownloadsContextValue {
   selected: ReadonlySet<RowKey>
   selectedViews: readonly DownloadTaskView[]
   summary: SelectionSummary
-  /** 显式多选模式：仅 Ctrl/Cmd+点击或全选进入，普通单击 / 清空选择退出（与 GPUI `multi_select` 对齐）。 */
+  /** 显式多选模式：Ctrl/Cmd+点击、行首复选框、右键「选择 / 全选」或全选进入，普通单击 / 清空选择退出（与 GPUI `multi_select` 对齐）。 */
   multiSelect: boolean
   /** 点击行：shift 连选，ctrl/cmd 切换，否则单选。 */
   clickSelect: (key: RowKey, modifiers: ClickModifiers) => void
   /** 只切换该行选中状态（复选框 / 移动端点选）。 */
   toggleSelected: (key: RowKey) => void
+  /** 桌面表格行首复选框（与 GPUI `toggle_multi_select` 对齐）：未处于多选模式时以该行开启多选，否则切换该行。 */
+  toggleMultiSelect: (key: RowKey) => void
+  /** 右键「选择」：保留当前选区并进入显式多选模式。 */
+  enterMultiSelect: () => void
   /** 右键 / 长按：未选中则单选它，已选中保持当前选区。 */
   contextSelect: (key: RowKey) => void
   selectAll: () => void
@@ -358,8 +363,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   const views = useMemo(() => [...localViews, ...remoteViews], [localViews, remoteViews])
   const byKey = useMemo(() => new Map(views.map((view) => [view.key, view])), [views])
 
-  const queueNames = useMemo(() => new Map(queues.map((queue) => [queue.queueId, queue.name])), [queues])
-  const queueName = useCallback((queueId: string) => queueNames.get(queueId) ?? queueId, [queueNames])
+  const queueName = useCallback((queueId: string) => queueLabelById(t, queues, queueId), [t, queues])
   const groupNames = useMemo(() => new Map(groups.map((group) => [group.groupId, group.name])), [groups])
 
   const groupSummaries = useMemo<GroupSummary[]>(() => {
@@ -470,7 +474,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
           const index = queues.findIndex((queue) => queue.queueId === view.queueId)
           return {
             key: `queue:${view.queueId}`,
-            label: queues[index]?.name ?? view.queueId,
+            label: queueLabelById(t, queues, view.queueId),
             order: index >= 0 ? index : Number.MAX_SAFE_INTEGER - 1,
           }
         }
@@ -595,6 +599,22 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
 
   const multiSelect = multiSelectMode && selected.size > 0
 
+  const toggleMultiSelect = useCallback(
+    (key: RowKey) => {
+      setSelected((current) => {
+        if (!multiSelect) return new Set([key])
+        const next = new Set(current)
+        if (!next.delete(key)) next.add(key)
+        return next
+      })
+      setMultiSelectMode(true)
+      anchor.current = key
+    },
+    [multiSelect],
+  )
+
+  const enterMultiSelect = useCallback(() => setMultiSelectMode(true), [])
+
   const toggleGroupCollapsed = useCallback(
     (groupKey: string) =>
       updatePrefs((current) => ({
@@ -684,6 +704,8 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       multiSelect,
       clickSelect,
       toggleSelected,
+      toggleMultiSelect,
+      enterMultiSelect,
       contextSelect,
       selectAll,
       clearSelection,
@@ -721,6 +743,8 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       multiSelect,
       clickSelect,
       toggleSelected,
+      toggleMultiSelect,
+      enterMultiSelect,
       contextSelect,
       selectAll,
       clearSelection,

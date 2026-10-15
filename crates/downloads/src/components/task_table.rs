@@ -33,6 +33,7 @@ use crate::{
         conflict_badge::conflict_badge, file_icon::task_file_icon, task_drag::DraggedTasks,
     },
     controller::DownloadsCommand,
+    deletion::{MIN_BATCH_DELETE, split_local_deletes},
     model::{
         CategoryIndex, DownloadFilter, DownloadTaskView, RowId, RowKey, SidebarSelection,
         TaskProtocol, TaskSource, TaskState, TaskStore,
@@ -72,6 +73,8 @@ const PROGRESS_LABEL_WIDTH: f32 = 32.;
 const PROGRESS_GAP: f32 = 8.;
 /// 暂停态进度条：`statusPaused` 的 40%。
 const PAUSED_BAR_ALPHA: f32 = 0.4;
+/// 正在删除（已提交、尚未从列表消失）的行的不透明度。
+const PENDING_DELETE_OPACITY: f32 = 0.4;
 /// 行悬停操作按钮边长。
 const ROW_ACTION_SIZE: f32 = 24.;
 /// 舒适密度下文件图标相对 `icon.lg`（16）的倍数：24px，与双行文字块（约 34px）协调。
@@ -84,6 +87,8 @@ const SELECTED_INSET_X: f32 = 4.;
 const ROW_GROUP: &str = "download-task-row";
 /// 表头全选格 group 名：悬停该格时显示全选框。
 const SELECT_ALL_GROUP: &str = "download-select-all";
+/// 任务行首图标格 group 名：只在悬停该格本身时把文件图标换成复选框。
+const SELECT_CELL_GROUP: &str = "download-task-select-cell";
 /// 超过一天的剩余时间估算不可信，不显示。
 const MAX_ETA_SECS: u64 = 86_400;
 /// 表头按下与抬起的位移超过它视为拖动列（不触发排序）。
@@ -367,6 +372,10 @@ pub(crate) struct TaskMenuFacts {
     pub(crate) boosted: bool,
     /// `url` 是否为 BT 哨兵值 `torrent-file://…`（不可重新下载）。
     pub(crate) is_torrent_sentinel: bool,
+    /// BT 任务（`magnet:` 链接或 `torrent-file://` 哨兵）：不支持更换链接 / 修改线程数。
+    pub(crate) is_bt: bool,
+    /// `url` 是 http(s) / ftp 链接（引擎 `change_task_url` 仅接受这些源）。
+    pub(crate) url_replaceable: bool,
     /// 失败态且错误消息带插件重试前缀。
     pub(crate) is_plugin_retry_error: bool,
     /// 已完成但产物已不在下载目录（文件跟踪扫描结果）。
@@ -375,6 +384,59 @@ pub(crate) struct TaskMenuFacts {
 
 /// 引擎/daemon 插件系统失败任务的错误消息前缀。
 pub(crate) const PLUGIN_ERROR_PREFIX: &str = "[插件]";
+
+/// `url` 以任一 scheme 前缀开头（ASCII 大小写不敏感，不分配）。
+pub(crate) fn url_has_prefix(url: &str, prefixes: &[&str]) -> bool {
+    prefixes.iter().any(|prefix| {
+        url.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
+}
+
+/// BT 任务源：`magnet:` 链接或 `torrent-file://` 本地种子哨兵。
+fn is_bt_url(url: &str) -> bool {
+    url_has_prefix(url, &["magnet:", "torrent-file://"])
+}
+
+/// 引擎 `change_task_url` 接受的源：http(s) / ftp。
+fn is_replaceable_url(url: &str) -> bool {
+    url_has_prefix(url, &["http://", "https://", "ftp://"])
+}
+
+impl TaskMenuFacts {
+    /// 「更换链接」可用：本地任务，状态为暂停 / 失败 / 等待（引擎拒绝下载中与已完成），
+    /// 且源为 http(s) / ftp。
+    pub(crate) fn can_change_url(&self) -> bool {
+        self.is_local
+            && self.url_replaceable
+            && matches!(
+                self.state,
+                TaskState::Paused | TaskState::Failed | TaskState::Pending
+            )
+    }
+
+    /// 「修改线程数」可用：本地非 BT、未完成的任务（下载中也可，引擎静默暂停后恢复）。
+    pub(crate) fn can_change_segments(&self) -> bool {
+        self.is_local && !self.is_bt && self.state != TaskState::Completed
+    }
+}
+
+/// 由任务行计算菜单事实：右键菜单、应用菜单与详情面板按钮共用同一事实源。
+pub(crate) fn task_menu_facts_for(store: &TaskStore, key: &RowKey) -> Option<TaskMenuFacts> {
+    let row = store.get(key)?;
+    Some(TaskMenuFacts {
+        is_local: key.is_local(),
+        controllable: row.remote_status != Some(RemoteTaskStatus::Unknown),
+        state: row.state,
+        boosted: row.boosted,
+        is_torrent_sentinel: row.url.starts_with("torrent-file://"),
+        is_bt: is_bt_url(&row.url),
+        url_replaceable: is_replaceable_url(&row.url),
+        is_plugin_retry_error: row.state == TaskState::Failed
+            && row.error_message.starts_with(PLUGIN_ERROR_PREFIX),
+        file_missing: row.is_file_missing(),
+    })
+}
 
 /// 任务右键菜单条目；数组顺序即渲染顺序。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,9 +449,16 @@ pub(crate) enum MenuEntry {
     OpenFile,
     OpenFolder,
     Rename,
+    /// 更换下载链接（单选；条件见 [`TaskMenuFacts::can_change_url`]）。
+    ChangeUrl,
+    /// 修改线程数（单选；条件见 [`TaskMenuFacts::can_change_segments`]）。
+    ChangeSegments,
     Redownload,
     CopyUrl,
     MoveToQueue,
+    /// 以当前选区进入显式多选模式（行首复选框常显、表头换选择条）。
+    Select,
+    SelectAll,
     Separator,
     Delete,
     DeleteWithFiles,
@@ -443,6 +512,14 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
     {
         items.push(MenuEntry::Rename);
     }
+    if let [only] = selection {
+        if only.can_change_url() {
+            items.push(MenuEntry::ChangeUrl);
+        }
+        if only.can_change_segments() {
+            items.push(MenuEntry::ChangeSegments);
+        }
+    }
     if selection.iter().all(|task| {
         task.is_local
             && matches!(task.state, TaskState::Completed | TaskState::Failed)
@@ -462,6 +539,31 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
     if selection.iter().any(|task| task.is_local) {
         items.push(MenuEntry::ShowDetail);
     }
+    items
+}
+
+/// 右键菜单完整条目：未处于显式多选模式时，在删除组前插入「选择 / 全选」作为
+/// 多选模式的鼠标入口（已在多选模式时表头选择条与复选框已可见，不再重复）。
+pub(crate) fn task_menu_entries(
+    selection: &[TaskMenuFacts],
+    in_multi_select: bool,
+) -> Vec<MenuEntry> {
+    let mut items = context_menu_items(selection);
+    if in_multi_select || items.is_empty() {
+        return items;
+    }
+    let at = items
+        .iter()
+        .position(|entry| *entry == MenuEntry::Separator)
+        .unwrap_or(items.len());
+    items.splice(
+        at..at,
+        [
+            MenuEntry::Separator,
+            MenuEntry::Select,
+            MenuEntry::SelectAll,
+        ],
+    );
     items
 }
 
@@ -540,6 +642,8 @@ pub(crate) struct DownloadTableDelegate {
     /// 显式多选模式：仅 Cmd/Ctrl+点击或全选进入，普通单击 / 清空选择退出；
     /// 行首复选框只在该模式且有选中项时显示（与 Web `multiSelect` 对齐）。
     multi_select: bool,
+    /// 已提交删除、尚未从列表消失的本地任务 id：行渲染时变淡，且不可再被选中 / 批量操作。
+    pending_delete: HashSet<String>,
     filter: TableFilter,
     query: String,
     prefs: ViewPrefs,
@@ -596,6 +700,7 @@ impl DownloadTableDelegate {
             selected_tasks: HashSet::new(),
             selection_anchor: None,
             multi_select: false,
+            pending_delete: HashSet::new(),
             filter: TableFilter::Download(DownloadFilter::ALL),
             query: String::new(),
             prefs: ViewPrefs::default(),
@@ -892,9 +997,11 @@ impl DownloadTableDelegate {
         // 折叠分组内的任务仍属于当前视图，不因折叠而取消选中。
         let mut selected = std::mem::take(&mut self.selected_tasks);
         selected.retain(|key| {
-            self.store
-                .get(key)
-                .is_some_and(|task| self.matches_filter(&task) && self.matches_query(&task))
+            !self.is_pending_delete(key)
+                && self
+                    .store
+                    .get(key)
+                    .is_some_and(|task| self.matches_filter(&task) && self.matches_query(&task))
         });
         self.selected_tasks = selected;
         self.selection_anchor = self
@@ -1090,7 +1197,7 @@ impl DownloadTableDelegate {
                     .find(|(_, (id, _))| *id == task.queue_id)
                     .map_or_else(
                         || (SharedString::from(task.queue_id.clone()), i64::MAX - 1),
-                        |(ix, (_, name))| (SharedString::from(name.clone()), ix as i64),
+                        |(ix, (id, name))| (strings.queue_name(id, name), ix as i64),
                     );
                 GroupBucket {
                     key: format!("queue:{}", task.queue_id),
@@ -1263,8 +1370,13 @@ impl DownloadTableDelegate {
     }
 
     pub(crate) fn select_all_tasks(&mut self) {
+        let keys: Vec<RowKey> = self
+            .visible_task_keys()
+            .into_iter()
+            .filter(|key| !self.is_pending_delete(key))
+            .collect();
         self.selected_tasks.clear();
-        self.selected_tasks.extend(self.visible_task_keys());
+        self.selected_tasks.extend(keys);
         self.selection_anchor = None;
         self.multi_select = true;
     }
@@ -1280,7 +1392,32 @@ impl DownloadTableDelegate {
         self.multi_select && !self.selected_tasks.is_empty()
     }
 
+    /// 右键「选择」：保留当前选区（右键已选中该行）并进入显式多选模式。
+    pub(crate) fn enter_multi_select(&mut self) {
+        self.multi_select = !self.selected_tasks.is_empty();
+    }
+
+    /// 行首复选框点击：未处于多选模式时以该行开启多选（不并入普通单击选中的行），
+    /// 已在多选模式时切换该行。
+    pub(crate) fn toggle_multi_select(&mut self, key: RowKey) {
+        if self.is_pending_delete(&key) {
+            return;
+        }
+        if !self.in_multi_select() {
+            self.selected_tasks.clear();
+            self.selected_tasks.insert(key.clone());
+        } else if !self.selected_tasks.remove(&key) {
+            self.selected_tasks.insert(key.clone());
+        }
+        self.multi_select = true;
+        self.selection_anchor = Some(key);
+    }
+
     pub(crate) fn select_task(&mut self, key: RowKey, modifiers: Modifiers) {
+        // 正在删除的任务不参与选择。
+        if self.is_pending_delete(&key) {
+            return;
+        }
         if modifiers.shift
             && let Some(anchor) = self.selection_anchor.clone()
         {
@@ -1294,8 +1431,12 @@ impl DownloadTableDelegate {
                     (task_index, anchor_index)
                 };
                 self.selected_tasks.clear();
-                self.selected_tasks
-                    .extend(keys[start..=end].iter().cloned());
+                let range: Vec<RowKey> = keys[start..=end]
+                    .iter()
+                    .filter(|item| !self.is_pending_delete(item))
+                    .cloned()
+                    .collect();
+                self.selected_tasks.extend(range);
                 self.selection_anchor = Some(key);
                 return;
             }
@@ -1330,12 +1471,39 @@ impl DownloadTableDelegate {
     }
 
     pub(crate) fn select_task_for_context_menu(&mut self, key: RowKey) {
+        if self.is_pending_delete(&key) {
+            // 正在删除的行没有可用操作：清空选区，菜单为空而不会作用于旧选区。
+            self.clear_selection();
+            return;
+        }
         if !self.selected_tasks.contains(&key) {
             self.selected_tasks.clear();
             self.selected_tasks.insert(key.clone());
             self.multi_select = false;
         }
         self.selection_anchor = Some(key);
+    }
+
+    /// 是否为已提交删除、尚未消失的本地任务。
+    pub(crate) fn is_pending_delete(&self, key: &RowKey) -> bool {
+        matches!(key, RowKey::Local(id) if self.pending_delete.contains(id))
+    }
+
+    /// 开始一批删除：清空选区，并登记尚未在途的任务（行随即变淡）；返回本次新登记的 id。
+    /// 已在另一批删除中的任务不会被重复提交。
+    pub(crate) fn begin_delete(&mut self, task_ids: Vec<String>) -> Vec<String> {
+        self.clear_selection();
+        task_ids
+            .into_iter()
+            .filter(|id| self.pending_delete.insert(id.clone()))
+            .collect()
+    }
+
+    /// 一批删除结束（成功 / 失败 / 取消）：释放登记，仍在列表里的行恢复正常。
+    pub(crate) fn finish_delete(&mut self, task_ids: &[String]) {
+        for id in task_ids {
+            self.pending_delete.remove(id);
+        }
     }
 
     pub(crate) fn selected_keys(&self) -> Vec<RowKey> {
@@ -1545,7 +1713,8 @@ impl DownloadTableDelegate {
     }
 
     /// 固定左列：平时显示系统文件图标（取不到时回退为按类型的图标，元数据加载中为
-    /// Spinner）；行悬停时经 `group_hover` 换成复选框；行已选中或存在任意选中时复选框常显。
+    /// Spinner）。只有悬停该格本身（而非整行）时图标换成复选框，点击即以该行进入多选；
+    /// 横扫列表不会让每行图标闪烁。多选模式下复选框常显。
     /// 隐藏（`invisible`）的元素不绘制、不注册鼠标监听，不会拦截行点击。
     fn render_selection_cell(
         &self,
@@ -1561,6 +1730,7 @@ impl DownloadTableDelegate {
         let key = task.key.clone();
         let selected = self.selected_tasks.contains(&key);
         let checkbox_pinned = self.in_multi_select();
+        let checked = checkbox_pinned && selected;
         let glyph = (!checkbox_pinned).then(|| {
             if task.metadata_pending {
                 return Spinner::new()
@@ -1577,49 +1747,72 @@ impl DownloadTableDelegate {
             };
             task_file_icon(task, size, window, cx)
         });
-        let checkbox = div()
-            .id(("download-task-multi-select", row_ix))
-            .p(px(4.))
-            .cursor_pointer()
-            .child(
-                check_mark(
-                    if selected {
-                        CheckState::Checked
-                    } else {
-                        CheckState::Unchecked
-                    },
-                    cx,
-                )
-                .when(!selected, |mark| {
-                    mark.hover(move |style| style.border_color(hover_border))
-                }),
-            )
-            .on_click(cx.listener(move |table, _: &ClickEvent, _, cx| {
-                cx.stop_propagation();
-                let delegate = table.delegate_mut();
-                if !delegate.selected_tasks.remove(&key) {
-                    delegate.selected_tasks.insert(key.clone());
-                }
-                delegate.selection_anchor = Some(key.clone());
-                cx.notify();
-            }));
-        // 复选框只在多选状态（已有选中项，经 Cmd/Ctrl+点击进入）显示；悬浮不再露出。
-        div()
-            .size_full()
-            .relative()
-            .when_some(glyph, |this, glyph| {
-                this.child(h_flex().absolute().inset_0().justify_center().child(glyph))
-            })
-            .when(checkbox_pinned, |this| {
-                this.child(
+        let check = check_mark(
+            if checked {
+                CheckState::Checked
+            } else {
+                CheckState::Unchecked
+            },
+            cx,
+        );
+        let toggle = cx.listener(move |table, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            table.delegate_mut().toggle_multi_select(key.clone());
+            cx.notify();
+        });
+        if !checkbox_pinned {
+            let tooltip = self.strings.select_task_tooltip.clone();
+            // 不拦截 mouse_down：从图标处仍可拖出文件；点击（未拖动）才进入多选。
+            return div()
+                .id(("download-task-select-cell", row_ix))
+                .group(SELECT_CELL_GROUP)
+                .size_full()
+                .relative()
+                .cursor_pointer()
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .when_some(glyph, |this, glyph| {
+                    this.child(
+                        h_flex()
+                            .absolute()
+                            .inset_0()
+                            .justify_center()
+                            .group_hover(SELECT_CELL_GROUP, |style| style.invisible())
+                            .child(glyph),
+                    )
+                })
+                .child(
                     h_flex()
                         .absolute()
                         .inset_0()
                         .justify_center()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(checkbox),
+                        .invisible()
+                        .group_hover(SELECT_CELL_GROUP, |style| style.visible())
+                        .child(check.group_hover(SELECT_CELL_GROUP, move |style| {
+                            style.border_color(hover_border)
+                        })),
                 )
-            })
+                .on_click(toggle)
+                .into_any_element();
+        }
+        let checkbox = div()
+            .id(("download-task-multi-select", row_ix))
+            .p(px(4.))
+            .cursor_pointer()
+            .child(check.when(!checked, |mark| {
+                mark.hover(move |style| style.border_color(hover_border))
+            }))
+            .on_click(toggle);
+        div()
+            .size_full()
+            .relative()
+            .child(
+                h_flex()
+                    .absolute()
+                    .inset_0()
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(checkbox),
+            )
             .into_any_element()
     }
 
@@ -1880,6 +2073,9 @@ impl DownloadTableDelegate {
     /// 舒适与紧凑密度一致。底色与行悬停一致（选中时叠加选中色），除「详情」外点击不
     /// 改变选中。
     fn render_row_actions(&self, task: &DownloadTaskView, cx: &App) -> Option<AnyElement> {
+        if self.is_pending_delete(&task.key) {
+            return None;
+        }
         let host = self.host.as_ref()?;
         let is_local = task.key.is_local();
         let with_detail = !self.prefs.detail_open;
@@ -2078,26 +2274,16 @@ impl DownloadTableDelegate {
         Some((selected, facts))
     }
 
-    fn task_menu_facts(&self, key: &RowKey) -> Option<TaskMenuFacts> {
-        let row = self.store.get(key)?;
-        Some(TaskMenuFacts {
-            is_local: key.is_local(),
-            controllable: row.remote_status != Some(RemoteTaskStatus::Unknown),
-            state: row.state,
-            boosted: row.boosted,
-            is_torrent_sentinel: row.url.starts_with("torrent-file://"),
-            is_plugin_retry_error: row.state == TaskState::Failed
-                && row.error_message.starts_with(PLUGIN_ERROR_PREFIX),
-            file_missing: row.is_file_missing(),
-        })
+    pub(crate) fn task_menu_facts(&self, key: &RowKey) -> Option<TaskMenuFacts> {
+        task_menu_facts_for(&self.store, key)
     }
 
-    /// 任务行右键菜单：按 [`context_menu_items`] 的纯函数结果逐项渲染。
+    /// 任务行右键菜单：按 [`task_menu_entries`] 的纯函数结果逐项渲染。
     fn task_context_menu(&self, menu: PopupMenu) -> PopupMenu {
         let Some((selected, facts)) = self.selected_menu_facts() else {
             return menu;
         };
-        context_menu_items(&facts)
+        task_menu_entries(&facts, self.in_multi_select())
             .into_iter()
             .fold(menu, |menu, entry| {
                 self.apply_menu_entry(menu, entry, &selected)
@@ -2170,6 +2356,16 @@ impl DownloadTableDelegate {
                 FluxIcon::Pen,
                 Box::new(crate::actions::RenameSelected),
             ),
+            MenuEntry::ChangeUrl => menu.menu_with_icon(
+                self.strings.change_url.clone(),
+                FluxIcon::Globe,
+                Box::new(crate::actions::ChangeSelectedUrl),
+            ),
+            MenuEntry::ChangeSegments => menu.menu_with_icon(
+                self.strings.edit_threads.clone(),
+                FluxIcon::Layers,
+                Box::new(crate::actions::ChangeSelectedSegments),
+            ),
             MenuEntry::Redownload => menu.menu_with_icon(
                 self.strings.redownload_task.clone(),
                 FluxIcon::RotateCw,
@@ -2197,13 +2393,24 @@ impl DownloadTableDelegate {
                 FluxIcon::PanelRight,
                 Box::new(crate::actions::ShowSelectedDetail),
             ),
+            MenuEntry::Select => menu.menu_with_icon(
+                self.strings.select_tasks.clone(),
+                FluxIcon::CircleCheck,
+                Box::new(crate::actions::EnterMultiSelect),
+            ),
+            MenuEntry::SelectAll => menu.menu_with_icon(
+                self.strings.select_all_tasks.clone(),
+                FluxIcon::CheckboxCheck,
+                Box::new(crate::actions::SelectAllTasks),
+            ),
         }
     }
 
     /// 「移动到队列」：固定版 gpui-component 的 `PopupMenu::submenu` 需要
     /// `Context<PopupMenu>`，而 `TableDelegate::context_menu` 只提供
     /// `Context<TableState<Self>>`（两者是不同实体的上下文，无法互转），因此
-    /// 这里无法构造真正的嵌套子菜单，改为「小节标题 + 缩进平铺项」。
+    /// 这里无法构造真正的嵌套子菜单，改为「带图标的不可点击标题 + 缩进队列项」：
+    /// 标题与其余菜单项同列对齐，队列项不带图标，文字落在标题文字列下形成缩进。
     fn append_move_to_queue(&self, menu: PopupMenu) -> PopupMenu {
         let Some(host) = self.host.clone() else {
             return menu;
@@ -2211,12 +2418,16 @@ impl DownloadTableDelegate {
         if self.queue_names.is_empty() {
             return menu;
         }
-        let mut menu = menu.label(self.strings.move_to_queue.clone());
+        let mut menu = menu.item(
+            PopupMenuItem::new(self.strings.move_to_queue.clone())
+                .icon(FluxIcon::Rows3)
+                .disabled(true),
+        );
         for (queue_id, name) in &self.queue_names {
             let host = host.clone();
             let queue_id = queue_id.clone();
             menu = menu.item(
-                PopupMenuItem::new(SharedString::from(format!("    {name}"))).on_click(
+                PopupMenuItem::new(self.strings.queue_name(&queue_id, name)).on_click(
                     move |_, _, cx| {
                         let queue_id = queue_id.clone();
 
@@ -2560,22 +2771,25 @@ impl TableDelegate for DownloadTableDelegate {
             return div().id(("download-task-row", row_ix)).h(row_height);
         };
         let selected = self.selected_tasks.contains(&key);
+        let pending = self.is_pending_delete(&key);
         let (accent, radius) = (
             theme.tokens().colors.accent,
             theme.components().task_row_radius,
         );
         // 已完成且文件仍在下载目录的行可按住拖到系统文件管理器 / 桌面。
-        let dragged = drag_visual.map(|(kind, name_fold, name)| DraggedTasks {
-            anchor: key.clone(),
-            kind,
-            name_fold,
-            name,
-            table: cx.weak_entity(),
-            host: self.host.clone(),
-        });
+        let dragged = drag_visual
+            .filter(|_| !pending)
+            .map(|(kind, name_fold, name)| DraggedTasks {
+                anchor: key.clone(),
+                kind,
+                name_fold,
+                name,
+                table: cx.weak_entity(),
+                host: self.host.clone(),
+            });
         // 双击：已完成打开文件，其余打开详情。独立于选择监听注册（普通闭包，不占用表格
         // 实体），这样 DownloadView 处理时可以自由读写表格状态。
-        let activate = self.host.clone().map(|host| {
+        let activate = self.host.clone().filter(|_| !pending).map(|host| {
             let key = key.clone();
             move |event: &ClickEvent, window: &mut Window, cx: &mut App| {
                 let modifiers = event.modifiers();
@@ -2596,6 +2810,7 @@ impl TableDelegate for DownloadTableDelegate {
             .h(row_height)
             .group(ROW_GROUP)
             .relative()
+            .when(pending, |this| this.opacity(PENDING_DELETE_OPACITY))
             // 覆盖 DataTable 自带的满宽悬浮底色，两种状态共用内缩背景。
             .child(div().absolute().inset_0().bg(theme.tokens().colors.surface))
             .child(
@@ -2712,7 +2927,10 @@ impl TableDelegate for DownloadTableDelegate {
                     self.queue_names
                         .iter()
                         .find(|(id, _)| *id == task.queue_id)
-                        .map_or_else(|| task.queue_id.clone(), |(_, name)| name.clone())
+                        .map_or_else(
+                            || task.queue_id.clone(),
+                            |(id, name)| self.strings.queue_name(id, name).to_string(),
+                        )
                 };
                 meta_cell(name, muted, false, cx)
             }
@@ -3249,7 +3467,8 @@ impl DownloadView {
         self.execute_commands(commands, cx);
     }
 
-    /// 执行一批命令。同类多任务的暂停 / 继续 / 删除先合并成批量 RPC
+    /// 执行一批命令。本地多任务删除先拆出走分块删除（见 [`crate::deletion`]）；同类多任务
+    /// 的暂停 / 继续 / 远程删除先合并成批量 RPC
     /// （见 [`coalesce_commands`]），其余命令按 [`MAX_IN_FLIGHT`] 限制并发；幂等命令被
     /// agent 以可重试的 `Unavailable` 拒绝时退避重试。任一失败在页面横幅提示（按错误
     /// `reason` 给出原因，同一批里先失败的错误一直保留，后完成的成功不会冲掉它）。
@@ -3260,6 +3479,11 @@ impl DownloadView {
         commands: Vec<DownloadsCommand>,
         cx: &mut Context<Self>,
     ) {
+        // 本地多任务删除走分块 + 进度 + 取消的专用路径；单任务删除与远程删除保持原路径。
+        let (deletions, commands) = split_local_deletes(commands, MIN_BATCH_DELETE);
+        for request in deletions {
+            self.start_deletion(request, cx);
+        }
         let interactive_start = match commands.as_slice() {
             [DownloadsCommand::Resume { task_id }] => Some((task_id.clone(), false)),
             [DownloadsCommand::Redownload(request, task_id)] if !request.start_paused => {
@@ -3457,6 +3681,76 @@ mod tests {
         assert_eq!(
             delegate.selected_tasks,
             HashSet::from([RowKey::Local("t2".into())])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkbox_starts_multi_select_from_its_row_then_toggles() -> Result<(), I18nError> {
+        let mut delegate = delegate(&[2, 2, 2])?;
+        delegate.refresh_view();
+        // 普通单击选中 t0 后点 t1 的复选框：以 t1 开启多选，不并入单击选中的行。
+        delegate.select_task(RowKey::Local("t0".into()), Modifiers::default());
+        delegate.toggle_multi_select(RowKey::Local("t1".into()));
+        assert!(delegate.in_multi_select());
+        assert_eq!(
+            delegate.selected_tasks,
+            HashSet::from([RowKey::Local("t1".into())])
+        );
+        delegate.toggle_multi_select(RowKey::Local("t2".into()));
+        delegate.toggle_multi_select(RowKey::Local("t1".into()));
+        assert_eq!(
+            delegate.selected_tasks,
+            HashSet::from([RowKey::Local("t2".into())])
+        );
+        // 取消最后一项即退出多选。
+        delegate.toggle_multi_select(RowKey::Local("t2".into()));
+        assert!(!delegate.in_multi_select());
+
+        // 右键「选择」把右键选区（含 shift 范围选）转为多选模式。
+        delegate.select_task_for_context_menu(RowKey::Local("t0".into()));
+        assert!(!delegate.in_multi_select());
+        delegate.enter_multi_select();
+        assert!(delegate.in_multi_select());
+        Ok(())
+    }
+
+    #[test]
+    fn pending_delete_rows_leave_the_selection_and_cannot_be_selected() -> Result<(), I18nError> {
+        let mut delegate = delegate(&[2, 2, 2, 2])?;
+        delegate.refresh_view();
+        delegate.select_all_tasks();
+        assert_eq!(delegate.selected_tasks.len(), 4);
+
+        // 开始删除清空选区；已在途的任务不会被重复登记。
+        let fresh = delegate.begin_delete(vec!["t0".into(), "t1".into()]);
+        assert_eq!(fresh, ["t0", "t1"]);
+        assert!(delegate.selected_tasks.is_empty());
+        assert!(delegate.begin_delete(vec!["t1".into()]).is_empty());
+        assert!(delegate.is_pending_delete(&RowKey::Local("t0".into())));
+        assert!(!delegate.is_pending_delete(&RowKey::Remote("t0".into())));
+
+        // 全选 / 点选 / 范围选 / 右键都跳过正在删除的行。
+        delegate.select_all_tasks();
+        assert_eq!(
+            delegate.selected_tasks,
+            HashSet::from([RowKey::Local("t2".into()), RowKey::Local("t3".into())])
+        );
+        delegate.select_task(RowKey::Local("t2".into()), Modifiers::default());
+        delegate.select_task(RowKey::Local("t1".into()), Modifiers::default());
+        assert_eq!(
+            delegate.selected_tasks,
+            HashSet::from([RowKey::Local("t2".into())])
+        );
+        delegate.select_task_for_context_menu(RowKey::Local("t0".into()));
+        assert!(delegate.selected_tasks.is_empty());
+
+        // 结束后恢复可选。
+        delegate.finish_delete(&["t0".to_owned(), "t1".to_owned()]);
+        delegate.select_task(RowKey::Local("t0".into()), Modifiers::default());
+        assert_eq!(
+            delegate.selected_tasks,
+            HashSet::from([RowKey::Local("t0".into())])
         );
         Ok(())
     }
@@ -4386,7 +4680,10 @@ mod tests {
 
 #[cfg(test)]
 mod context_menu_tests {
-    use super::{MenuEntry, PLUGIN_ERROR_PREFIX, TaskMenuFacts, context_menu_items};
+    use super::{
+        MenuEntry, PLUGIN_ERROR_PREFIX, TaskMenuFacts, context_menu_items, is_bt_url,
+        is_replaceable_url, task_menu_entries,
+    };
     use crate::model::TaskState;
 
     fn task(is_local: bool, state: TaskState) -> TaskMenuFacts {
@@ -4396,6 +4693,8 @@ mod context_menu_tests {
             state,
             boosted: false,
             is_torrent_sentinel: false,
+            is_bt: false,
+            url_replaceable: true,
             is_plugin_retry_error: false,
             file_missing: false,
         }
@@ -4532,6 +4831,120 @@ mod context_menu_tests {
 
         let remote = task(false, TaskState::Completed);
         assert!(!context_menu_items(&[remote]).contains(&MenuEntry::Redownload));
+    }
+
+    #[test]
+    fn change_url_needs_single_local_inactive_unfinished_http_ftp_task() {
+        for state in [TaskState::Paused, TaskState::Failed, TaskState::Pending] {
+            assert!(
+                context_menu_items(&[task(true, state)]).contains(&MenuEntry::ChangeUrl),
+                "{state:?}"
+            );
+        }
+        // 下载中（引擎 task-active）与已完成（task-completed）不可换链。
+        for state in [TaskState::Downloading, TaskState::Completed] {
+            assert!(
+                !context_menu_items(&[task(true, state)]).contains(&MenuEntry::ChangeUrl),
+                "{state:?}"
+            );
+        }
+        // 非 http(s)/ftp 源（BT / ed2k 等）、远程任务、多选均不显示。
+        let mut unsupported = task(true, TaskState::Paused);
+        unsupported.url_replaceable = false;
+        assert!(!context_menu_items(&[unsupported]).contains(&MenuEntry::ChangeUrl));
+        assert!(
+            !context_menu_items(&[task(false, TaskState::Paused)]).contains(&MenuEntry::ChangeUrl)
+        );
+        let pair = [task(true, TaskState::Paused), task(true, TaskState::Paused)];
+        assert!(!context_menu_items(&pair).contains(&MenuEntry::ChangeUrl));
+    }
+
+    #[test]
+    fn change_segments_needs_single_local_unfinished_non_bt_task() {
+        // 下载中也允许：引擎静默暂停 → 改 → 恢复。
+        for state in [
+            TaskState::Downloading,
+            TaskState::Paused,
+            TaskState::Failed,
+            TaskState::Pending,
+        ] {
+            assert!(
+                context_menu_items(&[task(true, state)]).contains(&MenuEntry::ChangeSegments),
+                "{state:?}"
+            );
+        }
+        assert!(
+            !context_menu_items(&[task(true, TaskState::Completed)])
+                .contains(&MenuEntry::ChangeSegments)
+        );
+        let mut bt = task(true, TaskState::Paused);
+        bt.is_bt = true;
+        assert!(!context_menu_items(&[bt]).contains(&MenuEntry::ChangeSegments));
+        assert!(
+            !context_menu_items(&[task(false, TaskState::Paused)])
+                .contains(&MenuEntry::ChangeSegments)
+        );
+        let pair = [task(true, TaskState::Paused), task(true, TaskState::Failed)];
+        assert!(!context_menu_items(&pair).contains(&MenuEntry::ChangeSegments));
+    }
+
+    #[test]
+    fn failed_local_task_menu_places_edit_entries_between_rename_and_redownload() {
+        assert_eq!(
+            context_menu_items(&[task(true, TaskState::Failed)]),
+            vec![
+                MenuEntry::Resume,
+                MenuEntry::Boost,
+                MenuEntry::OpenFolder,
+                MenuEntry::Rename,
+                MenuEntry::ChangeUrl,
+                MenuEntry::ChangeSegments,
+                MenuEntry::Redownload,
+                MenuEntry::CopyUrl,
+                MenuEntry::MoveToQueue,
+                MenuEntry::Separator,
+                MenuEntry::Delete,
+                MenuEntry::DeleteWithFiles,
+                MenuEntry::ShowDetail,
+            ]
+        );
+    }
+
+    #[test]
+    fn url_classification_matches_engine_supported_protocols() {
+        for url in ["http://a/b", "https://a/b", "HTTPS://a/b", "ftp://a/b"] {
+            assert!(is_replaceable_url(url), "{url}");
+            assert!(!is_bt_url(url), "{url}");
+        }
+        for url in ["magnet:?xt=urn:btih:abc", "torrent-file://local"] {
+            assert!(is_bt_url(url), "{url}");
+            assert!(!is_replaceable_url(url), "{url}");
+        }
+        for url in [
+            "ed2k://|file|a|1|h|/",
+            "sftp://a/b",
+            "ftps://a/b",
+            "",
+            "htt",
+        ] {
+            assert!(!is_replaceable_url(url), "{url}");
+            assert!(!is_bt_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn select_entries_only_outside_multi_select_and_before_delete_group() {
+        let selection = [task(true, TaskState::Completed)];
+        let items = task_menu_entries(&selection, false);
+        let select = items.iter().position(|entry| *entry == MenuEntry::Select);
+        let delete = items.iter().position(|entry| *entry == MenuEntry::Delete);
+        assert!(matches!((select, delete), (Some(s), Some(d)) if s < d));
+        assert!(items.contains(&MenuEntry::SelectAll));
+
+        let in_mode = task_menu_entries(&selection, true);
+        assert!(!in_mode.contains(&MenuEntry::Select));
+        assert!(!in_mode.contains(&MenuEntry::SelectAll));
+        assert!(task_menu_entries(&[], false).is_empty());
     }
 }
 

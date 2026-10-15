@@ -1,8 +1,15 @@
 package com.fluxdown.bridge
 
+import com.fluxdown.core.host.CreateTaskRequest
 import com.fluxdown.core.host.HostErrorCode
 import com.fluxdown.core.host.HostEvent
 import com.fluxdown.core.host.HostSignal
+import com.fluxdown.core.host.ImportBatch
+import com.fluxdown.core.host.ImportItem
+import com.fluxdown.core.host.ImportProgress
+import com.fluxdown.core.host.ImportRetry
+import com.fluxdown.core.host.ImportRules
+import com.fluxdown.core.host.ImportUpdate
 import com.fluxdown.core.model.FileExistsAction
 import com.fluxdown.core.model.SeedingStatus
 import com.fluxdown.core.model.SelectionKind
@@ -174,6 +181,75 @@ class MappingTest {
         for (failure in UpdateFailure.entries) assertEquals(failure, failure.toDto().toCore())
         for (reason in UpdateManualReason.entries) assertEquals(reason, reason.toDto().toCore())
         assertEquals(UpdatePhaseDto.entries.size, UpdatePhase.entries.size)
+    }
+
+    @Test
+    fun importChunkSizeMatchesTheRustConstant() {
+        assertEquals(importChunkSize().toInt(), ImportRules.CHUNK_SIZE)
+    }
+
+    @Test
+    fun importBatchMapsCommonAndItemsToTheWire() {
+        val common = CreateTaskRequest(url = "", saveDir = "/d", segments = 4, queueId = "q", startPaused = true, headers = mapOf("X" to "1"))
+        val dto = ImportBatch(common, listOf(ImportItem("https://a/1", "one.bin", "sha256=ab"), ImportItem("https://a/2"))).toDto()
+        assertEquals("/d", dto.common.saveDir)
+        assertEquals(4, dto.common.segments)
+        assertEquals("q", dto.common.queueId)
+        assertTrue(dto.common.startPaused)
+        assertEquals(mapOf("X" to "1"), dto.common.headers)
+        assertEquals(
+            listOf(ImportItemDto("https://a/1", "one.bin", "sha256=ab"), ImportItemDto("https://a/2", "", "")),
+            dto.items,
+        )
+    }
+
+    @Test
+    fun importProgressMapsCountsAndRetry() {
+        val progress = ImportUpdateDto.Progress(ImportProgressDto(1_000u, 256u, 3u, ImportRetryDto(2u, 3u, 4u))).toCore(emptyList())
+        assertEquals(
+            ImportUpdate.Progress(ImportProgress(1_000, 256, 3, ImportRetry(attempt = 2, max = 3, delaySecs = 4))),
+            progress,
+        )
+        val idle = (ImportUpdateDto.Progress(ImportProgressDto(10u, 0u, 0u, null)).toCore(emptyList()) as ImportUpdate.Progress).progress
+        assertNull(idle.retry)
+    }
+
+    @Test
+    fun importSummaryMapsFirstErrorWithoutEmptyMessage() {
+        val rejected = HostErrorDto(ErrorCodeDto.INVALID_ARGUMENT, "invalidChecksum", false, "")
+        val summary = (
+            ImportUpdateDto.Finished(ImportSummaryDto(300u, 299u, 1u, 0u, false, rejected, listOf(7u))).toCore(emptyList())
+                as ImportUpdate.Finished
+            ).summary
+        assertEquals(300, summary.total)
+        assertEquals(299, summary.succeeded)
+        assertEquals(1, summary.failed)
+        assertEquals(false, summary.cancelled)
+        val error = summary.firstError!!
+        assertEquals(HostErrorCode.InvalidArgument, error.code)
+        assertEquals("invalidChecksum", error.reason)
+        // 单条拒绝没有文案：message 回落到 reason，而不是空串
+        assertEquals("invalidChecksum", error.message)
+
+        val clean = (
+            ImportUpdateDto.Finished(ImportSummaryDto(5u, 0u, 0u, 5u, true, null, emptyList())).toCore(emptyList())
+                as ImportUpdate.Finished
+            ).summary
+        assertTrue(clean.cancelled)
+        assertEquals(5, clean.notSubmitted)
+        assertNull(clean.firstError)
+        assertTrue(clean.unfinished.isEmpty())
+    }
+
+    @Test
+    fun importSummaryResolvesUnfinishedIndicesAgainstTheSubmittedItems() {
+        val items = listOf(ImportItem("https://a/0"), ImportItem("https://a/1", "one.bin", "sha256=ab"), ImportItem("https://b/2"))
+        val summary = (
+            ImportUpdateDto.Finished(ImportSummaryDto(3u, 1u, 1u, 1u, true, null, listOf(1u, 2u, 99u))).toCore(items)
+                as ImportUpdate.Finished
+            ).summary
+        // 按序号还原为条目（保留文件名 / 校验值）；越界序号被忽略而不是崩溃
+        assertEquals(listOf(items[1], items[2]), summary.unfinished)
     }
 
     private fun task(status: Int, seeding: Int) = TaskDto(

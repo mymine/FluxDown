@@ -11,11 +11,12 @@ use fluxdown_engine::download_manager::{CreateGroupSpec, GroupItemSpec};
 use fluxdown_engine::log_info;
 use fluxdown_protocol::method;
 use fluxdown_protocol::{
-    ApplicationErrorCode, CdnConfigApplyParams, CdnReportAckParams, CreateGroupRequest,
-    CreateQueueRequest, DaemonConfigPatch, DaemonCreateTaskParams, DaemonDeleteTasksParams,
-    DaemonTaskIdsParams, MigrationAckParams, RpcErrorData, RpcErrorObject, RpcRequest, RpcResponse,
-    SelectionResolutionDto, ServiceHello, SiteAuthCredentialDto, SiteAuthDeleteParams,
-    SiteAuthMatchParams, SnapshotBody, TaskActivityQuery,
+    ApplicationErrorCode, CREATE_TASKS_BATCH_ID_MAX_LEN, CREATE_TASKS_MAX_ITEMS,
+    CdnConfigApplyParams, CdnReportAckParams, CreateGroupRequest, CreateQueueRequest,
+    DaemonConfigPatch, DaemonCreateTaskParams, DaemonCreateTasksParams, DaemonCreateTasksResult,
+    DaemonDeleteTasksParams, DaemonTaskIdsParams, MigrationAckParams, RpcErrorData, RpcErrorObject,
+    RpcRequest, RpcResponse, SelectionResolutionDto, ServiceHello, SiteAuthCredentialDto,
+    SiteAuthDeleteParams, SiteAuthMatchParams, SnapshotBody, TaskActivityQuery,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -203,6 +204,7 @@ impl DaemonService {
                 })
             }
             method::DAEMON_TASK_CREATE => self.create_task(params).await,
+            method::DAEMON_TASK_CREATE_MANY => self.create_tasks(params).await,
             method::DAEMON_TASK_PAUSE => {
                 let params = parse_params::<IdParams>(params)?;
                 self.execute_unit(ActorOperation::PauseTask { task_id: params.id })
@@ -227,6 +229,23 @@ impl DaemonService {
                 self.execute_unit(ActorOperation::ChangeTaskUrl {
                     task_id: params.task_id,
                     url: params.url,
+                })
+                .await
+            }
+            method::DAEMON_TASK_SET_SEGMENTS => {
+                let params = parse_params::<fluxdown_protocol::SetTaskSegmentsParams>(params)?;
+                if params.segments > fluxdown_protocol::MAX_TASK_SEGMENTS {
+                    return Err(invalid_argument(
+                        "segments",
+                        &format!(
+                            "segments must be at most {}",
+                            fluxdown_protocol::MAX_TASK_SEGMENTS
+                        ),
+                    ));
+                }
+                self.execute_unit(ActorOperation::SetTaskSegments {
+                    task_id: params.task_id,
+                    segments: params.segments.max(0),
                 })
                 .await
             }
@@ -310,6 +329,7 @@ impl DaemonService {
             method::DAEMON_QUEUE_STOP => self.queue_id_operation(params, QueueAction::Stop).await,
             method::DAEMON_QUEUE_SCHEDULE => {
                 let params = parse_params::<QueueScheduleParams>(params)?;
+                validate_queue_schedule(&params)?;
                 self.execute_unit(ActorOperation::SetQueueSchedule {
                     queue_id: params.queue_id,
                     enabled: params.enabled,
@@ -1190,6 +1210,35 @@ impl DaemonService {
         }
     }
 
+    /// `daemon.task.createMany`：校验整块参数（任何一项违规都是整体 `InvalidArgument`），
+    /// 逐条过演示模式守卫，然后交给 actor 在一个事务内落库。逐项拒绝（thunder 解码失败、
+    /// BT 被禁用、checksum 畸形…）以 `results[i].error` 返回，不影响同块其它项。
+    async fn create_tasks(&self, params: Option<Value>) -> Result<Value, RpcErrorObject> {
+        let params = parse_params::<DaemonCreateTasksParams>(params)?;
+        validate_create_tasks(&params)?;
+        for item in &params.items {
+            self.demo_guard(&item.url)?;
+        }
+        let DaemonCreateTasksParams {
+            batch_id,
+            common,
+            items,
+        } = params;
+        match self
+            .actor
+            .execute(ActorOperation::CreateTasks {
+                batch_id,
+                common: Box::new(common),
+                items,
+            })
+            .await
+        {
+            Ok(ActorResult::CreatedMany(results)) => to_value(DaemonCreateTasksResult { results }),
+            Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+            Err(error) => Err(actor_error(error)),
+        }
+    }
+
     async fn execute_unit(&self, operation: ActorOperation) -> Result<Value, RpcErrorObject> {
         match self.actor.execute(operation).await {
             Ok(ActorResult::Unit) => Ok(json!({ "ok": true })),
@@ -1216,6 +1265,9 @@ impl DaemonService {
         action: QueueAction,
     ) -> Result<Value, RpcErrorObject> {
         let params = parse_params::<IdParams>(params)?;
+        if matches!(action, QueueAction::Stop) {
+            validate_queue_stop(&params.id)?;
+        }
         let operation = match action {
             QueueAction::Delete => ActorOperation::DeleteQueue {
                 queue_id: params.id,
@@ -1902,6 +1954,72 @@ fn to_value(value: impl serde::Serialize) -> Result<Value, RpcErrorObject> {
     serde_json::to_value(value).map_err(|error| internal_error(error.to_string()))
 }
 
+/// `daemon.task.createMany` 参数的结构校验（不含演示模式守卫）。
+fn validate_create_tasks(params: &DaemonCreateTasksParams) -> Result<(), RpcErrorObject> {
+    if params.batch_id.is_empty() || params.batch_id.len() > CREATE_TASKS_BATCH_ID_MAX_LEN {
+        return Err(invalid_argument(
+            "batchId",
+            "batchId must be 1..=128 bytes long",
+        ));
+    }
+    if params.items.is_empty() || params.items.len() > CREATE_TASKS_MAX_ITEMS {
+        return Err(invalid_argument(
+            "items",
+            "items must contain 1..=512 entries",
+        ));
+    }
+    let common = &params.common;
+    for (field, value) in [
+        ("common.url", &common.url),
+        ("common.fileName", &common.file_name),
+        ("common.checksum", &common.checksum),
+    ] {
+        if !value.is_empty() {
+            return Err(invalid_argument(
+                field,
+                "this field is decided per item and must be empty in common",
+            ));
+        }
+    }
+    if common
+        .torrent_b64
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Err(invalid_argument(
+            "common.torrentB64",
+            "torrent files are not supported by daemon.task.createMany",
+        ));
+    }
+    if common
+        .audio_url
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Err(invalid_argument(
+            "common.audioUrl",
+            "audio tracks are not supported by daemon.task.createMany",
+        ));
+    }
+    if common.method.is_some() || common.body.is_some() {
+        return Err(invalid_argument(
+            "common.method",
+            "custom method / body are not supported by daemon.task.createMany",
+        ));
+    }
+    if let Some(index) = params
+        .items
+        .iter()
+        .position(|item| item.url.trim().is_empty())
+    {
+        return Err(invalid_argument(
+            "items",
+            &format!("items[{index}].url must not be empty"),
+        ));
+    }
+    Ok(())
+}
+
 fn actor_error(error: ActorCallError) -> RpcErrorObject {
     match error {
         ActorCallError::Unavailable => RpcErrorObject::application(
@@ -1950,6 +2068,27 @@ fn invalid_argument(field: &str, message: &str) -> RpcErrorObject {
             reason: None,
         },
     )
+}
+
+const ALWAYS_RUNNING_QUEUE: &str = "the main queue always runs and cannot be stopped or scheduled";
+
+/// 主队列恒运行（`is_always_running_queue`）：停止请求显式拒绝，不让客户端以为已生效。
+fn validate_queue_stop(queue_id: &str) -> Result<(), RpcErrorObject> {
+    if fluxdown_engine::model::is_always_running_queue(queue_id) {
+        return Err(invalid_argument("queueId", ALWAYS_RUNNING_QUEUE));
+    }
+    Ok(())
+}
+
+/// 主队列不可定时；只放行「关闭且无时刻」这一等价于现状的空操作，
+/// 兼容仍对每个队列都提交一次定时的旧客户端保存流程。
+fn validate_queue_schedule(params: &QueueScheduleParams) -> Result<(), RpcErrorObject> {
+    let sets_schedule =
+        params.enabled || !params.start_time.is_empty() || !params.stop_time.is_empty();
+    if sets_schedule && fluxdown_engine::model::is_always_running_queue(&params.queue_id) {
+        return Err(invalid_argument("queueId", ALWAYS_RUNNING_QUEUE));
+    }
+    Ok(())
 }
 
 /// 插件包 / 插件目录校验失败：记录完整原因，客户端按细分原因展示。
@@ -2057,9 +2196,135 @@ fn unsupported_error(message: &str) -> RpcErrorObject {
 
 #[cfg(test)]
 mod tests {
-    use fluxdown_protocol::{ApplicationErrorCode, RpcErrorData};
+    use fluxdown_protocol::{ApplicationErrorCode, DaemonCreateTasksParams, RpcErrorData};
+    use serde_json::{Value, json};
 
-    use super::{DaemonService, match_site_auth};
+    use super::{
+        DaemonService, QueueScheduleParams, match_site_auth, validate_create_tasks,
+        validate_queue_schedule, validate_queue_stop,
+    };
+
+    fn schedule(queue_id: &str, enabled: bool, start: &str, stop: &str) -> QueueScheduleParams {
+        QueueScheduleParams {
+            queue_id: queue_id.to_owned(),
+            enabled,
+            start_time: start.to_owned(),
+            stop_time: stop.to_owned(),
+            days: 127,
+        }
+    }
+
+    /// 主队列恒运行：停止与任何实际定时都按 `queueId` 参数错误拒绝；只放行等价于
+    /// 现状的「关闭且无时刻」（旧客户端保存每个队列都会提交一次定时）。其他队列不受限。
+    #[test]
+    fn main_queue_rejects_stop_and_schedule_requests() {
+        let rejected_field = |result: Result<(), super::RpcErrorObject>| {
+            let data = result
+                .expect_err("must be rejected")
+                .data
+                .expect("application error data");
+            assert_eq!(data.code, ApplicationErrorCode::InvalidArgument);
+            data.field
+        };
+        assert_eq!(
+            rejected_field(validate_queue_stop("main")).as_deref(),
+            Some("queueId")
+        );
+        for params in [
+            schedule("main", true, "08:00", ""),
+            schedule("main", false, "", "23:00"),
+            schedule("main", true, "", ""),
+        ] {
+            assert_eq!(
+                rejected_field(validate_queue_schedule(&params)).as_deref(),
+                Some("queueId")
+            );
+        }
+        assert!(validate_queue_schedule(&schedule("main", false, "", "")).is_ok());
+        assert!(validate_queue_stop("later").is_ok());
+        assert!(validate_queue_schedule(&schedule("later", true, "08:00", "23:00")).is_ok());
+    }
+
+    fn create_many(edit: impl FnOnce(&mut Value)) -> DaemonCreateTasksParams {
+        let mut value = json!({
+            "batchId": "batch-1",
+            "common": { "url": "", "startPaused": true },
+            "items": [{ "url": "http://example.test/a.bin" }],
+        });
+        edit(&mut value);
+        serde_json::from_value(value).expect("createMany params deserialize")
+    }
+
+    /// 违规参数必须是 `InvalidArgument`，`field` 指向违规字段。
+    fn rejected_field(params: &DaemonCreateTasksParams) -> Option<String> {
+        let error = validate_create_tasks(params).expect_err("params must be rejected");
+        let data = error.data.expect("application error data");
+        assert_eq!(data.code, ApplicationErrorCode::InvalidArgument);
+        data.field
+    }
+
+    #[test]
+    fn create_many_accepts_boundary_batch_ids_and_item_counts() {
+        assert!(validate_create_tasks(&create_many(|_| {})).is_ok());
+        let longest = "b".repeat(fluxdown_protocol::CREATE_TASKS_BATCH_ID_MAX_LEN);
+        assert!(validate_create_tasks(&create_many(|v| v["batchId"] = json!(longest))).is_ok());
+        let full = vec![json!({ "url": "http://example.test/a.bin" }); 512];
+        assert!(validate_create_tasks(&create_many(|v| v["items"] = json!(full))).is_ok());
+    }
+
+    #[test]
+    fn create_many_rejects_invalid_batch_id_and_item_counts() {
+        assert_eq!(
+            rejected_field(&create_many(|v| v["batchId"] = json!(""))).as_deref(),
+            Some("batchId")
+        );
+        let too_long = "b".repeat(fluxdown_protocol::CREATE_TASKS_BATCH_ID_MAX_LEN + 1);
+        assert_eq!(
+            rejected_field(&create_many(|v| v["batchId"] = json!(too_long))).as_deref(),
+            Some("batchId")
+        );
+        assert_eq!(
+            rejected_field(&create_many(|v| v["items"] = json!([]))).as_deref(),
+            Some("items")
+        );
+        let overfull = vec![json!({ "url": "http://example.test/a.bin" }); 513];
+        assert_eq!(
+            rejected_field(&create_many(|v| v["items"] = json!(overfull))).as_deref(),
+            Some("items")
+        );
+        assert_eq!(
+            rejected_field(&create_many(|v| v["items"] = json!([{ "url": "  " }]))).as_deref(),
+            Some("items")
+        );
+    }
+
+    #[test]
+    fn create_many_rejects_per_item_and_unsupported_common_fields() {
+        for (pointer, value, field) in [
+            ("/common/url", json!("http://example.test/x"), "common.url"),
+            ("/common/fileName", json!("x.bin"), "common.fileName"),
+            ("/common/checksum", json!("md5=aa"), "common.checksum"),
+            ("/common/torrentB64", json!("AAAA"), "common.torrentB64"),
+            (
+                "/common/audioUrl",
+                json!("http://example.test/a"),
+                "common.audioUrl",
+            ),
+            ("/common/method", json!("POST"), "common.method"),
+            (
+                "/common/body",
+                json!({ "kind": "formData", "fields": {} }),
+                "common.method",
+            ),
+        ] {
+            let params = create_many(|v| {
+                if let Some(common) = v.get_mut("common").and_then(Value::as_object_mut) {
+                    common.insert(pointer.trim_start_matches("/common/").to_owned(), value);
+                }
+            });
+            assert_eq!(rejected_field(&params).as_deref(), Some(field), "{pointer}");
+        }
+    }
 
     #[test]
     fn site_auth_match_uses_engine_site_key_including_non_default_port() {

@@ -44,7 +44,6 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
     let session = desktop.session.clone();
     let client = desktop.client.clone();
     let settings_store = desktop.settings_store.clone();
-    let menu_bar = desktop.menu_bar.clone();
     let mut options = main_window_options();
     options.focus = focus;
     WindowRegistry::restore_bounds(RememberedWindow::Main, &mut options, MAIN_WINDOW_SIZE, cx);
@@ -53,6 +52,7 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
         let downloads_port = Arc::new(AgentDownloadsPort::new(client.clone()));
         let downloads =
             cx.new(|cx| DownloadView::new(translator.clone(), downloads_port, window, cx));
+        watch_import_suspension(&client, &downloads, cx);
         let rss_port = Arc::new(AgentRssPort::new(client.clone()));
         let rss = cx.new(|cx| RssView::new(translator.clone(), rss_port, window, cx));
         let push = cx.new(|cx| {
@@ -136,8 +136,7 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
                 ),
             }
         }
-        let shell =
-            cx.new(|cx| ShellView::new(translator.clone(), routes, actions, Some(menu_bar), cx));
+        let shell = cx.new(|cx| ShellView::new(translator.clone(), routes, actions, cx));
         shell.update(cx, |shell, cx| {
             let preferences = Desktop::preferences(cx).clone();
             activity::apply_visibility(shell, &preferences, cx);
@@ -201,6 +200,32 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
         cx.defer(crate::update_notices::replay_pending);
     }
     handle
+}
+
+/// 导入闸门挂起状态同步到下载页：挂起期间「全部开始」必须可点（它是唯一解除入口）。
+fn watch_import_suspension(
+    client: &crate::agent_client::AgentClient,
+    downloads: &gpui::Entity<DownloadView>,
+    cx: &mut App,
+) {
+    let mut state = client.submissions.subscribe();
+    let suspended = state.borrow_and_update().suspended();
+    downloads.update(cx, |view, cx| view.set_import_suspended(suspended, cx));
+    let downloads = downloads.downgrade();
+    cx.spawn(async move |cx| {
+        while state.changed().await.is_ok() {
+            let suspended = state.borrow_and_update().suspended();
+            if downloads
+                .update(cx, |view, cx| view.set_import_suspended(suspended, cx))
+                .is_err()
+            {
+                // 主窗口已关闭：重建时会重新订阅。
+                return;
+            }
+        }
+        log::debug!("download submission state channel closed");
+    })
+    .detach();
 }
 
 /// 关闭策略：原生关闭按钮（`windowShouldClose:`）与 ⌘W 共用一份判定。

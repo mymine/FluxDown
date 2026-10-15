@@ -109,6 +109,20 @@ impl DaemonSnapshot {
             self.reindex_tasks();
         }
     }
+
+    /// 一次移除一批任务：整表只扫描、重建下标各一次（逐条移除是 O(N·B)）。
+    fn remove_tasks(&mut self, task_ids: &[String]) {
+        let removed: std::collections::HashSet<&str> =
+            task_ids.iter().map(String::as_str).collect();
+        let before = self.tasks.len();
+        self.tasks
+            .retain(|task| !removed.contains(task.task_id.as_str()));
+        if self.tasks.len() != before {
+            self.reindex_tasks();
+        }
+        self.task_runtime
+            .retain(|task_id, _| !removed.contains(task_id.as_str()));
+    }
 }
 
 /// agent 的完整物化投影。下载事实只来自嵌套 daemon 快照。
@@ -180,8 +194,15 @@ pub enum DaemonEvent {
     SnapshotReplaced(DaemonSnapshot),
     Engine(WsServerMsg),
     TaskChanged(TaskDto),
+    /// 一批任务事实（批量建任务）：语义等同按序逐条应用 [`DaemonEvent::TaskChanged`]。
+    TasksChanged(Vec<TaskDto>),
     TaskDeleted {
         task_id: String,
+    },
+    /// 一批任务已删除（`daemon.task.deleteMany` 一批一条）：语义等同按序逐条
+    /// [`DaemonEvent::TaskDeleted`]。
+    TasksDeleted {
+        task_ids: Vec<String>,
     },
     QueuesChanged(Vec<QueueDto>),
     GroupsChanged(Vec<GroupDto>),
@@ -369,20 +390,18 @@ pub fn apply_daemon_event(snapshot: &mut DaemonSnapshot, event: &DaemonEvent) {
         DaemonEvent::TaskActivityAdded(_) | DaemonEvent::TaskNotice(_) => {}
         DaemonEvent::SnapshotReplaced(replacement) => snapshot.clone_from(replacement),
         DaemonEvent::Engine(message) => apply_engine_message(snapshot, message),
-        DaemonEvent::TaskChanged(task) => {
-            if let Some(existing) = snapshot.task_mut(&task.task_id) {
-                existing.clone_from(task);
-            } else {
-                snapshot.push_task(task.clone());
-            }
-            if !matches!(task.status, 1 | 5) {
-                clear_active_runtime(snapshot, &task.task_id);
+        DaemonEvent::TaskChanged(task) => apply_task_changed(snapshot, task),
+        DaemonEvent::TasksChanged(tasks) => {
+            snapshot.tasks.reserve(tasks.len());
+            for task in tasks {
+                apply_task_changed(snapshot, task);
             }
         }
         DaemonEvent::TaskDeleted { task_id } => {
             snapshot.remove_task(task_id);
             snapshot.task_runtime.remove(task_id);
         }
+        DaemonEvent::TasksDeleted { task_ids } => snapshot.remove_tasks(task_ids),
         DaemonEvent::QueuesChanged(queues) => snapshot.queues.clone_from(queues),
         DaemonEvent::GroupsChanged(groups) => snapshot.groups.clone_from(groups),
         DaemonEvent::ConfigChanged(config) => snapshot.config.clone_from(config),
@@ -412,6 +431,17 @@ pub fn apply_daemon_event(snapshot: &mut DaemonSnapshot, event: &DaemonEvent) {
                 .pending_selections
                 .retain(|item| item.request_id != *request_id);
         }
+    }
+}
+
+fn apply_task_changed(snapshot: &mut DaemonSnapshot, task: &TaskDto) {
+    if let Some(existing) = snapshot.task_mut(&task.task_id) {
+        existing.clone_from(task);
+    } else {
+        snapshot.push_task(task.clone());
+    }
+    if !matches!(task.status, 1 | 5) {
+        clear_active_runtime(snapshot, &task.task_id);
     }
 }
 
@@ -964,6 +994,62 @@ mod tests {
         assert_eq!(snapshot.tasks.len(), 2);
         assert_eq!(snapshot.tasks[1].file_name, "d2.bin");
         assert_eq!(snapshot.tasks[1].total_bytes, 9);
+        Ok(())
+    }
+
+    /// 批量删除 = 按序逐条删除：剩余任务保序、下标仍可用，运行时随任务清除。
+    #[test]
+    fn tasks_deleted_matches_sequential_task_deleted() -> Result<(), serde_json::Error> {
+        let mut batched = super::DaemonSnapshot::default();
+        super::apply_daemon_event(
+            &mut batched,
+            &DaemonEvent::Engine(super::WsServerMsg::TasksSnapshot {
+                tasks: vec![
+                    sample_task("a", 1)?,
+                    sample_task("b", 2)?,
+                    sample_task("c", 2)?,
+                    sample_task("d", 1)?,
+                ],
+            }),
+        );
+        for id in ["a", "d"] {
+            super::apply_daemon_event(
+                &mut batched,
+                &DaemonEvent::TaskRuntimeChanged(crate::TaskRuntimeDto {
+                    task_id: id.into(),
+                    ..crate::TaskRuntimeDto::default()
+                }),
+            );
+        }
+        assert_eq!(batched.task_runtime.len(), 2);
+        let mut sequential = batched.clone();
+        super::apply_daemon_event(
+            &mut batched,
+            &DaemonEvent::TasksDeleted {
+                task_ids: vec!["d".into(), "missing".into(), "a".into()],
+            },
+        );
+        for id in ["d", "missing", "a"] {
+            super::apply_daemon_event(
+                &mut sequential,
+                &DaemonEvent::TaskDeleted { task_id: id.into() },
+            );
+        }
+        let ids = |snapshot: &super::DaemonSnapshot| -> Vec<String> {
+            snapshot.tasks.iter().map(|t| t.task_id.clone()).collect()
+        };
+        assert_eq!(ids(&batched), ["b", "c"]);
+        assert_eq!(ids(&batched), ids(&sequential));
+        assert!(batched.task_runtime.is_empty());
+        super::apply_daemon_event(
+            &mut batched,
+            &DaemonEvent::Engine(super::WsServerMsg::TaskMetaProbed {
+                task_id: "c".into(),
+                file_name: "c2.bin".into(),
+                total_bytes: 3,
+            }),
+        );
+        assert_eq!(batched.tasks[1].file_name, "c2.bin");
         Ok(())
     }
 }

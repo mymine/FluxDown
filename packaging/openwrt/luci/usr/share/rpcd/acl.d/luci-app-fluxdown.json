@@ -5,6 +5,9 @@
 			"uci": [ "fluxdown" ],
 			"ubus": {
 				"service": [ "list" ]
+			},
+			"file": {
+				"/usr/libexec/fluxdown/luci-token": [ "exec" ]
 			}
 		},
 		"write": {

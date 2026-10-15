@@ -4,8 +4,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    ActiveTaskEntry, BtConfig, Db, DownloadManager, DownloadManagerConfig, EngineEvent, EventSink,
-    MAIN_QUEUE_ID, NewTaskSpec, ProxyConfig,
+    ActiveTaskEntry, BatchItemOutcome, BtConfig, CreateRejection, Db, DownloadManager,
+    DownloadManagerConfig, EngineEvent, EventSink, MAIN_QUEUE_ID, META_PROBE_CONCURRENCY,
+    NewTaskSpec, ProxyConfig, TASK_CLIENT_CACHE_CAP,
 };
 
 #[derive(Default)]
@@ -246,4 +247,507 @@ async fn queue_drain_refills_all_five_configured_slots_not_one() {
     // The spawned workers are real downloader tasks; join cancellation before cleanup.
     manager.shutdown().await;
     std::fs::remove_dir_all(directory).expect("remove isolated download directory");
+}
+
+fn created(outcomes: &[BatchItemOutcome]) -> Vec<String> {
+    outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            BatchItemOutcome::Created(id) => id.clone(),
+            BatchItemOutcome::Rejected(reason) => panic!("unexpected rejection: {reason}"),
+        })
+        .collect()
+}
+
+/// 覆盖落库行每一类附加列的规格；全部「稍后下载」，不启动、不探测。
+fn rich_spec(index: usize) -> NewTaskSpec {
+    use base64::Engine as _;
+    let base = NewTaskSpec {
+        start_paused: true,
+        ..spec(index)
+    };
+    match index {
+        0 => base,
+        1 => NewTaskSpec {
+            user_agent: "Batch-UA/1.0".into(),
+            cookies: "sid=1".into(),
+            referrer: "https://example.test/ref".into(),
+            extra_headers: [("X-Token".to_owned(), "abc".to_owned())].into(),
+            checksum: format!("sha256={}", "0".repeat(64)),
+            ignore_tls_errors: true,
+            proxy_url: "http://127.0.0.1:8123".into(),
+            segments: 4,
+            ..base
+        },
+        2 => NewTaskSpec {
+            url: format!(
+                "thunder://{}",
+                base64::engine::general_purpose::STANDARD
+                    .encode("AAhttp://127.0.0.1:1/thunder.binZZ")
+            ),
+            ..base
+        },
+        3 => NewTaskSpec {
+            file_name: "sub/dir/nested.bin".into(),
+            group_id: "group-1".into(),
+            unattended_selection: true,
+            audio_url: Some("http://127.0.0.1:1/audio.m4a".into()),
+            ..base
+        },
+        _ => NewTaskSpec {
+            // hint 任务：名字为空，创建行直接携带 URL 推断的占位名。
+            file_name: String::new(),
+            hint_file_size: 5,
+            ..base
+        },
+    }
+}
+
+/// 同一规格走批量与逐条创建，持久化事实逐字段一致（task_id / created_at 除外）。
+#[tokio::test]
+async fn batch_creation_matches_single_creation_field_for_field() {
+    let (batch_db, mut batch_manager, batch_sink) = fixture().await;
+    let (single_db, mut single_manager, _single_sink) = fixture().await;
+
+    let outcomes = batch_manager
+        .create_tasks_batch("parity", (0..5).map(rich_spec).collect())
+        .await
+        .expect("batch create");
+    let batch_ids = created(&outcomes);
+    let mut single_ids = Vec::new();
+    for index in 0..5 {
+        single_ids.push(
+            single_manager
+                .create_task(rich_spec(index))
+                .await
+                .expect("single create"),
+        );
+    }
+
+    for (batch_id, single_id) in batch_ids.iter().zip(&single_ids) {
+        let mut batch_task = batch_db
+            .load_task_by_id(batch_id)
+            .await
+            .expect("load batch task")
+            .expect("batch task");
+        let mut single_task = single_db
+            .load_task_by_id(single_id)
+            .await
+            .expect("load single task")
+            .expect("single task");
+        for task in [&mut batch_task, &mut single_task] {
+            task.task_id.clear();
+            task.created_at.clear();
+        }
+        assert_eq!(batch_task, single_task, "task {batch_id}");
+        // 请求头 JSON 的键序取决于 HashMap 迭代顺序，按解析后的值比较。
+        let context = |context: Option<(String, String, String)>| {
+            context.map(|(cookies, referrer, headers)| {
+                (
+                    cookies,
+                    referrer,
+                    serde_json::from_str::<serde_json::Value>(&headers).ok(),
+                )
+            })
+        };
+        assert_eq!(
+            context(
+                batch_db
+                    .load_task_request_context(batch_id)
+                    .await
+                    .expect("context")
+            ),
+            context(
+                single_db
+                    .load_task_request_context(single_id)
+                    .await
+                    .expect("context")
+            ),
+        );
+        assert_eq!(
+            batch_db.load_audio_url(batch_id).await.expect("audio"),
+            single_db.load_audio_url(single_id).await.expect("audio"),
+        );
+    }
+    // 抽查关键事实，防止两条路径同时退化而互相一致。
+    let rich = batch_db
+        .load_task_by_id(&batch_ids[1])
+        .await
+        .expect("load")
+        .expect("task");
+    assert_eq!(
+        (rich.status, rich.segments, rich.ignore_tls_errors),
+        (2, 4, true)
+    );
+    let thunder = batch_db
+        .load_task_by_id(&batch_ids[2])
+        .await
+        .expect("load")
+        .expect("task");
+    assert_eq!(thunder.url, "http://127.0.0.1:1/thunder.bin");
+    assert!(thunder.origin_url.starts_with("thunder://"));
+    let nested = batch_db
+        .load_task_by_id(&batch_ids[3])
+        .await
+        .expect("load")
+        .expect("task");
+    assert_eq!(nested.file_name, "nested.bin");
+    assert!(nested.save_dir.ends_with("dir"));
+    assert_eq!(nested.group_id, "group-1");
+    let provisional = batch_db
+        .load_task_by_id(&batch_ids[4])
+        .await
+        .expect("load")
+        .expect("task");
+    assert_eq!(provisional.file_name, "import-4.bin");
+
+    // 一条整批事实，内容 = 落库后读回的行。
+    let events = batch_sink.take();
+    let [EngineEvent::TasksChanged(facts), ..] = events.as_slice() else {
+        panic!("first event must be the whole-batch creation fact");
+    };
+    assert_eq!(facts.len(), 5);
+    for (fact, id) in facts.iter().zip(&batch_ids) {
+        let persisted = batch_db
+            .load_task_by_id(id)
+            .await
+            .expect("load")
+            .expect("task");
+        assert_eq!(fact, &persisted);
+    }
+}
+
+#[tokio::test]
+async fn batch_continues_the_queue_order_tail_per_queue() {
+    let (db, mut manager, _sink) = fixture().await;
+    manager
+        .create_task(NewTaskSpec {
+            start_paused: true,
+            ..spec(0)
+        })
+        .await
+        .expect("existing tail task");
+    let specs: Vec<_> = (1..=5)
+        .map(|index| NewTaskSpec {
+            start_paused: true,
+            queue_id: if index % 2 == 0 {
+                "q2".into()
+            } else {
+                String::new()
+            },
+            ..spec(index)
+        })
+        .collect();
+    let ids = created(
+        &manager
+            .create_tasks_batch("order", specs)
+            .await
+            .expect("batch create"),
+    );
+    let mut orders = Vec::new();
+    for id in &ids {
+        let task = db.load_task_by_id(id).await.expect("load").expect("task");
+        orders.push((task.queue_id, task.queue_order));
+    }
+    let main = MAIN_QUEUE_ID.to_owned();
+    assert_eq!(
+        orders,
+        [
+            (main.clone(), 2),
+            ("q2".to_owned(), 1),
+            (main.clone(), 3),
+            ("q2".to_owned(), 2),
+            (main, 4),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn replaying_a_batch_id_returns_the_first_results_and_creates_nothing() {
+    let (db, mut manager, sink) = fixture().await;
+    let specs = || (0..3).map(rich_spec).collect::<Vec<_>>();
+    let first = manager
+        .create_tasks_batch("replay", specs())
+        .await
+        .expect("first call");
+    assert_eq!(db.load_all_tasks().await.expect("tasks").len(), 3);
+    sink.take();
+
+    let replay = manager
+        .create_tasks_batch("replay", specs())
+        .await
+        .expect("replay");
+    assert_eq!(replay, first);
+    assert_eq!(db.load_all_tasks().await.expect("tasks").len(), 3);
+    assert!(sink.take().is_empty(), "a replay publishes nothing");
+
+    // 不同 batch_id 即使内容相同也是新批次。
+    let other = manager
+        .create_tasks_batch("replay-2", specs())
+        .await
+        .expect("other batch");
+    assert_ne!(other, first);
+    assert_eq!(db.load_all_tasks().await.expect("tasks").len(), 6);
+}
+
+#[tokio::test]
+async fn rejected_items_keep_their_slot_and_do_not_abort_the_batch() {
+    let (db, mut manager, _sink) = fixture().await;
+    let specs = vec![
+        rich_spec(0),
+        NewTaskSpec {
+            url: "thunder://not-base64!!".into(),
+            ..rich_spec(1)
+        },
+        NewTaskSpec {
+            checksum: "md5=zz".into(),
+            ..rich_spec(2)
+        },
+        rich_spec(3),
+    ];
+    let outcomes = manager
+        .create_tasks_batch("rejections", specs)
+        .await
+        .expect("batch call");
+    assert!(matches!(outcomes[0], BatchItemOutcome::Created(_)));
+    assert!(matches!(
+        outcomes[1],
+        BatchItemOutcome::Rejected(CreateRejection::InvalidThunderLink(_))
+    ));
+    assert!(matches!(
+        outcomes[2],
+        BatchItemOutcome::Rejected(CreateRejection::InvalidChecksum(_))
+    ));
+    assert!(matches!(outcomes[3], BatchItemOutcome::Created(_)));
+    assert_eq!(db.load_all_tasks().await.expect("tasks").len(), 2);
+    // 拒绝项同样进入幂等记录：重放逐位一致（重放内容不参与比较，只认 batch_id）。
+    let replay = manager
+        .create_tasks_batch("rejections", vec![rich_spec(0)])
+        .await
+        .expect("replay");
+    assert_eq!(replay, outcomes);
+}
+
+#[tokio::test]
+async fn dedup_resolves_existing_and_in_batch_duplicates_to_the_first_task() {
+    let (db, mut manager, _sink) = fixture().await;
+    db.set_config("dedup_same_url", "true")
+        .await
+        .expect("enable dedup");
+    let existing = manager
+        .create_task(NewTaskSpec {
+            start_paused: true,
+            ..spec(0)
+        })
+        .await
+        .expect("existing task");
+    let duplicate_of_existing = NewTaskSpec {
+        url: format!("{}#fragment", spec(0).url),
+        start_paused: true,
+        ..spec(0)
+    };
+    let specs = vec![
+        duplicate_of_existing,
+        NewTaskSpec {
+            start_paused: true,
+            ..spec(1)
+        },
+        NewTaskSpec {
+            start_paused: true,
+            ..spec(1)
+        },
+        NewTaskSpec {
+            start_paused: true,
+            ..spec(2)
+        },
+    ];
+    let ids = created(
+        &manager
+            .create_tasks_batch("dedup", specs)
+            .await
+            .expect("batch call"),
+    );
+    assert_eq!(ids[0], existing);
+    assert_eq!(
+        ids[1], ids[2],
+        "in-batch duplicate resolves to the first item"
+    );
+    assert_ne!(ids[1], ids[3]);
+    assert_eq!(db.load_all_tasks().await.expect("tasks").len(), 3);
+}
+
+#[tokio::test]
+async fn batch_publishes_one_tasks_changed_before_any_progress_and_coalesces_positions() {
+    let (_db, mut manager, sink) = fixture().await;
+    occupy_five_slots(&mut manager);
+    let mut specs: Vec<_> = (0..6).map(spec).collect();
+    for index in 6..8 {
+        specs.push(NewTaskSpec {
+            resolver_item: "unavailable".into(),
+            ..spec(index)
+        });
+    }
+    let ids = created(
+        &manager
+            .create_tasks_batch("events", specs)
+            .await
+            .expect("batch call"),
+    );
+    let events = sink.take();
+    let Some(EngineEvent::TasksChanged(facts)) = events.first() else {
+        panic!("TasksChanged must be the first event");
+    };
+    assert_eq!(
+        facts
+            .iter()
+            .map(|task| task.task_id.clone())
+            .collect::<Vec<_>>(),
+        ids
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, EngineEvent::TasksChanged(_)))
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        EngineEvent::TaskChanged(_)
+            | EngineEvent::TasksSnapshot(_)
+            | EngineEvent::QueuePositionsChanged(_)
+    )));
+    let failed = events
+        .iter()
+        .filter(|event| matches!(event, EngineEvent::TaskProgress { status: 4, .. }))
+        .count();
+    assert_eq!(failed, 2, "fail-closed items report their error progress");
+    assert_eq!(manager.pending_queue.len(), 6);
+
+    manager.flush_queue_positions();
+    let positions = sink.take();
+    let [EngineEvent::QueuePositionsChanged(positions)] = positions.as_slice() else {
+        panic!("one coalesced position broadcast expected");
+    };
+    assert_eq!(positions.len(), 6);
+}
+
+#[tokio::test]
+async fn saved_site_credential_is_visible_to_later_items_in_the_same_batch() {
+    let (db, mut manager, _sink) = fixture().await;
+    let specs = vec![
+        NewTaskSpec {
+            http_user: "user".into(),
+            http_password: "pass".into(),
+            save_site_auth: true,
+            ..rich_spec(0)
+        },
+        rich_spec(1),
+    ];
+    let ids = created(
+        &manager
+            .create_tasks_batch("site-auth", specs)
+            .await
+            .expect("batch call"),
+    );
+    for id in &ids {
+        let (_, _, headers) = db
+            .load_task_request_context(id)
+            .await
+            .expect("context")
+            .expect("row");
+        assert!(headers.contains("Authorization"), "task {id}: {headers}");
+    }
+    let store = db
+        .get_config(crate::site_auth::SITE_AUTH_CONFIG_KEY)
+        .await
+        .expect("read store")
+        .expect("store written once at the end");
+    assert!(store.contains("user"));
+}
+
+#[tokio::test]
+async fn meta_probe_waits_for_a_gate_permit() {
+    let (_db, manager, _sink) = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind probe target");
+    let port = listener.local_addr().expect("local addr").port();
+    let permits = manager
+        .probe_gate
+        .clone()
+        .acquire_many_owned(META_PROBE_CONCURRENCY as u32)
+        .await
+        .expect("hold every permit");
+    manager.spawn_meta_probe(
+        "probe-task".into(),
+        format!("http://127.0.0.1:{port}/file.bin"),
+        String::new(),
+        crate::downloader::RequestSpec::from_captured(
+            None,
+            String::new(),
+            String::new(),
+            Default::default(),
+            None,
+        ),
+        manager.client.clone(),
+        ProxyConfig::default(),
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+            .await
+            .is_err(),
+        "no probe may start while the gate is exhausted"
+    );
+    drop(permits);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .is_ok(),
+        "the probe starts once a permit is free"
+    );
+}
+
+#[tokio::test]
+async fn dedicated_clients_are_cached_by_policy_and_bounded() {
+    let (_db, manager, _sink) = fixture().await;
+    let proxy = ProxyConfig::default();
+    let cached = || {
+        manager
+            .task_clients
+            .lock()
+            .expect("client cache lock")
+            .len()
+    };
+    manager
+        .dedicated_client(&proxy, "ua-a", false)
+        .expect("build");
+    manager
+        .dedicated_client(&proxy, "ua-a", false)
+        .expect("cache hit");
+    assert_eq!(cached(), 1, "same policy reuses one client");
+    manager
+        .dedicated_client(&proxy, "ua-b", false)
+        .expect("build");
+    manager
+        .dedicated_client(&proxy, "ua-a", true)
+        .expect("build");
+    assert_eq!(cached(), 3, "UA and TLS policy are part of the key");
+
+    {
+        let mut cache = manager.task_clients.lock().expect("client cache lock");
+        let seed = manager.client.clone();
+        cache.clear();
+        for index in 0..TASK_CLIENT_CACHE_CAP {
+            cache.insert((format!("fp-{index}"), String::new(), false), seed.clone());
+        }
+    }
+    manager
+        .dedicated_client(&proxy, "ua-overflow", false)
+        .expect("build after overflow");
+    assert_eq!(
+        cached(),
+        1,
+        "an overflowing cache restarts instead of growing"
+    );
 }

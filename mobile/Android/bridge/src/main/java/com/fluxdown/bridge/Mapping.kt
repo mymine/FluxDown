@@ -1,10 +1,17 @@
 package com.fluxdown.bridge
 
+import com.fluxdown.core.host.CreateTaskRequest
 import com.fluxdown.core.host.HostErrorCode
 import com.fluxdown.core.host.HostEvent
 import com.fluxdown.core.host.HostException
 import com.fluxdown.core.host.HostSignal
 import com.fluxdown.core.host.HostSnapshot
+import com.fluxdown.core.host.ImportBatch
+import com.fluxdown.core.host.ImportItem
+import com.fluxdown.core.host.ImportProgress
+import com.fluxdown.core.host.ImportRetry
+import com.fluxdown.core.host.ImportSummary
+import com.fluxdown.core.host.ImportUpdate
 import com.fluxdown.core.model.BtFile
 import com.fluxdown.core.model.Category
 import com.fluxdown.core.model.CloudDevice
@@ -397,4 +404,57 @@ internal fun AppUpdateStatusDto.toCore() = AppUpdateStatus(
 internal fun AppUpdateSignalDto.toCore(): AppUpdateSignal = when (this) {
     is AppUpdateSignalDto.Status -> AppUpdateSignal.Status(status.toCore())
     is AppUpdateSignalDto.InstallRequested -> AppUpdateSignal.InstallRequested(packagePath, version)
+}
+
+// ── 批量导入 ──────────────────────────────────────────────────────────────
+
+internal fun CreateTaskRequest.toDto() = CreateTaskRequestDto(
+    url = url,
+    fileName = fileName,
+    saveDir = saveDir,
+    segments = segments,
+    queueId = queueId,
+    startPaused = startPaused,
+    cookies = cookies,
+    referrer = referrer,
+    userAgent = userAgent,
+    proxyUrl = proxyUrl,
+    checksum = checksum,
+    ignoreTlsErrors = ignoreTlsErrors,
+    headers = headers,
+    httpUser = httpUser,
+    httpPassword = httpPassword,
+    saveSiteAuth = saveSiteAuth,
+)
+
+internal fun ImportBatch.toDto() = ImportBatchDto(
+    common = common.toDto(),
+    items = items.map { ImportItemDto(url = it.url, fileName = it.fileName, checksum = it.checksum) },
+)
+
+/** 单条拒绝没有文案（`message` 只带违规字段名）：空串按「无说明」处理，由 reason / code 兜底。 */
+internal fun HostErrorDto.toImportError(): HostException =
+    HostException(code.toCore(), reason, retryable, message.ifEmpty { null })
+
+internal fun ImportProgressDto.toCore() = ImportProgress(
+    total = total.toInt(),
+    done = done.toInt(),
+    failed = failed.toInt(),
+    retry = retry?.let { ImportRetry(attempt = it.attempt.toInt(), max = it.max.toInt(), delaySecs = it.delaySecs.toInt()) },
+)
+
+/** [items] = 提交时各组条目按顺序拼接的列表：Rust 汇总里的 `unfinished` 是其中的序号。 */
+internal fun ImportSummaryDto.toCore(items: List<ImportItem>) = ImportSummary(
+    total = total.toInt(),
+    succeeded = succeeded.toInt(),
+    failed = failed.toInt(),
+    notSubmitted = notSubmitted.toInt(),
+    cancelled = cancelled,
+    firstError = firstError?.toImportError(),
+    unfinished = unfinished.mapNotNull { items.getOrNull(it.toInt()) },
+)
+
+internal fun ImportUpdateDto.toCore(items: List<ImportItem>): ImportUpdate = when (this) {
+    is ImportUpdateDto.Progress -> ImportUpdate.Progress(progress.toCore())
+    is ImportUpdateDto.Finished -> ImportUpdate.Finished(summary.toCore(items))
 }

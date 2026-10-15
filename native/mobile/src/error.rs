@@ -5,7 +5,7 @@
 
 use fluxdown_protocol::{
     ApplicationErrorCode, ErrorReason, INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE,
-    INVALID_REQUEST_CODE, METHOD_NOT_FOUND_CODE, PARSE_ERROR_CODE, RpcErrorObject,
+    INVALID_REQUEST_CODE, METHOD_NOT_FOUND_CODE, PARSE_ERROR_CODE, RpcErrorData, RpcErrorObject,
 };
 
 /// `ApplicationErrorCode`。
@@ -170,6 +170,18 @@ impl From<HostErrorDto> for FluxError {
             reason: error.reason,
             retryable: error.retryable,
             detail: error.message,
+        }
+    }
+}
+
+/// 批量建任务的单条失败（`RpcErrorData` 不带文案，`message` 只放 `field`：指向违规的条目字段）。
+impl From<RpcErrorData> for HostErrorDto {
+    fn from(data: RpcErrorData) -> Self {
+        Self {
+            code: data.code.into(),
+            reason: data.reason.and_then(reason_wire),
+            retryable: data.retryable,
+            message: data.field.unwrap_or_default(),
         }
     }
 }

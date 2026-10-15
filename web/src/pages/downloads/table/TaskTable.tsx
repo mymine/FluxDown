@@ -86,7 +86,7 @@ interface RowProps {
   onToggle: (view: DownloadTaskView) => void
   getMenu: (view: DownloadTaskView) => MenuEntry[]
   onContext: (view: DownloadTaskView) => void
-  rowActionLabels: { pause: string; resume: string; download: string }
+  rowActionLabels: { pause: string; resume: string; download: string; select: string }
 }
 
 function renderCell(props: RowProps, column: LayoutColumn) {
@@ -207,13 +207,32 @@ const TaskRow = memo(function TaskRow(props: RowProps) {
         )}
       >
         <div className={cn('pointer-events-none absolute inset-y-0 left-1 right-1 rounded-[var(--fx-components-task-row-radius)]', selected ? 'bg-accent' : 'group-hover/row:bg-row-hover')} />
-        <div className="relative flex shrink-0 items-center justify-center" style={{ width: SELECTION_COLUMN_WIDTH }}>
+        <div className="relative flex shrink-0 items-center justify-center self-stretch" style={{ width: SELECTION_COLUMN_WIDTH }}>
           {anySelected ? (
             <div className="flex p-1" onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}>
               <Checkbox checked={selected} onCheckedChange={() => onToggle(view)} aria-label={view.name} />
             </div>
           ) : (
-            <KindGlyph view={view} tile={density === 'relaxed'} />
+            // 与 GPUI `render_selection_cell` 对齐：只在悬停该格本身时把图标换成复选框，点击以该行进入多选。
+            <Tooltip content={props.rowActionLabels.select}>
+              <div
+                role="button"
+                aria-label={props.rowActionLabels.select}
+                className="group/sel flex size-full cursor-pointer items-center justify-center"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  onToggle(view)
+                }}
+                onDoubleClick={(event) => event.stopPropagation()}
+              >
+                <span className="flex group-hover/sel:hidden">
+                  <KindGlyph view={view} tile={density === 'relaxed'} />
+                </span>
+                <span aria-hidden className="hidden p-1 group-hover/sel:flex">
+                  <Checkbox checked={false} className="pointer-events-none" />
+                </span>
+              </div>
+            </Tooltip>
           )}
         </div>
         {columns.map((column) => (
@@ -308,7 +327,7 @@ export function TaskTable() {
   )
 
   const rowActionLabels = useMemo(
-    () => ({ pause: t('pause'), resume: t('resume'), download: t('webDownloadFile') }),
+    () => ({ pause: t('pause'), resume: t('resume'), download: t('webDownloadFile'), select: t('selectTaskTooltip') }),
     [t],
   )
 
@@ -338,7 +357,7 @@ export function TaskTable() {
     if (isDownloadable(view)) downloadViewsFiles([view])
     else if (view.source === 'local') ctxRef.current.showDetail(view.taskId)
   }, [])
-  const onToggle = useCallback((view: DownloadTaskView) => ctxRef.current.toggleSelected(view.key), [])
+  const onToggle = useCallback((view: DownloadTaskView) => ctxRef.current.toggleMultiSelect(view.key), [])
   const onContext = useCallback((view: DownloadTaskView) => ctxRef.current.contextSelect(view.key), [])
   // 菜单在打开时才构建，此时读到的选区即右键选择后的最新选区。
   const getMenu = useCallback((view: DownloadTaskView) => {
@@ -349,6 +368,7 @@ export function TaskTable() {
       queues: current.queues,
       queueName: current.queueName,
       showDetail: current.showDetail,
+      selection: { multiSelect: current.multiSelect, enterMultiSelect: current.enterMultiSelect, selectAll: current.selectAll },
     })
   }, [])
 

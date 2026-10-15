@@ -1,3 +1,4 @@
+pub(crate) mod aria2c;
 pub(crate) mod categories;
 pub(crate) mod counts;
 pub(crate) mod devices;

@@ -29,6 +29,9 @@ pub struct LaunchOptions {
     /// 应用内更新完成后由 agent / 安装器拉起：旧桌面进程仍在退出，需等其释放单实例锁，
     /// 且就绪后提示已更新（不影响「普通启动」判定）。
     pub after_update: bool,
+    /// 托盘「重启」由 agent 拉起：与 `--after-update` 一样要等旧实例释放单实例锁，但没有
+    /// 更新发生，不提示已更新（同样不影响「普通启动」判定）。
+    pub relaunch: bool,
 }
 
 impl LaunchOptions {
@@ -43,6 +46,7 @@ impl LaunchOptions {
                 "--settings" => options.settings = true,
                 "--activate-existing" => options.activate_existing = true,
                 "--after-update" => options.after_update = true,
+                "--relaunch" => options.relaunch = true,
                 "--progress-task" => {
                     options.progress_task = args.next().filter(|task_id| !task_id.is_empty());
                 }
@@ -158,6 +162,10 @@ mod tests {
         let options = LaunchOptions::from_args(["--after-update"].map(str::to_owned));
         assert!(options.after_update);
         assert!(options.is_plain(), "after-update stays a plain launch");
+        let options = LaunchOptions::from_args(["--relaunch"].map(str::to_owned));
+        assert!(options.relaunch);
+        assert!(!options.after_update, "relaunch must not claim an update");
+        assert!(options.is_plain(), "relaunch stays a plain launch");
         let file = std::env::temp_dir().join(format!("fluxdown-{}.torrent", std::process::id()));
         std::fs::write(&file, b"d8:announce0:e").expect("write");
         let options = LaunchOptions::from_args([file.display().to_string()]);

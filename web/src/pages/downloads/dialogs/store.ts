@@ -29,9 +29,17 @@ export interface DialogsState {
   groupDetail: string | null
   rename: string | null
   changeUrl: string | null
+  changeSegments: string | null
 }
 
-let state: DialogsState = { newDownload: null, queueManager: null, groupDetail: null, rename: null, changeUrl: null }
+let state: DialogsState = {
+  newDownload: null,
+  queueManager: null,
+  groupDetail: null,
+  rename: null,
+  changeUrl: null,
+  changeSegments: null,
+}
 let counter = 0
 const listeners = new Set<() => void>()
 
@@ -113,4 +121,12 @@ export function openChangeUrl(taskId: string): void {
 
 export function closeChangeUrl(): void {
   publish({ changeUrl: null })
+}
+
+export function openChangeSegments(taskId: string): void {
+  publish({ changeSegments: taskId })
+}
+
+export function closeChangeSegments(): void {
+  publish({ changeSegments: null })
 }

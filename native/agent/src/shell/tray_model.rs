@@ -98,6 +98,7 @@ fn build(translator: &Translator, inputs: &Inputs) -> TrayModel {
             .power
             .armed_delay_secs
             .map(|_| translator.text("trayCancelShutdown").to_owned()),
+        restart: translator.text("trayRestart").to_owned(),
         quit: translator.text("trayExit").to_owned(),
         tooltip,
     }
@@ -156,6 +157,7 @@ mod tests {
                 (model.show_window.as_str(), "trayShowWindow"),
                 (model.pause_all.as_str(), "pauseAll"),
                 (model.resume_all.as_str(), "resumeAll"),
+                (model.restart.as_str(), "trayRestart"),
                 (model.quit.as_str(), "trayExit"),
                 (
                     model.cancel_shutdown.as_deref().unwrap_or_default(),

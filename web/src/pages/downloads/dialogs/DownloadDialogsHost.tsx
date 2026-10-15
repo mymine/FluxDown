@@ -10,7 +10,7 @@ import { NewDownloadDialog } from './NewDownloadDialog'
 import { QueueManagerDialog } from './QueueManagerDialog'
 import { SelectionHost } from './SelectionDialogs'
 import { capturesShown, openNewDownload, useDialogsState } from './store'
-import { ChangeUrlDialog, RenameDialog } from './TaskEditDialogs'
+import { ChangeSegmentsDialog, ChangeUrlDialog, RenameDialog } from './TaskEditDialogs'
 
 const EMPTY_SELECTIONS: readonly SelectionRequestDto[] = []
 const EMPTY_CAPTURES: readonly PendingCaptureDto[] = []
@@ -33,6 +33,7 @@ export function DownloadDialogsHost() {
       {state.groupDetail ? <GroupDetailDialog key={state.groupDetail} groupId={state.groupDetail} /> : null}
       {state.rename ? <RenameDialog key={state.rename} taskId={state.rename} /> : null}
       {state.changeUrl ? <ChangeUrlDialog key={state.changeUrl} taskId={state.changeUrl} /> : null}
+      {state.changeSegments ? <ChangeSegmentsDialog key={state.changeSegments} taskId={state.changeSegments} /> : null}
       <SelectionHost requests={selections} />
       <FileConflictDialog />
     </>

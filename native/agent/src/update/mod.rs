@@ -7,13 +7,15 @@
 //!
 //! ```text
 //! Idle/UpToDate/Available/Failed --check--> Checking --> UpToDate | Available | Failed(Network)
+//! Ready --check(更新的版本)--> Available（旧包作废，下次下载时清理）
 //! Available/Failed --download--> Downloading --> Ready | Failed(Network/Verify/Storage)
 //! Downloading --cancel--> Available
 //! Available/Failed --install--> Downloading(installPending) --> Installing
 //! Ready --install--> Installing --> (重启) | Failed(Install/..)
 //! ```
 //!
-//! 下载 / 就绪 / 安装中不再重新检查，避免丢失已就绪的包。
+//! 下载 / 安装中不再重新检查；就绪时照常检查，但只有查到比就绪包更新的版本才取代它，
+//! 失败或同版本保留就绪状态——常驻不重启的机器也能跟上后续发布。
 
 mod download;
 pub(crate) mod install;
@@ -47,6 +49,9 @@ use crate::http_client::LazyHttpClient;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(30);
 const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// 周期检查按墙钟判定到期：单调时钟是否计入系统睡眠因平台而异（std 不保证），
+/// 只靠一次 6h `sleep` 时睡眠 / 休眠会把检查无限推后。轮询只看时间，不碰网络与磁盘。
+const CHECK_TICK: Duration = Duration::from_secs(10 * 60);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 const PENDING_FILE: &str = "pending.json";
 const PREF_AUTO_CHECK: &str = "general.auto_check_update";
@@ -379,24 +384,41 @@ impl UpdateService {
                 return Ok(self.status());
             }
         };
-        let previous = {
+        // `Some(版本)`：检查前已有就绪包；查询期间不翻 Checking，保留可安装状态。
+        let (previous, ready) = {
             let mut core = self.lock();
-            if matches!(
-                core.status.phase,
-                UpdatePhase::Downloading | UpdatePhase::Ready | UpdatePhase::Installing
-            ) {
-                return Ok(core.status.clone());
+            match core.status.phase {
+                UpdatePhase::Downloading | UpdatePhase::Installing => {
+                    return Ok(core.status.clone());
+                }
+                UpdatePhase::Ready => (
+                    core.status.clone(),
+                    Some(core.status.latest_version.clone()),
+                ),
+                _ => {
+                    let previous = core.status.clone();
+                    core.status.phase = UpdatePhase::Checking;
+                    core.status.channel = channel.to_owned();
+                    core.status.failure = None;
+                    core.status.error_detail.clear();
+                    self.commit(&mut core);
+                    (previous, None)
+                }
             }
-            let previous = core.status.clone();
-            core.status.phase = UpdatePhase::Checking;
-            core.status.channel = channel.to_owned();
-            core.status.failure = None;
-            core.status.error_detail.clear();
-            self.commit(&mut core);
-            previous
         };
         match self.fetch_outcome(channel).await {
             Ok(outcome) => Ok(self.mutate(|core| {
+                if let Some(ready_version) = &ready {
+                    // 检查期间用户可能已点安装：只在仍就绪且查到更新的版本时取代旧包。
+                    let superseded = core.status.phase == UpdatePhase::Ready
+                        && outcome.release.as_ref().is_some_and(|release| {
+                            is_newer(&release.version, ready_version).unwrap_or(false)
+                        });
+                    if !superseded {
+                        return core.status.clone();
+                    }
+                    core.status.channel = channel.to_owned();
+                }
                 apply_outcome(
                     core,
                     outcome,
@@ -405,6 +427,10 @@ impl UpdateService {
                 );
                 core.status.clone()
             })),
+            Err(error) if ready.is_some() => {
+                tracing::debug!(error = %error, "update check while ready failed; keeping ready package");
+                Ok(self.status())
+            }
             Err(error) => {
                 self.mutate(|core| {
                     if silent {
@@ -963,13 +989,26 @@ impl UpdateService {
     }
 
     async fn periodic(self: &Arc<Self>, cancel: CancellationToken) {
-        let mut delay = FIRST_CHECK_DELAY;
+        let mut due = SystemTime::now() + FIRST_CHECK_DELAY;
         loop {
+            let wait = due
+                .duration_since(SystemTime::now())
+                .map_or(Duration::ZERO, |left| left.min(CHECK_TICK));
             tokio::select! {
                 () = cancel.cancelled() => return,
-                () = tokio::time::sleep(delay) => {}
+                () = tokio::time::sleep(wait) => {}
             }
-            delay = CHECK_INTERVAL;
+            let now = SystemTime::now();
+            if let Ok(left) = due.duration_since(now)
+                && !left.is_zero()
+            {
+                // 墙钟被往回拨：到期点不得比一个周期更远。
+                if left > CHECK_INTERVAL {
+                    due = now + CHECK_INTERVAL;
+                }
+                continue;
+            }
+            due = now + CHECK_INTERVAL;
             if self.pref(PREF_AUTO_CHECK).and_then(|value| value.as_bool()) == Some(false) {
                 continue;
             }
@@ -984,8 +1023,13 @@ impl UpdateService {
                     continue;
                 }
             };
-            let declined =
+            // 下载中取消过、或在提醒窗口「跳过此版本」的版本不再自动下载。
+            let cancelled =
                 self.lock().declined_auto.as_deref() == Some(status.latest_version.as_str());
+            let skipped = self
+                .pref(fluxdown_protocol::update_prompt::SKIPPED_VERSION_KEY)
+                .is_some_and(|value| value.as_str() == Some(status.latest_version.as_str()));
+            let declined = cancelled || skipped;
             if status.phase == UpdatePhase::Available
                 && status.has_update
                 && status.manual_reason.is_none()
@@ -1135,15 +1179,24 @@ mod tests {
 
     /// 官网形状的移动端发布：`mobile.assets` 只有 arm64 分包，`SHA256SUMS-mobile.txt` 带其校验和。
     async fn mobile_site(version: &'static str) -> String {
+        mobile_site_live(Arc::new(Mutex::new(version))).await
+    }
+
+    fn mobile_apk(version: &str) -> String {
+        format!("FluxDown-{version}-android-arm64-v8a.apk")
+    }
+
+    /// 同上，发布版本可在测试中途更换（模拟常驻期间出了新版）。
+    async fn mobile_site_live(version: Arc<Mutex<&'static str>>) -> String {
         use sha2::Digest;
-        let apk = format!("FluxDown-{version}-android-arm64-v8a.apk");
-        let sums = format!("{}  {apk}\n", hex::encode(sha2::Sha256::digest(APK)));
-        let release_apk = apk.clone();
+        let digest = hex::encode(sha2::Sha256::digest(APK));
+        let release_version = version.clone();
         let app = Router::new()
             .route(
                 "/api/release",
                 get(move || {
-                    let apk = release_apk.clone();
+                    let version = *release_version.lock().unwrap();
+                    let apk = mobile_apk(version);
                     async move {
                         axum::Json(serde_json::json!({
                             "version": "9.9.9",
@@ -1168,7 +1221,8 @@ mod tests {
                 "/api/download/{name}",
                 get(
                     move |axum::extract::Path(name): axum::extract::Path<String>| {
-                        let (apk, sums) = (apk.clone(), sums.clone());
+                        let apk = mobile_apk(*version.lock().unwrap());
+                        let sums = format!("{digest}  {apk}\n");
                         async move {
                             if name == "SHA256SUMS-mobile.txt" {
                                 Ok(sums.into_bytes())
@@ -1182,6 +1236,51 @@ mod tests {
                 ),
             );
         serve(app).await
+    }
+
+    /// 常驻不重启：已就绪的包不能挡住后续发布；同版本 / 检查失败保留就绪包。
+    #[tokio::test]
+    async fn ready_package_is_superseded_only_by_newer_release() {
+        let dir = temp_dir();
+        let version = Arc::new(Mutex::new("2.0.0"));
+        let base = mobile_site_live(version.clone()).await;
+        let (service, _delegate) = delegated(
+            &dir,
+            "1.0.0",
+            Endpoint::with_base(&base, true),
+            &["arm64-v8a"],
+        );
+        service.check("stable").await.unwrap();
+        service.download().await.unwrap();
+        wait_phase(&service, UpdatePhase::Ready).await;
+
+        let status = service.check("stable").await.unwrap();
+        assert_eq!(status.phase, UpdatePhase::Ready, "same version keeps ready");
+        assert_eq!(status.latest_version, "2.0.0");
+
+        *version.lock().unwrap() = "2.1.0";
+        let status = service.check("stable").await.unwrap();
+        assert_eq!(status.phase, UpdatePhase::Available);
+        assert_eq!(status.latest_version, "2.1.0");
+        assert_eq!(status.asset_name, mobile_apk("2.1.0"));
+        service.download().await.unwrap();
+        wait_phase(&service, UpdatePhase::Ready).await;
+        let updates = dir.join("updates");
+        assert!(updates.join("2.1.0").join(mobile_apk("2.1.0")).exists());
+        assert!(!updates.join("2.0.0").exists(), "superseded package pruned");
+
+        // 已就绪时站点不可达：保留就绪包，不翻 Failed。
+        let (offline, _delegate) = delegated(
+            &dir,
+            "1.0.0",
+            Endpoint::with_base(&dead_base().await, true),
+            &["arm64-v8a"],
+        );
+        offline.lock().status = service.status();
+        let status = offline.check("stable").await.unwrap();
+        assert_eq!(status.phase, UpdatePhase::Ready);
+        assert_eq!(status.latest_version, "2.1.0");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     async fn serve(app: Router) -> String {

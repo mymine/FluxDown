@@ -59,8 +59,14 @@ function onDaemonEvent(event: DaemonEvent) {
     case 'taskChanged':
       if (event.data.status !== 1 && event.data.status !== 5) drop(event.data.taskId)
       break
+    case 'tasksChanged':
+      for (const task of event.data) if (task.status !== 1 && task.status !== 5) drop(task.taskId)
+      break
     case 'taskDeleted':
       drop(event.data.taskId)
+      break
+    case 'tasksDeleted':
+      for (const taskId of event.data.taskIds) drop(taskId)
       break
     case 'engine': {
       const message = event.data

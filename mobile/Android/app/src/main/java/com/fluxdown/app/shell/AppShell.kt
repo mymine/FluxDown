@@ -64,6 +64,7 @@ import com.fluxdown.app.feature.downloads.HostSwitchSheet
 import com.fluxdown.app.feature.downloads.ProvideDownloadsView
 import com.fluxdown.app.feature.downloads.ViewOptionsSheet
 import com.fluxdown.app.feature.newtask.MoveToQueueSheet
+import com.fluxdown.app.feature.newtask.ImportEffects
 import com.fluxdown.app.feature.newtask.NewDownloadSheet
 import com.fluxdown.app.feature.rss.RssEditorSheet
 import com.fluxdown.app.feature.rss.RssEditorTarget
@@ -186,6 +187,7 @@ fun AppShell() {
         AppearanceSyncEffect()
         AccountEffects()
         UpdateEffects()
+        ImportEffects()
         ProvideDownloadsView {
             BackHandler(enabled = nav.searchOpen || nav.sheet != null || nav.selecting || nav.stack.isNotEmpty() || nav.tab != AppTab.Downloads) {
                 nav.back()

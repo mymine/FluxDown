@@ -71,6 +71,54 @@ function clearActiveRuntime(snapshot: DaemonSnapshot, taskId: string): DaemonSna
   return { ...snapshot, taskRuntime: { ...snapshot.taskRuntime, [taskId]: cleared } }
 }
 
+/**
+ * 一批 `taskChanged`（对应 Rust `DaemonEvent::TasksChanged`）：语义等同按序逐条应用，
+ * 但整批只复制一次任务数组（建任务块通常上百条，逐条复制是 O(N·B)）；
+ * 任务索引只建一次，`taskRuntime` 至多复制一次。
+ */
+function applyTasksChanged(snapshot: DaemonSnapshot, changed: readonly TaskDto[]): DaemonSnapshot {
+  if (changed.length === 0) return snapshot
+  const tasks = snapshot.tasks.slice()
+  const indexById = new Map<string, number>()
+  for (let index = 0; index < tasks.length; index += 1) indexById.set((tasks[index] as TaskDto).taskId, index)
+  let taskRuntime = snapshot.taskRuntime
+  for (const task of changed) {
+    const index = indexById.get(task.taskId)
+    if (index === undefined) {
+      indexById.set(task.taskId, tasks.length)
+      tasks.push(task)
+    } else {
+      tasks[index] = task
+    }
+    if (isActiveStatus(task.status)) continue
+    const runtime = taskRuntime[task.taskId]
+    if (!runtime) continue
+    const cleared = clearedRuntime(runtime)
+    if (cleared === runtime) continue
+    if (taskRuntime === snapshot.taskRuntime) taskRuntime = { ...taskRuntime }
+    taskRuntime[task.taskId] = cleared
+  }
+  return taskRuntime === snapshot.taskRuntime ? { ...snapshot, tasks } : { ...snapshot, tasks, taskRuntime }
+}
+
+/**
+ * 一批 `taskDeleted`（对应 Rust `DaemonEvent::TasksDeleted`）：语义等同按序逐条应用，
+ * 但整批一次过滤任务数组、`taskRuntime` 至多复制一次；没有任何命中时保持原引用。
+ */
+function applyTasksDeleted(snapshot: DaemonSnapshot, taskIds: readonly string[]): DaemonSnapshot {
+  if (taskIds.length === 0) return snapshot
+  const deleted = new Set(taskIds)
+  const tasks = snapshot.tasks.filter((task) => !deleted.has(task.taskId))
+  let taskRuntime = snapshot.taskRuntime
+  for (const taskId of deleted) {
+    if (!(taskId in taskRuntime)) continue
+    if (taskRuntime === snapshot.taskRuntime) taskRuntime = { ...taskRuntime }
+    delete taskRuntime[taskId]
+  }
+  if (tasks.length === snapshot.tasks.length && taskRuntime === snapshot.taskRuntime) return snapshot
+  return { ...snapshot, tasks, taskRuntime }
+}
+
 function updateTask(
   snapshot: DaemonSnapshot,
   taskId: string,
@@ -242,6 +290,10 @@ export function applyDaemonEvent(snapshot: DaemonSnapshot, event: DaemonEvent): 
       if (!isActiveStatus(task.status)) next = clearActiveRuntime(next, task.taskId)
       return next
     }
+    case 'tasksChanged':
+      return applyTasksChanged(snapshot, event.data)
+    case 'tasksDeleted':
+      return applyTasksDeleted(snapshot, event.data.taskIds)
     case 'taskDeleted':
       return {
         ...snapshot,

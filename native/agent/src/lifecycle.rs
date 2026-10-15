@@ -77,8 +77,9 @@ impl Lifecycle {
         });
     }
 
-    /// 应用更新后的完全退出：流程与 [`Self::request_quit`] 相同，另外标记为重启——
-    /// agent 运行期结束后由 `update::restart::run_pending` 重新拉起程序。幂等，立即返回。
+    /// 重启式完全退出（应用更新、托盘「重启」）：流程与 [`Self::request_quit`] 相同，另外标记为
+    /// 重启——调用方须先经 `update::restart::schedule` 登记计划，agent 运行期结束后由
+    /// `update::restart::run_pending` 重新拉起程序。幂等，立即返回。
     pub fn request_restart(self: &Arc<Self>) {
         self.restart_requested.store(true, Ordering::Release);
         self.request_quit();
@@ -87,8 +88,9 @@ impl Lifecycle {
     /// UI 连接在 agent 退出时的 WebSocket 关闭原因。
     ///
     /// 完全退出为 `service-quit`（客户端停止重连）；headless 服务器为更新而重启时为
-    /// `service-restart`（浏览器保持重连，服务版本变化后重新加载页面）——桌面形态的更新重启
-    /// 仍是 `service-quit`，由 agent 退出后重新拉起的桌面程序接管界面；其余为 `agent-shutdown`。
+    /// `service-restart`（浏览器保持重连，服务版本变化后重新加载页面）——桌面形态的重启（更新或
+    /// 托盘「重启」）仍是 `service-quit`，由 agent 退出后重新拉起的桌面程序接管界面；其余为
+    /// `agent-shutdown`。
     #[must_use]
     pub fn close_reason(&self) -> &'static str {
         if !self.quit_requested() {

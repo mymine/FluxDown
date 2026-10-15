@@ -106,6 +106,11 @@ export function moveViewsToQueue(views: readonly DownloadTaskView[], queueId: st
 /** Boost：同 id 再次调用即取消。 */
 export const toggleBoost = (taskId: string) => guarded(() => rpc.daemon.queue.boost({ id: taskId }))
 
+/** 更换链接 / 修改线程数成功后，失败任务立即重试（暂停 / 等待保持原状态）；重试失败 toast。 */
+export async function resumeIfFailed(taskId: string, wasFailed: boolean): Promise<boolean> {
+  return wasFailed ? guarded(() => rpc.daemon.task.resume({ taskId })) : true
+}
+
 export function isPluginRetryError(view: DownloadTaskView): boolean {
   return view.state === 'failed' && view.errorMessage.startsWith(PLUGIN_ERROR_PREFIX)
 }

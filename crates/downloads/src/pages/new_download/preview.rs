@@ -14,9 +14,10 @@ use gpui_component::{WindowExt as _, button::Button, notification::Notification,
 use super::NewDownloadView;
 use crate::{
     controller::{DownloadsCommand, DownloadsResult},
+    model::new_download::BuiltRequests,
     pages::manifest::ManifestView,
     strings::error_text,
-    submission::{NewDownloadSubmission, run_submission},
+    submission::{NewDownloadSubmission, SubmissionHooks, run_submission},
 };
 
 const PREVIEW_TIMEOUT: Duration = Duration::from_secs(90);
@@ -106,7 +107,7 @@ impl NewDownloadView {
         };
         match manifest {
             Some(manifest) => self.show_manifest(manifest, request, transaction_id, window, cx),
-            None => self.submit_requests(vec![request], window, cx),
+            None => self.submit_requests(BuiltRequests::from_single(request), window, cx),
         }
     }
 
@@ -164,13 +165,19 @@ impl NewDownloadView {
             return;
         }
         let port = self.port.clone();
+        let timer = cx.background_executor().clone();
         let submission = NewDownloadSubmission::Group {
             request: Box::new(request),
             context: Box::new(context),
             transaction_id: transaction_id.clone(),
         };
         cx.spawn_in(window, async move |this, cx| {
-            let report = run_submission(submission, move |command| port.execute(command)).await;
+            let report = run_submission(
+                submission,
+                move |command| port.execute(command),
+                SubmissionHooks::new(move |delay| timer.timer(delay)),
+            )
+            .await;
             let Ok(()) = this.update_in(cx, |this, window, cx| {
                 if report.failed() {
                     if let Some(manifest) = &this.manifest {

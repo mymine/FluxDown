@@ -11,6 +11,7 @@ mod sections;
 mod store;
 mod theme_library;
 mod ui;
+pub mod update_prompt;
 pub mod update_view;
 mod view;
 
@@ -19,6 +20,9 @@ pub use push_view::{PushHost, PushView, WindowAction};
 pub use search::{SettingsSearchEntry, SettingsTarget, search_index};
 pub use store::{SettingsError, SettingsErrorKind, SettingsStore};
 pub use theme_library::sync_theme_library;
+pub use update_prompt::{
+    UPDATE_PROMPT_WINDOW_HEIGHT, UPDATE_PROMPT_WINDOW_WIDTH, UpdatePromptEvent, UpdatePromptView,
+};
 pub use view::{ActivityBarToggle, SettingsContentSlots, SettingsView};
 
 /// 打开分类编辑对话框（`id = None` 新建；未知 id 视为新建）。供 app 把下载侧栏的

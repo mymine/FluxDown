@@ -212,11 +212,27 @@ impl DaemonEventHub {
     }
 }
 
-// Ten fixed buckets bound both memory and per-event work independently of the
-// number of tasks. Rates are bytes observed in the trailing one-second window,
-// quantized to 100 ms, not a sum of task EMAs that disappears on completion.
+// Fixed buckets bound both memory and per-event work independently of the
+// number of tasks. Rates are bytes actually transferred, not a sum of task
+// EMAs that disappears on completion. Each progress frame's delta is spread
+// uniformly over the interval since that task's previous sample (a task
+// reports at most every ~500 ms, and a small file may finish in one lump), so
+// lumpy reporting does not turn into a sawtooth. The rate averages a
+// two-second window that ends `REPORT_LAG` before now, so every bucket in it
+// has already been reported; the published value changes at most every
+// `PUBLISH_PERIOD`, which keeps the footer readable.
 const TRAFFIC_BUCKET: Duration = Duration::from_millis(100);
-const TRAFFIC_BUCKETS: usize = 10;
+const TRAFFIC_BUCKET_US: u128 = 100_000;
+/// Ring capacity: must cover lag + window + the longest spread.
+const TRAFFIC_BUCKETS: usize = 40;
+/// Averaging window (2 s).
+const RATE_WINDOW_BUCKETS: u128 = 20;
+/// Window end lag: per-task progress frames are at least 500 ms apart.
+const REPORT_LAG_BUCKETS: u128 = 7;
+/// Republish cadence for the rate (500 ms).
+const PUBLISH_PERIOD_BUCKETS: u128 = 5;
+/// Longest interval one delta is spread over (paused / long-silent tasks).
+const SPREAD_CAP_US: u128 = 1_000_000;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct TrafficBucket {
@@ -225,12 +241,21 @@ struct TrafficBucket {
     uploaded: i64,
 }
 
+impl TrafficBucket {
+    fn has_bytes(&self) -> bool {
+        self.downloaded != 0 || self.uploaded != 0
+    }
+}
+
 #[derive(Debug)]
 struct TaskSample {
     status: i32,
     downloaded: i64,
     uploaded: i64,
     explicit_baseline: bool,
+    /// When this task's bytes were last accounted (or it became active):
+    /// the start of the interval the next delta is spread over.
+    last_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -240,6 +265,22 @@ struct RuntimeAccounting {
     pending: u32,
     origin: Instant,
     buckets: [TrafficBucket; TRAFFIC_BUCKETS],
+    /// First bucket of the current traffic burst: the average never spans the
+    /// idle time before it, so a fresh burst is not diluted.
+    burst_start: Option<u128>,
+    /// `(publish period, download bps, upload bps)` last computed.
+    published: Option<(u128, i64, i64)>,
+}
+
+fn is_active(status: i32) -> bool {
+    matches!(status, 1 | 5)
+}
+
+/// `value * part / whole` without overflow (`whole > 0`).
+fn proportion(value: i64, part: u128, whole: u128) -> i64 {
+    let scaled = i128::from(value) * i128::try_from(part).unwrap_or(i128::MAX)
+        / i128::try_from(whole).unwrap_or(i128::MAX);
+    i64::try_from(scaled).unwrap_or(i64::MAX)
 }
 
 impl RuntimeAccounting {
@@ -250,22 +291,20 @@ impl RuntimeAccounting {
             pending: 0,
             origin: now,
             buckets: [TrafficBucket::default(); TRAFFIC_BUCKETS],
+            burst_start: None,
+            published: None,
         };
         accounting.reconcile(tasks);
         accounting
     }
 
     fn remove_status(&mut self, status: i32) {
-        self.active = self
-            .active
-            .saturating_sub(u32::from(matches!(status, 1 | 5)));
+        self.active = self.active.saturating_sub(u32::from(is_active(status)));
         self.pending = self.pending.saturating_sub(u32::from(status == 0));
     }
 
     fn add_status(&mut self, status: i32) {
-        self.active = self
-            .active
-            .saturating_add(u32::from(matches!(status, 1 | 5)));
+        self.active = self.active.saturating_add(u32::from(is_active(status)));
         self.pending = self.pending.saturating_add(u32::from(status == 0));
     }
 
@@ -280,17 +319,76 @@ impl RuntimeAccounting {
         if let Some(sample) = self.tasks.get_mut(task_id) {
             let delta = downloaded_bytes.saturating_sub(sample.downloaded).max(0);
             sample.downloaded = sample.downloaded.max(downloaded_bytes);
-            self.record_traffic(delta, 0, now);
+            let since = sample.last_at.replace(now);
+            self.record_traffic(delta, 0, since, now);
         }
     }
 
-    fn record_traffic(&mut self, downloaded: i64, uploaded: i64, now: Instant) {
+    fn micros(&self, at: Instant) -> u128 {
+        at.saturating_duration_since(self.origin).as_micros()
+    }
+
+    fn tick(&self, at: Instant) -> u128 {
+        self.micros(at) / TRAFFIC_BUCKET_US
+    }
+
+    /// Whether any bucket that can still reach the rate window holds bytes.
+    fn recent_traffic(&self, tick: u128) -> bool {
+        let horizon = tick.saturating_sub(REPORT_LAG_BUCKETS + RATE_WINDOW_BUCKETS);
+        self.buckets
+            .iter()
+            .any(|bucket| bucket.has_bytes() && bucket.tick >= horizon)
+    }
+
+    /// Spread `downloaded`/`uploaded` uniformly over `[since, now]` (capped at
+    /// [`SPREAD_CAP_US`]); bytes are conserved exactly.
+    fn record_traffic(
+        &mut self,
+        downloaded: i64,
+        uploaded: i64,
+        since: Option<Instant>,
+        now: Instant,
+    ) {
         if downloaded == 0 && uploaded == 0 {
             return;
         }
-        let tick = now.duration_since(self.origin).as_millis() / TRAFFIC_BUCKET.as_millis();
+        let end = self.micros(now);
+        let start = since
+            .map_or(end, |since| self.micros(since))
+            .max(end.saturating_sub(SPREAD_CAP_US))
+            .min(end);
+        let (first_tick, last_tick) = (start / TRAFFIC_BUCKET_US, end / TRAFFIC_BUCKET_US);
+        if !self.recent_traffic(last_tick) {
+            self.burst_start = Some(first_tick);
+            self.published = None;
+        }
+        let span = end - start;
+        let (mut downloaded_left, mut uploaded_left) = (downloaded, uploaded);
+        for tick in first_tick..=last_tick {
+            let (down, up) = if tick == last_tick {
+                (downloaded_left, uploaded_left)
+            } else {
+                let low = start.max(tick * TRAFFIC_BUCKET_US);
+                let high = end.min((tick + 1) * TRAFFIC_BUCKET_US);
+                let share = high.saturating_sub(low);
+                (
+                    proportion(downloaded, share, span),
+                    proportion(uploaded, share, span),
+                )
+            };
+            downloaded_left = downloaded_left.saturating_sub(down);
+            uploaded_left = uploaded_left.saturating_sub(up);
+            self.add_to_bucket(tick, down, up);
+        }
+    }
+
+    fn add_to_bucket(&mut self, tick: u128, downloaded: i64, uploaded: i64) {
         let slot = (tick % TRAFFIC_BUCKETS as u128) as usize;
         let bucket = &mut self.buckets[slot];
+        if bucket.tick > tick {
+            // Older than the ring (cannot happen within the spread cap).
+            return;
+        }
         if bucket.tick != tick {
             *bucket = TrafficBucket {
                 tick,
@@ -302,7 +400,7 @@ impl RuntimeAccounting {
         bucket.uploaded = bucket.uploaded.saturating_add(uploaded);
     }
 
-    fn baseline(&mut self, task: &TaskDto) {
+    fn baseline(&mut self, task: &TaskDto, now: Instant) {
         let previous_status = if let Some(sample) = self.tasks.get_mut(&task.task_id) {
             let previous = sample.status;
             sample.status = task.status;
@@ -313,6 +411,9 @@ impl RuntimeAccounting {
                 sample.downloaded = sample.downloaded.max(task.downloaded_bytes);
             }
             sample.uploaded = sample.uploaded.max(task.uploaded_bytes);
+            if is_active(task.status) && !is_active(previous) {
+                sample.last_at = Some(now);
+            }
             Some(previous)
         } else {
             self.tasks.insert(
@@ -322,6 +423,7 @@ impl RuntimeAccounting {
                     downloaded: task.downloaded_bytes.max(0),
                     uploaded: task.uploaded_bytes.max(0),
                     explicit_baseline: false,
+                    last_at: is_active(task.status).then_some(now),
                 },
             );
             None
@@ -354,6 +456,7 @@ impl RuntimeAccounting {
                         downloaded: task.downloaded_bytes.max(0),
                         uploaded: task.uploaded_bytes.max(0),
                         explicit_baseline: false,
+                        last_at: None,
                     },
                 );
             }
@@ -371,8 +474,18 @@ impl RuntimeAccounting {
         match event {
             DaemonEvent::SnapshotReplaced(snapshot) => self.reconcile(&snapshot.tasks),
             DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks }) => self.reconcile(tasks),
-            DaemonEvent::TaskChanged(task) => self.baseline(task),
+            DaemonEvent::TaskChanged(task) => self.baseline(task, now),
+            DaemonEvent::TasksChanged(tasks) => {
+                for task in tasks {
+                    self.baseline(task, now);
+                }
+            }
             DaemonEvent::TaskDeleted { task_id } => self.remove(task_id),
+            DaemonEvent::TasksDeleted { task_ids } => {
+                for task_id in task_ids {
+                    self.remove(task_id);
+                }
+            }
             DaemonEvent::Engine(WsServerMsg::TaskProgress {
                 task_id,
                 status,
@@ -400,33 +513,69 @@ impl RuntimeAccounting {
                 // arbitrary regressing samples and snapshots cannot.
                 sample.downloaded = sample.downloaded.max(*downloaded_bytes);
                 sample.uploaded = sample.uploaded.max(*uploaded_bytes);
+                let since = sample.last_at.replace(now);
                 self.remove_status(old_status);
                 self.add_status(*status);
-                self.record_traffic(downloaded, uploaded, now);
+                self.record_traffic(downloaded, uploaded, since, now);
             }
             _ => {}
         }
     }
 
+    /// Download / upload rate (bytes/s) over the lagged window; recomputed at
+    /// most once per [`PUBLISH_PERIOD_BUCKETS`].
     fn rates(&mut self, now: Instant) -> (i64, i64) {
-        let tick = now.duration_since(self.origin).as_millis() / TRAFFIC_BUCKET.as_millis();
-        let mut downloaded = 0_i64;
-        let mut uploaded = 0_i64;
+        let tick = self.tick(now);
         for bucket in &mut self.buckets {
             if tick.saturating_sub(bucket.tick) >= TRAFFIC_BUCKETS as u128 {
                 *bucket = TrafficBucket::default();
-            } else {
+            }
+        }
+        let period = tick / PUBLISH_PERIOD_BUCKETS;
+        if let Some((published, downloaded, uploaded)) = self.published
+            && published == period
+        {
+            return (downloaded, uploaded);
+        }
+        let end = tick.saturating_sub(REPORT_LAG_BUCKETS);
+        let window_start = end.saturating_sub(RATE_WINDOW_BUCKETS);
+        let first = self
+            .burst_start
+            .map_or(window_start, |burst| burst.max(window_start));
+        if !self.recent_traffic(tick) {
+            self.burst_start = None;
+        }
+        let buckets = end.saturating_sub(first);
+        if buckets == 0 {
+            // The burst has not reached the reported window yet.
+            return (0, 0);
+        }
+        let (mut downloaded, mut uploaded) = (0_i64, 0_i64);
+        for bucket in &self.buckets {
+            if bucket.has_bytes() && bucket.tick >= first && bucket.tick < end {
                 downloaded = downloaded.saturating_add(bucket.downloaded);
                 uploaded = uploaded.saturating_add(bucket.uploaded);
             }
         }
-        (downloaded, uploaded)
+        let per_second = 1_000_000 / TRAFFIC_BUCKET_US;
+        let rates = (
+            proportion(downloaded, per_second, buckets),
+            proportion(uploaded, per_second, buckets),
+        );
+        self.published = Some((period, rates.0, rates.1));
+        rates
     }
 
     fn has_traffic(&self) -> bool {
-        self.buckets
-            .iter()
-            .any(|bucket| bucket.downloaded != 0 || bucket.uploaded != 0)
+        self.buckets.iter().any(TrafficBucket::has_bytes)
+    }
+
+    /// Every byte still held in the ring (exact accounting, rate-independent).
+    #[cfg(test)]
+    fn window_bytes(&self) -> (i64, i64) {
+        self.buckets.iter().fold((0, 0), |(down, up), bucket| {
+            (down + bucket.downloaded, up + bucket.uploaded)
+        })
     }
 }
 
@@ -483,6 +632,20 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
                 self.0.publish_with_runtime_stats(DaemonEvent::TaskChanged(
                     fluxdown_engine_protocol::task_info_to_dto(*task),
                 ));
+                return;
+            }
+            EngineEvent::TasksChanged(tasks) => {
+                self.0.publish_with_runtime_stats(DaemonEvent::TasksChanged(
+                    tasks
+                        .into_iter()
+                        .map(fluxdown_engine_protocol::task_info_to_dto)
+                        .collect(),
+                ));
+                return;
+            }
+            EngineEvent::TasksDeleted(task_ids) => {
+                self.0
+                    .publish_with_runtime_stats(DaemonEvent::TasksDeleted { task_ids });
                 return;
             }
             EngineEvent::TaskRuntimeChanged(runtime) => {
@@ -936,6 +1099,138 @@ mod tests {
         assert_eq!(snapshot.runtime_stats.retry_pending_tasks, 0);
     }
 
+    fn engine_task(id: &str, status: i32) -> fluxdown_engine::model::TaskInfo {
+        fluxdown_engine::model::TaskInfo {
+            task_id: id.to_owned(),
+            url: format!("https://example.com/{id}"),
+            file_name: format!("{id}.bin"),
+            save_dir: "/tmp".to_owned(),
+            status,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            error_message: String::new(),
+            created_at: "1".to_owned(),
+            proxy_url: String::new(),
+            queue_id: String::new(),
+            checksum: String::new(),
+            ignore_tls_errors: false,
+            file_missing: false,
+            completed_at: String::new(),
+            segments: 0,
+            queue_order: 1,
+            uploaded_bytes: 0,
+            uploaded_at_completion: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
+            seeding_time_secs: 0,
+            seed_ratio_limit_milli: -2,
+            seed_post_ratio_limit_milli: -2,
+            seed_time_limit_minutes: -2,
+            seed_inactive_time_limit_minutes: -2,
+            seed_upload_limit_bps: 0,
+            referrer: String::new(),
+            group_id: String::new(),
+            rss_source_id: String::new(),
+            origin_url: String::new(),
+            auto_route: String::new(),
+            source_bytes: Default::default(),
+        }
+    }
+
+    /// 批量创建事实只发一帧 `TasksChanged`，投影与运行统计按任务逐个入账。
+    #[test]
+    fn tasks_changed_is_one_frame_and_accounts_every_task() {
+        let hub = DaemonEventHub::new(DaemonSnapshot::default(), 16);
+        let (mut subscriber, _) = hub.subscribe_and_snapshot();
+        let sink = DaemonEngineEventSink(hub.clone());
+        sink.emit(EngineEvent::TasksChanged(vec![
+            engine_task("a", 0),
+            engine_task("b", 0),
+            engine_task("c", 2),
+        ]));
+        let frame = subscriber.try_recv().expect("one batch frame");
+        let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::TasksChanged(tasks)) = frame.event
+        else {
+            panic!("the batch must travel as a single TasksChanged event");
+        };
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        let stats_frame = subscriber
+            .try_recv()
+            .expect("runtime stats follow the batch");
+        let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::RuntimeStatsChanged(stats)) =
+            stats_frame.event
+        else {
+            panic!("pending count changed, so runtime stats must follow");
+        };
+        assert_eq!(stats.pending_tasks, 2);
+        assert!(subscriber.try_recv().is_err(), "no per-task frames");
+        let SnapshotBody::Daemon(snapshot) = hub.snapshot().body else {
+            panic!("daemon snapshot expected");
+        };
+        assert_eq!(snapshot.tasks.len(), 3);
+
+        // 状态迁移按任务账本结算：pending → downloading 只移动对应计数。
+        sink.emit(EngineEvent::TasksChanged(vec![engine_task("a", 1)]));
+        let SnapshotBody::Daemon(snapshot) = hub.snapshot().body else {
+            panic!("daemon snapshot expected");
+        };
+        assert_eq!(
+            (
+                snapshot.runtime_stats.active_tasks,
+                snapshot.runtime_stats.pending_tasks
+            ),
+            (1, 1)
+        );
+    }
+
+    /// 批量删除事实只发一帧 `TasksDeleted`：投影整批移除，运行统计按被删任务结算。
+    #[test]
+    fn tasks_deleted_is_one_frame_and_releases_accounting() {
+        let hub = DaemonEventHub::new(DaemonSnapshot::default(), 16);
+        let sink = DaemonEngineEventSink(hub.clone());
+        sink.emit(EngineEvent::TasksChanged(vec![
+            engine_task("a", 1),
+            engine_task("b", 0),
+            engine_task("c", 0),
+        ]));
+        let (mut subscriber, _) = hub.subscribe_and_snapshot();
+        sink.emit(EngineEvent::TasksDeleted(vec![
+            "a".to_owned(),
+            "b".to_owned(),
+        ]));
+        let frame = subscriber.try_recv().expect("one batch frame");
+        let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::TasksDeleted { task_ids }) =
+            frame.event
+        else {
+            panic!("the batch must travel as a single TasksDeleted event");
+        };
+        assert_eq!(task_ids, ["a", "b"]);
+        let SnapshotBody::Daemon(snapshot) = hub.snapshot().body else {
+            panic!("daemon snapshot expected");
+        };
+        assert_eq!(
+            snapshot
+                .tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["c"]
+        );
+        assert_eq!(
+            (
+                snapshot.runtime_stats.active_tasks,
+                snapshot.runtime_stats.pending_tasks
+            ),
+            (0, 1)
+        );
+    }
+
     #[test]
     fn subscribe_snapshot_cursor_discards_prior_frames() {
         let hub = DaemonEventHub::new(DaemonSnapshot::default(), 8);
@@ -1049,29 +1344,27 @@ mod tests {
                 start + std::time::Duration::from_millis(20),
             );
         }
+        // The window ends `REPORT_LAG` behind now: the burst shows up once its
+        // bucket is complete and reported, as its real rate over that bucket.
+        hub.expire_locked_at(&mut state, start + std::time::Duration::from_millis(800));
         assert_eq!(
             state.snapshot.runtime_stats.total_download_bps,
-            20 * 128 * 1024
+            20 * 128 * 1024 * 10
         );
         assert_eq!(state.snapshot.runtime_stats.active_tasks, 0);
         assert_eq!(state.snapshot.runtime_stats.pending_tasks, 0);
-        hub.expire_locked_at(&mut state, start + std::time::Duration::from_millis(900));
-        assert_eq!(
-            state.snapshot.runtime_stats.total_download_bps,
-            20 * 128 * 1024
-        );
-        hub.expire_locked_at(&mut state, start + std::time::Duration::from_secs(1));
+        hub.expire_locked_at(&mut state, start + std::time::Duration::from_secs(5));
         assert_eq!(state.snapshot.runtime_stats.total_download_bps, 0);
-        let mut zero_frames = 0;
+        let mut published = Vec::new();
         while let Ok(frame) = receiver.try_recv() {
             if let ServiceEvent::Daemon(DaemonEvent::RuntimeStatsChanged(stats)) = frame.event {
-                assert_eq!(stats.total_download_bps, 0);
-                zero_frames += 1;
+                published.push(stats.total_download_bps);
             }
         }
         assert_eq!(
-            zero_frames, 1,
-            "expiry publishes zero even without another task"
+            published,
+            [20 * 128 * 1024 * 10, 0],
+            "expiry publishes the rate and then zero even without another task"
         );
     }
 
@@ -1082,23 +1375,23 @@ mod tests {
             &[traffic_task("resumed", 2, 8_000_000, 9_000_000)],
             start,
         );
-        assert_eq!(accounting.rates(start), (0, 0));
+        assert_eq!(accounting.window_bytes(), (0, 0));
         for bytes in [0, 8_000_000, 8_000_000] {
             accounting.apply(&traffic_progress("resumed", 1, bytes, 9_000_000), start);
         }
-        assert_eq!(accounting.rates(start), (0, 0));
+        assert_eq!(accounting.window_bytes(), (0, 0));
         accounting.apply(&traffic_progress("resumed", 1, 8_001_000, 9_000_200), start);
         for bytes in [8_001_000, 1, 8_000_900, 8_001_000] {
             accounting.apply(&traffic_progress("resumed", 1, bytes, 9_000_200), start);
         }
-        assert_eq!(accounting.rates(start), (1_000, 200));
+        assert_eq!(accounting.window_bytes(), (1_000, 200));
         assert_eq!((accounting.active, accounting.pending), (1, 0));
         accounting.apply(
             &DaemonEvent::TaskChanged(traffic_task("resumed", 2, 8_005_000, 9_005_000)),
             start,
         );
         accounting.apply(&traffic_progress("resumed", 1, 8_005_000, 9_005_000), start);
-        assert_eq!(accounting.rates(start), (1_000, 200));
+        assert_eq!(accounting.window_bytes(), (1_000, 200));
     }
 
     #[test]
@@ -1110,24 +1403,24 @@ mod tests {
         accounting.transfer_baseline("same-id", 0);
         accounting.apply(&traffic_progress("same-id", 1, 0, 0), start);
         accounting.apply(&traffic_progress("same-id", 1, 128 * 1024, 0), start);
-        assert_eq!(accounting.rates(start).0, 128 * 1024);
+        assert_eq!(accounting.window_bytes().0, 128 * 1024);
         // A DB snapshot can still carry the previous checkpoint. It cannot
         // overwrite the transport's explicitly established measurement base.
         accounting.reconcile(&[traffic_task("same-id", 1, 8_000_000, 0)]);
         accounting.apply(&traffic_progress("same-id", 1, 256 * 1024, 0), start);
-        assert_eq!(accounting.rates(start).0, 256 * 1024);
+        assert_eq!(accounting.window_bytes().0, 256 * 1024);
         // A true resume restores a larger prefix, without transferring it.
         accounting.transfer_baseline("same-id", 4_000_000);
         accounting.apply(&traffic_progress("same-id", 1, 4_000_000, 0), start);
-        assert_eq!(accounting.rates(start).0, 256 * 1024);
+        assert_eq!(accounting.window_bytes().0, 256 * 1024);
         // The HTTP response may reject Range and start again at zero.
         accounting.transfer_baseline("same-id", 0);
         accounting.apply(&traffic_progress("same-id", 1, 128 * 1024, 0), start);
-        assert_eq!(accounting.rates(start).0, 384 * 1024);
+        assert_eq!(accounting.window_bytes().0, 384 * 1024);
         // Checkpoint alignment also intentionally retransmits some old bytes.
         accounting.transfer_baseline("same-id", 64 * 1024);
         accounting.apply(&traffic_progress("same-id", 1, 128 * 1024, 0), start);
-        assert_eq!(accounting.rates(start).0, 448 * 1024);
+        assert_eq!(accounting.window_bytes().0, 448 * 1024);
         assert_eq!((accounting.active, accounting.pending), (1, 0));
     }
 
@@ -1159,7 +1452,7 @@ mod tests {
             traffic_progress("same-id", 1, 128 * 1024, 0),
             now,
         );
-        assert_eq!(state.snapshot.runtime_stats.total_download_bps, 128 * 1024);
+        assert_eq!(state.accounting.window_bytes().0, 128 * 1024);
     }
 
     #[test]
@@ -1181,10 +1474,10 @@ mod tests {
                 accounting.settle_download("ranges", end, now);
                 accounting.transfer_baseline("ranges", end);
                 accounting.apply(&traffic_progress("ranges", 1, end, 0), now);
-                assert_eq!(accounting.rates(now).0, window * 16 * MIB);
+                assert_eq!(accounting.window_bytes().0, window * 16 * MIB);
             }
             assert_eq!(
-                accounting.rates(start + std::time::Duration::from_secs(2)),
+                accounting.rates(start + std::time::Duration::from_secs(5)),
                 (0, 0)
             );
         }
@@ -1204,14 +1497,14 @@ mod tests {
             accounting.settle_download("ftp", 8 * MIB, start);
             accounting.transfer_baseline("ftp", actual_offset);
             accounting.apply(&traffic_progress("ftp", 1, actual_offset, 0), start);
-            assert_eq!(accounting.rates(start), (0, 0));
+            assert_eq!(accounting.window_bytes(), (0, 0));
             accounting.apply(&traffic_progress("ftp", 1, actual_offset + 65536, 0), start);
-            assert_eq!(accounting.rates(start), (65536, 0));
+            assert_eq!(accounting.window_bytes(), (65536, 0));
             // A REST-rejected retry truncates the file, then transfers bytes
             // below both the old checkpoint and the prior attempt's maximum.
             accounting.transfer_baseline("ftp", 0);
             accounting.apply(&traffic_progress("ftp", 1, 65536, 0), start);
-            assert_eq!(accounting.rates(start), (131072, 0));
+            assert_eq!(accounting.window_bytes(), (131072, 0));
         }
     }
 
@@ -1227,9 +1520,9 @@ mod tests {
         );
         accounting.transfer_baseline("adopted", 8 * 1024 * 1024);
         accounting.apply(&traffic_progress("adopted", 3, 8 * 1024 * 1024, 0), start);
-        assert_eq!(accounting.rates(start), (0, 0));
+        assert_eq!(accounting.window_bytes(), (0, 0));
         accounting.apply(&traffic_progress("downloaded", 3, 128 * 1024, 0), start);
-        assert_eq!(accounting.rates(start), (128 * 1024, 0));
+        assert_eq!(accounting.window_bytes(), (128 * 1024, 0));
         assert_eq!((accounting.active, accounting.pending), (0, 0));
     }
 
@@ -1247,7 +1540,7 @@ mod tests {
         assert_eq!((accounting.active, accounting.pending), (1, 1));
         accounting.apply(&traffic_progress("active", 3, 100, 0), start);
         accounting.apply(&traffic_progress("seed", 3, 100, 600), start);
-        assert_eq!(accounting.rates(start), (100, 200));
+        assert_eq!(accounting.window_bytes(), (100, 200));
         assert_eq!((accounting.active, accounting.pending), (0, 1));
         // A stale full snapshot must not make old bytes count twice.
         accounting.apply(
@@ -1261,7 +1554,7 @@ mod tests {
         );
         accounting.apply(&traffic_progress("active", 1, 100, 0), start);
         accounting.apply(&traffic_progress("new", 1, 500, 0), start);
-        assert_eq!(accounting.rates(start), (100, 200));
+        assert_eq!(accounting.window_bytes(), (100, 200));
         assert_eq!((accounting.active, accounting.pending), (2, 0));
         accounting.apply(
             &DaemonEvent::TaskDeleted {
@@ -1271,7 +1564,7 @@ mod tests {
         );
         accounting.apply(&traffic_progress("active", 1, 20_000, 0), start);
         assert_eq!((accounting.active, accounting.pending), (1, 0));
-        assert_eq!(accounting.rates(start), (100, 200));
+        assert_eq!(accounting.window_bytes(), (100, 200));
         let mut deleted = traffic_progress("new", 4, 500, 0);
         if let DaemonEvent::Engine(WsServerMsg::TaskProgress { error_message, .. }) = &mut deleted {
             *error_message = "deleted".into();
@@ -1286,27 +1579,57 @@ mod tests {
             start,
         );
         assert_eq!((accounting.active, accounting.pending), (0, 1));
-        assert_eq!(accounting.rates(start), (100, 200));
+        assert_eq!(accounting.window_bytes(), (100, 200));
         assert_eq!(
-            accounting.rates(start + std::time::Duration::from_secs(1)),
+            accounting.rates(start + std::time::Duration::from_secs(5)),
             (0, 0)
         );
     }
 
+    /// A task reporting a lump every 500 ms (the engine's per-task cadence)
+    /// must read as a flat rate, not a sawtooth, and fall to zero afterwards.
     #[test]
-    fn sustained_transfer_retains_only_the_bounded_measurement_window() {
+    fn lumpy_half_second_reports_read_as_a_steady_rate() {
+        const MIB: i64 = 1024 * 1024;
         let start = std::time::Instant::now();
         let mut accounting =
-            super::RuntimeAccounting::new(&[traffic_task("steady", 1, 0, 0)], start);
-        for tick in 1..=100 {
+            super::RuntimeAccounting::new(&[traffic_task("steady", 0, 0, 0)], start);
+        accounting.apply(
+            &DaemonEvent::TaskChanged(traffic_task("steady", 1, 0, 0)),
+            start,
+        );
+        for tick in 1..=200_u64 {
             let now = start + std::time::Duration::from_millis(tick * 100);
-            accounting.apply(&traffic_progress("steady", 1, tick as i64 * 100, 0), now);
-            assert_eq!(accounting.rates(now).0, (tick as i64 * 100).min(1_000));
+            if tick % 5 == 0 {
+                let bytes = i64::try_from(tick / 5).unwrap_or_default() * 5 * MIB;
+                accounting.apply(&traffic_progress("steady", 1, bytes, 0), now);
+            }
+            if tick >= 30 {
+                assert_eq!(accounting.rates(now), (10 * MIB, 0), "tick {tick}");
+            }
         }
         assert_eq!(
-            accounting.rates(start + std::time::Duration::from_secs(11)),
+            accounting.rates(start + std::time::Duration::from_secs(25)),
             (0, 0)
         );
+    }
+
+    /// Small files finishing in one frame each must not make the total jitter.
+    #[test]
+    fn back_to_back_small_files_read_as_a_steady_rate() {
+        const MIB: i64 = 1024 * 1024;
+        let start = std::time::Instant::now();
+        let mut accounting = super::RuntimeAccounting::new(&[], start);
+        for index in 0..1000_u64 {
+            let id = format!("small-{index}");
+            let begin = start + std::time::Duration::from_millis(index * 10);
+            let end = begin + std::time::Duration::from_millis(10);
+            accounting.apply(&DaemonEvent::TaskChanged(traffic_task(&id, 1, 0, 0)), begin);
+            accounting.apply(&traffic_progress(&id, 3, MIB, 0), end);
+            if index % 10 == 9 && index >= 299 {
+                assert_eq!(accounting.rates(end), (100 * MIB, 0), "file {index}");
+            }
+        }
     }
 
     #[test]
@@ -1355,14 +1678,20 @@ mod tests {
         };
         let mut state = super::lock_or_recover(&hub.state);
         let now = state.accounting.origin;
+        let at = |millis| now + std::time::Duration::from_millis(millis);
 
+        // Bytes in the still-open, not yet reported window publish nothing.
         hub.publish_with_stats_locked_at(&mut state, progress(20, 100), now);
-        assert_eq!(drain(), [None, Some(10)]);
+        assert_eq!(drain(), [None]);
         // Duplicate progress does not count its bytes twice, regardless of EMA.
         hub.publish_with_stats_locked_at(&mut state, progress(20, 250), now);
         assert_eq!(drain(), [None]);
-        hub.publish_with_stats_locked_at(&mut state, progress(40, 250), now);
-        assert_eq!(drain(), [None, Some(30)]);
+        // 20 bytes spread over 800 ms: 2 land in bucket 0 next to the first 10.
+        hub.publish_with_stats_locked_at(&mut state, progress(40, 250), at(800));
+        assert_eq!(drain(), [None, Some(120)]);
+        // Within the same 500 ms publish period the rate is not republished.
+        hub.publish_with_stats_locked_at(&mut state, progress(60, 250), at(900));
+        assert_eq!(drain(), [None]);
         // Unrelated events can also advance time; they must not silently clear
         // the materialized rate before the expiry timer gets to publish zero.
         hub.publish_with_stats_locked_at(
@@ -1370,7 +1699,7 @@ mod tests {
             DaemonEvent::TaskDeleted {
                 task_id: "unknown".into(),
             },
-            now + std::time::Duration::from_secs(1),
+            at(5_000),
         );
         assert_eq!(drain(), [None, Some(0)]);
         Ok(())

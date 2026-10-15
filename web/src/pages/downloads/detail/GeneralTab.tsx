@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Check, Copy, Download } from 'lucide-react'
+import { Check, Copy, Download, Layers, Link2 } from 'lucide-react'
 import { useT } from '../../../i18n'
 import { Button, Icon, Tooltip } from '../../../ui'
 import { copyText } from '../../../lib/copy'
@@ -7,7 +7,8 @@ import { useDownloads, stateLabel } from '../state'
 import { copyUrls, downloadViewsFiles, isDownloadable } from '../model/actions'
 import { MAX_ETA_SECS, PROTOCOL_LABEL, formatBytes, formatDateTime, sourceSite } from '../model/task'
 import type { DownloadTaskView, TaskState } from '../model/task'
-import { openGroupDetail } from '../dialogs'
+import { canChangeSegments, canChangeUrl } from '../model/taskEdit'
+import { openChangeSegments, openChangeUrl, openGroupDetail } from '../dialogs'
 import { DetailRow } from './DetailRow'
 import { SourcesSection } from './SourcesSection'
 
@@ -128,6 +129,16 @@ export function GeneralTab({ view }: { view: DownloadTaskView }) {
           <Button icon={Copy} onClick={() => copyUrls([view])}>
             {t('copyUrl')}
           </Button>
+          {canChangeUrl(view) ? (
+            <Button icon={Link2} onClick={() => openChangeUrl(view.taskId)}>
+              {t('webChangeUrl')}
+            </Button>
+          ) : null}
+          {canChangeSegments(view) ? (
+            <Button icon={Layers} onClick={() => openChangeSegments(view.taskId)}>
+              {t('editThreads')}
+            </Button>
+          ) : null}
         </div>
       </div>
       <SourcesSection view={view} />

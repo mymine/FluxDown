@@ -1,7 +1,6 @@
 //! 引擎源端活动：同步事件只入有界队列；持久化成功后才发布活动通知。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -88,7 +87,6 @@ pub struct JournalSink {
     downstream: Arc<dyn EventSink>,
     tx: mpsc::Sender<JournalCommand>,
     last_state: Mutex<HashMap<String, (i32, String)>>,
-    total_overflows: AtomicU64,
     overflows: Arc<Mutex<HashMap<String, ActivityLoss>>>,
 }
 
@@ -102,7 +100,6 @@ impl JournalSink {
             tx,
             last_state: Mutex::new(HashMap::new()),
             overflows: overflows.clone(),
-            total_overflows: AtomicU64::new(0),
         });
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -183,10 +180,6 @@ impl JournalSink {
         .await
         .map_err(|_| "activity journal flush timed out".to_owned())?
     }
-
-    pub fn overflow_count(&self) -> u64 {
-        self.total_overflows.load(Ordering::Relaxed)
-    }
 }
 
 async fn persist_overflows(
@@ -216,139 +209,140 @@ async fn persist_overflows(
     first_error.map_or(Ok(()), Err)
 }
 
+impl JournalSink {
+    /// 任务状态/错误文案相对上次记录发生变化时记一条活动；相同状态不重复记录。
+    fn record_state(&self, task_id: &str, status: i32, error_message: &str) {
+        let changed = {
+            let mut previous = self.last_state.lock().unwrap_or_else(|e| e.into_inner());
+            if previous
+                .get(task_id)
+                .is_some_and(|(old_status, old_error)| {
+                    *old_status == status && old_error == error_message
+                })
+            {
+                false
+            } else {
+                previous.insert(task_id.to_owned(), (status, error_message.to_owned()));
+                true
+            }
+        };
+        if changed {
+            self.push_activity(
+                task_id,
+                if error_message.is_empty() {
+                    "status"
+                } else {
+                    "error"
+                },
+                error_message.to_owned(),
+                Some(status),
+            );
+        }
+    }
+
+    /// 同步入队；队列满时记入溢出缺口，不阻塞 `emit`。
+    fn push_activity(&self, task_id: &str, kind: &str, message: String, status: Option<i32>) {
+        let entry = TaskActivity {
+            id: 0,
+            task_id: task_id.to_owned(),
+            timestamp_ms: timestamp_ms(),
+            kind: kind.to_owned(),
+            message,
+            status,
+        };
+        if let Err(error) = self.tx.try_send(JournalCommand::Add(entry)) {
+            let mut pending = self.overflows.lock().unwrap_or_else(|e| e.into_inner());
+            pending.entry(task_id.to_owned()).or_default().overflow += 1;
+            tracing::error!(%task_id, %error, "task activity journal overflow (reported in persistent history)");
+        }
+    }
+}
+
 impl EventSink for JournalSink {
     fn emit(&self, event: EngineEvent) {
-        let state_change = match &event {
+        match &event {
             EngineEvent::TaskProgress {
                 task_id,
                 status,
                 error_message,
                 ..
-            } => Some((task_id, status, error_message)),
+            } => self.record_state(task_id, *status, error_message),
             EngineEvent::TaskChanged(task) => {
-                Some((&task.task_id, &task.status, &task.error_message))
+                self.record_state(&task.task_id, task.status, &task.error_message);
             }
-            _ => None,
-        };
-        let activity = if let Some((task_id, status, error_message)) = state_change {
-            let changed = {
-                let mut previous = self.last_state.lock().unwrap_or_else(|e| e.into_inner());
-                if previous
-                    .get(task_id)
-                    .is_some_and(|(old_status, old_error)| {
-                        old_status == status && old_error == error_message
-                    })
-                {
-                    false
-                } else {
-                    previous.insert(task_id.clone(), (*status, error_message.clone()));
-                    true
+            EngineEvent::TasksChanged(tasks) => {
+                for task in tasks {
+                    self.record_state(&task.task_id, task.status, &task.error_message);
                 }
-            };
-            if changed {
-                let message = error_message.clone();
-                Some((
+            }
+            EngineEvent::TasksSnapshot(tasks) => {
+                let retained: HashSet<_> = tasks.iter().map(|task| task.task_id.as_str()).collect();
+                self.last_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|task_id, _| retained.contains(task_id.as_str()));
+            }
+            EngineEvent::SegmentSplit {
+                task_id,
+                parent_index,
+                child_index,
+                child_start,
+                child_end,
+                ..
+            } => self.push_activity(
+                task_id,
+                "split",
+                format!(
+                    "segment {parent_index} split child={child_index} range={child_start}..={child_end}"
+                ),
+                None,
+            ),
+            EngineEvent::TaskCdnEvent {
+                task_id,
+                kind,
+                host,
+                nodes,
+                ip,
+                reason,
+                candidates,
+                alive,
+                cap,
+                auto_cap,
+            } if kind != "leases" => {
+                let nodes = if kind == "pool" || kind == "summary" || kind == "links" {
+                    nodes
+                        .iter()
+                        .map(|node| {
+                            format!(
+                                "{}({}) bytes={} bps={}",
+                                node.ip, node.origin, node.bytes, node.ewma_bps
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(";")
+                } else {
+                    String::new()
+                };
+                let message = format!(
+                    "CDN {kind} host={host} ip={ip} reason={reason} candidates={candidates} alive={alive} cap={cap} auto_cap={auto_cap} nodes=[{nodes}]"
+                );
+                self.push_activity(
                     task_id,
-                    if error_message.is_empty() {
-                        "status"
-                    } else {
-                        "error"
+                    match kind.as_str() {
+                        "pool" => "cdn_pool",
+                        "kick" => "cdn_kick",
+                        "breaker" => "cdn_breaker",
+                        "fallback" => "cdn_fallback",
+                        "summary" => "cdn_summary",
+                        "links" => "nic_links",
+                        "links_off" => "nic_off",
+                        _ => "cdn",
                     },
                     message,
-                    Some(*status),
-                ))
-            } else {
-                None
-            }
-        } else {
-            match &event {
-                EngineEvent::TasksSnapshot(tasks) => {
-                    let retained: HashSet<_> =
-                        tasks.iter().map(|task| task.task_id.as_str()).collect();
-                    self.last_state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .retain(|task_id, _| retained.contains(task_id.as_str()));
-                    None
-                }
-                EngineEvent::SegmentSplit {
-                    task_id,
-                    parent_index,
-                    child_index,
-                    child_start,
-                    child_end,
-                    ..
-                } => Some((
-                    task_id,
-                    "split",
-                    format!(
-                        "segment {parent_index} split child={child_index} range={child_start}..={child_end}"
-                    ),
                     None,
-                )),
-                EngineEvent::TaskCdnEvent {
-                    task_id,
-                    kind,
-                    host,
-                    nodes,
-                    ip,
-                    reason,
-                    candidates,
-                    alive,
-                    cap,
-                    auto_cap,
-                } if kind != "leases" => {
-                    let nodes = if kind == "pool" || kind == "summary" || kind == "links" {
-                        nodes
-                            .iter()
-                            .map(|node| {
-                                format!(
-                                    "{}({}) bytes={} bps={}",
-                                    node.ip, node.origin, node.bytes, node.ewma_bps
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(";")
-                    } else {
-                        String::new()
-                    };
-                    let message = format!(
-                        "CDN {kind} host={host} ip={ip} reason={reason} candidates={candidates} alive={alive} cap={cap} auto_cap={auto_cap} nodes=[{nodes}]"
-                    );
-                    Some((
-                        task_id,
-                        match kind.as_str() {
-                            "pool" => "cdn_pool",
-                            "kick" => "cdn_kick",
-                            "breaker" => "cdn_breaker",
-                            "fallback" => "cdn_fallback",
-                            "summary" => "cdn_summary",
-                            "links" => "nic_links",
-                            "links_off" => "nic_off",
-                            _ => "cdn",
-                        },
-                        message,
-                        None,
-                    ))
-                }
-                _ => None,
+                );
             }
-        };
-        if let Some((task_id, kind, message, status)) = activity {
-            let entry = TaskActivity {
-                id: 0,
-                task_id: task_id.clone(),
-                timestamp_ms: timestamp_ms(),
-                kind: kind.to_owned(),
-                message,
-                status,
-            };
-            if let Err(error) = self.tx.try_send(JournalCommand::Add(entry)) {
-                self.total_overflows.fetch_add(1, Ordering::Relaxed);
-                let mut pending = self.overflows.lock().unwrap_or_else(|e| e.into_inner());
-                pending.entry(task_id.clone()).or_default().overflow += 1;
-                tracing::error!(%task_id, %error, "task activity journal overflow (reported in persistent history)");
-            }
+            _ => {}
         }
         self.downstream.emit(event);
     }

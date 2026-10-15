@@ -1,7 +1,7 @@
 //! 兼容 API 的任务生命周期事件（aria2 WS 通知源）与实时速率。
 //!
 //! daemon 只发布 `WsServerMsg::TaskProgress` / `TasksSnapshot`（以及防御性处理的
-//! `TaskChanged` / `TaskDeleted`）。这里按旧 headless 宿主 `ws_hub` 的迁移规则把它们
+//! `TaskChanged` / `TasksChanged` / `TaskDeleted`）。这里按旧 headless 宿主 `ws_hub` 的迁移规则把它们
 //! 翻译为 [`TaskEvent`]，判定统一委托 [`task_event_for_transition`]：
 //!
 //! - `TaskProgress` 是状态迁移的权威来源；`delete` 合成信号（`status=4` 且
@@ -154,9 +154,18 @@ impl Tracker {
                 .collect(),
             DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks }) => self.reconcile(tasks),
             DaemonEvent::TaskChanged(task) => self.task_changed(task).into_iter().collect(),
+            // 批量事实事件 = 按序逐条 `TaskChanged`。
+            DaemonEvent::TasksChanged(tasks) => tasks
+                .iter()
+                .filter_map(|task| self.task_changed(task))
+                .collect(),
             DaemonEvent::TaskDeleted { task_id } => {
                 self.task_deleted(task_id).into_iter().collect()
             }
+            DaemonEvent::TasksDeleted { task_ids } => task_ids
+                .iter()
+                .filter_map(|task_id| self.task_deleted(task_id))
+                .collect(),
             DaemonEvent::SnapshotReplaced(snapshot) => self.replace(&snapshot.tasks),
             _ => Vec::new(),
         }
@@ -460,6 +469,20 @@ mod tests {
     }
 
     #[test]
+    fn tasks_deleted_applies_task_deleted_per_id() {
+        let mut tracker = Tracker::default();
+        tracker.apply(&progress("run", 1, 1));
+        tracker.apply(&progress("done", 1, 1));
+        tracker.apply(&progress("done", 3, 0));
+        assert_eq!(
+            kinds(&tracker.apply(&DaemonEvent::TasksDeleted {
+                task_ids: vec!["run".into(), "done".into(), "unknown".into()]
+            })),
+            [("run".to_owned(), TaskEventKind::Stop)]
+        );
+    }
+
+    #[test]
     fn task_changed_uses_the_same_transition_rules() {
         let mut tracker = Tracker::default();
         assert_eq!(
@@ -469,6 +492,34 @@ mod tests {
         assert_eq!(
             kinds(&tracker.apply(&DaemonEvent::TaskChanged(task("t", 3)))),
             [("t".to_owned(), TaskEventKind::Complete)]
+        );
+    }
+
+    #[test]
+    fn tasks_changed_is_sequential_task_changed() {
+        let batch = vec![task("a", 1), task("b", 1), task("a", 3)];
+        let mut sequential = Tracker::default();
+        let expected: Vec<_> = batch
+            .iter()
+            .flat_map(|task| sequential.apply(&DaemonEvent::TaskChanged(task.clone())))
+            .collect();
+        assert_eq!(expected.len(), 3);
+
+        let mut batched = Tracker::default();
+        let actual = batched.apply(&DaemonEvent::TasksChanged(batch));
+        assert_eq!(kinds(&actual), kinds(&expected));
+        assert_eq!(
+            kinds(&actual),
+            [
+                ("a".to_owned(), TaskEventKind::Start),
+                ("b".to_owned(), TaskEventKind::Start),
+                ("a".to_owned(), TaskEventKind::Complete),
+            ]
+        );
+        assert!(
+            batched
+                .apply(&DaemonEvent::TasksChanged(Vec::new()))
+                .is_empty()
         );
     }
 

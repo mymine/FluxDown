@@ -116,7 +116,7 @@ struct QueueManagerSheet: View {
                     )
                 )
                 .labelsHidden()
-                .disabled(readOnly || busy)
+                .disabled(readOnly || busy || (queue.isRunning && !queue.canStop))
                 .accessibilityValue(L(queue.isRunning ? "queueRunningBadge" : "queueStoppedBadge"))
                 if !typeSize.isAccessibilitySize {
                     Button {
@@ -143,11 +143,13 @@ struct QueueManagerSheet: View {
         }
         .contextMenu {
             Button(L("editQueue"), systemImage: FluxSymbol.edit) { path.append(.edit(queue.queueId)) }
-            Button(
-                L(queue.isRunning ? "stopQueueAction" : "startQueueAction"),
-                systemImage: queue.isRunning ? FluxSymbol.pause : FluxSymbol.resume
-            ) { model.setRunning(!queue.isRunning, queue: queue, container: container) }
-                .disabled(readOnly || busy)
+            if !queue.isRunning || queue.canStop {
+                Button(
+                    L(queue.isRunning ? "stopQueueAction" : "startQueueAction"),
+                    systemImage: queue.isRunning ? FluxSymbol.pause : FluxSymbol.resume
+                ) { model.setRunning(!queue.isRunning, queue: queue, container: container) }
+                    .disabled(readOnly || busy)
+            }
             if !builtin {
                 Button(L("deleteQueueAction"), systemImage: FluxSymbol.delete, role: .destructive) { model.pendingDelete = queue }
                     .disabled(readOnly || busy)

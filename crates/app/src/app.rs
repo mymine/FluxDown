@@ -17,7 +17,6 @@ use fluxdown_ui_i18n::{I18nCatalog, I18nError, Translator, system_locale};
 use fluxdown_ui_settings::{SettingsStore, SettingsView, component_locale};
 use fluxdown_ui_shell::ShellView;
 use gpui::{App, AppContext as _, Entity, Global, WeakEntity};
-use gpui_component::menu::AppMenuBar;
 use tokio::sync::mpsc;
 
 use crate::agent_client::{AgentClient, AgentClientConfig, AgentClientError};
@@ -34,7 +33,8 @@ const EVENT_BATCH: usize = 256;
 /// 次实例等待刚启动主实例的 IPC 端点就绪、或等待旧主实例释放锁的最长时间。
 const ACTIVATION_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVATION_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-/// `--after-update`：旧桌面进程随 agent 整体退出而退出，等它释放单实例锁的最长时间与轮询间隔。
+/// `--after-update` / `--relaunch`：旧桌面进程随 agent 整体退出而退出，等它释放单实例锁的最长
+/// 时间与轮询间隔。
 const AFTER_UPDATE_LOCK_WAIT: Duration = Duration::from_secs(30);
 const AFTER_UPDATE_LOCK_INTERVAL: Duration = Duration::from_millis(100);
 /// agent 拉起的确认 / 进度界面（`--capture` / `--progress-task`）等旧主实例释放单实例锁的最长
@@ -78,7 +78,6 @@ pub(crate) struct Desktop {
     pub settings_store: Entity<SettingsStore>,
     /// 账户 / 设备 / 局域网配对状态：设置页与「添加设备」对话框共享。
     pub account_host: Entity<AccountHost>,
-    pub menu_bar: Entity<AppMenuBar>,
     /// 主窗口内的下载页（主窗口关闭后失效）。
     pub main_downloads: Option<WeakEntity<DownloadView>>,
     pub main_shell: Option<WeakEntity<ShellView>>,
@@ -136,7 +135,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         settings: launch.settings,
         progress_task: launch.progress_task.clone(),
     };
-    let lock_wait = if launch.after_update {
+    let lock_wait = if launch.after_update || launch.relaunch {
         Some(AFTER_UPDATE_LOCK_WAIT)
     } else if launch.agent_initiated() {
         Some(AGENT_LAUNCH_LOCK_WAIT)
@@ -253,7 +252,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         .detach();
 
         crate::menus::bind_keys(cx);
-        let menu_bar = crate::menus::install(cx, &translator);
+        crate::menus::install(cx, &translator);
         crate::menus::install_global_actions(cx);
         cx.set_global(Desktop {
             translator: translator.clone(),
@@ -261,7 +260,6 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             client: agent_client.clone(),
             settings_store,
             account_host,
-            menu_bar,
             main_downloads: None,
             main_shell: None,
             settings_view: None,

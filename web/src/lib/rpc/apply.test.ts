@@ -56,6 +56,53 @@ describe('apply daemon events', () => {
     expect(snap.taskRuntime.t?.segments[0]?.active).toBe(false)
   })
 
+  test('tasksChanged：同一事件内插入 + 更新，等价逐条 taskChanged；整批只复制一次数组并清零非活跃运行时', () => {
+    const base = daemon([task('a', 1), task('b', 1)], { a: runtime('a', 5), b: runtime('b', 5) })
+    const batch = [task('a', 2), task('c', 0), task('d', 1), task('c', 1)]
+    const batched = applyDaemonEvent(base, { type: 'tasksChanged', data: batch })
+
+    let sequential = base
+    for (const item of batch) sequential = applyDaemonEvent(sequential, { type: 'taskChanged', data: item })
+    expect(batched).toEqual(sequential)
+
+    expect(batched.tasks.map((item) => [item.taskId, item.status])).toEqual([
+      ['a', 2],
+      ['b', 1],
+      ['c', 1],
+      ['d', 1],
+    ])
+    // a 变为暂停：活跃读数清零；b 不在批内：运行时保持原引用。
+    expect(batched.taskRuntime.a?.activeTransfers).toBe(0)
+    expect(batched.taskRuntime.b).toBe(base.taskRuntime.b)
+    // 原快照不被就地修改。
+    expect(base.tasks.length).toBe(2)
+  })
+
+  test('tasksChanged：空批保持引用；只含活跃任务时不复制 taskRuntime', () => {
+    const base = daemon([task('a', 1)], { a: runtime('a', 5) })
+    expect(applyDaemonEvent(base, { type: 'tasksChanged', data: [] })).toBe(base)
+    const next = applyDaemonEvent(base, { type: 'tasksChanged', data: [task('n', 1)] })
+    expect(next.tasks.length).toBe(2)
+    expect(next.taskRuntime).toBe(base.taskRuntime)
+  })
+
+  test('tasksDeleted：整批等价于逐条 taskDeleted；空批或无命中保持引用', () => {
+    const base = daemon([task('a', 1), task('b', 1), task('c', 3)], { a: runtime('a', 5), c: runtime('c', 5) })
+    const ids = ['a', 'c', 'missing']
+    const batched = applyDaemonEvent(base, { type: 'tasksDeleted', data: { taskIds: ids } })
+
+    let sequential = base
+    for (const taskId of ids) sequential = applyDaemonEvent(sequential, { type: 'taskDeleted', data: { taskId } })
+    expect(batched.tasks).toEqual(sequential.tasks)
+    expect(batched.taskRuntime).toEqual(sequential.taskRuntime)
+    expect(batched.tasks.map((item) => item.taskId)).toEqual(['b'])
+    expect(base.tasks.length).toBe(3)
+    expect(base.taskRuntime.a).not.toBeUndefined()
+
+    expect(applyDaemonEvent(base, { type: 'tasksDeleted', data: { taskIds: [] } })).toBe(base)
+    expect(applyDaemonEvent(base, { type: 'tasksDeleted', data: { taskIds: ['zzz'] } })).toBe(base)
+  })
+
   test('未知任务的采样被忽略', () => {
     const snap = daemon([])
     expect(applyDaemonEvent(snap, { type: 'taskRuntimeChanged', data: runtime('x', 1) })).toBe(snap)
