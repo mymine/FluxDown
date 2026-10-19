@@ -48,6 +48,10 @@ echo "------------------------------------------"
 echo "[1/4] 拉取最新代码..."
 git -C "${REPO_DIR}" fetch origin "${BRANCH}"
 git -C "${REPO_DIR}" reset --hard "origin/${BRANCH}"
+# bash 边读边执行：reset 若改写了本脚本，继续跑会执行新旧拼接的内容，重新执行一次新版本
+if [ -z "${DEPLOY_REEXEC-}" ]; then
+  DEPLOY_REEXEC=1 exec bash "${SCRIPT_DIR}/deploy.sh" "$@"
+fi
 HEAD_SHA="$(git -C "${REPO_DIR}" rev-parse HEAD)"
 TREE="$(git -C "${REPO_DIR}" rev-parse "HEAD:${SUBDIR}")"
 echo "      HEAD ${HEAD_SHA:0:8}，${SUBDIR}/ 子树 ${TREE:0:8}"
@@ -69,6 +73,27 @@ ${DOCKER} compose down --remove-orphans >/dev/null 2>&1 || true
 # 兜底：清掉残留的同名容器（旧的 docker run / 其他 project 创建的）
 ${DOCKER} rm -f fluxdown-website-v2 >/dev/null 2>&1 || true
 ${DOCKER} compose up -d --wait website
+
+# ── 清除 Cloudflare 边缘缓存（仅根部署）────────
+# 静态页面在 Cloudflare 边缘缓存 1 天（区域 Cache Rules），旧 HTML 引用的 /_astro 哈希资源
+# 在新镜像里已不存在，必须在新容器就绪后按主机名清除。失败即中止且不写部署戳，下次重跑会再清。
+if [ -z "${SITE_BASE}" ]; then
+  echo "[+] 清除 Cloudflare 缓存（fluxdown.com / www.fluxdown.com）..."
+  CF_TOKEN="$(sed -n 's/^CLOUDFLARE_API_TOKEN=//p' "${SCRIPT_DIR}/.env" 2>/dev/null | tail -n 1)"
+  CF_ZONE="${CLOUDFLARE_ZONE_ID:-ccb51a98de238a1916428142f890db4d}"
+  if [ -z "${CF_TOKEN}" ]; then
+    echo "      .env 缺少 CLOUDFLARE_API_TOKEN（需 区域.清除缓存 权限）" >&2
+    exit 1
+  fi
+  PURGE="$(curl -sS -m 30 -X POST \
+    -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
+    "https://api.cloudflare.com/client/v4/zones/${CF_ZONE}/purge_cache" \
+    -d '{"hosts":["fluxdown.com","www.fluxdown.com"]}')"
+  if ! printf '%s' "${PURGE}" | grep -q '"success":[[:space:]]*true'; then
+    echo "      清除失败: ${PURGE}" >&2
+    exit 1
+  fi
+fi
 echo "${TREE} ${SITE_BASE}" > "${STAMP}"
 
 # ── 4. 清理悬空镜像 ──────────────────────────
