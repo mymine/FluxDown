@@ -105,14 +105,21 @@ jobs:
           cargo +nightly fetch --target "$TARGET" || true
           python3 patch-mips32.py "${CARGO_HOME:-$HOME/.cargo}" || true
 
-          # rquickjs-sys 无 mipsel 预生成 bindings → 借用 32 位小端的 armv7/i686 bindings
-          for d in "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/rquickjs-sys-*; do
-            [ -d "$d/src/bindings" ] || continue
-            [ -f "$d/src/bindings/mipsel-unknown-linux-musl.rs" ] && continue
-            for cand in armv7-unknown-linux-gnueabihf.rs i686-unknown-linux-gnu.rs; do
-              if [ -f "$d/src/bindings/$cand" ]; then
-                cp "$d/src/bindings/$cand" "$d/src/bindings/mipsel-unknown-linux-musl.rs"
-                echo "rquickjs-sys bindings <- $cand"
+          # quickjs 系 crate 无 mipsel 预生成 bindings → 借用 32 位小端的 armv7/i686 bindings。
+          # 上游 [patch.crates-io] 把 rquickjs 指到 longbridge/quickjs-jit（git 检出，
+          # 包名 quickjs-jit-sys），所以 registry 与 git/checkouts 两处都要扫。
+          for d in "$CARGO"/registry/src/*/rquickjs-sys-*/src/bindings \
+                   "$CARGO"/registry/src/*/quickjs-jit-sys-*/src/bindings \
+                   "$CARGO"/git/checkouts/*/*/sys/src/bindings \
+                   "$CARGO"/git/checkouts/*/*/src/bindings \
+                   "$CARGO"/git/checkouts/*/*/*/sys/src/bindings \
+                   "$CARGO"/git/checkouts/*/*/vendor/*/sys/src/bindings; do
+            [ -d "$d" ] || continue
+            [ -f "$d/mipsel-unknown-linux-musl.rs" ] && continue
+            for cand in armv7-unknown-linux-gnueabihf.rs armv7-unknown-linux-gnueabi.rs i686-unknown-linux-gnu.rs; do
+              if [ -f "$d/$cand" ]; then
+                cp "$d/$cand" "$d/mipsel-unknown-linux-musl.rs"
+                echo "quickjs bindings: $d <- $cand"
                 break
               fi
             done
