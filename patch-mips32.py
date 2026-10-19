@@ -115,26 +115,41 @@ def fix_quickjs_bindings(root):
 
 # 注入 crate 内部的最小 64 位原子 shim（只用 core；自旋锁 + 两个 32 位原子；std/no_std 通用）
 SHIM_SRC = '''//! 由 patch-mips32.py 自动注入：在缺少原生 64 位原子（无 target_has_atomic="64"）的
-//! 32 位目标（如 mipsel）上，用「自旋锁 + 两个 32 位原子」提供 AtomicU64 / AtomicI64 的
-//! 等价实现（含 std 较新加入的 update / try_update）。仅依赖 core，std / no_std crate 均可编译。
+//! 32 位目标（如 mipsel O32）上，用「自旋锁 + UnsafeCell」提供 AtomicU64 / AtomicI64
+//! 的等价实现，API 与 std 对齐（load/store/swap/fetch_add/sub/and/or/xor/max/min、
+//! compare_exchange(_weak)、update/fetch_update/try_update、get_mut/as_ptr/into_inner）。
+//! 仅依赖 core，std / no_std crate 均可编译。
 #![allow(dead_code, unused_imports)]
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 macro_rules! pd_atomic64 {
     ($name:ident, $int:ty) => {
-        #[derive(Debug, Default)]
         pub struct $name {
             lock: AtomicBool,
-            hi: AtomicU32,
-            lo: AtomicU32,
+            val: UnsafeCell<$int>,
+        }
+
+        // 所有读写都在自旋锁内完成，故可跨线程共享
+        unsafe impl Sync for $name {}
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new(0)
+            }
+        }
+
+        impl core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(f, concat!(stringify!($name), "({})"), self.load(Ordering::Relaxed))
+            }
         }
 
         impl $name {
             pub const fn new(v: $int) -> Self {
                 Self {
                     lock: AtomicBool::new(false),
-                    hi: AtomicU32::new(((v as u64) >> 32) as u32),
-                    lo: AtomicU32::new((v as u64) as u32),
+                    val: UnsafeCell::new(v),
                 }
             }
 
@@ -154,17 +169,16 @@ macro_rules! pd_atomic64 {
                 self.lock.store(false, Ordering::Release);
             }
 
+            /// 读原始值（调用方须已持有 lock）
             #[inline]
             fn get_raw(&self) -> $int {
-                (((self.hi.load(Ordering::Relaxed) as u64) << 32)
-                    | (self.lo.load(Ordering::Relaxed) as u64)) as $int
+                unsafe { *self.val.get() }
             }
 
+            /// 写原始值（调用方须已持有 lock）
             #[inline]
             fn set_raw(&self, v: $int) {
-                let u = v as u64;
-                self.lo.store(u as u32, Ordering::Relaxed);
-                self.hi.store((u >> 32) as u32, Ordering::Relaxed);
+                unsafe { *self.val.get() = v }
             }
 
             pub fn load(&self, _o: Ordering) -> $int {
@@ -228,6 +242,28 @@ macro_rules! pd_atomic64 {
                 old
             }
 
+            /// 与 std 一致：若 val > 当前值则写入 val，返回旧值。
+            pub fn fetch_max(&self, val: $int, _o: Ordering) -> $int {
+                self.acquire();
+                let old = self.get_raw();
+                if val > old {
+                    self.set_raw(val);
+                }
+                self.release();
+                old
+            }
+
+            /// 与 std 一致：若 val < 当前值则写入 val，返回旧值。
+            pub fn fetch_min(&self, val: $int, _o: Ordering) -> $int {
+                self.acquire();
+                let old = self.get_raw();
+                if val < old {
+                    self.set_raw(val);
+                }
+                self.release();
+                old
+            }
+
             pub fn compare_exchange(
                 &self,
                 cur: $int,
@@ -257,7 +293,7 @@ macro_rules! pd_atomic64 {
                 self.compare_exchange(cur, new, s, f)
             }
 
-            /// 应用 f 到当前值，写回新值，返回旧值（与 std 的 AtomicU64::update 语义一致）。
+            /// 应用 f 到当前值，写回新值，返回旧值（与 std 的 update 语义一致）。
             pub fn update(
                 &self,
                 _set: Ordering,
@@ -271,7 +307,7 @@ macro_rules! pd_atomic64 {
                 old
             }
 
-            /// 应用 f，返回 Some(new) 则写回，否则不动（与 std 的 try_update/fetch_update 一致）。
+            /// 应用 f，返回 Some(new) 则写回，否则不动（与 std 的 fetch_update 一致）。
             pub fn fetch_update(
                 &self,
                 _set: Ordering,
@@ -300,8 +336,23 @@ macro_rules! pd_atomic64 {
                 self.fetch_update(s, f, fun)
             }
 
+            /// 独占借用下的可变引用（与 std 一致，无需原子操作）。
+            pub fn get_mut(&mut self) -> &mut $int {
+                self.val.get_mut()
+            }
+
+            /// 底层指针（与 std 一样是 unsafe 语义的入口）。
+            pub fn as_ptr(&self) -> *mut $int {
+                self.val.get()
+            }
+
+            /// 本实现始终基于锁，非无锁。
+            pub fn is_lock_free(&self) -> bool {
+                false
+            }
+
             pub fn into_inner(self) -> $int {
-                self.get_raw()
+                self.val.into_inner()
             }
         }
     };
