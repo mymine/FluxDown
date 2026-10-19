@@ -196,7 +196,8 @@ export default defineConfig({
       // ── 可选：阿里云 OSS 发布资产源（/api/download 优先 302 到此处，缺失回退 GitHub）──
       // 对象布局 `<OSS_RELEASE_PREFIX>/<tag>/<file>`，与 .github/actions/oss-upload 一致。
       // bucket 私有：官网用 AK/SK 做存在性探测；未配 AK/SK 时整条 OSS 路径关闭。
-      // 302 目标优先 OSS_CDN_BASE（Cloudflare 边缘缓存 dl.fluxdown.com，见 cdn/oss-proxy.js），置空则签发 1h 预签名直链。
+      // 302 目标：中国大陆访客（CF-IPCountry=CN）走 CN_CDN_BASE（阿里云 CDN，URL 鉴权 A），其余走
+      // OSS_CDN_BASE（Cloudflare Worker dl.fluxdown.com，见 cdn/oss-proxy.js）；两者都不可用时签发 1h 预签名直链。
       OSS_ACCESS_KEY_ID: envField.string({
         context: "server",
         access: "secret",
@@ -226,6 +227,24 @@ export default defineConfig({
         context: "server",
         access: "secret",
         default: "https://dl.fluxdown.com",
+      }),
+      // Worker 下载链接签名密钥（与 Worker secret DOWNLOAD_SIGNING_SECRET 相同）；不配置则签发无签名链接。
+      OSS_CDN_SIGNING_SECRET: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+      // 阿里云 CDN（加速区域：全球不含中国内地，OSS 私有 Bucket 回源）；CN_CDN_AUTH_KEY 为
+      // 「URL 鉴权 → A 方式」主 KEY，缺省则大陆访客也走 Cloudflare。
+      CN_CDN_BASE: envField.string({
+        context: "server",
+        access: "secret",
+        default: "https://dl-cn.fluxdown.com",
+      }),
+      CN_CDN_AUTH_KEY: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
       }),
 
       // ── 赞助名录（Sponsor Wall）──

@@ -3,12 +3,18 @@ import { bustApiCaches } from "../src/lib/api-cache";
 
 let configured = true;
 let cdnConfigured = false;
+let cnConfigured = false;
 const signatures: string[] = [];
 mock.module("astro:env/server", () => ({ GITHUB_TOKEN: "", GITHUB_REPO: "owner/repo" }));
 const ossMock = () => ({
   ossConfigured: configured,
+  cnCdnConfigured: cnConfigured,
   cdnDownloadUrl: (key: string, tag: string) => cdnConfigured
     ? `https://cdn.example/${key}?fallback=github&tag=${encodeURIComponent(tag)}` : null,
+  cnCdnDownloadUrl: (key: string) => {
+    signatures.push("CN");
+    return `https://cn.example/${key}?auth_key=signed`;
+  },
   releaseObjectKey: (tag: string, name: string) => `${tag}/${name}`,
   presignOssUrl: (method: string, key: string) => {
     signatures.push(method);
@@ -33,6 +39,7 @@ beforeEach(() => {
   bustApiCaches();
   configured = true;
   cdnConfigured = false;
+  cnConfigured = false;
   mock.module("../src/lib/oss", ossMock);
   draft = false;
   prerelease = false;
@@ -55,11 +62,12 @@ beforeEach(() => {
 });
 afterAll(() => { globalThis.fetch = originalFetch; mock.restore(); });
 
-async function get(source = "", tag = `v${sequence}`, filename = "app.zip") {
+async function get(source = "", tag = `v${sequence}`, filename = "app.zip", country = "") {
   const url = new URL(`https://site.example/api/download/${filename}`);
   if (source) url.searchParams.set("source", source);
   if (tag) url.searchParams.set("tag", tag);
-  return GET({ params: { filename }, url } as Parameters<typeof GET>[0]);
+  const request = new Request(url, { headers: country ? { "cf-ipcountry": country } : {} });
+  return GET({ params: { filename }, url, request } as Parameters<typeof GET>[0]);
 }
 
 test("github never signs or probes OSS", async () => {
@@ -103,6 +111,34 @@ test("auto CDN still requires published exact GitHub metadata", async () => {
   bustApiCaches();
   status = 503;
   expect((await get("auto")).status).toBe(503);
+  expect(signatures).toEqual([]);
+});
+
+test("mainland visitors get a verified OSS asset through the signed Aliyun CDN, else GitHub", async () => {
+  cdnConfigured = true;
+  cnConfigured = true;
+  mock.module("../src/lib/oss", ossMock);
+  for (const source of ["auto", ""]) {
+    const response = await get(source, `v${sequence}`, "app.zip", "CN");
+    expect(response.headers.get("X-Download-Source")).toBe("cn-cdn");
+    expect(response.headers.get("Location")).toBe(`https://cn.example/v${sequence}/app.zip?auth_key=signed`);
+  }
+  // HEAD 结果缓存：同一资产只探测一次。
+  expect(signatures).toEqual(["HEAD", "CN", "CN"]);
+  expect((await get("auto", `v${sequence}`, "app.zip", "HK")).headers.get("X-Download-Source")).toBe("cdn");
+  sequence++;
+  headSize = "11";
+  signatures.length = 0;
+  const missing = await get("auto", `v${sequence}`, "app.zip", "CN");
+  expect(missing.headers.get("X-Download-Source")).toBe("github");
+  expect(signatures).toEqual(["HEAD"]);
+});
+
+test("mainland routing is off until the Aliyun CDN key is configured", async () => {
+  cdnConfigured = true;
+  mock.module("../src/lib/oss", ossMock);
+  const response = await get("auto", `v${sequence}`, "app.zip", "CN");
+  expect(response.headers.get("X-Download-Source")).toBe("cdn");
   expect(signatures).toEqual([]);
 });
 

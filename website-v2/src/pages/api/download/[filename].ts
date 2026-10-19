@@ -1,13 +1,17 @@
 /**
  * Release 下载入口（仅 302，不代理文件流量）。
- * source=auto：CDN 缓存优先、未命中 OSS 回源、失败 GitHub；无 CDN 时验证 OSS 后直连。
+ * source=auto：中国大陆访客先验证 OSS 再走阿里云 CDN；其余走 Cloudflare 边缘缓存（未命中 OSS 回源、
+ * 失败 GitHub）；两者都没有时验证 OSS 后直连。OSS 缺少该资产一律回退 GitHub。
  * source=github：仅 GitHub；source=oss：仅已验证 OSS，不可用返回 503。
- * 无 source / 未知 source：保留旧客户端 OSS 优先、GitHub 兜底行为。
+ * 无 source / 未知 source：保留旧客户端 OSS 优先、GitHub 兜底行为（大陆访客同样分流到阿里云 CDN）。
  */
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
 import { getCached, setCached } from "@/lib/api-cache";
-import { cdnDownloadUrl, ossConfigured, ossDownloadUrl, presignOssUrl, releaseObjectKey } from "@/lib/oss";
+import {
+  cdnDownloadUrl, cnCdnConfigured, cnCdnDownloadUrl, ossConfigured, ossDownloadUrl, presignOssUrl,
+  releaseObjectKey,
+} from "@/lib/oss";
 import { DownloadLookupCache } from "@/lib/download-cache";
 import { createOssProbe } from "@/lib/download-probe";
 import {
@@ -97,11 +101,14 @@ function jsonError(status: number, error: string): Response {
   });
 }
 
-export const GET: APIRoute = async ({ params, url }) => {
+export const GET: APIRoute = async ({ params, url, request }) => {
   const { filename } = params;
   if (!filename) return jsonError(400, "Missing filename");
   const tag = url.searchParams.get("tag")?.trim() || "";
   const source = downloadSource(url.searchParams.get("source"));
+  // 阿里云 CDN 不会回退 GitHub，所以大陆访客必须先确认 OSS 里有这个资产（结果缓存 1h）。
+  // CF-IPCountry 由 Cloudflare 写入；官网只经 Cloudflare 代理对外。
+  const mainland = cnCdnConfigured && ossConfigured && request.headers.get("cf-ipcountry") === "CN";
 
   try {
     const { value: releases, stale } = await releaseCache().lookup(
@@ -121,8 +128,8 @@ export const GET: APIRoute = async ({ params, url }) => {
 
     // 只有 GitHub 新鲜元数据确认的 tag + asset 才有资格获得 OSS 签名。
     // 过期缓存只允许 GitHub 公共 URL：撤回/转草稿后由 GitHub 自身拒绝访问。
-    if (source === "auto" && !stale) {
-      const cdn = cdnDownloadUrl(releaseObjectKey(release.tag_name, asset.name), release.tag_name);
+    if (source === "auto" && !stale && !mainland) {
+      const cdn = await cdnDownloadUrl(releaseObjectKey(release.tag_name, asset.name), release.tag_name);
       // 不先 HEAD OSS：即使源站离线，边缘仍可能持有完整缓存。
       if (cdn) return downloadRedirect(cdn, "cdn");
     }
@@ -130,8 +137,8 @@ export const GET: APIRoute = async ({ params, url }) => {
       const key = releaseObjectKey(release.tag_name, asset.name);
       if (await ossHasAsset(key, asset.size)) {
         try {
-          const target = ossDownloadUrl(key);
-          if (target) return downloadRedirect(target, "oss");
+          const target = mainland ? cnCdnDownloadUrl(key) : await ossDownloadUrl(key);
+          if (target) return downloadRedirect(target, mainland ? "cn-cdn" : "oss");
         } catch {
           // 签名失败同样遵循强制 OSS 的 503 / auto 与旧客户端的 GitHub 兜底策略。
         }

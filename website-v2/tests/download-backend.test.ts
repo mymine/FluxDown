@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { DownloadLookupCache } from "../src/lib/download-cache";
 import { createOssProbe } from "../src/lib/download-probe";
 import worker from "../cdn/oss-proxy.js";
+import { downloadSignature } from "../src/lib/download-signature";
 import {
   DownloadLookupError, downloadSource, latestWithAsset, matchesAssetSize,
   mayProbeOss, ossUnavailable, downloadRedirect, transientGitHubStatus, isGitHubDownloadUrl,
@@ -319,6 +320,34 @@ describe("CDN Worker download consumer", () => {
       }
       expect((await worker.fetch(request(undefined, undefined, { method: "POST" }), env)).status).toBe(405);
       expect(calls).toBe(0);
+    });
+  });
+
+  test("with a signing secret only unexpired links signed for the exact path reach OSS", async () => {
+    const signed = { ...env, DOWNLOAD_SIGNING_SECRET: "s3cret" };
+    const path = "/releases/v1.2.3/app/App%20ARM.zip";
+    const now = Math.floor(Date.now() / 1000);
+    let calls = 0;
+    await withOrigin((async () => { calls++; return new Response("zip"); }) as typeof fetch, async () => {
+      const sig = await downloadSignature("s3cret", path, now + 600);
+      const ok = await worker.fetch(request(undefined, `exp=${now + 600}&sig=${sig}`), signed);
+      expect(ok.status).toBe(200);
+      expect(calls).toBe(1);
+      const expired = await downloadSignature("s3cret", path, now - 1);
+      const tooLong = await downloadSignature("s3cret", path, now + 25 * 3600);
+      for (const [target, query] of [
+        [undefined, ""],
+        [undefined, "fallback=github&tag=v1.2.3"],
+        [undefined, `exp=${now - 1}&sig=${expired}`],
+        [undefined, `exp=${now + 25 * 3600}&sig=${tooLong}`],
+        [undefined, `exp=${now + 601}&sig=${sig}`],
+        ["v1.2.3/app/Other.zip", `exp=${now + 600}&sig=${sig}`],
+      ] as const) {
+        const response = await worker.fetch(request(target, query), signed);
+        expect(response.status).toBe(403);
+        expect(response.headers.has("location")).toBe(false);
+      }
+      expect(calls).toBe(1);
     });
   });
 });

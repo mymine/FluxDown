@@ -5,6 +5,8 @@
  * 命中边缘缓存不计 OSS 外网流出；auto 链在 OSS 失败时回退精确 GitHub release asset。
  *
  * - 只放行 GET / HEAD 与 `${PREFIX}/<version>/<component>/<asset>`；桶保持私有。
+ * - 配置 secret `DOWNLOAD_SIGNING_SECRET` 后只接受官网 /api/download 签发、未过期的链接
+ *   （`exp` + `sig`，算法见 src/lib/download-signature.ts），其余一律 403。
  * - 回源 URL 用固定过期时间签名（V1 query 签名）：同一对象的回源 URL 恒定，
  *   CF 缓存键稳定；签名 URL 只在 CF 与 OSS 之间出现，不下发给客户端。
  * - 发布资产按版本目录不可变，边缘缓存 30 天；Range 由 CF 缓存层切片。
@@ -16,6 +18,7 @@
  */
 
 import { ossStorageKey, renamedDownloadHeaders } from "../src/lib/oss-storage";
+import { verifyDownloadSignature } from "../src/lib/download-signature";
 
 // 2100-01-01T00:00:00Z：回源签名恒定，保证缓存键稳定。
 const SIGN_EXPIRES = 4102444800;
@@ -52,6 +55,14 @@ export default {
       segments.some((s) => s === "" || s === "." || s === ".." || /[\\\u0000-\u001f\u007f]/.test(s))
     ) {
       return new Response("Not Found", { status: 404 });
+    }
+    if (env.DOWNLOAD_SIGNING_SECRET && !(await verifyDownloadSignature(
+      env.DOWNLOAD_SIGNING_SECRET,
+      url.pathname,
+      url.searchParams.get("exp"),
+      url.searchParams.get("sig"),
+    ))) {
+      return new Response("Forbidden", { status: 403, headers: { "cache-control": "no-store" } });
     }
 
     let fallback = null;

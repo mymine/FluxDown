@@ -68,7 +68,7 @@ export function transientGitHubStatus(status: number, headers: Headers): boolean
       headers.has("retry-after")));
 }
 
-export function downloadRedirect(location: string, source: "github" | "oss" | "cdn", stale = false): Response {
+export function downloadRedirect(location: string, source: "github" | "oss" | "cdn" | "cn-cdn", stale = false): Response {
   return new Response(null, {
     status: 302,
     headers: {
