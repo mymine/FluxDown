@@ -37,6 +37,7 @@
 # =============================================================================
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -54,6 +55,63 @@ STD_BLOCK = re.compile(r'use\s+(std|core)::\{[^;]*\};', re.S)   # [^;]* 可跨�
 ATOMIC_GROUP = re.compile(r'atomic::\{([^}]*)\}')               # 含 sync::atomic::{…} 与 atomic::{…}
 HAVE_DEP = re.compile(r'(?m)^\s*portable-atomic\s*=|^\s*\[[^\]]*dependencies\.portable-atomic\s*\]')
 PORTABLE_PATH = re.compile(r'(?:::)?portable_atomic::')
+
+# ---- quickjs 系 crate 的 mipsel FFI bindings 补齐 --------------------------
+# rquickjs-sys（crates.io）与 quickjs-jit-sys（longbridge 分叉，由 [patch.crates-io] 指过来、
+# 走 git 检出；其 [lib] name 仍叫 rquickjs_sys）都没有预生成 mipsel 的 bindings，而
+# sys/src/lib.rs 里是 include!(concat!("bindings/", bindings_env!("TARGET"), ".rs"))，
+# 即缺 bindings/mipsel-unknown-linux-musl.rs。借用同为 32 位小端的 armv7 绑定
+# （64 位类型按 8 字节对齐，与 MIPS O32 一致；i686 只有 4 字节对齐）充当之。
+BINDINGS_NAME = 'mipsel-unknown-linux-musl.rs'
+BINDINGS_CANDIDATES = (
+    'armv7-unknown-linux-gnueabihf.rs',
+    'armv7-unknown-linux-gnueabi.rs',
+    'i686-unknown-linux-gnu.rs',
+    'i686-unknown-linux-musl.rs',
+)
+BINDINGS_GLOBS = (
+    'registry/src/*/rquickjs-sys-*/src/bindings',
+    'registry/src/*/quickjs-jit-sys-*/src/bindings',
+    'registry/src/*/quickjs-jit-sys-*/bindings',
+    'git/checkouts/*/*/sys/src/bindings',
+    'git/checkouts/*/*/src/bindings',
+    'git/checkouts/*/*/*/sys/src/bindings',          # 仓库内再嵌一层（如 gpui-kit/vendor/...）
+    'git/checkouts/*/*/vendor/*/sys/src/bindings',
+)
+
+
+def quickjs_bindings_dirs(root):
+    """registry 与 git checkouts 两处可能的 quickjs bindings 目录。"""
+    seen, out = set(), []
+    for pat in BINDINGS_GLOBS:
+        for d in sorted(root.glob(pat)):
+            if d.is_dir() and d not in seen:
+                seen.add(d)
+                out.append(d)
+    return out
+
+
+def fix_quickjs_bindings(root):
+    """给缺 mipsel bindings 的 quickjs 系 crate 补一份 32 位小端的。"""
+    fixed = []
+    for d in quickjs_bindings_dirs(root):
+        dst = d / BINDINGS_NAME
+        if dst.exists():
+            continue
+        if not list(d.glob('*-unknown-linux-*.rs')):
+            continue                      # 不是 quickjs 的绑定目录
+        for cand in BINDINGS_CANDIDATES:
+            src = d / cand
+            if src.is_file():
+                shutil.copyfile(src, dst)
+                fixed.append((d, cand))
+                break
+        else:
+            print(f'[patch-mips32] 警告: {d} 找不到可用作 mipsel 的 32 位小端 bindings')
+    for d, cand in fixed:
+        print(f'[patch-mips32] quickjs bindings: {d}  <-  {cand}')
+    return fixed
+
 
 # 注入 crate 内部的最小 64 位原子 shim（只用 core；自旋锁 + 两个 32 位原子；std/no_std 通用）
 SHIM_SRC = '''//! 由 patch-mips32.py 自动注入：在缺少原生 64 位原子（无 target_has_atomic="64"）的
@@ -564,6 +622,8 @@ def main() -> int:
     if not root.is_dir():
         print(f'[patch-mips32] 目录不存在，跳过: {root}')
         return 0
+
+    fix_quickjs_bindings(root)
 
     changed_rs, deps_added, shim_crates, port_crates = [], [], set(), set()
     skipped_noroot = []
