@@ -16,6 +16,7 @@ import { useConflictTaskIds } from '../dialogs/fileConflict'
 import { ConflictBadge, KindGlyph } from './cells'
 import { kindLabel, STATUS_TEXT, statusDetail, statusLabel } from './text'
 import type { Translate } from './text'
+import { usePluginTaskCommands } from '../../plugins/usePluginContributions'
 import { buildGroupMenu, buildTaskMenu } from './menus'
 import { SegmentProgress } from './SegmentProgress'
 import { TaskEmpty } from './TaskEmpty'
@@ -111,6 +112,7 @@ export function TaskCards() {
   const t = useT()
   const ctx = useDownloads()
   const conflictTaskIds = useConflictTaskIds()
+  const pluginCommands = usePluginTaskCommands()
   const { rows, selected, selectedViews, queues, views, groupSummaries } = ctx
   const scrollRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
@@ -136,8 +138,9 @@ export function TaskCards() {
         queues,
         queueName: ctx.queueName,
         showDetail: ctx.showDetail,
+        pluginCommands,
       }),
-    [t, selected, selectedViews, queues, ctx.queueName, ctx.showDetail],
+    [t, selected, selectedViews, queues, ctx.queueName, ctx.showDetail, pluginCommands],
   )
 
   if (rows.length === 0) return <TaskEmpty />

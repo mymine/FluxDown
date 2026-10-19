@@ -26,6 +26,14 @@ export interface ResolveVariantOptionDto {
   totalBytes: number;
 }
 
+/** 多插件择一的候选。 */
+export interface PluginCandidateDto {
+  identity: string;
+  name: string;
+  version: string;
+  description: string;
+}
+
 /** 「文件已存在」可选动作；`cancelled` 结果 = 取消下载（任务暂停）。 */
 export type FileExistsAction = 'rename' | 'overwrite' | 'skip';
 
@@ -46,6 +54,15 @@ export type SelectionKind =
       /** 选「重命名」时将落盘的文件名。 */
       renamePreview: string;
       actions: FileExistsAction[];
+    }
+  | {
+      type: 'plugin';
+      /** 命中多个插件的站点（如 `bilibili.com`）。 */
+      site: string;
+      /** 任务原始 URL。 */
+      url: string;
+      /** 候选插件，按 identity 升序。 */
+      candidates: PluginCandidateDto[];
     };
 
 /**
@@ -57,6 +74,7 @@ export type SelectionOutcome =
   | { kind: 'bt'; indices: number[] }
   | { kind: 'variant'; index: number }
   | { kind: 'fileExists'; action: FileExistsAction }
+  | { kind: 'plugin'; identity: string; remember: boolean }
   | { kind: 'cancelled' };
 
 /** 待选择请求（快照 `pendingSelections` / `selectionPending` 事件）。 */

@@ -24,7 +24,7 @@ use crate::{
     controller::DownloadsCommand,
     model::{
         DownloadFilter, DownloadStatusFilter, SidebarSection, SidebarSelection, StatusFolderMotion,
-        devices::{DeviceKind, devices_section_visible},
+        devices::devices_section_visible,
     },
     pages::downloads::DownloadView,
 };
@@ -70,7 +70,6 @@ impl DownloadView {
     /// 折叠箭头与 `trailing` 操作按钮只在悬停标题时出现。
     fn section_header(
         &self,
-        id: &'static str,
         label: SharedString,
         section: SidebarSection,
         open_amount: f32,
@@ -92,7 +91,11 @@ impl DownloadView {
         let hide_label = self.strings.hide_section.clone();
 
         h_flex()
-            .id(id)
+            .id(match section {
+                SidebarSection::Status => "download-status-toggle",
+                SidebarSection::Queues => "download-queue-toggle",
+                SidebarSection::Devices => "download-devices-toggle",
+            })
             .group(SECTION_HEADER_GROUP)
             .h(header_height)
             .px(spacing.sm)
@@ -565,7 +568,6 @@ impl DownloadView {
 
         Self::section_container(first, cx)
             .child(self.section_header(
-                "download-status-toggle",
                 self.strings.sidebar_status.clone(),
                 SidebarSection::Status,
                 open_amount,
@@ -779,7 +781,6 @@ impl DownloadView {
         }
         Self::section_container(first, cx)
             .child(self.section_header(
-                "download-queue-toggle",
                 self.strings.sidebar_queues.clone(),
                 SidebarSection::Queues,
                 open_amount,
@@ -841,7 +842,7 @@ impl DownloadView {
         let icon_size = theme.extended().icon.lg;
         let online_color = theme.extended().colors.success;
         let offline_color = theme.extended().colors.text_tertiary;
-        let others = self.controller.other_devices();
+        let others = self.controller.sidebar_devices();
         let mut rows: Vec<(String, SharedString, FluxIcon, Option<Hsla>)> = Vec::new();
         if !others.is_empty() {
             rows.push((
@@ -858,10 +859,7 @@ impl DownloadView {
             None,
         ));
         rows.extend(others.into_iter().map(|device| {
-            let icon = match device.kind {
-                DeviceKind::Cloud => FluxIcon::Globe,
-                DeviceKind::Paired => FluxIcon::Network,
-            };
+            let icon = FluxIcon::Globe;
             let dot = match device.online {
                 Some(true) => Some(online_color),
                 Some(false) => Some(offline_color),
@@ -892,7 +890,6 @@ impl DownloadView {
         }
         Self::section_container(first, cx)
             .child(self.section_header(
-                "download-devices-toggle",
                 self.strings.sidebar_devices.clone(),
                 SidebarSection::Devices,
                 open_amount,
@@ -916,7 +913,7 @@ impl DownloadView {
                 self.controller
                     .preference(section.visibility_pref())
                     .and_then(serde_json::Value::as_bool),
-                self.controller.other_devices().len(),
+                self.controller.sidebar_devices().len(),
             ),
             _ => self
                 .controller

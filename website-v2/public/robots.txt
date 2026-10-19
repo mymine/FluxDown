@@ -37,4 +37,4 @@ Allow: /
 User-agent: Bytespider
 Allow: /
 
-Sitemap: https://fluxdown.zerx.dev/sitemap-index.xml
+Sitemap: https://fluxdown.com/sitemap-index.xml

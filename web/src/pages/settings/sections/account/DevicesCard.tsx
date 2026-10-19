@@ -1,11 +1,11 @@
 // 受信任设备（GPUI devices.rs）：列表 + 重试 + 详情 / 重命名 / 删除（agent.device.*；删除当前设备 = 登出）。
 
-import { Info, Pencil, RefreshCw, Trash2 } from 'lucide-react'
+import { Info, Pencil, Power, RefreshCw, TriangleAlert, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useT } from '../../../../i18n'
 import { rpc } from '../../../../lib/rpc'
 import type { CloudConnectionDto, CloudDevice } from '../../../../lib/rpc'
-import { cloudConnectionLabelKey, cloudPresenceKnown, devicePresenceKey } from '../../../../lib/cloud-presence'
+import { canDisconnectDevice, cloudConnectionLabelKey, cloudPresenceKnown, devicePresenceKey, onlineLimitWaiting } from '../../../../lib/cloud-presence'
 import { Badge, Button, Card, ConfirmFooter, Dialog, FieldError, Form, FormField, Icon, Input, confirmDialog, toast } from '../../../../ui'
 import { accountErrorKey, REASON_KEYS } from './errorText'
 import { sortedDevices } from './deviceList'
@@ -90,7 +90,7 @@ function DetailDialog({ device, presenceKnown, onClose }: { device: CloudDevice;
   )
 }
 
-function DeviceRow({ device, disabled, presenceKnown }: { device: CloudDevice; disabled: boolean; presenceKnown: boolean }) {
+function DeviceRow({ device, disabled, presenceKnown, waiting }: { device: CloudDevice; disabled: boolean; presenceKnown: boolean; waiting: boolean }) {
   const t = useT()
   const [renaming, setRenaming] = useState(false)
   const [detail, setDetail] = useState(false)
@@ -117,6 +117,14 @@ function DeviceRow({ device, disabled, presenceKnown }: { device: CloudDevice; d
     }
   }
 
+  const disconnect = async () => {
+    try {
+      await rpc.agent.device.disconnect({ id: device.id })
+    } catch (error) {
+      toast.key(accountErrorKey(error), 'error')
+    }
+  }
+
   return (
     <div className="flex items-center gap-2 px-3 py-2 coarse:min-h-touch">
       <span className={`size-2 shrink-0 rounded-full ${presenceKnown && device.isOnline ? 'bg-success' : 'bg-text-tertiary/50'}`} aria-hidden />
@@ -128,6 +136,11 @@ function DeviceRow({ device, disabled, presenceKnown }: { device: CloudDevice; d
         {meta ? <div className="truncate text-xs text-muted-foreground">{meta}</div> : null}
       </div>
       <div className="flex shrink-0 items-center gap-0.5">
+        {canDisconnectDevice(device, presenceKnown, waiting) ? (
+          <Button variant="ghost" iconOnly aria-label={t('accountDeviceDisconnectAction')} title={t('accountDeviceDisconnectAction')} className="text-muted-foreground hover:text-foreground" disabled={disabled} onClick={() => void disconnect()}>
+            <Icon icon={Power} size="md" />
+          </Button>
+        ) : null}
         <Button variant="ghost" iconOnly aria-label={t('accountDeviceDetailTitle')} title={t('accountDeviceDetailTitle')} className="text-muted-foreground hover:text-foreground" onClick={() => setDetail(true)}>
           <Icon icon={Info} size="md" />
         </Button>
@@ -152,15 +165,50 @@ function DeviceRow({ device, disabled, presenceKnown }: { device: CloudDevice; d
   )
 }
 
-export function DevicesCard({ devices, disabled, connection }: {
+function OnlineLimitNotice({ devices, maxOnline, disabled }: { devices: readonly CloudDevice[]; maxOnline: number | null; disabled: boolean }) {
+  const t = useT()
+  const occupying = devices.filter((device) => device.isOnline && !device.isCurrent)
+  const disconnect = async (device: CloudDevice) => {
+    try {
+      await rpc.agent.device.disconnect({ id: device.id })
+    } catch (error) {
+      toast.key(accountErrorKey(error), 'error')
+    }
+  }
+  return (
+    <div role="status" aria-live="polite" className="flex flex-col gap-2 rounded-md border border-warning/30 bg-warning/8 px-3 py-2">
+      <div className="flex items-start gap-2 text-sm text-foreground">
+        <Icon icon={TriangleAlert} size="md" className="mt-0.5 shrink-0 text-warning" />
+        <span>{maxOnline === null ? t('cloudOnlineLimitNoticeNoMax') : t('cloudOnlineLimitNotice', { max: maxOnline })}</span>
+      </div>
+      {occupying.length > 0 ? (
+        <div className="flex flex-col gap-1">
+          <div className="text-xs text-muted-foreground">{t('cloudOnlineLimitListTitle')}</div>
+          {occupying.map((device) => (
+            <div key={device.id} className="flex items-center justify-between gap-2">
+              <span className="min-w-0 truncate text-sm text-foreground">{device.name}</span>
+              <Button disabled={disabled} onClick={() => void disconnect(device)}>
+                {t('accountDeviceDisconnectAction')}
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+export function DevicesCard({ devices, disabled, connection, maxOnline }: {
   devices: readonly CloudDevice[]
   disabled: boolean
   connection: CloudConnectionDto | undefined
+  maxOnline: number | null
 }) {
   const t = useT()
   const [refreshing, setRefreshing] = useState(false)
   const [errorKey, setErrorKey] = useState<string | null>(null)
   const presenceKnown = cloudPresenceKnown(connection, !disabled)
+  const waiting = onlineLimitWaiting(connection, !disabled)
   const connectionErrorKey = connection?.lastErrorReason
     ? (REASON_KEYS[connection.lastErrorReason] ?? 'accountErrorNetwork')
     : connection?.lastError ? 'accountErrorNetwork' : null
@@ -196,14 +244,15 @@ export function DevicesCard({ devices, disabled, connection }: {
           {t(cloudConnectionLabelKey(connection, !disabled))}
         </span>
         {!presenceKnown ? <span className="text-muted-foreground">{t('cloudConnectionStatusHint')}</span> : null}
-        {!disabled && connectionErrorKey ? <FieldError>{t(connectionErrorKey)}</FieldError> : null}
+        {!disabled && connectionErrorKey && !waiting ? <FieldError>{t(connectionErrorKey)}</FieldError> : null}
       </div>
+      {waiting ? <OnlineLimitNotice devices={devices} maxOnline={maxOnline} disabled={disabled} /> : null}
       {errorKey ? <FieldError>{t(errorKey)}</FieldError> : null}
       <Card className="w-full overflow-hidden [&>*+*]:border-t [&>*+*]:border-hairline">
         {devices.length === 0 ? (
           <div className="flex justify-center p-4 text-xs text-muted-foreground">{t('accountDevicesEmpty')}</div>
         ) : (
-          sortedDevices(devices, presenceKnown).map((device) => <DeviceRow key={device.id} device={device} disabled={disabled} presenceKnown={presenceKnown} />)
+          sortedDevices(devices, presenceKnown).map((device) => <DeviceRow key={device.id} device={device} disabled={disabled} presenceKnown={presenceKnown} waiting={waiting} />)
         )}
       </Card>
     </section>

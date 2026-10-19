@@ -1,4 +1,4 @@
-//! 插件熔断提示：插件被熔断器自动禁用是全局事件（提示引导用户到「设置 → 扩展」重新启用），
+//! 插件自动禁用提示：插件被熔断器或插件市场撤回而自动禁用是全局事件（提示引导用户到「设置 → 扩展」处理），
 //! 不依赖设置窗口是否打开。应用级订阅 agent 会话，在承载浮层的窗口（主窗口优先）弹 warning
 //! 通知；暂时没有承载窗口时暂存，主窗口就绪后补弹。
 
@@ -49,12 +49,12 @@ pub(crate) fn install(cx: &mut App) {
                 remember_names(cx, plugins);
             }
             ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::Engine(
-                WsServerMsg::PluginAutoDisabled { identity, .. },
+                WsServerMsg::PluginAutoDisabled { identity, reason },
             )))
             | ServiceEvent::Daemon(DaemonEvent::Engine(WsServerMsg::PluginAutoDisabled {
                 identity,
-                ..
-            })) => notify_auto_disabled(identity, cx),
+                reason,
+            })) => notify_auto_disabled(identity, reason, cx),
             _ => {}
         },
         SessionSignal::Stale | SessionSignal::Fatal(_) | SessionSignal::ServiceStopped => {}
@@ -89,12 +89,17 @@ fn display_name<'a>(names: &'a HashMap<String, String>, identity: &'a str) -> &'
         .unwrap_or(identity)
 }
 
-fn notify_auto_disabled(identity: &str, cx: &mut App) {
+fn notify_auto_disabled(identity: &str, reason: &str, cx: &mut App) {
     let name = display_name(&cx.global::<PluginNotices>().names, identity).to_owned();
+    let key = if reason == "Revoked" {
+        "pluginRevokedToast"
+    } else {
+        "pluginAutoDisabledToast"
+    };
     let message = Desktop::global(cx)
         .translator
         .read(cx)
-        .text_with("pluginAutoDisabledToast", &[("name", &name)]);
+        .text_with(key, &[("name", &name)]);
     show(message, cx);
 }
 

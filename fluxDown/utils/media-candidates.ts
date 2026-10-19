@@ -1,19 +1,17 @@
 /**
  * 将嗅探到的原始媒体请求投影为用户真正能理解的「视频候选」。
  *
- * resource-store 保留原始请求，便于认证信息恢复和高级诊断；本模块只负责
+ * background/tab-state 保留原始请求，便于认证信息恢复和高级诊断；本模块只负责
  * UI/下载层的聚合，不把 m4s/ts 分片伪装成独立视频。
  */
 
 import type { DashManifest } from "./dash-manifest";
 import type { DetectedResource } from "./resource-types";
-import {
-  extractExtension,
-  extractFilenameFromUrl,
-  isStreamingUrl,
-  normalizeUrlForDedup,
-} from "./resource-types";
-import { normalizeDashManifest } from "./dash-manifest";
+import { extractFilenameFromUrl, isStreamingUrl } from "./resource-types";
+import { hostMatches } from "@/rules/glob";
+import { extractExtension } from "@/rules/url";
+import { normalizeDashManifest, SEGMENT_PLACEHOLDER } from "./dash-manifest";
+import { hlsSegmentDir, type HlsPlaylistEntry, type HlsPlaylistInfo } from "./hls-playlist";
 
 export type MediaCandidateSource =
   | "direct"
@@ -25,6 +23,8 @@ export type MediaCandidateSource =
 export interface DashManifestEntry {
   url: string;
   manifest: DashManifest;
+  /** 换页前观察到的清单（预取的下一个视频等）：只在关联到播放元素后展示。 */
+  carried?: boolean;
 }
 
 export interface MediaCandidateVariant {
@@ -39,6 +39,11 @@ export interface MediaCandidateVariant {
   frameRate?: number;
   fileSize?: number;
   resourceId?: string;
+  /**
+   * 同一画质档被合并掉的其它编码轨 URL（只用于把播放元素关联到本档，不用于下载）：
+   * 播放器可能正在放 av01，而本档下载选的是码率最高的 avc1。
+   */
+  alternateUrls?: string[];
 }
 
 export interface MediaCandidate {
@@ -53,6 +58,15 @@ export interface MediaCandidate {
   fragmentCount: number;
   /** False when only orphan fragments were seen and no complete source is known. */
   downloadable: boolean;
+  /** 全部来源清单都是换页前的（见 `DashManifestEntry.carried`）：未关联到播放元素时不展示。 */
+  provisional?: boolean;
+  /** 内容受 DRM 保护（清单声明或播放元素触发了 EME 加密）：下载得到的是密文，不提供下载。 */
+  protected?: boolean;
+  /**
+   * 字节只存在于浏览器内（页面 Service Worker 合成的地址，如 Telegram Web 的 `/k/stream/…`）：
+   * 引擎按 URL 重放只会拿到网页，不提供下载。
+   */
+  browserOnly?: boolean;
 }
 
 export interface MediaCandidateOptions {
@@ -63,10 +77,12 @@ export interface MediaCandidateOptions {
   /** Localized label used when multiple candidates share one page title. */
   videoLabel?: string;
   manifests?: DashManifestEntry[];
-}
-
-function urlKey(url: string): string {
-  return normalizeUrlForDedup(url);
+  /** 已观察到的 HLS 播放列表关联（子列表 / 分片目录）。 */
+  hlsPlaylists?: HlsPlaylistEntry[];
+  /** mirror 规则声明的镜像域名组（host 模式）。 */
+  mirrorGroups?: string[][];
+  /** URL 去重键（调用方传入 `engine.dedupeKey` 的闭包）。 */
+  key: (url: string) => string;
 }
 
 /**
@@ -84,24 +100,7 @@ function stableMediaPath(url: string): string {
     parsed.hash = "";
     return parsed.toString();
   } catch {
-    return urlKey(url);
-  }
-}
-
-/**
- * 返回不含 Origin、查询参数和 hash 的媒体路径。
- *
- * 同一媒体的备用 CDN 常常只替换域名，分片路径和文件名保持不变；这
- * 个键只用于把分片关联到已经解析出的清单，不用于生成下载 URL 或跨
- * 媒体去重。
- */
-function mediaPathKey(url: string): string {
-  try {
-    const parsed = new URL(url);
-    const pathname = parsed.pathname.replace(/\/+$/, "");
-    return pathname || "/";
-  } catch {
-    return urlKey(url);
+    return url;
   }
 }
 
@@ -122,19 +121,19 @@ function isFragmentUrl(url: string): boolean {
   return ext === "m4s" || ext === "ts";
 }
 
-function isManifestUrl(url: string, mimeType?: string): boolean {
+/** URL / MIME 是否为播放清单（HLS / DASH）；分片不算。 */
+export function isManifestUrl(url: string, mimeType?: string): boolean {
   if (isStreamingUrl(url) && !isFragmentUrl(url)) return true;
-  const mime = mimeType?.toLowerCase().split(";", 1)[0].trim();
-  return mime === "application/vnd.apple.mpegurl" ||
-    mime === "application/x-mpegurl" ||
-    mime === "application/mpegurl" ||
+  const mime = mimeType?.toLowerCase().split(";", 1)[0].trim() ?? "";
+  // HLS 的 MIME 写法很多（application/vnd.apple.mpegurl、audio/mpegurl、audio/x-mpegurl…）
+  return mime.endsWith("mpegurl") ||
     mime === "application/octet-stream-m3u8" ||
     mime === "application/dash+xml";
 }
 
 function isCompleteFragmentResource(resource: DetectedResource): boolean {
   if (!isFragmentUrl(resource.url)) return false;
-  // resource-store 会用 URL 基名补全 filename，所以 filename 非空并不代表服务器
+  // tab-state 入库时会用 URL 基名补全 filename，所以 filename 非空并不代表服务器
   // 给了 Content-Disposition 文件名；只有与 URL 基名不同的名字才算显式信号。
   // 无显式名字的媒体，超大响应也不是普通 MSE 分片。
   const filename = resource.filename?.trim();
@@ -224,6 +223,34 @@ function periodKey(track: DashManifest["video"][number]): string {
   return track.periodId || "__default__";
 }
 
+/**
+ * 主播放列表的各档：每档的媒体播放列表可单独交给 HLS 下载器。
+ * 引用了独立音频组（EXT-X-MEDIA AUDIO）的档单独下载会没有声音，这种主列表只保留「自动」
+ * （由下载器读主列表并合并音轨）。同分辨率同帧率档只留码率最高的一档。
+ */
+function hlsQualityVariants(playlist: HlsPlaylistInfo | undefined, resourceId: string): MediaCandidateVariant[] {
+  const variants = playlist?.variants ?? [];
+  if (variants.length < 2 || variants.some((v) => v.audioGroup)) return [];
+  const tracks: DashManifest["video"] = variants.map((v) => ({
+    url: v.url,
+    height: v.height,
+    width: v.width,
+    bandwidth: v.bandwidth,
+    frameRate: v.frameRate,
+    codecs: v.codecs,
+  }));
+  return selectQualityVideoTracks(tracks)
+    .sort((a, b) => (b.height ?? 0) - (a.height ?? 0) || (b.bandwidth ?? 0) - (a.bandwidth ?? 0))
+    .map((track, index) => ({
+      id: `hls:${resourceId}:${index}:${trackFileKey(track.url)}`,
+      label: qualityLabel(track.height, track.bandwidth),
+      videoUrl: track.url,
+      bandwidth: track.bandwidth,
+      codec: shortCodec(track.codecs),
+      frameRate: track.frameRate,
+    }));
+}
+
 function bestAudioUrl(audio: DashManifest["audio"]): string | undefined {
   return audio.filter((track) => track.downloadable !== false).reduce<string | undefined>((best, track) => {
     if (!best) return track.url;
@@ -251,21 +278,31 @@ function trackIdentity(
   ].join("|");
 }
 
-/** 将同一分辨率、同一帧率的不同编码合并为一个用户可选择的画质档。 */
+/**
+ * 画质档键：同一 Period、同一分辨率（无高度时按码率）、同一帧率档。
+ *
+ * 帧率按档（≈30 / ≈60 / ≈120）比较：不同编码对同一档常报出略有差异的值
+ * （B 站同一 720P 的 avc1 报 29.412、av01 报 30.019），按整数比较会拆成两档。
+ */
+function qualityTierKey(track: DashManifest["video"][number]): string {
+  const height = track.height ?? 0;
+  const frameRateKey = track.frameRate && track.frameRate > 0
+    ? String(Math.max(1, Math.round(track.frameRate / 30)))
+    : "unknown";
+  const qualityKey = height > 0
+    ? `height:${height}`
+    : `bandwidth:${track.bandwidth ?? 0}`;
+  return `${periodKey(track)}|${qualityKey}|${frameRateKey}`;
+}
+
+/** 将同一画质档（见 `qualityTierKey`）的不同编码合并为一个用户可选择的画质档。 */
 export function selectQualityVideoTracks(
   tracks: DashManifest["video"],
 ): DashManifest["video"] {
   const selected = new Map<string, DashManifest["video"][number]>();
   for (const track of tracks) {
     if (track.downloadable === false) continue;
-    const height = track.height ?? 0;
-    const frameRateKey = track.frameRate && track.frameRate > 0
-      ? String(Math.round(track.frameRate))
-      : "unknown";
-    const qualityKey = height > 0
-      ? `height:${height}`
-      : `bandwidth:${track.bandwidth ?? 0}`;
-    const key = `${periodKey(track)}|${qualityKey}|${frameRateKey}`;
+    const key = qualityTierKey(track);
     const current = selected.get(key);
     if (!current || (track.bandwidth ?? 0) > (current.bandwidth ?? 0)) {
       selected.set(key, track);
@@ -280,16 +317,149 @@ export function qualityResolutionLabel(label: string): string | undefined {
   return match ? `${Number(match[1])}P` : undefined;
 }
 
+/** 常见标称帧率：编码器报出的实测值（29.412、59.94 等）就近归到这些档位显示。 */
+const NOMINAL_FRAME_RATES = [24, 25, 30, 48, 50, 60, 90, 120, 144, 240];
+
 export function qualityFrameRateLabel(frameRate?: number): string | undefined {
   if (!frameRate || !Number.isFinite(frameRate) || frameRate <= 0) return undefined;
-  return `${Math.round(frameRate)}FPS`;
+  const nominal = NOMINAL_FRAME_RATES.find((rate) => Math.abs(rate - frameRate) <= rate * 0.03);
+  return `${nominal ?? Math.round(frameRate)}FPS`;
 }
 
-function manifestSignature(manifest: DashManifest): string {
-  return [
-    ...manifest.video.map((track) => trackIdentity(track, "video")),
-    ...manifest.audio.map((track) => trackIdentity(track, "audio")),
-  ].sort().join("\n");
+/**
+ * 轨道文件身份：路径末两段（`<目录>/<文件名>`），不含域名、query。
+ *
+ * 同一媒体常由多台 CDN 镜像提供，镜像只换域名或在路径前加前缀（B 站
+ * `upos-*.bilivideo.com/upgcxcode/…` 与 `*.mcdn.bilivideo.cn:8082/v1/resource/upgcxcode/…`），
+ * 签名 query 每次请求清单都会轮换。只有一段路径时文件名太泛，保留域名。
+ */
+export function trackFileKey(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const segments = parsed.pathname.split("/").filter(Boolean);
+    if (segments.length < 2) return `${parsed.host}/${segments.join("/")}`;
+    return segments.slice(-2).join("/");
+  } catch {
+    return url;
+  }
+}
+
+/** 泛用文件名（index / video / playlist / segment… 或过短）：不同媒体也常同名，不能单凭它认定同一文件。 */
+function isGenericFileKey(fileKey: string): boolean {
+  const base = (fileKey.split("/").pop() ?? "").replace(/\.[a-z0-9]{1,5}$/i, "");
+  return base.length <= 3 ||
+    /^(?:index|video|audio|playlist|master|manifest|segment|init|stream|media|chunk|main|output|file|default|track)[-_]?\d{0,4}$/i
+      .test(base);
+}
+
+/** 域名归类：mirror 规则声明的镜像组内的域名视为同一来源，其余按 host 本身。 */
+export type HostClassifier = (host: string) => string;
+
+export function hostClassifier(mirrorGroups: readonly string[][] = []): HostClassifier {
+  return (host) => {
+    const index = mirrorGroups.findIndex((group) => group.some((pattern) => hostMatches(host, pattern)));
+    return index >= 0 ? `mirror:${index}` : host.toLowerCase();
+  };
+}
+
+function urlParts(url: string): { host: string; path: string } {
+  try {
+    const parsed = new URL(url);
+    return { host: parsed.host, path: parsed.pathname };
+  } catch {
+    return { host: "", path: url };
+  }
+}
+
+/**
+ * 两个 URL 是否同一轨道文件：文件身份（`trackFileKey`）相同，且满足其一——文件名足够特定；
+ * 完整路径相同（镜像只换域名）；来自同一来源（同 host / 同一 mirror 规则镜像组）。
+ * 泛用文件名在不同域名、不同路径前缀下不认定为同一文件。
+ */
+function sameTrackFile(a: string, b: string, classify: HostClassifier): boolean {
+  const key = trackFileKey(a);
+  if (key !== trackFileKey(b)) return false;
+  if (!isGenericFileKey(key)) return true;
+  const pa = urlParts(a);
+  const pb = urlParts(b);
+  return pa.path === pb.path || classify(pa.host) === classify(pb.host);
+}
+
+interface ManifestItem {
+  entry: DashManifestEntry;
+  manifestIndex: number;
+  manifestKey: string;
+}
+
+interface ManifestGroup {
+  /** 合并后的清单；url 取最新一份，便于用最新签名做关联。 */
+  entry: DashManifestEntry;
+  /** 最新一份的下标（variant id 用）。 */
+  manifestIndex: number;
+  /** 最早一份的键：候选 id 在清单刷新（换签名 / 换清晰度集合）后保持稳定。 */
+  manifestKey: string;
+  memberKeys: string[];
+  members: DashManifestEntry[];
+}
+
+/** 合并同一份媒体的轨道：新清单的同一文件覆盖旧清单（签名更新），旧清单独有的档位保留。 */
+function mergeTracks(
+  lists: DashManifest["video"][],
+  compare: (a: DashManifest["video"][number], b: DashManifest["video"][number]) => number,
+): DashManifest["video"] {
+  const byFile = new Map<string, DashManifest["video"][number]>();
+  for (const list of lists) {
+    for (const track of list) byFile.set(`${periodKey(track)}|${trackFileKey(track.url)}`, track);
+  }
+  return [...byFile.values()].sort(compare);
+}
+
+/**
+ * 把描述同一媒体的多份清单合并为一组（按出现顺序，旧 → 新）。
+ *
+ * 播放器会为同一视频多次请求清单：预加载低清晰度、登录后补全高清晰度、签名过期后刷新，
+ * 页面内嵌状态与接口响应也会各给一份。它们共享轨道文件（见 `trackFileKey`）；不合并时
+ * 同一个视频会以「Video 1 / Video 2」重复出现，且只有其中一份能关联到播放元素。
+ */
+function groupManifests(items: ManifestItem[], classify: HostClassifier): ManifestGroup[] {
+  const groups: { items: ManifestItem[]; urls: string[] }[] = [];
+  for (const item of items) {
+    const urls = [...item.entry.manifest.video, ...item.entry.manifest.audio].map((track) => track.url);
+    const matching = groups.filter((group) => urls.some((url) => group.urls.some((other) => sameTrackFile(url, other, classify))));
+    const target = matching[0] ?? { items: [], urls: [] };
+    if (matching.length === 0) groups.push(target);
+    for (const other of matching.slice(1)) {
+      target.items.push(...other.items);
+      target.urls.push(...other.urls);
+      groups.splice(groups.indexOf(other), 1);
+    }
+    target.items.push(item);
+    target.urls.push(...urls);
+  }
+  return groups.map(({ items: members }) => {
+    members.sort((a, b) => a.manifestIndex - b.manifestIndex);
+    const newest = members[members.length - 1];
+    const manifests = members.map((member) => member.entry.manifest);
+    return {
+      entry: {
+        url: newest.entry.url,
+        manifest: {
+          video: mergeTracks(
+            manifests.map((manifest) => manifest.video),
+            (a, b) => (b.height ?? 0) - (a.height ?? 0) || (b.bandwidth ?? 0) - (a.bandwidth ?? 0),
+          ),
+          audio: mergeTracks(
+            manifests.map((manifest) => manifest.audio),
+            (a, b) => (b.bandwidth ?? 0) - (a.bandwidth ?? 0),
+          ),
+        },
+      },
+      manifestIndex: newest.manifestIndex,
+      manifestKey: members[0].manifestKey,
+      memberKeys: members.map((member) => member.manifestKey),
+      members: members.map((member) => member.entry),
+    };
+  });
 }
 
 function manifestPeriods(manifest: DashManifest): Array<{
@@ -316,20 +486,40 @@ function manifestPeriods(manifest: DashManifest): Array<{
   }));
 }
 
+function originAndPath(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return null;
+  }
+}
+
+/** SegmentTemplate 轨 URL → 匹配其实际分片 `origin+pathname` 的正则（占位符匹配单个路径段内任意字符）。 */
+function templatePattern(templateUrl: string): RegExp | null {
+  const target = originAndPath(templateUrl);
+  if (!target) return null;
+  const escaped = target
+    .split(SEGMENT_PLACEHOLDER)
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("[^/]*");
+  return new RegExp(`^${escaped}$`);
+}
+
 function relatedManifestResources(
+  urlKey: (url: string) => string,
   resources: DetectedResource[],
   manifestUrl: string,
   manifest: DashManifest,
   allowBroadFragmentMatch: boolean,
+  classify: HostClassifier,
 ): DetectedResource[] {
   const trackUrlKeys = new Set<string>();
   const trackPathKeys = new Set<string>();
-  const trackMediaPathKeys = new Set<string>();
   const fragmentFamilies = new Set<string>();
   for (const track of [...manifest.video, ...manifest.audio]) {
     trackUrlKeys.add(urlKey(track.url));
     trackPathKeys.add(stableMediaPath(track.url));
-    trackMediaPathKeys.add(mediaPathKey(track.url));
     fragmentFamilies.add(fragmentFamilyKey(track.url));
   }
   if (manifestUrl) {
@@ -339,6 +529,12 @@ function relatedManifestResources(
 
   const trackUrls = [...manifest.video, ...manifest.audio].map((track) => track.url);
   const trackPathInfos = trackUrls.map(urlPathInfo);
+  // SegmentTemplate 轨：分片序号 / 时间以占位符表示，其余部分（目录、表示 id、扩展名）确定。
+  // 分片扩展名不限于 m4s / ts（常见 .m4v / .m4a / .mp4），按模板匹配而不是按扩展名猜。
+  const segmentPatterns = trackUrls
+    .filter((url) => url.includes(SEGMENT_PLACEHOLDER))
+    .map((url) => templatePattern(url))
+    .filter((pattern): pattern is RegExp => pattern !== null);
   const manifestOrigins = new Set(
     [manifestUrl, ...trackUrls]
       .map((url) => urlPathInfo(url)?.origin)
@@ -361,16 +557,21 @@ function relatedManifestResources(
       ) {
         return true;
       }
+      if (segmentPatterns.length > 0) {
+        const target = originAndPath(resource.url);
+        if (target && segmentPatterns.some((pattern) => pattern.test(target))) return true;
+      }
       if (!isFragmentUrl(resource.url) || isCompleteFragmentResource(resource)) return false;
 
       const resourceUrls = [resource.url, resource.finalUrl].filter(
         (url): url is string => !!url,
       );
-      // CDN 备用域名可能不出现在当前清单的 BaseURL 中，但同一轨道的
-      // pathname 和文件名仍然一致。Bilibili 等站点会同时请求这种镜像
-      // 地址；它们应归入清单候选，而不是被误报为“无播放清单”。
+      // CDN 备用域名可能不出现在当前清单的 BaseURL 中，但同一轨道的文件
+      // 身份一致（镜像只换域名或加路径前缀，如 B 站 mcdn 的 /v1/resource/）。
+      // 它们应归入清单候选，而不是被误报为“无播放清单”。
+      const trackList = [...manifest.video, ...manifest.audio];
       if (resourceUrls.some((resourceUrl) =>
-        trackMediaPathKeys.has(mediaPathKey(resourceUrl)))) {
+        trackList.some((track) => sameTrackFile(resourceUrl, track.url, classify)))) {
         return true;
       }
       if (resourceUrls.some((resourceUrl) => {
@@ -412,6 +613,7 @@ export function buildMediaCandidates(
   resources: DetectedResource[],
   options: MediaCandidateOptions,
 ): MediaCandidate[] {
+  const urlKey = options.key;
   const mediaResources = resources.filter(
     (resource) =>
       resource.type === "video" ||
@@ -424,65 +626,53 @@ export function buildMediaCandidates(
   const usedResourceIds = new Set<string>();
   const candidates: MediaCandidate[] = [];
   const seenManifestUrls = new Set<string>();
+  /** 声明了 DRM（ContentProtection）的模板清单键。 */
+  const manifestProtected = new Set<string>();
+  /** 无完整轨道 URL 的清单（SegmentTemplate / HLS 播放列表）键 → 归属它的分片资源。 */
+  const manifestSegments = new Map<string, DetectedResource[]>();
 
-  // Map replacement deliberately keeps the newest manifest. CDN signatures and
-  // track URLs are often short-lived; retaining the first copy would dedupe the
-  // row but leave the user with an expired download URL.
-  const latestByManifestUrl = new Map<string, {
-    entry: DashManifestEntry;
-    manifestIndex: number;
-    signature: string;
-  }>();
+  // 同一 URL 只保留最新一份（签名有时效，旧 URL 会过期），再把描述同一媒体的清单合并。
+  const latestByManifestUrl = new Map<string, ManifestItem>();
   for (const [manifestIndex, entry] of (options.manifests || []).entries()) {
     const normalizedManifest = normalizeDashManifest(entry?.manifest);
     if (!entry || !normalizedManifest) continue;
-    const normalizedEntry = { ...entry, manifest: normalizedManifest };
     const manifestKey = entry.url ? urlKey(entry.url) : "__legacy__";
+    latestByManifestUrl.delete(manifestKey);
     latestByManifestUrl.set(manifestKey, {
-      entry: normalizedEntry,
+      entry: { ...entry, manifest: normalizedManifest },
       manifestIndex,
-      signature: manifestSignature(normalizedManifest),
-    });
-  }
-
-  const latestBySignature = new Map<string, {
-    entry: DashManifestEntry;
-    manifestIndex: number;
-    manifestKey: string;
-  }>();
-  for (const [manifestKey, item] of latestByManifestUrl) {
-    latestBySignature.set(item.signature, {
-      entry: item.entry,
-      manifestIndex: item.manifestIndex,
       manifestKey,
     });
   }
+  const classify = hostClassifier(options.mirrorGroups);
+  const manifestGroups = groupManifests([...latestByManifestUrl.values()], classify);
 
-  const manifestItems = Array.from(latestBySignature.values());
   const currentPagePath = pagePathKey(options.pageUrl);
   const pageManifests = currentPagePath
-    ? manifestItems.filter((item) => pagePathKey(item.entry.url) === currentPagePath)
+    ? manifestGroups.filter((group) => group.members.some((member) => pagePathKey(member.url) === currentPagePath))
     : [];
   // 页面内嵌清单的 URL 通常就是当前页面 URL。若存在这种强关联，只保留
   // 同页面的清单，避免播放器预加载的另一个视频因共用页面标题而出现在
   // 资源列表中；若没有强关联，则维持多播放器页面的兼容行为。
   const selectedManifestItems = pageManifests.length > 0
     ? pageManifests
-    : manifestItems;
+    : manifestGroups;
   const ignoredManifestItems = pageManifests.length > 0
-    ? manifestItems.filter((item) => !pageManifests.includes(item))
+    ? manifestGroups.filter((group) => !pageManifests.includes(group))
     : [];
 
-  for (const { entry, manifestIndex, manifestKey } of selectedManifestItems) {
-    const root = entry.url
-      ? mediaResources.find((resource) => urlKey(resource.url) === urlKey(entry.url))
-      : undefined;
+  for (const { entry, manifestIndex, manifestKey, memberKeys, members } of selectedManifestItems) {
+    const root = mediaResources.find((resource) =>
+      members.some((member) => member.url && urlKey(resource.url) === urlKey(member.url)),
+    );
     const related = entry.url
       ? relatedManifestResources(
+        urlKey,
         mediaResources,
         entry.url,
         entry.manifest,
-        latestBySignature.size === 1,
+        manifestGroups.length === 1,
+        classify,
       )
         .filter((resource) => !usedResourceIds.has(resource.id))
       : mediaResources.filter(
@@ -501,6 +691,10 @@ export function buildMediaCandidates(
         const trackKey = trackIdentity(track, "video");
         if (seenVariantKeys.has(trackKey)) return [];
         seenVariantKeys.add(trackKey);
+        const tier = qualityTierKey(track);
+        const alternateUrls = period.video
+          .filter((other) => other !== track && other.downloadable !== false && qualityTierKey(other) === tier)
+          .map((other) => other.url);
         return [{
           id: `dash:${manifestIndex}:${period.key}:${track.id ?? trackIndex}:${trackKey}`,
           label: qualityLabel(track.height, track.bandwidth),
@@ -510,6 +704,7 @@ export function buildMediaCandidates(
           bandwidth: track.bandwidth,
           codec: shortCodec(track.codecs),
           frameRate: track.frameRate,
+          ...(alternateUrls.length > 0 ? { alternateUrls } : {}),
         }];
       });
       if (variants.length === 0) continue;
@@ -535,13 +730,24 @@ export function buildMediaCandidates(
           ? related.filter((resource) => isFragmentUrl(resource.url) && !isCompleteFragmentResource(resource)).length
           : 0,
         downloadable: true,
+        ...(members.every((member) => member.carried) ? { provisional: true } : {}),
+        ...([...period.video, ...period.audio].some((track) => track.protected) ? { protected: true } : {}),
       });
     }
 
     // A parsed SegmentTemplate/SegmentList has no complete track URL. Leave the
-    // original manifest resource available so the engine can handle it itself.
-    if (periodRows.length === 0) continue;
-    seenManifestUrls.add(manifestKey);
+    // original manifest resource available so the engine can handle it itself;
+    // its segments still belong to it (they are not standalone videos).
+    if (periodRows.length === 0) {
+      const segments = related.filter((resource) => resource.id !== root?.id);
+      for (const resource of segments) usedResourceIds.add(resource.id);
+      for (const key of memberKeys) manifestSegments.set(key, segments);
+      if ([...entry.manifest.video, ...entry.manifest.audio].some((track) => track.protected)) {
+        for (const key of memberKeys) manifestProtected.add(key);
+      }
+      continue;
+    }
+    for (const key of memberKeys) seenManifestUrls.add(key);
     for (const resource of related) usedResourceIds.add(resource.id);
     if (root) usedResourceIds.add(root.id);
     candidates.push(...periodRows);
@@ -552,10 +758,12 @@ export function buildMediaCandidates(
   // 条不可下载的内部候选，既消费其原始资源，也让调试日志保留关联关系。
   for (const { entry, manifestKey } of ignoredManifestItems) {
     const related = relatedManifestResources(
+      urlKey,
       mediaResources,
       entry.url,
       entry.manifest,
       true,
+      classify,
     );
     for (const resource of related) usedResourceIds.add(resource.id);
     if (related.length === 0) continue;
@@ -574,6 +782,47 @@ export function buildMediaCandidates(
     });
   }
 
+  // HLS：主播放列表吸收它引用的子列表（各档视频 / 音轨），播放列表吸收自己的分片。
+  // 关联来自播放列表正文（见 `parseHlsPlaylist`），不按目录或文件名猜测。
+  const presentManifestKeys = new Set(
+    mediaResources
+      .filter((resource) => !usedResourceIds.has(resource.id) && isManifestUrl(resource.url, resource.mimeType))
+      .map((resource) => urlKey(resource.url)),
+  );
+  const hlsPlaylists = new Map<string, HlsPlaylistInfo>();
+  for (const entry of options.hlsPlaylists ?? []) hlsPlaylists.set(urlKey(entry.url), entry.playlist);
+  const hlsParent = new Map<string, string>();
+  for (const [key, playlist] of hlsPlaylists) {
+    if (!presentManifestKeys.has(key)) continue;
+    for (const child of playlist.children) {
+      const childKey = urlKey(child);
+      if (childKey !== key && !hlsParent.has(childKey)) hlsParent.set(childKey, key);
+    }
+  }
+  // 分片目录（或收敛后的公共目录前缀）→ 所属播放列表；按最长前缀匹配。
+  const segmentOwners: Array<{ dir: string; owner: string }> = [];
+  for (const [key, playlist] of hlsPlaylists) {
+    const owner = hlsParent.get(key) ?? key;
+    if (!presentManifestKeys.has(owner)) continue;
+    for (const dir of playlist.segmentDirs) segmentOwners.push({ dir, owner });
+  }
+  segmentOwners.sort((a, b) => b.dir.length - a.dir.length);
+  const attach = (owner: string, resource: DetectedResource): void => {
+    usedResourceIds.add(resource.id);
+    manifestSegments.set(owner, [...(manifestSegments.get(owner) ?? []), resource]);
+  };
+  for (const resource of mediaResources) {
+    if (usedResourceIds.has(resource.id)) continue;
+    if (isManifestUrl(resource.url, resource.mimeType)) {
+      const parent = hlsParent.get(urlKey(resource.url));
+      if (parent) attach(parent, resource);
+      continue;
+    }
+    const dir = hlsSegmentDir(resource.url);
+    const owner = dir ? segmentOwners.find((entry) => dir.startsWith(entry.dir))?.owner : undefined;
+    if (owner) attach(owner, resource);
+  }
+
   // Manifest URLs not parsed as DASH are still valid complete HLS/DASH sources.
   for (const resource of mediaResources) {
     if (
@@ -589,23 +838,31 @@ export function buildMediaCandidates(
       mime.includes("mpegurl")
       ? "hls"
       : "dash";
+    const key = urlKey(resource.url);
+    const related = manifestSegments.get(key) ?? [];
+    const playlist = hlsPlaylists.get(key);
+    const childProtected = (playlist?.children ?? []).some((child) => hlsPlaylists.get(urlKey(child))?.protected);
+    const isProtected = manifestProtected.has(key) || playlist?.protected === true || childProtected;
+    const auto: MediaCandidateVariant = {
+      id: `${source}:${resource.id}`,
+      label: "auto",
+      videoUrl: resource.url,
+      mimeType: resource.mimeType,
+      fileSize: resource.size > 0 ? resource.size : undefined,
+      resourceId: resource.id,
+    };
     candidates.push({
-      id: `${source}:${urlKey(resource.url)}`,
+      id: `${source}:${key}`,
       title: baseTitle,
       type: "stream",
       source,
       pageUrl: options.pageUrl || resource.pageUrl,
-      variants: [{
-        id: `${source}:${resource.id}`,
-        label: "auto",
-        videoUrl: resource.url,
-        mimeType: resource.mimeType,
-        fileSize: resource.size > 0 ? resource.size : undefined,
-        resourceId: resource.id,
-      }],
-      rawResourceIds: [resource.id],
-      fragmentCount: 0,
+      variants: [auto, ...hlsQualityVariants(playlist, resource.id)],
+      rawResourceIds: [resource.id, ...related.map((item) => item.id)],
+      fragmentCount: related.filter((item) => !isManifestUrl(item.url, item.mimeType)).length,
       downloadable: true,
+      ...(isProtected ? { protected: true } : {}),
+      ...(resource.carried ? { provisional: true } : {}),
     });
   }
 
@@ -685,12 +942,10 @@ function safeFilenamePart(value: string): string {
 function variantExtension(variant: MediaCandidateVariant): string {
   if (variant.audioUrl) return "mp4";
   const ext = extractExtension(variant.videoUrl);
-  // .m3u8 auto 候选走引擎的 HLS 下载器，产物就是 .ts 分片拼接，扩展名 ts 准确。
-  // .mpd auto 候选走引擎 DASH 下载器：下载完音视频轨后 ffmpeg mux 成 mp4
-  // 容器，再 rename 回原文件名（dash_downloader.rs run_dash_download_inner /
-  // mux_audio_video）——若扩展名仍是 ts，用户会拿到一个 .ts 后缀的 MP4 文件。
-  if (ext === "m3u8") return "ts";
-  if (ext === "mpd") return "mp4";
+  // 清单类候选的产物都是 mp4：
+  // - .m3u8 走引擎 HLS 下载器，分片拼接后转封装为 mp4（fMP4 直接改名；转封装失败才保留 .ts）；
+  // - .mpd 走引擎 DASH 下载器，音视频轨下载后 mux 成 mp4。
+  if (ext === "m3u8" || ext === "m3u" || ext === "mpd") return "mp4";
   if (ext === "m4s" || ext === "ts" || !ext) return "mp4";
   return ext;
 }

@@ -17,6 +17,8 @@ public struct GatewayStatusDto: Codable, Sendable, Hashable {
     public var portEditable: Bool
     /// 是否对局域网开放兼容 API；修改后下次 agent 启动生效。
     public var lanEnabled: Bool
+    /// 本次运行网关是否实际监听非回环地址（`lanEnabled` 改动需重启才生效）。
+    public var lanActive: Bool
 
     /// 缺省端口（`default_gateway_port`）。
     public static let defaultPort = 17800
@@ -32,7 +34,8 @@ public struct GatewayStatusDto: Codable, Sendable, Hashable {
         userTokenConfigured: Bool = false,
         port: Int = GatewayStatusDto.defaultPort,
         portEditable: Bool = true,
-        lanEnabled: Bool = false
+        lanEnabled: Bool = false,
+        lanActive: Bool = false
     ) {
         self.takeoverEnabled = takeoverEnabled
         self.jsonrpcEnabled = jsonrpcEnabled
@@ -43,6 +46,7 @@ public struct GatewayStatusDto: Codable, Sendable, Hashable {
         self.port = port
         self.portEditable = portEditable
         self.lanEnabled = lanEnabled
+        self.lanActive = lanActive
     }
 
     public init(from decoder: any Decoder) throws {
@@ -56,6 +60,7 @@ public struct GatewayStatusDto: Codable, Sendable, Hashable {
         port = try c.decodeIfPresent(Int.self, forKey: .port) ?? Self.defaultPort
         portEditable = try c.decodeIfPresent(Bool.self, forKey: .portEditable) ?? true
         lanEnabled = try c.decodeIfPresent(Bool.self, forKey: .lanEnabled) ?? false
+        lanActive = try c.decodeIfPresent(Bool.self, forKey: .lanActive) ?? false
     }
 }
 

@@ -17,7 +17,7 @@ export type ExportMode = "diff" | "full";
 
 export const THEME_FORMAT = "fluxdown.gpui-theme";
 export const THEME_SCHEMA_VERSION = 2;
-export const THEME_SCHEMA_URL = "https://fluxdown.zerx.dev/schemas/gpui-theme.v2.json";
+export const THEME_SCHEMA_URL = "https://fluxdown.com/schemas/gpui-theme.v2.json";
 
 export type DiagnosticKind =
   | "invalidValue"

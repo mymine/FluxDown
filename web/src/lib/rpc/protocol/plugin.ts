@@ -25,6 +25,64 @@ export interface SettingFieldDto {
   helperLabel: string | null;
 }
 
+export type PluginRisk = "standard" | "elevated" | "full";
+
+/** 视图的桌面增强入口：仅 GPUI 桌面端经 GPUI Shell 运行，Web 不执行。 */
+export interface PluginDesktopEntryDto {
+  entry: string;
+  width?: number;
+  height?: number;
+  networkHosts: string[];
+}
+
+/** 视图贡献声明。 */
+export interface PluginViewDeclDto {
+  id: string;
+  title: string;
+  /** `activity` / `settings` / `taskDetail` / `window`。 */
+  location: string;
+  /** 是否有可移植实现：无 `desktop` 的视图恒为 true；带 `desktop` 的仅在 manifest 显式 `portable: true` 时为 true。 */
+  portable: boolean;
+  desktop?: PluginDesktopEntryDto;
+}
+
+/** 命令贡献声明。 */
+export interface PluginCommandDeclDto {
+  id: string;
+  title: string;
+  palette: boolean;
+  taskMenu: boolean;
+}
+
+/** 插件贡献点。 */
+export interface PluginContributionsDto {
+  views: PluginViewDeclDto[];
+  commands: PluginCommandDeclDto[];
+  /** 是否贡献浏览器扩展嗅探规则。 */
+  sniffRules: boolean;
+}
+
+/** 站点默认插件条目（`daemon.plugin.siteDefaults`，按 site 排序）。 */
+export interface PluginSiteDefaultDto {
+  site: string;
+  /** 当前默认插件 identity。 */
+  identity: string;
+  /** 可选插件 identity 集合。 */
+  candidates: string[];
+  /** true = 无人值守下载自动选定、尚未确认（普通下载仍会询问）；false = 用户已确认。 */
+  automatic: boolean;
+}
+
+/**
+ * plugin 层嗅探规则包；`pack` 为 null 表示从未有过插件规则（sequence 为 0）。
+ * `epoch` 是随序号持久化的实例标识，数据库重置后必变。
+ */
+export interface PluginSniffRulesDto {
+  sequence: number;
+  epoch: string;
+  pack: Record<string, unknown> | null;
+}
+
 /** 已安装插件视图。 */
 export interface PluginDto {
   identity: string;
@@ -34,7 +92,7 @@ export interface PluginDto {
   homepage: string;
   enabled: boolean;
   devMode: boolean;
-  /** `None` / `Manual` / `CircuitBreaker`。 */
+  /** `None` / `Manual` / `CircuitBreaker` / `Revoked`。 */
   disabledReason: string;
   settings: SettingFieldDto[];
   /** 当前设置值（key → 字符串）。 */
@@ -44,10 +102,24 @@ export interface PluginDto {
   /** 是否声明平台登录入口。 */
   authSupported: boolean;
   subscriptionProviderIds: string[];
+  /** manifest resolvers[0].match.urls（glob，供扩展判断页面是否可由插件解析）。 */
+  resolverUrls: string[];
   /** `Loaded` / `Failed`；与 `enabled` 独立。 */
   loadStatus: string;
   /** 加载失败原因；成功为空。 */
   loadError: string;
+  /** manifest `contributes`：视图 / 命令 / 嗅探规则。 */
+  contributions: PluginContributionsDto;
+  /** 风险等级（由权限推导）。 */
+  risk: PluginRisk;
+  /** 尚未授权的权限。 */
+  consentPending: string[];
+  /** 尚未授权的网络主机。 */
+  consentPendingHosts: string[];
+  /** 全部桌面视图声明的网络主机。 */
+  networkHosts: string[];
+  /** 插件包在 daemon 主机上的绝对目录（仅已加载插件有值）。 */
+  packageDir?: string;
 }
 
 /** 插件平台登录请求。 */
@@ -96,6 +168,8 @@ export interface MarketEntryDto {
   yanked: string;
   tags: string[];
   permissions: string[];
+  /** 插件桌面视图声明的网络主机。 */
+  networkHosts: string[];
 }
 
 /** daemon 托管组件标识。 */
@@ -130,4 +204,57 @@ export interface ComponentVersions {
   versions: string[];
   /** 最新稳定版（空 = 解析失败）。 */
   latestStable: string;
+}
+
+/** `daemon.plugin.consent` 参数：集合须与插件当前请求的完全相等。 */
+export interface PluginConsentParams {
+  identity: string;
+  permissions: string[];
+  networkHosts: string[];
+}
+
+/** `daemon.plugin.audit.list` 参数。 */
+export interface PluginAuditListParams {
+  identity?: string;
+  beforeId?: number;
+  /** 缺省 200，上限 1000。 */
+  limit?: number;
+}
+
+/** 一条插件审计记录。 */
+export interface PluginAuditEntryDto {
+  id: number;
+  atMs: number;
+  identity: string;
+  /** `daemon` | `desktop`。 */
+  origin: string;
+  action: string;
+  target: string;
+  /** `ok` | `denied` | `error`。 */
+  outcome: string;
+  detail: string;
+}
+
+export interface PluginAuditListDto {
+  entries: PluginAuditEntryDto[];
+  /** 还有更早的记录时给出下一页游标。 */
+  nextBeforeId?: number;
+}
+
+export interface PluginAuditClearParams {
+  identity?: string;
+}
+
+/** 客户端上报的桌面脚本审计记录（origin 由 daemon 强制为 desktop）。 */
+export interface PluginAuditRecordEntry {
+  identity: string;
+  /** 必须以 `desktop.` 开头。 */
+  action: string;
+  target: string;
+  outcome: string;
+  detail: string;
+}
+
+export interface PluginAuditRecordParams {
+  entries: PluginAuditRecordEntry[];
 }

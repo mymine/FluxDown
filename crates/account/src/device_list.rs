@@ -1,6 +1,6 @@
 //! 云设备列表的展示规则：排序、搜索、折叠数量、名称校验与时间格式。
 
-use fluxdown_protocol::CloudDevice;
+use fluxdown_protocol::{CloudDevice, Entitlements};
 
 /// 设备卡片默认展示的设备数；更多设备经「管理全部」对话框查看。
 pub(crate) const VISIBLE_LIMIT: usize = 5;
@@ -17,6 +17,20 @@ pub(crate) fn sorted(devices: &[CloudDevice], presence_known: bool) -> Vec<Cloud
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     list
+}
+
+/// 在线设备数（含本机）。
+pub(crate) fn online_count(devices: &[CloudDevice]) -> usize {
+    devices.iter().filter(|device| device.is_online).count()
+}
+
+/// 权益里的同时在线设备上限；缺失、非正整数或 0（不限）为 `None`。
+pub(crate) fn max_online_devices(entitlements: &Entitlements) -> Option<u64> {
+    entitlements
+        .0
+        .get("maxOnlineDevices")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|max| *max > 0)
 }
 
 /// 名称 / 平台 / 版本任一包含查询词（不区分大小写）；空查询匹配全部。
@@ -131,6 +145,39 @@ mod tests {
             default_save_dir: None,
             path_style: None,
         }
+    }
+
+    #[test]
+    fn online_count_includes_current_device() {
+        let devices = [
+            device("me", true, true),
+            device("a", false, true),
+            device("b", false, false),
+        ];
+        assert_eq!(online_count(&devices), 2);
+        assert_eq!(online_count(&[]), 0);
+    }
+
+    #[test]
+    fn max_online_devices_reads_positive_integer_only() {
+        let entitlements = |value: serde_json::Value| {
+            let mut map = std::collections::BTreeMap::new();
+            map.insert("maxOnlineDevices".to_owned(), value);
+            Entitlements(map)
+        };
+        assert_eq!(
+            max_online_devices(&entitlements(serde_json::json!(2))),
+            Some(2)
+        );
+        assert_eq!(
+            max_online_devices(&entitlements(serde_json::json!(0))),
+            None
+        );
+        assert_eq!(
+            max_online_devices(&entitlements(serde_json::json!("2"))),
+            None
+        );
+        assert_eq!(max_online_devices(&Entitlements::default()), None);
     }
 
     #[test]

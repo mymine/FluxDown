@@ -6,12 +6,12 @@ use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::downloader::{
-    DB_SAVE_INTERVAL_SECS, DownloadError, DownloadParams, ProgressUpdate, TEMP_EXT,
+    DB_SAVE_INTERVAL_SECS, DownloadError, DownloadParams, DownloadSpec, ProgressUpdate,
+    RequestSpec, TEMP_EXT,
 };
 use crate::events::EventSink;
 use crate::hls_downloader::{
     SEGMENT_HEADER_TIMEOUT, SEGMENT_IDLE_TIMEOUT, SMALL_REQUEST_TIMEOUT, extra_headers_for_origin,
-    fetch_small,
 };
 use crate::logger::log_info;
 use crate::model::HlsQualityOption;
@@ -87,8 +87,22 @@ pub fn is_dash_url(url: &str) -> bool {
 
 #[derive(Clone)]
 struct DashSegment {
+    /// 清单给出的原始地址。续传指纹只看它，不受插件地址改写影响。
     url: String,
     range: Option<String>,
+    /// 仅 DASH SegmentTemplate：`$Number$` 取值。
+    number: Option<u64>,
+    /// 仅 DASH SegmentTemplate：`$Time$` 取值。
+    time: Option<u64>,
+    /// 插件 `segments` 阶段改写后的请求地址（如逐片签名）；`None` = 请求 `url`。
+    rewritten: Option<String>,
+}
+
+impl DashSegment {
+    /// 实际发请求用的地址。
+    fn fetch_url(&self) -> &str {
+        self.rewritten.as_deref().unwrap_or(&self.url)
+    }
 }
 
 struct ProgressState {
@@ -101,32 +115,178 @@ struct ProgressState {
     geometry: Vec<crate::downloader::SegmentProgressInfo>,
 }
 
+/// 一次 DASH 请求发送失败的归类。
+enum SendFailure {
+    /// 瞬时失败（网络错误、响应头超时）：调用方按各自的重试策略处理。
+    Transient(DownloadError),
+    /// 不可重试：取消，或插件 `refresh` 阶段要求中止任务。
+    Abort(DownloadError),
+}
+
+impl SendFailure {
+    fn into_error(self) -> DownloadError {
+        match self {
+            Self::Transient(e) | Self::Abort(e) => e,
+        }
+    }
+}
+
+/// 以请求身份 `spec` 构造一次 DASH GET：Cookie 按 `reference_url` 同源过滤，凭据类头
+/// 按其源站过滤，Referer 对所有请求附加，按站点请求头随身份切换。
+fn dash_get(
+    client: &Client,
+    spec: &RequestSpec,
+    reference_url: &str,
+    url: &str,
+    range: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = client.get(url);
+    if let Some(r) = range {
+        req = req.header("Range", format!("bytes={}", r));
+    }
+    let safe_cookies = cookies_for_url(reference_url, url, &spec.cookies);
+    if !safe_cookies.is_empty() {
+        req = req.header("Cookie", safe_cookies);
+    }
+    // CDN 常对分段强制要求 Referer（缺失即 403）。放在 apply_extra_headers 之前：
+    // 扩展捕获的真实请求头若含 referer 会覆盖此默认值。
+    if crate::downloader::is_valid_referrer(&spec.referrer) {
+        req = req.header(reqwest::header::REFERER, &spec.referrer);
+    }
+    // 目标指向清单以外的主机时，Authorization/Cookie 等凭据类头不随请求发出。
+    let headers = extra_headers_for_origin(reference_url, url, &spec.extra_headers);
+    req = crate::downloader::apply_extra_headers(req, &headers);
+    crate::downloader::apply_origin_headers(req, url, &spec.origin_headers)
+}
+
+/// 一次 DASH 运行内发请求用的上下文。请求身份（Cookie / Referer / 请求头 / 按站点
+/// 请求头）全部取自运行级共享的 [`DownloadSpec`]，凭据刷新后其后的请求立即换用新身份。
 struct SegmentDownloadContext<'a> {
     client: &'a Client,
-    cookies: &'a str,
+    /// 运行级请求身份；被拒（401 / 403 / 410）时经插件 `refresh` 阶段换发。
+    spec: &'a DownloadSpec,
+    /// Cookie / 凭据类请求头的同源判定基准。
     reference_url: &'a str,
     cancel_token: &'a tokio_util::sync::CancellationToken,
     task_id: &'a str,
-    /// 浏览器扩展捕获的额外 HTTP 请求头
-    extra_headers: &'a std::collections::HashMap<String, String>,
-    /// 浏览器扩展捕获的页面 Referer（B站等 CDN 强制要求，缺失即 403）
-    referrer: &'a str,
-    /// 块级进度上报通道（200ms 节流，见 download_segment_streaming）。
+    /// 块级进度上报通道（200ms 节流，见 stream_segment）。
     progress_tx: &'a tokio::sync::mpsc::Sender<ProgressUpdate>,
     /// 块级 DB 进度持久化（5s 节流，单调写入防进度回退）。
     db: &'a crate::db::Db,
     sink: &'a dyn EventSink,
 }
 
+impl SegmentDownloadContext<'_> {
+    /// 以身份 `used` 发出一次请求，与取消、响应头超时竞速；不判定状态码。
+    async fn send_once(
+        &self,
+        used: &RequestSpec,
+        what: &str,
+        header_timeout: std::time::Duration,
+        url: &str,
+        range: Option<&str>,
+    ) -> Result<reqwest::Response, SendFailure> {
+        // 刷新改写了任务 URL 时，发往起跑 URL 的请求改走新地址。
+        let routed = self.spec.route_url(url);
+        let req = dash_get(
+            self.client,
+            used,
+            self.reference_url,
+            routed.as_deref().unwrap_or(url),
+            range,
+        );
+        tokio::select! {
+            _ = self.cancel_token.cancelled() => Err(SendFailure::Abort(DownloadError::Cancelled)),
+            sent = tokio::time::timeout(header_timeout, req.send()) => match sent {
+                Ok(Ok(resp)) => Ok(resp),
+                Ok(Err(e)) => Err(SendFailure::Transient(DownloadError::from(e))),
+                Err(_) => Err(SendFailure::Transient(DownloadError::Other(format!(
+                    "{what} stalled: no response headers within {header_timeout:?}"
+                )))),
+            },
+        }
+    }
+
+    /// 发请求并返回响应（不判定状态码）。被拒（401 / 403 / 410）且有插件声明
+    /// `refresh` 阶段时，用换发后的身份重发一次（同一请求至多一次）；无刷新器时
+    /// 与直接发送完全一致。
+    async fn send(
+        &self,
+        what: &str,
+        header_timeout: std::time::Duration,
+        url: &str,
+        range: Option<&str>,
+    ) -> Result<reqwest::Response, SendFailure> {
+        let used = self.spec.current();
+        let resp = self
+            .send_once(&used, what, header_timeout, url, range)
+            .await?;
+        if resp.status().is_success() {
+            self.spec.confirm(&used);
+            return Ok(resp);
+        }
+        match self
+            .spec
+            .refresh_after_rejection(&used, resp.status())
+            .await
+            .map_err(SendFailure::Abort)?
+        {
+            Some(fresh) => {
+                drop(resp);
+                let resp = self
+                    .send_once(&fresh, what, header_timeout, url, range)
+                    .await?;
+                if resp.status().is_success() {
+                    self.spec.confirm(&fresh);
+                }
+                Ok(resp)
+            }
+            None => Ok(resp),
+        }
+    }
+}
+
+fn request_ctx<'a>(
+    p: &'a DownloadParams,
+    spec: &'a DownloadSpec,
+    reference_url: &'a str,
+) -> SegmentDownloadContext<'a> {
+    SegmentDownloadContext {
+        client: &p.client,
+        spec,
+        reference_url,
+        cancel_token: &p.cancel_token,
+        task_id: &p.task_id,
+        progress_tx: &p.progress_tx,
+        db: &p.db,
+        sink: p.sink.as_ref(),
+    }
+}
+
 pub async fn run_dash_download(params: DownloadParams) {
     let task_id_log = params.task_id.clone();
     let result = match run_dash_download_inner(&params).await {
-        Ok(total) => params
-            .db
-            .update_task_status(&params.task_id, 3, "")
+        Ok(total) => {
+            // 插件后处理：成功写状态 3 前执行；替换文件时只更新 total
+            // （文件名随后从 DB 读取）。
+            match crate::downloader::finalize_with_interceptors(
+                &params,
+                crate::intercept::ProtocolKind::Dash,
+            )
             .await
-            .map(|()| total)
-            .map_err(DownloadError::Db),
+            {
+                Ok(replaced) => {
+                    let total = replaced.map_or(total, |(_, size)| size);
+                    params
+                        .db
+                        .update_task_status(&params.task_id, 3, "")
+                        .await
+                        .map(|()| total)
+                        .map_err(DownloadError::Db)
+                }
+                Err(error) => Err(error),
+            }
+        }
         Err(error) => Err(error),
     };
 
@@ -321,7 +481,9 @@ pub(crate) async fn ffmpeg_copy_to_mp4(
         }
     }
 
-    let copy_args = ["-c", "copy", "-movflags", "+faststart", "-f", "mp4"];
+    // 不加 `+faststart`:它会在封装完成后把整份 mp4 再重写一遍(搬移 moov),
+    // 本地播放不需要,只徒增一倍写盘。
+    let copy_args = ["-c", "copy", "-f", "mp4"];
     let first_result =
         run_ffmpeg_mux_step(ffmpeg, video, audio, output, &copy_args, cancel_token).await?;
 
@@ -350,18 +512,7 @@ pub(crate) async fn ffmpeg_copy_to_mp4(
             output.display()
         );
 
-        let aac_fallback_args = [
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-        ];
+        let aac_fallback_args = ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-f", "mp4"];
 
         let retry_result = run_ffmpeg_mux_step(
             ffmpeg,
@@ -487,24 +638,29 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
         tracing::debug!("download progress receiver closed");
     }
 
+    // 本次运行共享的请求身份：MPD 拉取、分片请求、轨对探测与多段协调器都取自它。
+    // 无插件声明 `refresh` 阶段时刷新器为 None，被拒请求按原逻辑处理。
+    let spec = std::sync::Arc::new(
+        DownloadSpec::new(p.spec.clone())
+            .with_connection_cap(p.connection_cap)
+            .with_refresher(crate::intercept::Refresher::for_params(
+                p,
+                crate::intercept::ProtocolKind::Dash,
+            )),
+    );
+
     // 离散音视频轨对旁路：调用方已直接给出视频轨(p.url)+音频轨(p.audio_url)两条
     // 直链，无需（也无法）拉取 .mpd manifest 解析。直接把两条 URL 当单分段下载后 mux。
     if let Some(audio_url) = p.audio_url.as_deref()
         && !audio_url.is_empty()
     {
-        return run_track_pair_inner(p, audio_url).await;
+        return run_track_pair_inner(p, &spec, audio_url).await;
     }
 
     // 相对 BaseURL/SegmentTemplate 必须以清单的最终 URL(重定向后)为基准解析。
-    let (mpd, mpd_base_url) = fetch_and_parse_mpd(
-        &p.client,
-        &p.url,
-        &p.cookies,
-        &p.referrer,
-        &p.extra_headers,
-        &p.cancel_token,
-    )
-    .await?;
+    let task_ctx = crate::intercept::ctx::task_ctx(p, crate::intercept::ProtocolKind::Dash);
+    let notes = crate::intercept::ActivityNotes::of(p);
+    let (mpd, mpd_base_url, mpd_raw) = fetch_and_parse_mpd(p, &spec).await?;
     // 直播清单只有当前时间窗的段,按 VOD 下载会静默产出几十秒的快照。
     if mpd
         .mpdtype
@@ -519,20 +675,28 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
         // 全新开始:清掉上一轮遗留的续传检查点,避免误续传过期数据。
         p.db.delete_config(&dash_resume_key(&p.task_id)).await?;
     }
-    // 多 Period DASH 尚未完全支持，仅下载首个 Period；后续 Period 被静默忽略
-    // 可能导致内容不完整。这里记录警告，便于用户排查。
+    // 多 Period DASH 只支持下载单个 Period（不做拼接）：默认首个，
+    // 插件可通过 selectPeriod 阶段指定其它 Period。
+    let period_index = pick_period(
+        p.interceptor.as_ref(),
+        &p.cancel_token,
+        &task_ctx,
+        &notes,
+        &mpd,
+        &mpd_raw,
+    )
+    .await?;
     if mpd.periods.len() > 1 {
         log_info!(
-            "[dash-download] task {} warning: MPD contains {} Period(s), \
-             多 Period DASH 未完全支持，仅下载首个 Period，后续 {} 个 Period 将被忽略",
+            "[dash-download] task {} MPD contains {} Period(s), 仅下载第 {} 个 Period",
             p.task_id,
             mpd.periods.len(),
-            mpd.periods.len() - 1,
+            period_index + 1,
         );
     }
     let period = mpd
         .periods
-        .first()
+        .get(period_index)
         .ok_or_else(|| DownloadError::Other("MPD contains no Period".to_string()))?;
 
     let video_adaptations: Vec<&dash_mpd::AdaptationSet> = period
@@ -554,21 +718,47 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
         ));
     }
 
-    let repr_index = select_representation(
-        &p.task_id,
-        representations,
-        best_video,
-        p.selector.as_ref(),
+    let repr_index = match pick_variant(
+        p.interceptor.as_ref(),
         &p.cancel_token,
-        p.unattended,
+        &task_ctx,
+        &notes,
+        best_video,
     )
-    .await?;
+    .await?
+    {
+        Some(i) => i,
+        None => {
+            select_representation(
+                &p.task_id,
+                representations,
+                best_video,
+                p.selector.as_ref(),
+                &p.cancel_token,
+                p.unattended,
+            )
+            .await?
+        }
+    };
     let repr = representations
         .get(repr_index)
         .ok_or_else(|| DownloadError::Other("selected representation missing".to_string()))?;
 
     let (video_init, video_segments) =
         build_segment_list(&mpd_base_url, &mpd, period, best_video, repr)?;
+    let video_segments = filter_segments(
+        p.interceptor.as_ref(),
+        &p.cancel_token,
+        &task_ctx,
+        &notes,
+        crate::intercept::ctx::SegmentTrack::Video,
+        &p.url,
+        period_index,
+        repr.id.clone(),
+        &mpd_raw,
+        video_segments,
+    )
+    .await?;
 
     if video_segments.is_empty() {
         return Err(DownloadError::Other(
@@ -634,6 +824,7 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
 
     let (video_bytes, dest_path) = download_track(
         p,
+        &spec,
         &p.url,
         &video_init,
         &video_segments,
@@ -665,12 +856,26 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
                 .ok_or_else(|| DownloadError::Other("audio Representation missing".to_string()))?;
             let (audio_init, audio_segments) =
                 build_segment_list(&mpd_base_url, &mpd, period, audio, audio_repr)?;
+            let audio_segments = filter_segments(
+                p.interceptor.as_ref(),
+                &p.cancel_token,
+                &task_ctx,
+                &notes,
+                crate::intercept::ctx::SegmentTrack::Audio,
+                &p.url,
+                period_index,
+                audio_repr.id.clone(),
+                &mpd_raw,
+                audio_segments,
+            )
+            .await?;
             if audio_segments.is_empty() {
                 0
             } else {
                 let audio_path = build_audio_path(&dest_path);
                 match download_track(
                     p,
+                    &spec,
                     &p.url,
                     &audio_init,
                     &audio_segments,
@@ -798,20 +1003,24 @@ struct TrackProbe {
 /// 用 `Range: bytes=0-0` 探测轨道全长（解析 `Content-Range: bytes 0-0/N` 的 N）
 /// 并顺带记下 `Last-Modified`。单次尝试、失败返回空结果（调用方退化为未知大小 /
 /// 无服务器时间），绝不阻塞下载主流程。
-async fn probe_track(p: &DownloadParams, url: &str) -> TrackProbe {
-    let mut req = p.client.get(url).header("Range", "bytes=0-0");
-    if crate::downloader::is_valid_referrer(&p.referrer) {
-        req = req.header(reqwest::header::REFERER, &p.referrer);
+async fn probe_track(
+    p: &DownloadParams,
+    spec: &DownloadSpec,
+    url: &str,
+) -> Result<TrackProbe, DownloadError> {
+    // 轨自身即同源基准：探测按该轨的请求身份发出，不做跨源凭据过滤。
+    let ctx = request_ctx(p, spec, url);
+    match ctx
+        .send("DASH probe", SMALL_REQUEST_TIMEOUT, url, Some("0-0"))
+        .await
+    {
+        Ok(resp) => Ok(track_probe_from_headers(resp.headers())),
+        // 取消由调用方随后的取消检查甄别；插件要求中止的错误须传播为任务失败。
+        Err(SendFailure::Abort(DownloadError::Cancelled)) | Err(SendFailure::Transient(_)) => {
+            Ok(TrackProbe::default())
+        }
+        Err(SendFailure::Abort(e)) => Err(e),
     }
-    req = crate::downloader::apply_extra_headers(req, &p.extra_headers);
-    let resp = tokio::select! {
-        _ = p.cancel_token.cancelled() => return TrackProbe::default(),
-        r = tokio::time::timeout(SMALL_REQUEST_TIMEOUT, req.send()) => match r {
-            Ok(Ok(resp)) => resp,
-            _ => return TrackProbe::default(),
-        },
-    };
-    track_probe_from_headers(resp.headers())
 }
 
 fn track_probe_from_headers(headers: &reqwest::header::HeaderMap) -> TrackProbe {
@@ -841,6 +1050,7 @@ fn track_probe_from_headers(headers: &reqwest::header::HeaderMap) -> TrackProbe 
 #[allow(clippy::too_many_arguments)]
 async fn download_track_best_effort(
     p: &DownloadParams,
+    spec: &std::sync::Arc<DownloadSpec>,
     url: &str,
     single_segs: &[DashSegment],
     dest_path: &Path,
@@ -854,8 +1064,17 @@ async fn download_track_best_effort(
         && len > MULTI_SEGMENT_TRACK_THRESHOLD
         && p.spec.is_get_like()
     {
-        match download_track_coordinated(p, url, dest_path, role, len, progress_base, pair_total)
-            .await
+        match download_track_coordinated(
+            p,
+            spec,
+            url,
+            dest_path,
+            role,
+            len,
+            progress_base,
+            pair_total,
+        )
+        .await
         {
             Ok(done) => return Ok(done),
             // 与 HTTP 路径相同的三类"多段不可行"错误 → 清理多段残留（段行 +
@@ -908,6 +1127,7 @@ async fn download_track_best_effort(
     }
     download_track(
         p,
+        spec,
         url,
         &None,
         single_segs,
@@ -933,8 +1153,10 @@ async fn download_track_best_effort(
 ///   • 成功后清行 + rename 临时文件；
 ///   • 取消（暂停）【保留】行与临时文件，resume 续传；
 ///   • 其余错误保留现场（fail-loud + 数据保留，与 HTTP 路径一致）。
+#[allow(clippy::too_many_arguments)]
 async fn download_track_coordinated(
     p: &DownloadParams,
+    spec: &std::sync::Arc<DownloadSpec>,
     url: &str,
     dest_path: &Path,
     role: DashTrack,
@@ -956,6 +1178,11 @@ async fn download_track_coordinated(
         } else {
             advice.segments
         }
+    };
+    let seg_count = if p.connection_cap > 0 {
+        seg_count.min(p.connection_cap).max(1)
+    } else {
+        seg_count
     };
     log_info!(
         "[dash-download] task {} track multi-segment: len={}, segments={}, base={}",
@@ -991,7 +1218,7 @@ async fn download_track_coordinated(
         &p.progress_tx,
         &p.cancel_token,
         &p.speed_limiter,
-        &std::sync::Arc::new(crate::downloader::DownloadSpec::new(p.spec.clone())),
+        spec,
         p.sink.as_ref(),
         "",
         "",
@@ -1102,7 +1329,11 @@ async fn finalize_track_rename(
 /// 可直接 GET 的完整轨道直链（如 DASH 分离的 m4s）。分别下载后用 ffmpeg mux
 /// 合并为单 mp4。与 MPD manifest 解析路径共用 `download_track` / `mux_audio_video`
 /// / `build_audio_path`，不依赖 `dash_mpd` 解析，因此对任何提供离散轨对的站点通用。
-async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64, DownloadError> {
+async fn run_track_pair_inner(
+    p: &DownloadParams,
+    spec: &std::sync::Arc<DownloadSpec>,
+    audio_url: &str,
+) -> Result<i64, DownloadError> {
     log_info!(
         "[dash-download] task {} track-pair mode: video={} audio={}",
         p.task_id,
@@ -1168,8 +1399,8 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
     // 失败 → None = 未知，UI 退化为只显示已下载字节，不阻塞下载）。
     // 探测成功本身就是服务器履行 Range 请求（206 + Content-Range）的硬证据，
     // 下方据此决定该轨能否走多段并发；失败（配额型端点等）自动保持单流。
-    let video_probe = probe_track(p, &p.url).await;
-    let audio_probe = probe_track(p, audio_url).await;
+    let video_probe = probe_track(p, spec, &p.url).await?;
+    let audio_probe = probe_track(p, spec, audio_url).await?;
     let (video_len, audio_len) = (video_probe.len, audio_probe.len);
     let total_bytes = match (video_len, audio_len) {
         (Some(v), Some(a)) => v + a,
@@ -1193,10 +1424,16 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
     let video_seg = [DashSegment {
         url: p.url.clone(),
         range: None,
+        number: None,
+        time: None,
+        rewritten: None,
     }];
     let audio_seg = [DashSegment {
         url: audio_url.to_string(),
         range: None,
+        number: None,
+        time: None,
+        rewritten: None,
     }];
 
     // 轨级真续传：视频轨完成判定（文件系统真值）。dest 只在整轨成功后才由
@@ -1251,6 +1488,7 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
     } else {
         download_track_best_effort(
             p,
+            spec,
             &p.url,
             &video_seg,
             &dest_path,
@@ -1300,6 +1538,7 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
     } else {
         download_track_best_effort(
             p,
+            spec,
             audio_url,
             &audio_seg,
             &audio_path,
@@ -1468,30 +1707,198 @@ pub(crate) fn build_audio_path(video_path: &Path) -> PathBuf {
     }
 }
 
-async fn fetch_and_parse_mpd(
-    client: &Client,
-    url: &str,
-    cookies: &str,
-    referrer: &str,
-    extra_headers: &std::collections::HashMap<String, String>,
+/// `selectPeriod` 阶段：多 Period 且有插件声明时让插件选择要下载的 Period，
+/// 否则（或插件未选择）取首个。
+async fn pick_period(
+    ic: &dyn crate::intercept::TaskInterceptor,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<(dash_mpd::MPD, String), DownloadError> {
-    let mut req = client.get(url);
-    if !cookies.is_empty() {
-        req = req.header("Cookie", cookies);
+    task: &crate::intercept::ctx::TaskCtx,
+    notes: &crate::intercept::ActivityNotes,
+    mpd: &dash_mpd::MPD,
+    raw: &[u8],
+) -> Result<usize, DownloadError> {
+    use crate::intercept::{InterceptStage, ctx, drive, wants};
+
+    if mpd.periods.len() <= 1 || !wants(ic, InterceptStage::SelectPeriod) {
+        return Ok(0);
     }
-    if crate::downloader::is_valid_referrer(referrer) {
-        req = req.header(reqwest::header::REFERER, referrer);
+    let (manifest_text, manifest_text_omitted) = ctx::manifest_text(raw);
+    let periods = mpd
+        .periods
+        .iter()
+        .enumerate()
+        .map(|(index, period)| ctx::PeriodCtx {
+            index,
+            id: period.id.clone(),
+            start_seconds: period.start.map(|d| d.as_secs_f64()),
+            duration_seconds: period.duration.map(|d| d.as_secs_f64()),
+            has_video: period.adaptations.iter().any(is_video_adaptation),
+            has_audio: period.adaptations.iter().any(is_audio_adaptation),
+        })
+        .collect();
+    let arg = serde_json::to_value(ctx::SelectPeriodCtx {
+        task,
+        manifest_text,
+        manifest_text_omitted,
+        periods,
+    })
+    .map_err(|e| DownloadError::Other(format!("构造 selectPeriod 上下文失败: {e}")))?;
+    let picked = drive::run_select(
+        ic,
+        notes,
+        cancel,
+        InterceptStage::SelectPeriod,
+        arg,
+        mpd.periods.len(),
+    )
+    .await?;
+    Ok(picked.unwrap_or(0))
+}
+
+/// `selectVariant` 阶段：候选为视频 AdaptationSet 的 Representation；
+/// 插件未声明或未选择时返回 `None`，由调用方走原有选择逻辑。
+async fn pick_variant(
+    ic: &dyn crate::intercept::TaskInterceptor,
+    cancel: &tokio_util::sync::CancellationToken,
+    task: &crate::intercept::ctx::TaskCtx,
+    notes: &crate::intercept::ActivityNotes,
+    best_video: &dash_mpd::AdaptationSet,
+) -> Result<Option<usize>, DownloadError> {
+    use crate::intercept::{InterceptStage, ctx, drive, wants};
+
+    if !wants(ic, InterceptStage::SelectVariant) {
+        return Ok(None);
     }
-    // 应用浏览器扩展捕获的额外请求头(请求的就是用户提交的清单 URL 本身)
-    req = crate::downloader::apply_extra_headers(req, extra_headers);
+    let variants: Vec<ctx::VariantCtx> = best_video
+        .representations
+        .iter()
+        .enumerate()
+        .map(|(index, r)| ctx::VariantCtx {
+            index,
+            bandwidth: r.bandwidth.unwrap_or(0),
+            width: r.width,
+            height: r.height,
+            uri: r
+                .BaseURL
+                .first()
+                .map(|b| b.base.clone())
+                .unwrap_or_default(),
+            id: r.id.clone(),
+            codecs: r.codecs.clone(),
+        })
+        .collect();
+    let count = variants.len();
+    let arg = serde_json::to_value(ctx::SelectVariantCtx {
+        task,
+        format: "dash",
+        variants,
+    })
+    .map_err(|e| DownloadError::Other(format!("构造 selectVariant 上下文失败: {e}")))?;
+    Ok(drive::run_select(ic, notes, cancel, InterceptStage::SelectVariant, arg, count).await?)
+}
+
+/// `a-b` 形式的 Range 转为 `{offset, length}`；解析失败为 `None`。
+fn parse_byte_range(range: &str) -> Option<crate::intercept::ctx::ByteRangeCtx> {
+    let (a, b) = range.trim().split_once('-')?;
+    let offset: u64 = a.trim().parse().ok()?;
+    let end: u64 = b.trim().parse().ok()?;
+    let length = end.checked_sub(offset)?.checked_add(1)?;
+    Some(crate::intercept::ctx::ByteRangeCtx { offset, length })
+}
+
+/// `segments` 阶段：按插件的 drop 结果删除媒体分片（init 不在列表内，天然保留），
+/// 并把 rewrite 结果记为分片的请求地址；其余分片保持原有顺序。
+#[allow(clippy::too_many_arguments)]
+async fn filter_segments(
+    ic: &dyn crate::intercept::TaskInterceptor,
+    cancel: &tokio_util::sync::CancellationToken,
+    task: &crate::intercept::ctx::TaskCtx,
+    notes: &crate::intercept::ActivityNotes,
+    track: crate::intercept::ctx::SegmentTrack,
+    playlist_url: &str,
+    period_index: usize,
+    representation_id: Option<String>,
+    raw: &[u8],
+    segments: Vec<DashSegment>,
+) -> Result<Vec<DashSegment>, DownloadError> {
+    use crate::intercept::{InterceptStage, ctx, drive, wants};
+
+    if !wants(ic, InterceptStage::Segments) || segments.is_empty() {
+        return Ok(segments);
+    }
+    let (manifest_text, manifest_text_omitted) = ctx::manifest_text(raw);
+    let header = ctx::SegmentsHeader {
+        task,
+        format: "dash",
+        track,
+        playlist_url: playlist_url.to_string(),
+        manifest_text,
+        manifest_text_omitted,
+        media_sequence: None,
+        target_duration: None,
+        period_index: Some(period_index),
+        representation_id,
+    };
+    let items: Vec<ctx::SegmentItem> = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| ctx::SegmentItem {
+            id: i as u64,
+            uri: s.url.clone(),
+            byte_range: s.range.as_deref().and_then(parse_byte_range),
+            number: s.number,
+            time: s.time,
+            ..Default::default()
+        })
+        .collect();
+    let mut decision =
+        drive::run_segments(ic, notes, cancel, InterceptStage::Segments, &header, &items).await?;
+    if decision.dropped.is_empty() && decision.rewrites.is_empty() {
+        return Ok(segments);
+    }
+    // 改写只写入 `rewritten`：`url` 保持清单原样，续传指纹据此计算，
+    // 逐次签名不同（甚至路径不同）的地址不会让续传失效。
+    Ok(segments
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !decision.dropped.contains(&(*i as u64)))
+        .map(|(i, mut s)| {
+            s.rewritten = decision.rewrites.remove(&(i as u64));
+            s
+        })
+        .collect())
+}
+
+async fn fetch_and_parse_mpd(
+    p: &DownloadParams,
+    spec: &DownloadSpec,
+) -> Result<(dash_mpd::MPD, String, bytes::Bytes), DownloadError> {
+    // 请求的就是用户提交的清单 URL 本身：它同时是同源判定基准。
+    let ctx = request_ctx(p, spec, &p.url);
+    let resp = ctx
+        .send("DASH manifest", SMALL_REQUEST_TIMEOUT, &p.url, None)
+        .await
+        .map_err(SendFailure::into_error)?
+        .error_for_status()?;
     // 返回重定向后的最终 URL:调用方据此解析相对 BaseURL(RFC 3986 §5.1)。
-    let (final_url, bytes) = fetch_small(req, cancel).await?;
+    let final_url = resp.url().to_string();
+    let bytes = tokio::select! {
+        _ = p.cancel_token.cancelled() => return Err(DownloadError::Cancelled),
+        body = tokio::time::timeout(SMALL_REQUEST_TIMEOUT, resp.bytes()) => match body {
+            Ok(body) => body?,
+            Err(_) => {
+                return Err(DownloadError::Other(format!(
+                    "request timed out after {}s",
+                    SMALL_REQUEST_TIMEOUT.as_secs()
+                )));
+            }
+        },
+    };
     let xml = String::from_utf8(bytes.to_vec())
         .map_err(|e| DownloadError::Other(format!("MPD utf8 error: {e}")))?;
     let mpd =
         dash_mpd::parse(&xml).map_err(|e| DownloadError::Other(format!("MPD parse error: {e}")))?;
-    Ok((mpd, final_url))
+    Ok((mpd, final_url, bytes))
 }
 
 fn is_video_adaptation(a: &dash_mpd::AdaptationSet) -> bool {
@@ -1948,6 +2355,9 @@ fn build_from_template(
         Some(DashSegment {
             url: full_url,
             range: None,
+            number: None,
+            time: None,
+            rewritten: None,
         })
     } else if let Some(elem) = template.Initialization.as_ref() {
         // <Initialization> 子元素：sourceURL 与 range 来自同一元素，可配对使用
@@ -1957,6 +2367,9 @@ fn build_from_template(
             Some(DashSegment {
                 url: full_url,
                 range: elem.range.clone(),
+                number: None,
+                time: None,
+                rewritten: None,
             })
         } else {
             None
@@ -2071,6 +2484,9 @@ fn build_from_template(
                 media_segments.push(DashSegment {
                     url: join_base(base, &url)?,
                     range: None,
+                    number: Some(number),
+                    time: Some(time_value),
+                    rewritten: None,
                 });
                 number += 1;
                 time_value = time_value.saturating_add(s.d);
@@ -2142,6 +2558,9 @@ fn build_from_template(
             media_segments.push(DashSegment {
                 url: join_base(base, &url)?,
                 range: None,
+                number: Some(number),
+                time: Some(time_value),
+                rewritten: None,
             });
         }
     } else {
@@ -2165,6 +2584,9 @@ fn build_from_list(
             Ok::<DashSegment, DownloadError>(DashSegment {
                 url: join_base(base, &u)?,
                 range: list.Initialization.as_ref().and_then(|i| i.range.clone()),
+                number: None,
+                time: None,
+                rewritten: None,
             })
         })
         .transpose()?;
@@ -2179,6 +2601,9 @@ fn build_from_list(
         media_segments.push(DashSegment {
             url: seg_url,
             range: seg.mediaRange.clone(),
+            number: None,
+            time: None,
+            rewritten: None,
         });
         if media_segments.len() > MAX_SEGMENTS {
             return Err(DownloadError::Other(format!(
@@ -2337,6 +2762,7 @@ fn segments_fingerprint(init_seg: &Option<DashSegment>, media_segs: &[DashSegmen
 #[allow(clippy::too_many_arguments)]
 async fn download_track(
     p: &DownloadParams,
+    spec: &std::sync::Arc<DownloadSpec>,
     reference_url: &str,
     init_seg: &Option<DashSegment>,
     media_segs: &[DashSegment],
@@ -2352,6 +2778,7 @@ async fn download_track(
     let temp_path = PathBuf::from(format!("{}{}", dest_path.display(), TEMP_EXT));
     let result = download_track_inner(
         p,
+        spec,
         reference_url,
         init_seg,
         media_segs,
@@ -2375,6 +2802,7 @@ async fn download_track(
 #[allow(clippy::too_many_arguments)]
 async fn download_track_inner(
     p: &DownloadParams,
+    spec: &std::sync::Arc<DownloadSpec>,
     reference_url: &str,
     init_seg: &Option<DashSegment>,
     media_segs: &[DashSegment],
@@ -2450,18 +2878,7 @@ async fn download_track_inner(
         None => File::create(temp_path).await?,
     };
 
-    let ctx = SegmentDownloadContext {
-        client: &p.client,
-        cookies: &p.cookies,
-        reference_url,
-        cancel_token: &p.cancel_token,
-        task_id: &p.task_id,
-        extra_headers: &p.extra_headers,
-        referrer: &p.referrer,
-        progress_tx: &p.progress_tx,
-        db: &p.db,
-        sink: p.sink.as_ref(),
-    };
+    let ctx = request_ctx(p, spec, reference_url);
 
     let segment_iter = init_seg.iter().chain(media_segs.iter());
 
@@ -2477,7 +2894,7 @@ async fn download_track_inner(
 
         let seg_bytes = match download_segment_with_retry(
             &ctx,
-            &segment.url,
+            segment.fetch_url(),
             segment.range.as_deref(),
             idx,
             &mut file,
@@ -2510,7 +2927,7 @@ async fn download_track_inner(
             }
         };
 
-        // 块内已由 download_segment_streaming 逐 chunk 累加 progress_state，
+        // 块内已由 stream_segment 逐 chunk 累加 progress_state，
         // 此处只累计轨道字节数，避免重复计数。
         total_track += seg_bytes;
 
@@ -2600,8 +3017,13 @@ async fn download_segment_with_retry(
         let progress_snapshot = progress_state.downloaded_bytes;
         let geometry_len = progress_state.geometry.len();
 
-        match download_segment_streaming(ctx, url, range, file, speed_limiter, progress_state).await
-        {
+        let outcome = match open_segment(ctx, url, range).await {
+            Ok(resp) => stream_segment(ctx, resp, range, file, speed_limiter, progress_state).await,
+            // 取消 / 插件要求中止：不是瞬时错误，不进入重试。
+            Err(SendFailure::Abort(e)) => return Err(e),
+            Err(SendFailure::Transient(e)) => Err(e),
+        };
+        match outcome {
             Ok(written) => return Ok(written),
             Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
             Err(DownloadError::Db(error)) => return Err(DownloadError::Db(error)),
@@ -2650,48 +3072,29 @@ async fn download_segment_with_retry(
     }
 }
 
-/// Stream a single segment directly to file with speed limiting and
-/// cancellation support on each chunk.  Returns bytes written.
-async fn download_segment_streaming(
+/// 发出分片请求并取得 2xx 响应（被拒时先经插件刷新凭据重发一次）。
+async fn open_segment(
     ctx: &SegmentDownloadContext<'_>,
     url: &str,
+    range: Option<&str>,
+) -> Result<reqwest::Response, SendFailure> {
+    // 等待响应头设上限:挂起的连接按 stalled 报错,复用段重试与 auto-retry。
+    ctx.send("DASH segment", SEGMENT_HEADER_TIMEOUT, url, range)
+        .await?
+        .error_for_status()
+        .map_err(|e| SendFailure::Transient(DownloadError::from(e)))
+}
+
+/// Stream a single segment's response directly to file with speed limiting and
+/// cancellation support on each chunk.  Returns bytes written.
+async fn stream_segment(
+    ctx: &SegmentDownloadContext<'_>,
+    resp: reqwest::Response,
     range: Option<&str>,
     file: &mut File,
     speed_limiter: &crate::speed_limiter::SpeedLimiter,
     progress_state: &mut ProgressState,
 ) -> Result<i64, DownloadError> {
-    let safe_cookies = cookies_for_url(ctx.reference_url, url, ctx.cookies);
-    let mut req = ctx.client.get(url);
-    if let Some(r) = range {
-        req = req.header("Range", format!("bytes={}", r));
-    }
-    if !safe_cookies.is_empty() {
-        req = req.header("Cookie", safe_cookies);
-    }
-    // B站等 CDN 对 .m4s 分段强制要求 Referer（缺失即 403）。放在
-    // apply_extra_headers 之前：扩展捕获的真实请求头若含 referer 会覆盖此默认值。
-    if crate::downloader::is_valid_referrer(ctx.referrer) {
-        req = req.header(reqwest::header::REFERER, ctx.referrer);
-    }
-    // 应用浏览器扩展捕获的额外请求头;段/BaseURL 指向清单以外的主机时,
-    // Authorization/Cookie 等凭据类头不随请求发出。
-    let headers = extra_headers_for_origin(ctx.reference_url, url, ctx.extra_headers);
-    req = crate::downloader::apply_extra_headers(req, &headers);
-
-    // 等待响应头设上限:挂起的连接按 stalled 报错,复用段重试与 auto-retry。
-    let resp = tokio::select! {
-        _ = ctx.cancel_token.cancelled() => return Err(DownloadError::Cancelled),
-        r = tokio::time::timeout(SEGMENT_HEADER_TIMEOUT, req.send()) => match r {
-            Ok(r) => r?.error_for_status()?,
-            Err(_) => {
-                return Err(DownloadError::Other(format!(
-                    "DASH segment stalled: no response headers within {:?}",
-                    SEGMENT_HEADER_TIMEOUT
-                )));
-            }
-        },
-    };
-
     // Range 请求必须返回 206 Partial Content。若服务器/中间代理忽略 Range 返回
     // 200 全量响应，本函数会把整份资源写入文件——而这些 range 段会被拼接到同一
     // 文件，导致重复/超长内容，文件损坏且不可播放。这里显式拒绝非 206 响应，让
@@ -2978,6 +3381,557 @@ mod tests {
     }
 
     #[test]
+    fn template_segments_carry_number_and_time() {
+        let timeline = dash_mpd::SegmentTimeline {
+            segments: vec![s_elem(Some(100), 10, Some(1)), s_elem(None, 5, None)],
+        };
+        let mut template = template_with_timeline(timeline, Some(1), None);
+        template.startNumber = Some(7);
+        let period = dash_mpd::Period::default();
+        let repr = dash_mpd::Representation::default();
+        let (init, segs) = build_from_template(
+            "https://cdn.example.com/base/",
+            &period,
+            &repr,
+            &template,
+            None,
+        )
+        .expect("build_from_template should succeed");
+        assert!(init.is_none());
+        let got: Vec<(Option<u64>, Option<u64>)> =
+            segs.iter().map(|s| (s.number, s.time)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(7), Some(100)),
+                (Some(8), Some(110)),
+                (Some(9), Some(120)),
+            ]
+        );
+    }
+
+    struct NullSink;
+    impl crate::events::EventSink for NullSink {
+        fn emit(&self, _event: crate::events::EngineEvent) {}
+    }
+
+    async fn test_notes() -> crate::intercept::ActivityNotes {
+        let db = crate::db::Db::connect("sqlite::memory:").await.expect("db");
+        db.insert_task(
+            "t1",
+            "https://example.com/a.mpd",
+            "a.mp4",
+            "/tmp",
+            1,
+            0,
+            "",
+            "",
+            "",
+            0,
+        )
+        .await
+        .expect("insert task");
+        crate::intercept::ActivityNotes::new(db, std::sync::Arc::new(NullSink), "t1".to_string())
+    }
+
+    fn test_task_ctx() -> crate::intercept::ctx::TaskCtx {
+        crate::intercept::ctx::TaskCtx {
+            id: "t1".to_string(),
+            url: "https://example.com/a.mpd".to_string(),
+            source_url: "https://example.com/a.mpd".to_string(),
+            file_name: "a.mp4".to_string(),
+            save_dir: "/tmp".to_string(),
+            protocol: crate::intercept::ProtocolKind::Dash.as_str(),
+            track_pair: false,
+            is_resume: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn dash_drop_keeps_init_and_order() {
+        use crate::intercept::InterceptStage;
+        use crate::intercept::drive::tests::{ScriptedInterceptor, entry};
+
+        let ic = ScriptedInterceptor::new(vec![entry("a@b", &[InterceptStage::Segments], false)])
+            .reply("a@b", InterceptStage::Segments, Ok(Some(r#"{"drop":[1]}"#)));
+        let notes = test_notes().await;
+        let init = seg("https://cdn.example.com/init.mp4", None);
+        let media = vec![
+            seg("https://cdn.example.com/s0.m4s", Some("0-99")),
+            seg("https://cdn.example.com/s1.m4s", None),
+            seg("https://cdn.example.com/s2.m4s", None),
+        ];
+        let kept = super::filter_segments(
+            &ic,
+            &tokio_util::sync::CancellationToken::new(),
+            &test_task_ctx(),
+            &notes,
+            crate::intercept::ctx::SegmentTrack::Video,
+            "https://example.com/a.mpd",
+            0,
+            Some("v1".to_string()),
+            b"<MPD/>",
+            media,
+        )
+        .await
+        .expect("filter");
+        let urls: Vec<&str> = kept.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://cdn.example.com/s0.m4s",
+                "https://cdn.example.com/s2.m4s"
+            ]
+        );
+        // init 分片独立于媒体列表，不参与过滤。
+        assert_eq!(init.url, "https://cdn.example.com/init.mp4");
+
+        let seen = ic.seen.lock().expect("seen lock");
+        let (_, _, ctx) = &seen[0];
+        assert_eq!(ctx["format"], "dash");
+        assert_eq!(ctx["track"], "video");
+        assert_eq!(ctx["representationId"], "v1");
+        assert_eq!(ctx["periodIndex"], 0);
+        assert_eq!(ctx["segments"][0]["id"], 0);
+        assert_eq!(ctx["segments"][0]["byteRange"]["offset"], 0);
+        assert_eq!(ctx["segments"][0]["byteRange"]["length"], 100);
+        assert!(ctx["segments"][1]["byteRange"].is_null());
+    }
+
+    #[tokio::test]
+    async fn period_selection_defaults_to_first() {
+        use crate::intercept::InterceptStage;
+        use crate::intercept::drive::tests::{ScriptedInterceptor, entry};
+
+        let mpd = dash_mpd::MPD {
+            periods: vec![dash_mpd::Period::default(), dash_mpd::Period::default()],
+            ..Default::default()
+        };
+        let notes = test_notes().await;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = test_task_ctx();
+
+        // 无插件：默认首个。
+        let none = crate::intercept::noop();
+        let idx = super::pick_period(none.as_ref(), &cancel, &task, &notes, &mpd, b"")
+            .await
+            .expect("pick");
+        assert_eq!(idx, 0);
+
+        // 插件未返回 select：仍为首个。
+        let silent =
+            ScriptedInterceptor::new(vec![entry("a@b", &[InterceptStage::SelectPeriod], false)]);
+        let idx = super::pick_period(&silent, &cancel, &task, &notes, &mpd, b"")
+            .await
+            .expect("pick");
+        assert_eq!(idx, 0);
+
+        // 插件选择第二个。
+        let chooser =
+            ScriptedInterceptor::new(vec![entry("a@b", &[InterceptStage::SelectPeriod], false)])
+                .reply(
+                    "a@b",
+                    InterceptStage::SelectPeriod,
+                    Ok(Some(r#"{"select":1}"#)),
+                );
+        let idx = super::pick_period(&chooser, &cancel, &task, &notes, &mpd, b"<MPD/>")
+            .await
+            .expect("pick");
+        assert_eq!(idx, 1);
+    }
+
+    type Handler = std::sync::Arc<dyn Fn(&str) -> (u16, Vec<u8>) + Send + Sync>;
+    type Hits = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    /// 请求行里的目标（路径 + 查询）。
+    fn request_target(request: &str) -> &str {
+        request.split_whitespace().nth(1).unwrap_or_default()
+    }
+
+    /// 按 `handler(原始请求)` 返回 `(状态码, body)` 的本地服务器，记录收到的原始请求。
+    async fn serve(handler: Handler) -> (std::net::SocketAddr, Hits) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        let hits: Hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let handler = std::sync::Arc::clone(&handler);
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let (status, body) = handler(&request);
+                    log.lock().expect("hits lock").push(request);
+                    let reason = match status {
+                        200 => "OK",
+                        403 => "Forbidden",
+                        _ => "Not Found",
+                    };
+                    let mut response = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    response.extend(body);
+                    if let Err(error) = socket.write_all(&response).await {
+                        tracing::debug!(%error, "DASH fixture client disconnected");
+                    }
+                });
+            }
+        });
+        (address, hits)
+    }
+
+    fn hit_targets(hits: &Hits) -> Vec<String> {
+        hits.lock()
+            .expect("hits lock")
+            .iter()
+            .map(|r| request_target(r).to_string())
+            .collect()
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_dash_{tag}_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create DASH fixture directory");
+        dir
+    }
+
+    /// 把进度通道排空，避免下载器的进度上报在有界通道上阻塞。
+    fn drained_progress() -> tokio::sync::mpsc::Sender<crate::downloader::ProgressUpdate> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        tx
+    }
+
+    fn dash_params(
+        url: &str,
+        dir: &std::path::Path,
+        db: &crate::db::Db,
+        interceptor: std::sync::Arc<dyn crate::intercept::TaskInterceptor>,
+        is_resume: bool,
+    ) -> crate::downloader::DownloadParams {
+        crate::downloader::DownloadParams {
+            spawn_gen: 1,
+            unattended: true,
+            preprobed: None,
+            interceptor,
+            connection_cap: 0,
+            run_meta: crate::intercept::RunMeta::default(),
+            auto_proxy: None,
+            multi_nic: None,
+            task_id: "t-dash".to_string(),
+            url: url.to_string(),
+            save_dir: dir.to_string_lossy().to_string(),
+            file_name: "out.mp4".to_string(),
+            segment_count: 0,
+            is_resume,
+            range_verified: true,
+            db: db.clone(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("client"),
+            progress_tx: drained_progress(),
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            sink: std::sync::Arc::new(NullSink),
+            cookies: String::new(),
+            referrer: String::new(),
+            speed_limiter: crate::speed_limiter::SpeedLimiter::new(0),
+            hint_file_size: 0,
+            proxy_config: crate::proxy_config::ProxyConfig::default(),
+            selector: std::sync::Arc::new(crate::NoopSelection),
+            checksum: String::new(),
+            extra_headers: std::collections::HashMap::new(),
+            spec: crate::downloader::RequestSpec::empty_get(),
+            audio_url: None,
+            auto_max_connections: 0,
+            use_server_time: false,
+            overwrite: crate::file_exists::OverwritePolicy::Never,
+            ffmpeg_path: None,
+            cdn: crate::cdn::CdnTaskInput::default(),
+        }
+    }
+
+    async fn dash_db(dir: &std::path::Path) -> crate::db::Db {
+        let db = crate::db::Db::connect("sqlite::memory:").await.expect("db");
+        db.insert_task(
+            "t-dash",
+            "http://127.0.0.1/m.mpd",
+            "out.mp4",
+            &dir.to_string_lossy(),
+            0,
+            0,
+            "",
+            "",
+            "",
+            0,
+        )
+        .await
+        .expect("insert task");
+        db
+    }
+
+    fn fresh_progress() -> super::ProgressState {
+        super::ProgressState {
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            last_report: std::time::Instant::now(),
+            last_db_save: std::time::Instant::now(),
+            tracker: super::TransferTracker::new(),
+            geometry: Vec::new(),
+        }
+    }
+
+    /// 与 `run_dash_download_inner` 相同的运行级请求身份。
+    fn run_spec(p: &crate::downloader::DownloadParams) -> std::sync::Arc<super::DownloadSpec> {
+        std::sync::Arc::new(super::DownloadSpec::new(p.spec.clone()).with_refresher(
+            crate::intercept::Refresher::for_params(p, crate::intercept::ProtocolKind::Dash),
+        ))
+    }
+
+    /// 按 `id` 顺序给每个分片返回改写地址的 `segments` 阶段，对清单分片做过滤。
+    async fn rewritten_run(
+        address: std::net::SocketAddr,
+        prefix: &str,
+        sig: &str,
+    ) -> Vec<DashSegment> {
+        use crate::intercept::InterceptStage;
+        use crate::intercept::drive::tests::{ScriptedInterceptor, entry};
+
+        let reply = format!(
+            r#"{{"rewrite":[{{"id":0,"uri":"http://{address}/{prefix}/s0.m4s?sig={sig}"}},{{"id":1,"uri":"http://{address}/{prefix}/s1.m4s?sig={sig}"}}]}}"#
+        );
+        let ic = ScriptedInterceptor::new(vec![entry("a@b", &[InterceptStage::Segments], false)])
+            .reply("a@b", InterceptStage::Segments, Ok(Some(&reply)));
+        let notes = test_notes().await;
+        super::filter_segments(
+            &ic,
+            &tokio_util::sync::CancellationToken::new(),
+            &test_task_ctx(),
+            &notes,
+            crate::intercept::ctx::SegmentTrack::Video,
+            &format!("http://{address}/m.mpd"),
+            0,
+            Some("v1".to_string()),
+            b"<MPD/>",
+            manifest_segments(address),
+        )
+        .await
+        .expect("filter")
+    }
+
+    fn manifest_segments(address: std::net::SocketAddr) -> Vec<DashSegment> {
+        vec![
+            seg(&format!("http://{address}/s0.m4s"), None),
+            seg(&format!("http://{address}/s1.m4s"), None),
+        ]
+    }
+
+    #[tokio::test]
+    async fn dash_rewrite_keeps_resume_fingerprint() {
+        let handler: Handler = std::sync::Arc::new(|request| match request_target(request) {
+            "/a/s0.m4s?sig=1" => (200, b"AAAA".to_vec()),
+            "/a/s1.m4s?sig=1" => (200, b"BBBB".to_vec()),
+            _ => (404, Vec::new()),
+        });
+        let (address, hits) = serve(handler).await;
+
+        // 同一清单两次运行：改写出不同签名、甚至不同路径的地址。
+        let run_a = rewritten_run(address, "a", "1").await;
+        let run_b = rewritten_run(address, "b", "2").await;
+        let plain = manifest_segments(address);
+        assert_ne!(run_a[0].fetch_url(), run_b[0].fetch_url());
+        assert_eq!(
+            run_a[0].fetch_url(),
+            format!("http://{address}/a/s0.m4s?sig=1")
+        );
+        assert_eq!(run_a[0].url, plain[0].url, "清单原始地址保持不变");
+        let fingerprint = |segs: &[DashSegment]| segments_fingerprint(&None, segs);
+        assert_eq!(fingerprint(&run_a), fingerprint(&plain));
+        assert_eq!(fingerprint(&run_a), fingerprint(&run_b));
+
+        let dir = scratch_dir("rewrite_resume");
+        let db = dash_db(&dir).await;
+        let manifest_url = format!("http://{address}/m.mpd");
+        let dest = dir.join("out.mp4");
+
+        // 第一次运行：请求的是改写后的地址。
+        let first = dash_params(&manifest_url, &dir, &db, crate::intercept::noop(), false);
+        let (bytes, _) = super::download_track(
+            &first,
+            &run_spec(&first),
+            &manifest_url,
+            &None,
+            &run_a,
+            &dest,
+            &mut fresh_progress(),
+            Some(DashTrack::Video),
+            DashTrack::Video,
+        )
+        .await
+        .expect("first run");
+        assert_eq!(bytes, 8);
+        assert_eq!(
+            hit_targets(&hits),
+            vec!["/a/s0.m4s?sig=1".to_string(), "/a/s1.m4s?sig=1".to_string()]
+        );
+        assert_eq!(std::fs::read(&dest).expect("read output"), b"AAAABBBB");
+
+        // 第二次运行（续传）：改写地址全变，检查点仍判定整轨已完成，不再发任何请求。
+        let second = dash_params(&manifest_url, &dir, &db, crate::intercept::noop(), true);
+        let (bytes, _) = super::download_track(
+            &second,
+            &run_spec(&second),
+            &manifest_url,
+            &None,
+            &run_b,
+            &dest,
+            &mut fresh_progress(),
+            Some(DashTrack::Video),
+            DashTrack::Video,
+        )
+        .await
+        .expect("second run");
+        assert_eq!(bytes, 8);
+        assert_eq!(hit_targets(&hits).len(), 2, "续传不应重新请求任何分片");
+        assert_eq!(std::fs::read(&dest).expect("read output"), b"AAAABBBB");
+    }
+
+    /// 刷新阶段换发 `X-Token`；带令牌的请求才放行。
+    fn token_gate(body: &'static [u8]) -> Handler {
+        std::sync::Arc::new(move |request| {
+            if request.to_ascii_lowercase().contains("x-token: tok-new") {
+                (200, body.to_vec())
+            } else {
+                (403, Vec::new())
+            }
+        })
+    }
+
+    fn refresh_interceptor(
+        fail_task: bool,
+        reply: Result<Option<&str>, &str>,
+    ) -> std::sync::Arc<crate::intercept::drive::tests::ScriptedInterceptor> {
+        use crate::intercept::InterceptStage;
+        use crate::intercept::drive::tests::{ScriptedInterceptor, entry};
+        std::sync::Arc::new(
+            ScriptedInterceptor::new(vec![entry("a@b", &[InterceptStage::Refresh], fail_task)])
+                .reply("a@b", InterceptStage::Refresh, reply),
+        )
+    }
+
+    #[tokio::test]
+    async fn dash_segment_rejection_refreshes_credentials() {
+        let (address, hits) = serve(token_gate(b"SEG!")).await;
+        let ic = refresh_interceptor(false, Ok(Some(r#"{"setHeaders":{"X-Token":"tok-new"}}"#)));
+        let dir = scratch_dir("segment_refresh");
+        let db = dash_db(&dir).await;
+        let manifest_url = format!("http://{address}/m.mpd");
+        let p = dash_params(&manifest_url, &dir, &db, ic.clone(), false);
+        let spec = run_spec(&p);
+        let dest = dir.join("out.mp4");
+
+        let (bytes, _) = super::download_track(
+            &p,
+            &spec,
+            &manifest_url,
+            &None,
+            &manifest_segments(address),
+            &dest,
+            &mut fresh_progress(),
+            Some(DashTrack::Video),
+            DashTrack::Video,
+        )
+        .await
+        .expect("download after refresh");
+        assert_eq!(bytes, 8);
+        assert_eq!(std::fs::read(&dest).expect("read output"), b"SEG!SEG!");
+
+        // 首片被拒一次、刷新后重发成功；第二片直接带新身份，不再被拒。
+        assert_eq!(hit_targets(&hits), vec!["/s0.m4s", "/s0.m4s", "/s1.m4s"]);
+        {
+            let raw = hits.lock().expect("hits lock");
+            assert!(!raw[0].to_ascii_lowercase().contains("x-token"));
+            assert!(raw[1].to_ascii_lowercase().contains("x-token: tok-new"));
+        }
+        let seen = ic.seen.lock().expect("seen lock");
+        assert_eq!(seen.len(), 1, "单飞：整次运行只询问插件一次");
+        assert_eq!(seen[0].2["status"], 403);
+        assert_eq!(seen[0].2["stage"], "refresh");
+    }
+
+    #[tokio::test]
+    async fn dash_manifest_rejection_refreshes_credentials() {
+        let (address, hits) = serve(token_gate(
+            br#"<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"><Period/></MPD>"#,
+        ))
+        .await;
+        let ic = refresh_interceptor(false, Ok(Some(r#"{"setHeaders":{"X-Token":"tok-new"}}"#)));
+        let dir = scratch_dir("manifest_refresh");
+        let db = dash_db(&dir).await;
+        let p = dash_params(
+            &format!("http://{address}/m.mpd"),
+            &dir,
+            &db,
+            ic.clone(),
+            false,
+        );
+
+        let (mpd, _, raw) = super::fetch_and_parse_mpd(&p, &run_spec(&p))
+            .await
+            .expect("manifest after refresh");
+        assert_eq!(mpd.periods.len(), 1);
+        assert!(!raw.is_empty());
+        assert_eq!(hit_targets(&hits), vec!["/m.mpd", "/m.mpd"]);
+        assert_eq!(ic.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dash_refresh_abort_is_not_retried_as_transient() {
+        // 插件以 onFailure=fail 中止：任务立即失败，不进入分片重试（否则会反复询问插件）。
+        let (address, hits) = serve(std::sync::Arc::new(|_| (403, Vec::new()))).await;
+        let ic = refresh_interceptor(true, Err("boom"));
+        let dir = scratch_dir("refresh_abort");
+        let db = dash_db(&dir).await;
+        let manifest_url = format!("http://{address}/m.mpd");
+        let p = dash_params(&manifest_url, &dir, &db, ic.clone(), false);
+
+        let err = super::download_track(
+            &p,
+            &run_spec(&p),
+            &manifest_url,
+            &None,
+            &manifest_segments(address),
+            &dir.join("out.mp4"),
+            &mut fresh_progress(),
+            Some(DashTrack::Video),
+            DashTrack::Video,
+        )
+        .await
+        .expect_err("refresh abort fails the task");
+        assert!(err.to_string().contains("boom"), "got: {err}");
+        assert_eq!(hit_targets(&hits).len(), 1);
+        assert_eq!(ic.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    #[test]
     fn test_is_dash_url() {
         assert!(is_dash_url("https://example.com/manifest.mpd"));
         assert!(is_dash_url("https://example.com/manifest.MPD"));
@@ -3028,6 +3982,9 @@ mod tests {
         DashSegment {
             url: url.to_string(),
             range: range.map(str::to_string),
+            number: None,
+            time: None,
+            rewritten: None,
         }
     }
 

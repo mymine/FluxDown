@@ -65,6 +65,8 @@ describe('update view rules', () => {
     expect(manualUrl(status({ phase: 'available' }))).toBeNull()
     expect(manualLine(status({ manualReason: 'managedPackage', installKind: 'qnap' }))?.key).toBe('updateManualQnap')
     expect(manualLine(status({ manualReason: 'managedPackage', installKind: 'unknown' }))?.key).toBe('updateManualUnsupported')
+    expect(manualLine(status({ manualReason: 'managedPackage', installKind: 'linuxArch' }))?.key).toBe('updateManualSystemPackage')
+    expect(manualLine(status({ manualReason: 'managedPackage', installKind: 'linuxDeb' }))?.key).toBe('updateManualSystemPackage')
   })
 
   test('横幅按版本忽略', () => {

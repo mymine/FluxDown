@@ -13,6 +13,7 @@ mod pages;
 mod strings;
 mod submission;
 
+pub use components::status_bar::{DownloadWidget, WidgetPlacement};
 pub use components::title_bar::DownloadTitleBar;
 pub use controller::{
     DownloadsCommand, DownloadsController, DownloadsPort, DownloadsResult,

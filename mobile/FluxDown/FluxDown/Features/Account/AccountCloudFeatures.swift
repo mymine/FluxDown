@@ -20,6 +20,15 @@ struct AccountCloudFeatures: View {
     private static let syncKey = "sync"
     private static func scopeKey(_ group: SyncGroup) -> String { "scope.\(group.id.rawValue)" }
 
+    /// 同步范围分组；store 构建不展示 P2P 两组（主机上的取值不受影响）。
+    private static var syncGroups: [SyncGroup] {
+        #if FULL_P2P
+        return SyncRules.groups
+        #else
+        return SyncRules.groups.filter { $0.id != .bt && $0.id != .ed2k }
+        #endif
+    }
+
     var body: some View {
         let state = container.store.state
         let readOnly = state.isReadOnly
@@ -94,7 +103,7 @@ struct AccountCloudFeatures: View {
 
     private func scopeSection(sync: SyncStatusDto, readOnly: Bool) -> some View {
         Section {
-            ForEach(SyncRules.groups) { group in
+            ForEach(Self.syncGroups) { group in
                 let state = group.state(localOnlyKeys: sync.localOnlyKeys)
                 let key = Self.scopeKey(group)
                 Toggle(
@@ -119,7 +128,7 @@ struct AccountCloudFeatures: View {
             Text(L("syncScopeDesc"))
         }
         .onChange(of: sync.localOnlyKeys) {
-            for group in SyncRules.groups { optimistic.settle(Self.scopeKey(group)) }
+            for group in Self.syncGroups { optimistic.settle(Self.scopeKey(group)) }
         }
     }
 
@@ -282,7 +291,11 @@ struct AccountCloudFeatures: View {
         let reason = L(SyncRules.reasonKey(sync))
         switch phase {
         case .off:
-            return StatusLine(symbol: FluxSymbol.cloud, tone: .neutral, text: L("cloudSyncDesc"))
+            return StatusLine(
+                symbol: FluxSymbol.cloud,
+                tone: .neutral,
+                text: L(BuildFlavor.key(full: "cloudSyncDesc", store: "cloudSyncDescGeneric"))
+            )
         case .halted:
             return StatusLine(symbol: "pause.circle.fill", tone: .warning, text: L("cloudSyncStatusHalted", ["reason": reason]))
         case .error:

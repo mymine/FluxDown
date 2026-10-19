@@ -18,6 +18,8 @@ pub struct LaunchOptions {
     pub capture_only: bool,
     /// 直接打开或聚焦设置窗口，不打开主窗口。
     pub settings: bool,
+    /// 直接打开新建下载窗口（agent 全局快捷键「新建下载」拉起；已有主实例时转交它处理）。
+    pub new_download: bool,
     /// 仅唤起已有 UI；绝不新建 UI 或启动本机后台服务。
     pub activate_existing: bool,
     /// 需要交给 agent 的外部链接。
@@ -44,6 +46,7 @@ impl LaunchOptions {
                 "--minimized" | "--start-minimized" => options.minimized = true,
                 "--capture" => options.capture_only = true,
                 "--settings" => options.settings = true,
+                "--new-download" => options.new_download = true,
                 "--activate-existing" => options.activate_existing = true,
                 "--after-update" => options.after_update = true,
                 "--relaunch" => options.relaunch = true,
@@ -68,6 +71,7 @@ impl LaunchOptions {
         !self.minimized
             && !self.capture_only
             && !self.settings
+            && !self.new_download
             && !self.activate_existing
             && self.urls.is_empty()
             && self.torrent_files.is_empty()
@@ -208,6 +212,7 @@ mod tests {
             "--minimized",
             "--capture",
             "--settings",
+            "--new-download",
             "--activate-existing",
             "magnet:?xt=urn:btih:abc",
         ] {

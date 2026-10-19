@@ -17,6 +17,10 @@ public struct SpeedAreaChart: View {
     public let downLabel: String
     public let upLabel: String
     public let timeLabel: String
+    /// 无障碍 X 值朗读（入参为点序号）；nil = 默认「N 秒前」（实时 1Hz 序列）。
+    public let xValueLabel: ((Double) -> String)?
+    /// 触摸读数的时间文案（入参为点序号）；nil = 不启用触摸读数。
+    public let readoutTime: ((Int) -> String)?
 
     public init(
         down: [Double],
@@ -25,7 +29,9 @@ public struct SpeedAreaChart: View {
         title: String = "Speed",
         downLabel: String = "Download",
         upLabel: String = "Upload",
-        timeLabel: String = "Seconds ago"
+        timeLabel: String = "Seconds ago",
+        xValueLabel: ((Double) -> String)? = nil,
+        readoutTime: ((Int) -> String)? = nil
     ) {
         self.down = down
         self.up = up
@@ -34,6 +40,8 @@ public struct SpeedAreaChart: View {
         self.downLabel = downLabel
         self.upLabel = upLabel
         self.timeLabel = timeLabel
+        self.xValueLabel = xValueLabel
+        self.readoutTime = readoutTime
     }
 
     private nonisolated struct Point: Identifiable {
@@ -46,6 +54,13 @@ public struct SpeedAreaChart: View {
     }
 
     private var count: Int { max(down.count, up?.count ?? 0) }
+
+    @State private var selectedX: Double?
+
+    private var selectedIndex: Int? {
+        guard readoutTime != nil, let x = selectedX, !down.isEmpty else { return nil }
+        return min(max(Int(x.rounded()), 0), down.count - 1)
+    }
 
     public var body: some View {
         let downPoints = points(down)
@@ -70,6 +85,32 @@ public struct SpeedAreaChart: View {
                         .interpolationMethod(.catmullRom)
                 }
             }
+            if let index = selectedIndex, let time = readoutTime?(index) {
+                RuleMark(x: .value("t", index))
+                    .foregroundStyle(Color(uiColor: .separator))
+                    .lineStyle(StrokeStyle(lineWidth: 1))
+                    .annotation(
+                        position: .top, spacing: 2,
+                        overflowResolution: .init(x: .fit(to: .chart), y: .disabled)
+                    ) {
+                        VStack(spacing: 1) {
+                            Text(time).foregroundStyle(.secondary)
+                            Text(valueFormat(down[index])).foregroundStyle(.primary)
+                        }
+                        .font(.caption2)
+                        .monospacedDigit()
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+                    }
+                PointMark(x: .value("t", index), y: .value(downLabel, down[index]))
+                    .foregroundStyle(Color.accentColor)
+                    .symbolSize(40)
+            }
+        }
+        .chartXSelection(value: $selectedX)
+        .chartPlotStyle { plot in
+            plot.padding(.top, readoutTime != nil ? 32 : 0)
         }
         .chartXScale(domain: 0...max(count - 1, 1))
         .chartXAxis(.hidden)
@@ -92,7 +133,7 @@ public struct SpeedAreaChart: View {
         .accessibilityChartDescriptor(
             SpeedChartDescriptor(
                 down: down, up: up, valueFormat: valueFormat,
-                title: title, downLabel: downLabel, upLabel: upLabel, timeLabel: timeLabel
+                title: title, downLabel: downLabel, upLabel: upLabel, timeLabel: timeLabel, xValueLabel: xValueLabel
             )
         )
     }
@@ -106,6 +147,7 @@ private struct SpeedChartDescriptor: AXChartDescriptorRepresentable {
     let downLabel: String
     let upLabel: String
     let timeLabel: String
+    let xValueLabel: ((Double) -> String)?
 
     func makeChartDescriptor() -> AXChartDescriptor {
         let count = max(down.count, up?.count ?? 0)
@@ -115,7 +157,7 @@ private struct SpeedChartDescriptor: AXChartDescriptorRepresentable {
             range: 0...Double(max(count - 1, 1)),
             gridlinePositions: []
         ) { index in
-            "\(Int(Double(max(count - 1, 0)) - index))"
+            xValueLabel?(index) ?? "\(Int(Double(max(count - 1, 0)) - index))"
         }
         let format = valueFormat
         let yAxis = AXNumericDataAxisDescriptor(

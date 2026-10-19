@@ -53,6 +53,8 @@ impl DownloadError {
 
 pub(super) struct DownloadSpec<'a> {
     pub url: &'a str,
+    /// 出口方案给出的附加请求头（插件改写地址才会有）。
+    pub headers: &'a [(String, String)],
     /// 版本私有目录（`updates/<version>`）。
     pub dir: &'a Path,
     pub name: &'a str,
@@ -153,6 +155,9 @@ async fn fetch_into_part(
     progress: &mut (impl FnMut(u64) + Send),
 ) -> Result<FetchOutcome, DownloadError> {
     let mut request = client.get(spec.url);
+    for (name, value) in spec.headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
     if existing > 0 {
         request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
     }
@@ -237,6 +242,11 @@ async fn remove_part(path: &Path) -> Result<(), DownloadError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(DownloadError::io(path)(error)),
     }
+}
+
+/// 丢弃某个包的未完成 `.part`：换下载来源前调用，避免把一个来源的残片接到另一个来源上。
+pub(super) async fn discard_partial(dir: &Path, name: &str) -> Result<(), DownloadError> {
+    remove_part(&dir.join(format!("{name}.part"))).await
 }
 
 /// 大小 + SHA-256；哈希在阻塞线程里流式计算。
@@ -364,6 +374,7 @@ mod tests {
         let digest = sha(&data);
         let spec = DownloadSpec {
             url: &url,
+            headers: &[],
             dir: &dir,
             name: "pkg.bin",
             size: data.len() as u64,
@@ -395,6 +406,7 @@ mod tests {
         let digest = sha(&data);
         let spec = DownloadSpec {
             url: &url,
+            headers: &[],
             dir: &dir,
             name: "pkg.bin",
             size: data.len() as u64,
@@ -425,6 +437,7 @@ mod tests {
         let digest = sha(&data);
         let spec = DownloadSpec {
             url: &url,
+            headers: &[],
             dir: &dir,
             name: "pkg.bin",
             size: data.len() as u64,
@@ -450,6 +463,7 @@ mod tests {
         let wrong = "0".repeat(64);
         let spec = DownloadSpec {
             url: &url,
+            headers: &[],
             dir: &dir,
             name: "pkg.bin",
             size: data.len() as u64,
@@ -478,6 +492,7 @@ mod tests {
         let digest = sha(&data);
         let spec = DownloadSpec {
             url: &url,
+            headers: &[],
             dir: &dir,
             name: "pkg.bin",
             size: data.len() as u64,

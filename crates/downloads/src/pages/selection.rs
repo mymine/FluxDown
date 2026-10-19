@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fluxdown_protocol::{
-    BtFileDto, HlsQualityOptionDto, ResolveVariantOptionDto, SelectionKind, SelectionOutcome,
-    SelectionRequestDto, SelectionResolutionDto,
+    BtFileDto, HlsQualityOptionDto, PluginCandidateDto, ResolveVariantOptionDto, SelectionKind,
+    SelectionOutcome, SelectionRequestDto, SelectionResolutionDto,
 };
 use fluxdown_ui_components::{
     CheckState, ControlExt as _, check_mark, check_row, field_hint, tabular_numbers,
@@ -37,6 +37,8 @@ use crate::{
     model::format_bytes,
 };
 
+mod plugin_choice;
+
 /// 单个交互选择请求的独立弹窗内容。
 pub struct SelectionView {
     strings: SelectionStrings,
@@ -59,6 +61,15 @@ enum SelectionState {
     Variant {
         options: Vec<ResolveVariantOptionDto>,
         selected: i32,
+    },
+    Plugin {
+        site: String,
+        url: String,
+        candidates: Vec<PluginCandidateDto>,
+        /// 引擎给出的默认候选（徽标所在项）；与初始预选一致，之后不随用户选择变化。
+        default_identity: String,
+        selected: String,
+        remember: bool,
     },
 }
 
@@ -94,6 +105,22 @@ impl SelectionPlan {
                     _ => options.first().map_or(0, |option| option.index),
                 };
                 SelectionState::Variant { options, selected }
+            }
+            SelectionKind::Plugin {
+                site,
+                url,
+                candidates,
+            } => {
+                let selected =
+                    plugin_choice::initial_selection(&candidates, &request.default_choice);
+                SelectionState::Plugin {
+                    site,
+                    url,
+                    default_identity: selected.clone(),
+                    selected,
+                    remember: false,
+                    candidates,
+                }
             }
             SelectionKind::FileExists { .. } => return None,
         };
@@ -150,7 +177,11 @@ impl SelectionView {
 
     /// 引擎把空 BT 选择回退为全部文件，所以全不选时不允许确认（与 web 一致）。
     fn can_confirm(&self) -> bool {
-        !matches!(&self.state, SelectionState::Bt { selected, .. } if selected.is_empty())
+        match &self.state {
+            SelectionState::Bt { selected, .. } => !selected.is_empty(),
+            SelectionState::Plugin { selected, .. } => !selected.is_empty(),
+            _ => true,
+        }
     }
 
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -165,6 +196,12 @@ impl SelectionView {
             SelectionState::Variant { selected, .. } => {
                 SelectionOutcome::Variant { index: *selected }
             }
+            SelectionState::Plugin {
+                selected, remember, ..
+            } => match plugin_choice::confirm_outcome(selected, *remember) {
+                Some(outcome) => outcome,
+                None => return,
+            },
         };
         self.resolve(outcome, window, cx);
     }
@@ -230,6 +267,9 @@ impl SelectionView {
                 self.strings.variant_title.clone(),
                 self.strings.variant_desc.clone(),
             ),
+            SelectionState::Plugin { .. } => {
+                (self.strings.plugin_title.clone(), SharedString::default())
+            }
         };
         v_flex()
             .gap(tokens.spacing.xs)
@@ -246,10 +286,14 @@ impl SelectionView {
                     .text_size(tokens.typography.xs.size)
                     .line_height(tokens.typography.xs.line_height)
                     .text_color(tokens.colors.muted_foreground)
-                    .child(if self.task_name.is_empty() {
-                        description
+                    .child(if matches!(self.state, SelectionState::Plugin { .. }) {
+                        // 站点名加粗；任务名已在窗口标题里，不重复。
+                        self.plugin_description(cx)
+                    } else if self.task_name.is_empty() {
+                        description.into_any_element()
                     } else {
                         SharedString::from(format!("{description} · {}", self.task_name))
+                            .into_any_element()
                     }),
             )
     }
@@ -272,6 +316,7 @@ impl SelectionView {
                 .overflow_y_scroll()
                 .child(self.render_variant(options, *selected, cx))
                 .into_any_element(),
+            SelectionState::Plugin { .. } => self.render_plugin(cx),
         }
     }
 
@@ -533,6 +578,8 @@ impl SelectionView {
                     .replace("{count}", &selected.len().to_string())
                     .replace("{size}", &format_bytes(size.max(0) as u64)),
             )
+        } else if matches!(self.state, SelectionState::Plugin { .. }) {
+            self.strings.plugin_confirm.clone()
         } else {
             self.strings.confirm.clone()
         };
@@ -604,6 +651,12 @@ struct SelectionStrings {
     bt_confirm: SharedString,
     variant_title: SharedString,
     variant_desc: SharedString,
+    plugin_title: SharedString,
+    plugin_desc: String,
+    plugin_default_badge: SharedString,
+    plugin_remember: String,
+    plugin_remember_hint: SharedString,
+    plugin_confirm: SharedString,
     select_all: SharedString,
     deselect_all: SharedString,
     selected_count: SharedString,
@@ -624,6 +677,12 @@ impl SelectionStrings {
             bt_confirm: shared(translator.text("btFileSelectConfirm")),
             variant_title: shared(translator.text("resolveVariantTitle")),
             variant_desc: shared(translator.text("resolveVariantDesc")),
+            plugin_title: shared(translator.text("pluginChoiceTitle")),
+            plugin_desc: translator.text("pluginChoiceDesc").to_owned(),
+            plugin_default_badge: shared(translator.text("pluginChoiceDefaultBadge")),
+            plugin_remember: translator.text("pluginChoiceRemember").to_owned(),
+            plugin_remember_hint: shared(translator.text("pluginChoiceRememberHint")),
+            plugin_confirm: shared(translator.text("pluginChoiceConfirm")),
             select_all: shared(translator.text("btFileSelectAll")),
             deselect_all: shared(translator.text("deselectAll")),
             selected_count: shared(translator.text("selectedCount")),

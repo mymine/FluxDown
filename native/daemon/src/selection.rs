@@ -23,6 +23,7 @@ enum SelectionType {
     Bt,
     Variant,
     FileExists,
+    Plugin,
 }
 
 struct PendingSelection {
@@ -31,6 +32,8 @@ struct PendingSelection {
     default_choice: SelectionOutcome,
     /// 仅 FileExists：该请求允许的动作；其余类型为空。
     file_exists_actions: Vec<FileExistsAction>,
+    /// 仅 Plugin：可选插件 identity；其余类型为空。
+    plugin_candidates: Vec<String>,
     sender: oneshot::Sender<SelectionOutcome>,
 }
 
@@ -125,6 +128,13 @@ impl DaemonSelection {
                 default_choice: request.default_choice.clone(),
                 file_exists_actions: match &request.kind {
                     SelectionKind::FileExists { actions, .. } => actions.clone(),
+                    _ => Vec::new(),
+                },
+                plugin_candidates: match &request.kind {
+                    SelectionKind::Plugin { candidates, .. } => candidates
+                        .iter()
+                        .map(|candidate| candidate.identity.clone())
+                        .collect(),
                     _ => Vec::new(),
                 },
                 sender,
@@ -259,9 +269,10 @@ impl DaemonSelection {
                 };
                 let outcome = match selection.kind {
                     SelectionType::Hls => selection.default_choice,
-                    SelectionType::Bt | SelectionType::Variant | SelectionType::FileExists => {
-                        SelectionOutcome::Cancelled
-                    }
+                    SelectionType::Bt
+                    | SelectionType::Variant
+                    | SelectionType::FileExists
+                    | SelectionType::Plugin => SelectionOutcome::Cancelled,
                 };
                 if selection.sender.send(outcome).is_err() {
                     tracing::debug!(request_id = %id, "selection waiter disconnected before task cancellation");
@@ -591,6 +602,60 @@ impl fluxdown_engine::selection::HostSelection for DaemonSelection {
             }
         }
     }
+
+    async fn select_resolver_plugin(
+        &self,
+        task_id: &str,
+        request: &fluxdown_engine::selection::PluginChoiceRequest,
+        timeout: std::time::Duration,
+    ) -> fluxdown_engine::selection::SelectionOutcome<fluxdown_engine::selection::PluginChoice>
+    {
+        use fluxdown_engine::selection::{PluginChoice, SelectionOutcome as EngineOutcome};
+
+        let fallback = PluginChoice::Use {
+            identity: request.default_identity.clone(),
+            remember: false,
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let selection = SelectionRequestDto {
+            request_id: request_id.clone(),
+            task_id: task_id.to_owned(),
+            kind: SelectionKind::Plugin {
+                site: request.site.clone(),
+                url: request.url.clone(),
+                candidates: request
+                    .candidates
+                    .iter()
+                    .cloned()
+                    .map(fluxdown_engine_protocol::plugin_candidate_to_dto)
+                    .collect(),
+            },
+            default_choice: SelectionOutcome::Plugin {
+                identity: request.default_identity.clone(),
+                remember: false,
+            },
+            deadline_unix_ms: deadline_unix_ms(timeout),
+        };
+        match self.begin(selection) {
+            SelectionWait::Immediate(_) => EngineOutcome::NoSelectorConfigured(fallback),
+            SelectionWait::Pending(receiver) => {
+                // 任务暂停 / 删除时引擎丢弃本 future；守卫保证待选项随之撤销并广播。
+                let _guard = PendingGuard {
+                    selection: self,
+                    request_id,
+                };
+                match tokio::time::timeout(timeout, receiver).await {
+                    Ok(Ok(SelectionOutcome::Plugin { identity, remember })) => {
+                        EngineOutcome::UserChose(PluginChoice::Use { identity, remember })
+                    }
+                    Ok(Ok(SelectionOutcome::Cancelled)) => {
+                        EngineOutcome::UserChose(PluginChoice::Cancel)
+                    }
+                    _ => EngineOutcome::TimedOutDefaulted(fallback),
+                }
+            }
+        }
+    }
 }
 
 /// 等待方被丢弃或结束时撤销仍待处理的请求；已终局的请求无操作。
@@ -623,6 +688,7 @@ fn selection_type(kind: &SelectionKind) -> SelectionType {
         SelectionKind::Bt { .. } => SelectionType::Bt,
         SelectionKind::Variant { .. } => SelectionType::Variant,
         SelectionKind::FileExists { .. } => SelectionType::FileExists,
+        SelectionKind::Plugin { .. } => SelectionType::Plugin,
     }
 }
 
@@ -639,9 +705,17 @@ fn validate_outcome(
         {
             Ok(())
         }
+        (SelectionType::Plugin, SelectionOutcome::Plugin { identity, .. })
+            if pending.plugin_candidates.contains(identity) =>
+        {
+            Ok(())
+        }
         (SelectionType::Hls, SelectionOutcome::Cancelled) => Err(SelectionError::HlsCancel),
         (
-            SelectionType::Bt | SelectionType::Variant | SelectionType::FileExists,
+            SelectionType::Bt
+            | SelectionType::Variant
+            | SelectionType::FileExists
+            | SelectionType::Plugin,
             SelectionOutcome::Cancelled,
         ) => Ok(()),
         _ => Err(SelectionError::InvalidOutcome),
@@ -1002,6 +1076,68 @@ mod tests {
             waiter.await.expect("join"),
             Engine::UserChose(FileExistsChoice::Rename)
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_choice_only_accepts_offered_candidates_and_remember_round_trips() {
+        use fluxdown_engine::selection::{
+            HostSelection, PluginCandidate, PluginChoice, PluginChoiceRequest,
+            SelectionOutcome as Engine,
+        };
+        let manager = manager();
+        manager.subscribe("c".to_owned());
+        let candidate = |identity: &str| PluginCandidate {
+            identity: identity.to_owned(),
+            name: identity.to_owned(),
+            version: "1.0.0".to_owned(),
+            description: String::new(),
+        };
+        let request = PluginChoiceRequest {
+            site: "example.com".to_owned(),
+            url: "https://example.com/v".to_owned(),
+            candidates: vec![candidate("a@x"), candidate("b@x")],
+            default_identity: "a@x".to_owned(),
+        };
+        let waiter = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .select_resolver_plugin("t", &request, std::time::Duration::from_secs(5))
+                    .await
+            })
+        };
+        let request_id = loop {
+            if let Some(id) = super::lock_or_recover(&manager.state).pending.keys().next() {
+                break id.clone();
+            }
+            tokio::task::yield_now().await;
+        };
+        let resolve = |outcome| {
+            manager.resolve(SelectionResolutionDto {
+                request_id: request_id.clone(),
+                outcome,
+            })
+        };
+        assert!(matches!(
+            resolve(SelectionOutcome::Plugin {
+                identity: "evil@x".to_owned(),
+                remember: true,
+            }),
+            Err(SelectionError::InvalidOutcome)
+        ));
+        resolve(SelectionOutcome::Plugin {
+            identity: "b@x".to_owned(),
+            remember: true,
+        })
+        .expect("offered candidate");
+        assert_eq!(
+            waiter.await.expect("join"),
+            Engine::UserChose(PluginChoice::Use {
+                identity: "b@x".to_owned(),
+                remember: true,
+            })
+        );
+        assert_eq!(lock_pending_len(&manager), 0);
     }
 
     fn lock_pending_len(manager: &DaemonSelection) -> usize {

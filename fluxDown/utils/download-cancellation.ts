@@ -4,6 +4,10 @@
  * Chrome's filename pipeline waits for suggest. Request cancellation before
  * releasing that pipeline, and avoid holding suggest until cancellation settles:
  * a pending filename decision could otherwise block cancellation progress.
+ *
+ * Resolves as soon as the cancellation settles. Erasing only removes the
+ * cancelled entry from the browser's download list, so it runs in the
+ * background instead of delaying the hand-off to FluxDown.
  */
 export async function cancelBeforeFilenameResolution(
   downloadId: number,
@@ -27,10 +31,11 @@ export async function cancelBeforeFilenameResolution(
     return false;
   }
 
-  try {
-    await erase({ id: downloadId });
-  } catch {
-    // The cancellation succeeded; erasing only removes browser history residue.
-  }
+  Promise.resolve()
+    .then(() => erase({ id: downloadId }))
+    .catch((error: unknown) => {
+      // The cancellation succeeded; a leftover history entry is cosmetic.
+      console.debug("[FluxDown] failed to erase cancelled download:", downloadId, error);
+    });
   return true;
 }

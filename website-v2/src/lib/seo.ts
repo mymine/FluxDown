@@ -12,7 +12,7 @@
 import { BASE } from "@/lib/base";
 
 /** 站点源(不含挂载前缀);与已带前缀的路径(`href()` / `Astro.url.pathname`)拼接用它。 */
-export const SITE_ORIGIN = "https://fluxdown.zerx.dev";
+export const SITE_ORIGIN = "https://fluxdown.com";
 /** 站点根 URL(含挂载前缀);与无前缀的站点路径拼接用它。 */
 export const SITE_URL = `${SITE_ORIGIN}${BASE}`;
 export const SITE_NAME = "FluxDown";

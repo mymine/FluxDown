@@ -21,7 +21,7 @@ use crate::{
             DownloadTableDelegate, SelectionSummary, TableFilter, ToolbarCommand,
             spawn_midnight_refresh,
         },
-        title_bar::{DownloadTitleBar, left_edge_probe},
+        title_bar::DownloadTitleBar,
     },
     controller::{DownloadsCommand, DownloadsController, DownloadsPort, ResumeTargets},
     deletion::{
@@ -45,10 +45,9 @@ use crate::{
 use fluxdown_ui_components::{ControlExt as _, FluxIcon, SidebarChange, SidebarState};
 use fluxdown_ui_i18n::Translator;
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity,
+    AnyView, AnyWindowHandle, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity,
     ExternalPaths, FocusHandle, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
-    PathPromptOptions, Pixels, Render, SharedString, Styled, Window, div,
-    prelude::FluentBuilder as _, px,
+    PathPromptOptions, Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable as _, Icon, ResizableState, WindowExt as _,
@@ -96,6 +95,24 @@ pub type PlainOpener = Rc<dyn Fn(&mut Window, &mut App)>;
 pub type CategoryEditorOpener = Rc<dyn Fn(Option<String>, &mut Window, &mut App)>;
 /// 单任务交互式开始的生命周期。新建成功直接通知；已有任务须在执行命令前通知 Requested。
 pub type UserStartHook = Rc<dyn Fn(UserStartIntent, &mut App)>;
+/// 执行插件命令：`(identity, command, task_ids)`。
+pub type PluginCommandRunner = Rc<dyn Fn(String, String, Vec<String>, &mut Window, &mut App)>;
+/// 构造插件详情 tab 视图：`(tab 下标, task_id)`。
+pub type PluginTabViewFactory = Rc<dyn Fn(u16, String, &mut Window, &mut App) -> AnyView>;
+
+/// 插件贡献的任务右键命令。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginTaskCommand {
+    pub identity: String,
+    pub command: String,
+    pub title: SharedString,
+}
+
+/// 插件贡献的任务详情 tab。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PluginTaskTab {
+    pub title: SharedString,
+}
 
 /// app 注入的跨窗口 / 跨能力入口；未注入的入口对应按钮无动作。
 #[derive(Clone, Default)]
@@ -116,6 +133,10 @@ pub struct DownloadHostActions {
     pub shutdown: Option<crate::model::shutdown::ShutdownPort>,
     /// 单任务交互式开始回调（批量操作不回调）。
     pub on_user_started: Option<UserStartHook>,
+    /// 点击插件任务右键命令：`(插件 identity, 命令 id, 任务 id 列表)`。
+    pub run_plugin_command: Option<PluginCommandRunner>,
+    /// 取插件详情 tab 内容：`(tab 下标, 任务 id)`；同一 `(下标, 任务)` 的视图由详情面板缓存。
+    pub plugin_tab_view: Option<PluginTabViewFactory>,
 }
 
 /// 一个进行中的大批量导入：进度只在分块边界更新，取消不回滚已创建的任务。
@@ -164,6 +185,10 @@ pub struct DownloadView {
     pub(crate) sidebar: Entity<SidebarState>,
     pub(crate) table_state: Entity<TableState<DownloadTableDelegate>>,
     pub(crate) host: DownloadHostActions,
+    /// 插件贡献的任务详情 tab（下标即 `DetailTab::Plugin`）。
+    pub(crate) plugin_tabs: Vec<PluginTaskTab>,
+    /// 插件贡献的任务右键命令（下标即 `MenuEntry::Plugin`）。
+    pub(crate) plugin_commands: Vec<PluginTaskCommand>,
     pub(crate) last_error: Option<SharedString>,
     /// 根元素 focus handle：右键菜单 action_context 分派目标，`escape`
     /// 清空搜索框后也交回给它。
@@ -185,8 +210,6 @@ pub struct DownloadView {
     pub(crate) detail_resizable_state: Entity<ResizableState>,
     /// 上次渲染时的选中投影；表格选中变化时与之比较，变了才重绘本页（浮动选择条）。
     pub(crate) selection_summary: Cell<SelectionSummary>,
-    /// 内容区（侧栏右侧）左缘的窗口横坐标；顶栏插槽据此把「新建」主按钮与内容区左对齐。
-    pub(crate) content_left: Pixels,
     /// 文件跟踪重扫节流（主窗口获焦触发）。
     file_rescan: RescanThrottle,
     /// 事件驱动刷新的合并闸门（≤30Hz、同批事件一次刷新）。
@@ -309,6 +332,8 @@ impl DownloadView {
             sidebar,
             table_state,
             host: DownloadHostActions::default(),
+            plugin_tabs: Vec::new(),
+            plugin_commands: Vec::new(),
             last_error: None,
             focus_handle,
             search_input,
@@ -320,7 +345,6 @@ impl DownloadView {
             detail: None,
             detail_resizable_state: cx.new(|_| ResizableState::default()),
             selection_summary: Cell::new(SelectionSummary::default()),
-            content_left: px(0.),
             file_rescan: RescanThrottle::default(),
             refresh_gate: RefreshGate::default(),
             refreshed_structure: u64::MAX,
@@ -341,6 +365,65 @@ impl DownloadView {
     /// 注入宿主入口（新建下载 / 任务窗口 / 队列管理…）。
     pub fn set_host_actions(&mut self, host: DownloadHostActions) {
         self.host = host;
+    }
+
+    /// 注入插件贡献点：详情 tab 与任务右键命令（顺序即下标，宿主回调按下标定位）。
+    pub fn set_plugin_contributions(
+        &mut self,
+        mut tabs: Vec<PluginTaskTab>,
+        mut commands: Vec<PluginTaskCommand>,
+        cx: &mut Context<Self>,
+    ) {
+        tabs.truncate(usize::from(u16::MAX));
+        commands.truncate(usize::from(u16::MAX));
+        if self.plugin_tabs == tabs && self.plugin_commands == commands {
+            return;
+        }
+        self.plugin_tabs = tabs.clone();
+        self.plugin_commands = commands.clone();
+        self.table_state.update(cx, |table, cx| {
+            table.delegate_mut().set_plugin_commands(commands);
+            cx.notify();
+        });
+        if let Some(detail) = self.detail.clone() {
+            detail.update(cx, |detail, cx| detail.set_plugin_tabs(tabs, cx));
+        }
+        cx.notify();
+    }
+
+    /// 当前选中的本机任务 id（已排序；远程任务不含）。命令面板的插件命令据此取目标任务。
+    pub fn selected_local_task_ids(&self, cx: &App) -> Vec<String> {
+        self.table_state
+            .read(cx)
+            .delegate()
+            .selected_keys()
+            .iter()
+            .filter(|key| key.is_local())
+            .map(|key| key.task_id().to_owned())
+            .collect()
+    }
+
+    /// 右键菜单点击插件命令：把选中任务 id 交给宿主回调。
+    pub(crate) fn run_plugin_command(
+        &self,
+        index: u16,
+        task_ids: Vec<String>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let (Some(run), Some(command)) = (
+            self.host.run_plugin_command.clone(),
+            self.plugin_commands.get(usize::from(index)),
+        ) else {
+            return;
+        };
+        run(
+            command.identity.clone(),
+            command.command.clone(),
+            task_ids,
+            window,
+            cx,
+        );
     }
 
     /// 宿主同步导入闸门挂起状态（见 `import_suspended`）。
@@ -851,7 +934,7 @@ impl DownloadView {
                     && id != SidebarSelection::ALL_DEVICES
                     && !self
                         .controller
-                        .other_devices()
+                        .sidebar_devices()
                         .iter()
                         .any(|device| device.id == *id) =>
             {
@@ -1188,6 +1271,7 @@ impl DownloadView {
                 detail.update(cx, |detail, cx| detail.set_task(task_id, cx));
             }
             None => {
+                let plugin_tabs = self.plugin_tabs.clone();
                 let store = Rc::clone(self.controller.store());
                 let host = self.host.clone();
                 let translator = self.translator.clone();
@@ -1195,6 +1279,9 @@ impl DownloadView {
                 let detail = cx.new(|cx| {
                     TaskDetailView::new_docked(translator, task_id, store, port, host, window, cx)
                 });
+                if !plugin_tabs.is_empty() {
+                    detail.update(cx, |detail, cx| detail.set_plugin_tabs(plugin_tabs, cx));
+                }
                 if self.controller.is_stale() {
                     detail.update(cx, |detail, cx| detail.mark_stale(cx));
                 }
@@ -2171,11 +2258,6 @@ impl DownloadView {
             .min_h_0()
             .bg(surface)
             .child(body)
-            .child(left_edge_probe(
-                cx.weak_entity(),
-                |view| view.content_left,
-                |view, left| view.content_left = left,
-            ))
             .into_any_element()
     }
 
@@ -2338,6 +2420,7 @@ impl Render for DownloadView {
             .on_action(cx.listener(Self::on_rename_selected))
             .on_action(cx.listener(Self::on_change_selected_url))
             .on_action(cx.listener(Self::on_change_selected_segments))
+            .on_action(cx.listener(Self::on_verify_selected))
             .on_action(cx.listener(Self::on_toggle_detail_panel))
             .on_drop(cx.listener(Self::on_paths_dropped))
             .drag_over::<ExternalPaths>(|style, _, _, cx| {
@@ -2345,7 +2428,6 @@ impl Render for DownloadView {
                 style.bg(tokens.colors.accent.opacity(0.2))
             })
             .child(self.render_sidebar_layout(window, cx))
-            .child(self.render_status_bar(cx))
     }
 }
 

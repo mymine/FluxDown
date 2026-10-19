@@ -11,8 +11,12 @@ export function installConnectionDiagnostics() {
 
   return async (message: { type: string; event?: unknown }, sender: { id?: string; url?: string }) => {
     const page = sender.url?.split(/[?#]/, 1)[0];
-    const source = page === browser.runtime.getURL("/popup.html") ? "popup"
-      : page === browser.runtime.getURL("/options.html") ? "options" : null;
+    const pages: Record<string, "popup" | "options" | "sidepanel"> = {
+      [browser.runtime.getURL("/popup.html")]: "popup",
+      [browser.runtime.getURL("/options.html")]: "options",
+      [browser.runtime.getURL("/sidepanel.html")]: "sidepanel",
+    };
+    const source = page ? pages[page] ?? null : null;
     // Content scripts and web pages cannot read the journal or inject entries.
     if (sender.id !== browser.runtime.id || !source) {
       throw new Error("Diagnostics are only available to extension pages");

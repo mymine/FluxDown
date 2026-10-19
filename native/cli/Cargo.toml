@@ -14,7 +14,7 @@ workspace = true
 clap = { version = "4.6.1", features = ["derive", "env"] }
 directories = "6.0.0"
 fluxdown_api = { version = "0.1.0", path = "../api" }
-fluxdown_engine = { version = "0.1.0", path = "../engine" }
+fluxdown_engine = { version = "0.1.0", path = "../engine", default-features = false }
 fluxdown_protocol = { version = "0.1.0", path = "../protocol" }
 mimalloc = "0.1.52"
 reqwest = { version = "0.12", default-features = false, features = ["json", "charset"] }
@@ -30,3 +30,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "cha
 
 [target.'cfg(not(windows))'.dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "charset", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+
+[features]
+# 与 engine 一致：P2P 默认开启，需要精简时 `--no-default-features`。
+default = ["bt", "ed2k"]
+bt = ["fluxdown_engine/bt"]
+ed2k = ["fluxdown_engine/ed2k"]

@@ -10,10 +10,17 @@
     "build": "wxt build",
     "build:firefox": "wxt build --browser firefox",
     "zip": "wxt zip",
-    "zip:firefox": "wxt zip --browser firefox"
+    "zip:firefox": "wxt zip --browser firefox",
+    "postinstall": "wxt prepare",
+    "test": "bun test",
+    "typecheck": "wxt prepare && tsc --noEmit"
   },
   "devDependencies": {
-    "wxt": "^0.20.14",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "wxt": "^0.20.14"
+  },
+  "dependencies": {
+    "@preact/signals": "^2.11.3",
+    "preact": "^11.0.1"
   }
 }

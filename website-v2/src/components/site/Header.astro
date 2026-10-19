@@ -9,7 +9,7 @@ import Logo from "./Logo.astro";
 import { common } from "../../i18n/messages/common";
 import { href, switchLang, stripLang } from "../../i18n/routing";
 import { LANG_LABEL, type Lang } from "../../i18n/config";
-import { COMMUNITY_LINKS, GITHUB_URL, PRODUCT_LINKS, SPONSOR_LINK, docsPath } from "../../lib/site-nav";
+import { COMMUNITY_LINKS, GITHUB_URL, PRODUCT_LINKS, SPONSOR_LINK, docsPath, navHref } from "../../lib/site-nav";
 import { stripBase } from "@/lib/base";
 
 interface Props {
@@ -113,7 +113,7 @@ const isActive = (links: typeof PRODUCT_LINKS) =>
                 </a>
                 <div class="nav-links">
                   {menu.links.map((link) => (
-                    <a href={href(link.path, lang)} class="nav-entry">
+                    <a href={navHref(link, lang)} class="nav-entry">
                       <span class="nav-entry-icon">
                         <link.icon size={15} strokeWidth={1.75} />
                       </span>
@@ -194,7 +194,7 @@ const isActive = (links: typeof PRODUCT_LINKS) =>
         <div class="mt-6">
           <div class="eyebrow-plain mb-2">{menu.label}</div>
           {menu.links.map((link) => (
-            <a href={href(link.path, lang)} class="mobile-link">
+            <a href={navHref(link, lang)} class="mobile-link">
               <link.icon size={16} strokeWidth={1.75} className="text-subtle" />
               {t.nav[link.label]}
             </a>

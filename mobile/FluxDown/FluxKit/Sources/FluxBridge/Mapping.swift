@@ -183,6 +183,10 @@ extension SelectionKindDto {
                 renamePreview: renamePreview,
                 actions: actions.map(\.domain)
             ))
+        case let .plugin(site, url, candidates):
+            .plugin(site: site, url: url, candidates: candidates.map {
+                PluginCandidate(identity: $0.identity, name: $0.name, version: $0.version, description: $0.description)
+            })
         }
     }
 }
@@ -194,6 +198,7 @@ extension SelectionOutcomeDto {
         case let .bt(indices): .bt(indices: indices)
         case let .variant(index): .variant(index: index)
         case let .fileExists(action): .fileExists(action: action.domain)
+        case let .plugin(identity, remember): .plugin(identity: identity, remember: remember)
         case .cancelled: .cancelled
         }
     }
@@ -206,6 +211,7 @@ extension SelectionOutcome {
         case let .bt(indices): .bt(indices: indices)
         case let .variant(index): .variant(index: index)
         case let .fileExists(action): .fileExists(action: action.dto)
+        case let .plugin(identity, remember): .plugin(identity: identity, remember: remember)
         case .cancelled: .cancelled
         }
     }
@@ -274,7 +280,13 @@ extension LinkDeviceDto {
             platform: platform,
             online: online,
             defaultSaveDir: defaultSaveDir,
-            pathStyle: pathStyle.map(PathStyle.init(wire:))
+            pathStyle: pathStyle.map(PathStyle.init(wire:)),
+            customName: customName,
+            appVersion: appVersion,
+            cloudDeviceId: cloudDeviceId,
+            revoked: revoked,
+            pairedAt: pairedAt,
+            lastSeenAt: lastSeenAt
         )
     }
 }

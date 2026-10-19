@@ -1,5 +1,5 @@
 name: FluxDown
-website_url: https://fluxdown.zerx.dev
+website_url: https://fluxdown.com
 description: Multi-protocol download manager with a Web UI, browser extension, aria2-compatible JSON-RPC and MCP endpoint, supporting HTTP/FTP/BitTorrent/HLS with intelligent segmentation and resume. (alternative to Internet Download Manager, aria2)
 licenses:
   - AGPL-3.0

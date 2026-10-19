@@ -345,7 +345,7 @@ nonisolated enum SettingsDownloadRow: String, CaseIterable, Identifiable {
         case .cdnMulti: "cdnMultiEnabledDesc"
         case .cdnMaxNodes: "cdnMaxNodesDesc"
         case .multiNic: "multiNicEnabledDesc"
-        case .maxConcurrent: "maxConcurrentDesc"
+        case .maxConcurrent: BuildFlavor.key(full: "maxConcurrentDesc", store: "maxConcurrentDescGeneric")
         case .speedLimit: "speedLimitDesc"
         case .uploadLimit: "uploadLimitDesc"
         case .autoRetryCount: "autoRetryCountDesc"

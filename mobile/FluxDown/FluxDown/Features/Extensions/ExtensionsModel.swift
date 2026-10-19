@@ -65,6 +65,8 @@ final class ExtensionsModel {
     private(set) var marketEntries: [MarketEntry] = []
     private(set) var marketPending: Set<String> = []
     var permissionRequest: PermissionRequest?
+    private(set) var siteDefaults: [PluginSiteDefault] = []
+    private(set) var siteDefaultBusy: Set<String> = []
 
     @ObservationIgnored private let container: AppContainer
     @ObservationIgnored private var marketRequested = false
@@ -124,6 +126,33 @@ final class ExtensionsModel {
             }
         }
         return done
+    }
+
+    // MARK: 站点默认插件
+
+    func loadSiteDefaults() async {
+        do throws(HostError) {
+            siteDefaults = try await session.call(HostMethod.daemonPluginSiteDefaults)
+        } catch {
+            // 旧 daemon / 无插件构建不支持该方法：保持空列表，整段不渲染。
+            siteDefaults = []
+        }
+    }
+
+    /// `identity == nil` 移除条目；否则确认 / 修改。完成后重新拉取列表。
+    func setSiteDefault(site: String, identity: String?) async {
+        guard !siteDefaultBusy.contains(site) else { return }
+        siteDefaultBusy.insert(site)
+        do throws(HostError) {
+            try await session.callVoid(
+                HostMethod.daemonPluginSetSiteDefault,
+                params: PluginSetSiteDefaultParams(site: site, identity: identity)
+            )
+        } catch {
+            toast(L("pluginSiteDefaultSaveFailed", ["error": ExtensionErrorText.describe(error)]), .error)
+        }
+        siteDefaultBusy.remove(site)
+        await loadSiteDefaults()
     }
 
     func reload(_ plugin: PluginDto) async {
@@ -388,7 +417,8 @@ struct PluginAutoDisabledToasts: ViewModifier {
         for notice in pending where notice.name == HostNoticeName.pluginAutoDisabled {
             guard let payload = notice.decode(PluginAutoDisabledNotice.self) else { continue }
             let name = known.first { $0.identity == payload.identity }?.name ?? payload.identity
-            container.toasts.show(text: L("pluginAutoDisabledToast", ["name": name]), tone: .warning)
+            let toastKey = payload.reason == "Revoked" ? "pluginRevokedToast" : "pluginAutoDisabledToast"
+            container.toasts.show(text: L(toastKey, ["name": name]), tone: .warning)
         }
     }
 }

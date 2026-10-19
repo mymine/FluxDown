@@ -24,7 +24,7 @@ use gpui_component::{
 use crate::search::SettingsTarget;
 use crate::sections::{
     self, SectionContext, about, api, appearance, bt, doctor, download, ed2k, general, notify,
-    proxy,
+    proxy, shortcuts,
 };
 use crate::store::{SettingsErrorKind, SettingsStore};
 use crate::ui::{
@@ -34,12 +34,48 @@ use crate::ui::{
 /// 分类导航列宽（与下载侧栏默认宽一致）。
 const SIDEBAR_WIDTH: f32 = 200.;
 
-/// app 注入的外部内容：账户页与扩展页由对应 capability 提供；活动栏开关由 app 的
+/// 「推介有奖」页的可见性：app 依「已登录 + 设备本地偏好」维护，设置窗口与搜索索引共用。
+#[derive(Debug, Default)]
+pub struct SlotVisibility {
+    visible: bool,
+}
+
+impl SlotVisibility {
+    #[must_use]
+    pub fn visible(&self) -> bool {
+        self.visible
+    }
+
+    /// 更新可见性；值未变时不通知，避免无谓重绘。
+    pub fn set(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible != visible {
+            self.visible = visible;
+            cx.notify();
+        }
+    }
+}
+
+/// 动态显隐的整页插槽：视图本身 + 控制它是否出现在侧栏 / 搜索里的可见性。
+pub struct VisibleSlot {
+    pub view: AnyView,
+    pub visible: Entity<SlotVisibility>,
+}
+
+/// 构建页面列表时「推介有奖」页的取舍：`Hidden` 整页不出现；`Shown(None)` 仅供搜索索引
+/// （没有真实视图，显示分类描述）。
+pub(crate) enum ReferralPage {
+    Hidden,
+    Shown(Option<AnyView>),
+}
+
+/// app 注入的外部内容：账户 / 推介页与扩展页由对应 capability 提供；活动栏开关由 app 的
 /// 活动栏注册表派生。
 #[derive(Default)]
 pub struct SettingsContentSlots {
     pub account: Option<AnyView>,
     pub extensions: Option<AnyView>,
+    /// 「推介有奖」页（账户之后）；不可见时整页不出现在侧栏、搜索与直达里。
+    pub referral: Option<VisibleSlot>,
     /// 「通用 → 活动栏」分区的开关行，按活动栏自上而下顺序。
     pub activity_bar: Vec<ActivityBarToggle>,
 }
@@ -125,6 +161,9 @@ impl SettingsView {
         let placeholder = translator.read(cx).text("settingsSearchHint").to_owned();
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         cx.observe(&search, |_, _, cx| cx.notify()).detach();
+        if let Some(slot) = &slots.referral {
+            cx.observe(&slot.visible, |_, _, cx| cx.notify()).detach();
+        }
         Self {
             store,
             translator,
@@ -163,6 +202,14 @@ impl SettingsView {
             .map(|key| (SharedString::from(translator.text(key).to_owned()), false))
     }
 
+    /// 「推介有奖」页当前是否可见（无插槽即不可见）。
+    fn referral_visible(&self, cx: &App) -> bool {
+        self.slots
+            .referral
+            .as_ref()
+            .is_some_and(|slot| slot.visible.read(cx).visible())
+    }
+
     fn pages(&self, cx: &mut Context<Self>) -> Vec<SettingsPage> {
         let translator = self.translator.read(cx).clone();
         let ctx = SectionContext {
@@ -174,6 +221,12 @@ impl SettingsView {
             &self.slots.activity_bar,
             self.slots.account.clone(),
             self.slots.extensions.clone(),
+            match &self.slots.referral {
+                Some(slot) if slot.visible.read(cx).visible() => {
+                    ReferralPage::Shown(Some(slot.view.clone()))
+                }
+                _ => ReferralPage::Hidden,
+            },
             cx,
         )
     }
@@ -314,6 +367,7 @@ impl SettingsView {
         let extended = theme.extended().clone();
         let tab_id = self.active_tab_id(page);
         let tabs = self.render_tabs(page, tab_id, cx);
+        let fill = page.tab_fills_height(tab_id);
 
         v_flex()
             .flex_1()
@@ -337,8 +391,8 @@ impl SettingsView {
                     ))
                     .children(tabs),
             )
-            .child(
-                v_flex()
+            .child({
+                let body = v_flex()
                     .id(gpui::ElementId::from(SharedString::from(format!(
                         "settings-body-{}-{tab_id}",
                         page.key
@@ -350,9 +404,14 @@ impl SettingsView {
                     .pr(px(CONTENT_PADDING_RIGHT))
                     .pt(tokens.spacing.lg + tokens.spacing.xs)
                     .pb(tokens.spacing.xl)
-                    .overflow_y_scrollbar()
-                    .child(page.render_tab(tab_id, content_width, window, cx)),
-            )
+                    .child(page.render_tab(tab_id, content_width, window, cx));
+                // 占满高度的注入视图自管滚动（固定头部 + 局部滚动），宿主不再包滚动容器。
+                if fill {
+                    body.into_any_element()
+                } else {
+                    body.overflow_y_scrollbar().into_any_element()
+                }
+            })
     }
 }
 
@@ -362,9 +421,10 @@ pub(crate) fn build_pages(
     activity_bar: &[ActivityBarToggle],
     account: Option<AnyView>,
     extensions: Option<AnyView>,
+    referral: ReferralPage,
     cx: &mut App,
 ) -> Vec<SettingsPage> {
-    vec![
+    let mut pages = vec![
         general::page(ctx, activity_bar, cx),
         sections::slot_page(
             ctx,
@@ -374,7 +434,23 @@ pub(crate) fn build_pages(
             FluxIcon::User,
             account,
         ),
+    ];
+    if let ReferralPage::Shown(view) = referral {
+        pages.push(
+            sections::slot_page(
+                ctx,
+                "referral",
+                "settingsCatReferral",
+                "settingsCatReferralDesc",
+                FluxIcon::Gift,
+                view,
+            )
+            .fill_height(),
+        );
+    }
+    pages.extend([
         appearance::page(ctx, cx),
+        shortcuts::page(ctx, cx),
         download::page(ctx, cx),
         bt::page(ctx, cx),
         ed2k::page(ctx, cx),
@@ -391,7 +467,8 @@ pub(crate) fn build_pages(
         ),
         doctor::page(ctx, cx),
         about::page(ctx, cx),
-    ]
+    ]);
+    pages
 }
 
 impl Render for SettingsView {
@@ -403,6 +480,10 @@ impl Render for SettingsView {
             .into_iter()
             .filter_map(|page| page.filtered(&query))
             .collect();
+        // 当前就在「推介有奖」页而它已不可见（登出 / 偏好关闭）：退回账户页。
+        if self.selected == "referral" && !self.referral_visible(cx) {
+            self.selected = SharedString::from("account");
+        }
         if !pages.iter().any(|page| self.selected == page.key)
             && let Some(first) = pages.first()
         {

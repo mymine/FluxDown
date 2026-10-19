@@ -50,7 +50,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.IOException
 
-private const val SITE_HOST = "fluxdown.zerx.dev"
+private const val SITE_HOST = "fluxdown.com"
 private const val SITE_URL = "https://$SITE_HOST"
 private const val SPONSOR_URL = "$SITE_URL/sponsor"
 private const val PRIVACY_URL = "$SITE_URL/privacy"

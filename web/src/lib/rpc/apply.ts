@@ -276,6 +276,9 @@ export function applyDaemonEvent(snapshot: DaemonSnapshot, event: DaemonEvent): 
     }
     case 'taskActivityAdded':
     case 'taskNotice':
+    case 'pluginViewFrame':
+    case 'pluginViewClosed':
+    case 'pluginToast':
       return snapshot
     case 'snapshotReplaced':
       return event.data

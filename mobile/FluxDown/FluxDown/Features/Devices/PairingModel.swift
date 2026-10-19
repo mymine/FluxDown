@@ -6,8 +6,9 @@ import OSLog
 
 /// V4 直连配对页签的状态机（本机配对码 / 发现 / 手动配对 / SAS 核对）。
 ///
-/// 生命周期：页签出现 `start()`（开启发现 + 申请配对码），消失或 sheet 关闭 `stop()`（关闭发现 + `stopPairing`）；
-/// SAS 核对页挂起时 sheet 被关闭则 `pairFinish(accept:false)`，避免对端悬挂会话。
+/// 生命周期：页签出现 `start()`、本机局域网实际可达（`LanAccess.active`）时开启发现 + 申请配对码；
+/// 页签消失 / sheet 关闭 / 局域网不可达则 `stop()`（关闭发现 + `stopPairing`，并放弃进行中的发起流程）；
+/// 发起流程在 begin 进行中 / SAS 核对 / 等待对方确认时被放弃，一律 `pairFinish(accept:false)` 释放会话。
 /// 所有失败都落到可见的错误文案（`AccountText.error(_, context: .pairing)`），不伪造数据；只有拆除阶段（无界面可显示）才写日志。
 @MainActor
 @Observable
@@ -46,11 +47,20 @@ final class PairingModel {
     private var ownRequests = 0
     private(set) var discoveryError: String?
     private(set) var scanning = false
+    /// 发现开启 / 重新搜索后的 8 秒搜索窗口内（列表为空时显示「正在搜索…」）。
+    private(set) var searching = false
+    /// 本机局域网三态（由视图按 `agent.gateway` 分区同步；同步前按未就绪处理，不提前申请配对码 / 开发现）。
+    private(set) var lan: LinkRules.LanAccess = .disabled
 
     var ownLoading: Bool { ownRequests > 0 }
 
     @ObservationIgnored private unowned let container: AppContainer
+    /// 配对码 / 发现是否正在运行（= 页签可见 && 局域网 active && 未关闭）。
     @ObservationIgnored private var active = false
+    @ObservationIgnored private var visible = false
+    /// 发起流程代次：放弃流程（离开页签 / 关闭 / 取消等待）时自增，迟到的响应据此丢弃。
+    @ObservationIgnored private var flowGeneration = 0
+    @ObservationIgnored private var searchTask: Task<Void, Never>?
     @ObservationIgnored private var pairingStarted = false
     @ObservationIgnored private var closed = false
     @ObservationIgnored private var chain: Task<Void, Never>?
@@ -68,38 +78,92 @@ final class PairingModel {
 
     /// 直连页签出现：开启发现并申请本机配对码。
     func start() {
-        guard !active else { return }
-        active = true
+        visible = true
         closed = false
-        enqueue { [self] in await setDiscovery(true, report: true) }
-        refreshOwnCode()
+        reconcile()
     }
 
-    /// 直连页签消失：关闭发现与配对码广播（顺序在已排队的操作之后）。
-    func stop() {
-        guard active else { return }
-        active = false
-        expiryTask?.cancel()
-        expiryTask = nil
-        own = nil
-        ownError = nil
-        let stopCode = pairingStarted
-        pairingStarted = false
-        enqueue { [self] in
-            await setDiscovery(false, report: false)
-            if stopCode { await stopPairing() }
+    /// 视图同步本机局域网三态；变为 active 时补开发现与配对码，离开 active 时撤回。
+    func setLan(_ access: LinkRules.LanAccess) {
+        guard lan != access else { return }
+        lan = access
+        reconcile()
+    }
+
+    private func reconcile() {
+        let shouldRun = visible && !closed
+        if shouldRun, !active {
+            active = true
+            enqueue { [self] in await setDiscovery(true, report: true) }
+            beginSearching()
+        } else if !shouldRun, active {
+            active = false
+            searchTask?.cancel()
+            searchTask = nil
+            searching = false
+            enqueue { [self] in await setDiscovery(false, report: false) }
+        }
+        // 本机配对码（及其 mDNS 广播）只在局域网实际可达时申请；发现 / 发起配对不依赖它。
+        if active, lan == .active {
+            refreshOwnCode()
+        } else if pairingStarted || own != nil || ownError != nil {
+            expiryTask?.cancel()
+            expiryTask = nil
+            own = nil
+            ownError = nil
+            let stopCode = pairingStarted
+            pairingStarted = false
+            if stopCode { enqueue { [self] in await stopPairing() } }
         }
     }
 
-    /// sheet 关闭：停止一切，并放弃仍在等待核对的会话。
+    /// 直连页签消失：关闭发现与配对码广播（顺序在已排队的操作之后），并放弃进行中的发起流程。
+    func stop() {
+        visible = false
+        reconcile()
+        abandonFlow()
+    }
+
+    /// sheet 关闭：停止一切，并放弃仍在等待的会话。
     func dismissed() {
         closed = true
         stop()
-        if case let .verify(verify) = step {
+    }
+
+    /// 放弃进行中的发起流程：核对 / 等待阶段立即释放会话，begin 在途的迟到响应由代次丢弃并释放。
+    private func abandonFlow() {
+        flowGeneration += 1
+        switch step {
+        case let .verify(verify), let .finishing(verify):
             step = .form
             Task { await rejectSilently(token: verify.token) }
+        default:
+            break
         }
     }
+
+    /// 等待对方确认阶段点「取消」：回到表单并放弃等待。
+    func cancelFinishing() {
+        guard case .finishing = step else { return }
+        flowGeneration += 1
+        step = .form
+        message = nil
+    }
+
+    private func beginSearching() {
+        searchTask?.cancel()
+        searching = true
+        searchTask = Task { [self] in
+            do {
+                try await Task.sleep(for: .seconds(Self.searchWindow))
+            } catch {
+                return
+            }
+            searching = false
+        }
+    }
+
+    private static let searchWindow = 8
 
     // MARK: 本机配对码
 
@@ -160,6 +224,7 @@ final class PairingModel {
     func rescan() {
         guard active, !scanning else { return }
         scanning = true
+        beginSearching()
         enqueue { [self] in
             await setDiscovery(false, report: true)
             await setDiscovery(true, report: true)
@@ -194,11 +259,12 @@ final class PairingModel {
         case let .success(params):
             connecting = true
             message = nil
+            let generation = flowGeneration
             defer { connecting = false }
             do throws(HostError) {
                 let response = try await container.agent.linkPairBegin(params)
-                if closed {
-                    // sheet 已在等待期间关闭：不留悬挂会话。
+                if closed || generation != flowGeneration {
+                    // 对话框 / 页签已在等待期间离开：不留悬挂会话。
                     await rejectSilently(token: response.token)
                     return
                 }
@@ -219,9 +285,12 @@ final class PairingModel {
     func finish(accept: Bool) async {
         guard case let .verify(verify) = step else { return }
         message = nil
+        let generation = flowGeneration
         if accept { step = .finishing(verify) }
         do throws(HostError) {
             let response = try await container.agent.linkPairFinish(token: verify.token, accept: accept)
+            // 等待期间被取消 / 离开：结果作废（配对若已成立，由已配对列表的推送体现）。
+            guard generation == flowGeneration else { return }
             if !accept {
                 step = .form
                 code = ""
@@ -235,6 +304,7 @@ final class PairingModel {
                 FluxHaptic.warning.play()
             }
         } catch {
+            guard generation == flowGeneration else { return }
             step = .form
             message = AccountText.error(error, context: .pairing)
             FluxHaptic.error.play()

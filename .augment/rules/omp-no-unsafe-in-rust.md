@@ -43,6 +43,7 @@ description: "Rust 默认安全；仅允许经审查、无语义等价安全替�
 |`native/agent/src/platform/macos_cf.rs`|CF/LaunchServices 单一所有权边界；调用方不得操作裸 CF 引用|
 |`native/agent/src/platform/`|系统图标、Shell 定位/关联变更、环境变量变更广播（`WM_SETTINGCHANGE`）、COM 生命周期；每项遵守上述约束|
 |`native/agent/src/notification/`|macOS UserNotifications ABI 与 Windows WinRT apartment；已有安全接口优先|
+|`native/agent/src/platform/hotkey/`|全局快捷键：Windows `RegisterHotKey` + `WH_KEYBOARD_LL`（专用消息循环线程，钩子只观察不吞键、仅在有双击绑定时安装）；macOS Carbon `RegisterEventHotKey` + `NSEvent` 全局监听 + `AXIsProcessTrustedWithOptions`（主线程）。Linux X11 / Wayland 用 x11rb / ashpd 安全 API，零 unsafe|
 
 `native/{api,protocol,daemon,server,mobile}`、`crates/*`（GPUI）、`native/nmh`、`scripts/desktop-dev` 的项目源码保持零 unsafe；冻结 server 不改动。测试不自动豁免：先用安全 API，确需独立平台 oracle 才保留最小 FFI 并检查失败。
 

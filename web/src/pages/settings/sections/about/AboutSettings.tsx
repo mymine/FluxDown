@@ -3,18 +3,20 @@
 // 这里按 `snapshot.update` 展示状态，并提供「更新并重启」、取消下载、手动升级入口（Docker / NAS 为页内说明）。
 
 import { useState } from 'react'
-import { useT } from '../../../../i18n'
+import { useI18n, useT } from '../../../../i18n'
 import { exportLogs, rpc, useRpcSelector } from '../../../../lib/rpc'
+import type { ReleaseNoteDto } from '../../../../lib/rpc'
 import { Button, toast } from '../../../../ui'
 import { rpcErrorText } from '../../../../lib/rpcErrorText'
+import { localizedReleaseBody, releaseDate, releaseNoteBlocks, stripVersionHeading } from '../../../../lib/releaseNotes'
 import { canCancel, canInstall, manualLine, manualUrl, statusLine, updateLineText, useUpdateStatus } from '../../../../lib/update'
 import { DaemonNumberRow, PrefDropdownRow, PrefSwitchRow, SettingsCustomRow, SettingsPage, SettingsRow, SettingsSection, useSettingsReadOnly, usePrefString } from '../../kit'
 
 const CHROME_STORE = 'https://chromewebstore.google.com/search/FluxDown'
 const FIREFOX_STORE = 'https://addons.mozilla.org/firefox/addon/fluxdown/'
 const EDGE_STORE = 'https://microsoftedge.microsoft.com/addons/search/FluxDown'
-const DONATE = 'https://fluxdown.zerx.dev/sponsor'
-const WEBSITE = 'https://fluxdown.zerx.dev'
+const DONATE = 'https://fluxdown.com/sponsor'
+const WEBSITE = 'https://fluxdown.com'
 /** 服务端资产随统一的 `vX.Y.Z` release 发布（更早版本在 `server-v*` release）。 */
 const SERVER_RELEASES = 'https://github.com/zerx-lab/FluxDown/releases'
 
@@ -34,8 +36,51 @@ function LinkButtons({ links }: { links: readonly { label: string; url: string }
   )
 }
 
+/** 一个版本的更新说明：标题统一为「v版本 + 发布日期」，正文按界面语言取段并去掉重复的版本标题。 */
+function ReleaseNote({ note, locale, divided }: { note: ReleaseNoteDto; locale: string; divided: boolean }) {
+  const date = releaseDate(note.publishedAt)
+  const blocks = releaseNoteBlocks(stripVersionHeading(localizedReleaseBody(note.body, locale), note.version))
+  return (
+    <div className={divided ? 'flex flex-col gap-2 border-t border-border pt-4' : 'flex flex-col gap-2'}>
+      <div className="flex items-baseline gap-2">
+        <span className="text-sm font-semibold text-foreground">v{note.version}</span>
+        {date ? <span className="text-xs tabular text-muted-foreground">{date}</span> : null}
+      </div>
+      <div className="flex flex-col gap-2 break-words text-xs leading-relaxed text-foreground">
+        {blocks.map((block, index) => {
+          switch (block.kind) {
+            case 'heading':
+              return (
+                <div key={index} className="pt-1 font-medium">
+                  {block.text}
+                </div>
+              )
+            case 'list':
+              return (
+                <ul key={index} className="flex list-disc flex-col gap-1 pl-5 marker:text-muted-foreground">
+                  {block.items.map((item, itemIndex) => (
+                    <li key={itemIndex} style={item.depth > 0 ? { marginLeft: `${item.depth * 1.25}rem` } : undefined}>
+                      {item.text}
+                    </li>
+                  ))}
+                </ul>
+              )
+            case 'paragraph':
+              return (
+                <p key={index} className="whitespace-pre-line">
+                  {block.lines.join('\n')}
+                </p>
+              )
+          }
+        })}
+      </div>
+    </div>
+  )
+}
+
 function UpdateRow() {
   const t = useT()
+  const { locale } = useI18n()
   const disabled = useSettingsReadOnly()
   const channel = usePrefString('general.update_channel', 'stable')
   const status = useUpdateStatus()
@@ -94,14 +139,9 @@ function UpdateRow() {
         </div>
       </SettingsRow>
       {status && status.notes.length > 0 ? (
-        <SettingsCustomRow className="flex flex-col gap-3">
-          {status.notes.slice(0, 10).map((note) => (
-            <div key={note.version} className="flex flex-col gap-0.5">
-              <div className="text-sm text-foreground">
-                v{note.version} {note.publishedAt}
-              </div>
-              <div className="whitespace-pre-wrap break-words text-xs text-muted-foreground">{note.body}</div>
-            </div>
+        <SettingsCustomRow className="flex flex-col gap-4">
+          {status.notes.slice(0, 10).map((note, index) => (
+            <ReleaseNote key={note.version} note={note} locale={locale} divided={index > 0} />
           ))}
         </SettingsCustomRow>
       ) : null}

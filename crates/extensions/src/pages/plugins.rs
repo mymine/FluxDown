@@ -1,7 +1,10 @@
 //! 插件子页：已安装插件管理（启用 / 设置 / 更新 / 卸载）+ 安装区（zip / 开发目录）
 //! + 插件市场浏览与安装。
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use fluxdown_protocol::{InstalledPlugin, MarketEntryDto, PluginDto};
 use fluxdown_ui_components::{
@@ -29,15 +32,18 @@ use super::Frame;
 use crate::{
     ExtensionsTab, ExtensionsView,
     components::{
+        plugin_audit::open_plugin_audit,
         plugin_auth::PluginAuthDialog,
-        plugin_detail::{PluginDetail, open_plugin_detail, permission_label, yanked_label},
-        plugin_settings::PluginSettingsForm,
+        plugin_consent::{ConsentAction, ConsentRequest, open_consent_dialog},
+        plugin_detail::{OpenAudit, PluginDetail, open_plugin_detail, yanked_label},
+        plugin_settings::{PluginSettingsForm, PluginSettingsTabs},
     },
-    controller::{COMPONENT_KINDS, component_wire_name},
+    controller::{COMPONENT_KINDS, component_wire_name, grant_plugin_consent},
     error_text,
     market::{
-        MarketAction, confirmation_holds, filter_market, installed_version_yanked,
-        latest_per_plugin, market_action, permissions_to_confirm,
+        ConsentFlow, MarketAction, confirmation_holds, consent_flow, filter_market,
+        hosts_to_confirm, installed_version_yanked, latest_per_plugin, market_action,
+        permissions_to_confirm, risk_of,
     },
     ui,
 };
@@ -55,6 +61,9 @@ pub enum PluginOp {
     Reload,
 }
 
+/// 用户安装前确认过的（权限，主机）。
+pub(crate) type ConfirmedSets = (Vec<String>, Vec<String>);
+
 pub(crate) struct PluginsUi {
     pub dev_mode: bool,
     pub dev_dir: String,
@@ -65,6 +74,12 @@ pub(crate) struct PluginsUi {
     /// 「重新加载」在途的 dev 插件（按钮显示转圈）；是 `busy` 的子集。
     pub reloading: HashSet<String>,
     pub market: MarketUi,
+    pub site_defaults: super::site_defaults::SiteDefaultsUi,
+    /// 安装 / 更新 / 重载成功、等待插件列表追上后再判定授权流程的插件；
+    /// 值 = 市场路径下用户安装前确认过的（权限，主机）。
+    pub awaiting_consent: HashMap<String, Option<ConfirmedSets>>,
+    /// 市场安装在途时用户已确认的（权限，主机），按插件 id。
+    pub market_confirmed: HashMap<String, ConfirmedSets>,
 }
 
 impl Default for PluginsUi {
@@ -77,6 +92,9 @@ impl Default for PluginsUi {
             busy: HashSet::new(),
             reloading: HashSet::new(),
             market: MarketUi::default(),
+            site_defaults: super::site_defaults::SiteDefaultsUi::default(),
+            awaiting_consent: HashMap::new(),
+            market_confirmed: HashMap::new(),
         }
     }
 }
@@ -120,7 +138,9 @@ impl ExtensionsView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         self.ensure_market_loaded(window, cx);
+        self.ensure_site_defaults_loaded(window, cx);
         let search = self.ensure_market_search(window, cx);
+        self.schedule_ready_consents(window, cx);
         let query = search.read(cx).value().to_string();
         let theme = active_theme(cx);
         let frame = Frame {
@@ -178,6 +198,16 @@ impl ExtensionsView {
                         h_flex()
                             .gap(tokens.spacing.sm)
                             .items_center()
+                            .child(
+                                Button::new("plugin-audit-open")
+                                    .ghost()
+                                    .control(cx)
+                                    .label(translator.text("pluginAuditOpenAll").to_owned())
+                                    .disabled(stale)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_audit_dialog(None, window, cx);
+                                    })),
+                            )
                             .child(ui::meta_text(
                                 translator.text("pluginDevModeSwitch").to_owned(),
                                 frame,
@@ -203,6 +233,7 @@ impl ExtensionsView {
             } else {
                 list_card(installed, frame, cx)
             })
+            .children(self.render_site_defaults(frame, cx))
             .child(
                 v_flex()
                     .w_full()
@@ -382,6 +413,20 @@ impl ExtensionsView {
                     frame,
                 )
             }),
+            (plugin.disabled_reason == "Revoked").then(|| {
+                ui::tone_pill(
+                    translator.text("pluginDisabledRevoked").to_owned(),
+                    destructive,
+                    frame,
+                )
+            }),
+            (plugin.disabled_reason == "ConsentRequired").then(|| {
+                ui::tone_pill(
+                    translator.text("pluginDisabledConsentRequired").to_owned(),
+                    frame.extended.colors.warning,
+                    frame,
+                )
+            }),
             yanked
                 .and_then(|yanked| yanked_label(translator, yanked))
                 .map(|label| {
@@ -399,8 +444,8 @@ impl ExtensionsView {
                 )
             }),
         ];
-        let detail = PluginDetail::from_plugin(plugin);
-        let detail_translator = translator.clone();
+        let detail_identity = identity.clone();
+        let consent_pending = has_pending_consent(plugin);
         list_row(frame)
             .child(
                 v_flex()
@@ -429,7 +474,8 @@ impl ExtensionsView {
                                 !plugin.homepage.is_empty() && !ui::is_web_url(&plugin.homepage),
                                 |this| this.child(ui::meta_text(plugin.homepage.clone(), frame)),
                             )
-                            .children(badges.into_iter().flatten()),
+                            .children(badges.into_iter().flatten())
+                            .children(ui::risk_pill(("plugin-risk", index), &plugin.risk, frame)),
                     )
                     .when(!plugin.description.is_empty(), |this| {
                         this.child(
@@ -453,6 +499,21 @@ impl ExtensionsView {
                         )
                     }),
             )
+            .when(consent_pending, |this| {
+                let identity = identity.clone();
+                this.child(
+                    Button::new(("plugin-consent", index))
+                        .primary()
+                        .control(cx)
+                        .label(translator.text("pluginConsentButton").to_owned())
+                        .disabled(busy)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(plugin) = this.controller.plugin(&identity).cloned() {
+                                this.open_consent(plugin, window, cx);
+                            }
+                        })),
+                )
+            })
             .when_some(update, |this, entry| {
                 let pending = self.plugins.market.pending.contains(&entry.plugin_id);
                 let entry = entry.clone();
@@ -498,24 +559,60 @@ impl ExtensionsView {
                     .control_icon(cx)
                     .icon(FluxIcon::Info)
                     .tooltip(translator.text("pluginDetailDescription").to_owned())
-                    .on_click(move |_, window, cx| {
-                        open_plugin_detail(detail.clone(), detail_translator.clone(), window, cx);
-                    }),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.show_plugin_detail(&detail_identity, window, cx);
+                    })),
             )
-            .when(!load_failed && !plugin.settings.is_empty(), |this| {
-                let identity = identity.clone();
-                this.child(
-                    Button::new(("plugin-settings", index))
-                        .ghost()
-                        .control_icon(cx)
-                        .icon(FluxIcon::Settings)
-                        .tooltip(translator.text("pluginSettingsTooltip").to_owned())
-                        .disabled(busy || load_failed)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_plugin_settings(&identity, window, cx);
-                        })),
-                )
-            })
+            .children(
+                plugin
+                    .contributions
+                    .views
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, view)| {
+                        !load_failed
+                            && plugin.enabled
+                            && plugin.package_dir.is_some()
+                            && view.location == "window"
+                            && view.desktop.is_some()
+                    })
+                    .map(|(view_index, view)| {
+                        let target = plugin.clone();
+                        let view_id = view.id.clone();
+                        // views ≤ 16（manifest 校验），index * 16 + view_index 唯一。
+                        Button::new(("plugin-window", index * 16 + view_index))
+                            .ghost()
+                            .control_icon(cx)
+                            .icon(FluxIcon::AppWindow)
+                            .tooltip(view.title.clone())
+                            .disabled(busy)
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(crate::ExtensionsEvent::OpenPluginView {
+                                    plugin: target.clone(),
+                                    view: view_id.clone(),
+                                });
+                            }))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .when(
+                !load_failed
+                    && (!plugin.settings.is_empty() || self.settings_view(plugin).is_some()),
+                |this| {
+                    let identity = identity.clone();
+                    this.child(
+                        Button::new(("plugin-settings", index))
+                            .ghost()
+                            .control_icon(cx)
+                            .icon(FluxIcon::Settings)
+                            .tooltip(translator.text("pluginSettingsTooltip").to_owned())
+                            .disabled(busy || load_failed)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_plugin_settings(&identity, window, cx);
+                            })),
+                    )
+                },
+            )
             .when(!load_failed && plugin.auth_supported, |this| {
                 let identity = identity.clone();
                 this.child(
@@ -552,7 +649,7 @@ impl ExtensionsView {
             .child(
                 Switch::new(("plugin-enabled", index))
                     .checked(plugin.enabled && !load_failed)
-                    .disabled(busy || load_failed)
+                    .disabled(busy || load_failed || consent_pending)
                     .on_click(cx.listener(move |this, checked: &bool, window, cx| {
                         let future = this
                             .controller
@@ -725,7 +822,12 @@ impl ExtensionsView {
                             )
                             .children(yanked.map(|label| {
                                 ui::tone_pill(label, tokens.colors.destructive, frame)
-                            })),
+                            }))
+                            .children(ui::risk_pill(
+                                ("market-risk", index),
+                                risk_of(&entry.permissions),
+                                frame,
+                            )),
                     )
                     .when(!entry.description.is_empty(), |this| {
                         this.child(
@@ -742,7 +844,13 @@ impl ExtensionsView {
                     .icon(FluxIcon::Info)
                     .tooltip(translator.text("pluginDetailDescription").to_owned())
                     .on_click(move |_, window, cx| {
-                        open_plugin_detail(detail.clone(), detail_translator.clone(), window, cx);
+                        open_plugin_detail(
+                            detail.clone(),
+                            detail_translator.clone(),
+                            None,
+                            window,
+                            cx,
+                        );
                     }),
             )
             .child(
@@ -923,12 +1031,12 @@ impl ExtensionsView {
         self.recheck_market_install(entry.plugin_id, None, window, cx);
     }
 
-    /// 重新拉取索引后继续安装流程。`confirmed` = 用户已确认过的（版本，权限）：
+    /// 重新拉取索引后继续安装流程。`confirmed` = 用户已确认过的（版本，权限，主机）：
     /// 仍覆盖最新条目才直接安装，否则按最新条目重新确认。`pending` 由调用方置位。
     fn recheck_market_install(
         &mut self,
         plugin_id: String,
-        confirmed: Option<(String, Vec<String>)>,
+        confirmed: Option<(String, Vec<String>, Vec<String>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -970,18 +1078,29 @@ impl ExtensionsView {
                 };
                 let installed = this.controller.plugin(&plugin_id);
                 let permissions = permissions_to_confirm(&latest, installed);
+                let hosts = hosts_to_confirm(&latest, installed);
                 let holds = match &confirmed {
-                    Some((version, granted)) => {
-                        confirmation_holds(version, granted, &latest, installed)
-                    }
-                    None => permissions.is_empty(),
+                    Some((version, granted_permissions, granted_hosts)) => confirmation_holds(
+                        version,
+                        granted_permissions,
+                        granted_hosts,
+                        &latest,
+                        installed,
+                    ),
+                    None => permissions.is_empty() && hosts.is_empty(),
                 };
                 if holds {
                     let version = latest.version.clone();
-                    this.start_market_install(plugin_id, version, op, window, cx);
+                    let confirmed_sets = match confirmed {
+                        Some((_, granted_permissions, granted_hosts)) => {
+                            (granted_permissions, granted_hosts)
+                        }
+                        None => (permissions, hosts),
+                    };
+                    this.start_market_install(plugin_id, version, op, confirmed_sets, window, cx);
                 } else {
                     this.plugins.market.pending.remove(&plugin_id);
-                    this.confirm_market_permissions(latest, op, &permissions, window, cx);
+                    this.confirm_market_permissions(latest, op, permissions, hosts, window, cx);
                     cx.notify();
                 }
             }) else {
@@ -992,11 +1111,13 @@ impl ExtensionsView {
         .detach();
     }
 
+    /// 市场安装 / 更新前的权限确认：与授权对话框同一组件，展示权限、网络主机与风险等级。
     fn confirm_market_permissions(
         &self,
         entry: MarketEntryDto,
         op: PluginOp,
-        permissions: &[String],
+        permissions: Vec<String>,
+        hosts: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1019,67 +1140,58 @@ impl ExtensionsView {
                 "pluginPermConfirmInstallOk",
             )
         };
-        let lines = permissions
-            .iter()
-            .map(|permission| {
-                let (label, desc) = permission_label(translator, permission);
-                format!("• {label} — {desc}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let title = SharedString::from(translator.text_with(title_key, &[("name", &name)]));
-        let body = SharedString::from(format!(
-            "{}\n{lines}",
-            translator.text_with(body_key, &[("version", &entry.version)])
-        ));
-        let ok = SharedString::from(translator.text(ok_key).to_owned());
-        let cancel = SharedString::from(translator.text("cancel").to_owned());
+        let request = ConsentRequest {
+            title: translator.text_with(title_key, &[("name", &name)]).into(),
+            intro: translator
+                .text_with(body_key, &[("version", &entry.version)])
+                .into(),
+            ok_label: translator.text(ok_key).to_owned().into(),
+            risk: risk_of(&entry.permissions).to_owned(),
+            permissions: permissions.clone(),
+            network_hosts: hosts.clone(),
+        };
         let view = cx.entity().downgrade();
         let plugin_id = entry.plugin_id;
         let version = entry.version;
-        let confirmed = permissions.to_vec();
-        window.open_alert_dialog(cx, move |alert, _, cx| {
-            let view = view.clone();
-            let plugin_id = plugin_id.clone();
-            let version = version.clone();
-            let confirmed = confirmed.clone();
-            alert
-                .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
-                .description(body.clone())
-                .footer(fluxdown_ui_components::dialog_footer(
-                    Some(cancel.clone()),
-                    ok.clone(),
-                    fluxdown_ui_components::DialogIntent::Confirm,
+        let on_confirm = Rc::new(move |window: &mut Window, cx: &mut gpui::App| {
+            // 页面已释放时未提交安装，不能报告确认成功。
+            view.update(cx, |this, cx| {
+                // 确认后重新核对索引：daemon 安装的是当时最新条目。
+                this.plugins.market.pending.insert(plugin_id.clone());
+                cx.notify();
+                this.recheck_market_install(
+                    plugin_id.clone(),
+                    Some((version.clone(), permissions.clone(), hosts.clone())),
+                    window,
                     cx,
-                ))
-                .on_ok(move |_, window, cx| {
-                    // 页面已释放时未提交安装，不能报告确认成功。
-                    view.update(cx, |this, cx| {
-                        // 确认后重新核对索引：daemon 安装的是当时最新条目。
-                        this.plugins.market.pending.insert(plugin_id.clone());
-                        cx.notify();
-                        this.recheck_market_install(
-                            plugin_id.clone(),
-                            Some((version.clone(), confirmed.clone())),
-                            window,
-                            cx,
-                        );
-                    })
-                    .is_ok()
-                })
+                );
+            })
+            .is_ok()
         });
+        open_consent_dialog(
+            request,
+            ConsentAction::Confirm(on_confirm),
+            self.translator.clone(),
+            window,
+            cx,
+        );
     }
 
     /// 调用方已把 `plugin_id` 放入 `pending`；安装结束（成功或失败）时移除。
+    /// `confirmed` = 用户安装前确认的（权限，主机），安装成功后用于判定能否直接授权。
     fn start_market_install(
         &mut self,
         plugin_id: String,
         version: String,
         op: PluginOp,
+        confirmed: (Vec<String>, Vec<String>),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.plugins.market.pending.insert(plugin_id.clone());
+        self.plugins
+            .market_confirmed
+            .insert(plugin_id.clone(), confirmed);
         cx.notify();
         let future = self.controller.market_install(plugin_id.clone(), version);
         cx.spawn_in(window, async move |this, cx| {
@@ -1090,6 +1202,7 @@ impl ExtensionsView {
                 if let Err(error) = &result
                     && error.reason == Some(fluxdown_protocol::ErrorReason::MarketVersionChanged)
                 {
+                    this.plugins.market_confirmed.remove(&plugin_id);
                     this.finish_plugin_op(op, result, window, cx);
                     this.recheck_market_install(plugin_id, None, window, cx);
                     cx.notify();
@@ -1097,6 +1210,8 @@ impl ExtensionsView {
                 }
                 this.plugins.market.pending.remove(&plugin_id);
                 this.finish_plugin_op(op, result, window, cx);
+                // 失败时清理残留；成功时 `finish_plugin_op` 已取走。
+                this.plugins.market_confirmed.remove(&plugin_id);
                 cx.notify();
             }) else {
                 // 对话框或窗口已释放，停止回写异步结果。
@@ -1160,9 +1275,14 @@ impl ExtensionsView {
                     "pluginOpInstallSuccess"
                 };
                 let message = translator.text(key).to_owned();
-                let missing = serde_json::from_value::<InstalledPlugin>(value)
-                    .map(|installed| installed.missing_components)
+                let installed = serde_json::from_value::<InstalledPlugin>(value).ok();
+                let missing = installed
+                    .as_ref()
+                    .map(|installed| installed.missing_components.clone())
                     .unwrap_or_default();
+                if let Some(installed) = installed {
+                    self.track_consent(installed.identity);
+                }
                 self.toast_success(message, window, cx);
                 if !missing.is_empty() {
                     self.show_missing_components(&missing, window, cx);
@@ -1174,9 +1294,14 @@ impl ExtensionsView {
             }
             (PluginOp::Reload, Ok(value)) => {
                 let message = translator.text("pluginOpReloadSuccess").to_owned();
-                let missing = serde_json::from_value::<InstalledPlugin>(value)
-                    .map(|installed| installed.missing_components)
+                let installed = serde_json::from_value::<InstalledPlugin>(value).ok();
+                let missing = installed
+                    .as_ref()
+                    .map(|installed| installed.missing_components.clone())
                     .unwrap_or_default();
+                if let Some(installed) = installed {
+                    self.track_consent(installed.identity);
+                }
                 self.toast_success(message, window, cx);
                 if !missing.is_empty() {
                     self.show_missing_components(&missing, window, cx);
@@ -1302,45 +1427,56 @@ impl ExtensionsView {
         let cancel = SharedString::from(translator.text("cancel").to_owned());
         let translator_entity = self.translator.clone();
         let port = self.controller.port().clone();
-        let form =
-            cx.new(|cx| PluginSettingsForm::new(translator_entity, port, plugin, window, cx));
+        let view = match (self.settings_view(plugin), &self.plugin_view_factory) {
+            (Some(decl), Some(factory)) => Some(factory(plugin, decl, None, window, cx)),
+            _ => None,
+        };
+        let form = (!plugin.settings.is_empty()).then(|| {
+            cx.new(|cx| {
+                PluginSettingsForm::new(translator_entity.clone(), port, plugin, window, cx)
+            })
+        });
+        let tabs = cx.new(|_| PluginSettingsTabs::new(translator_entity.clone(), view, form));
         window.open_dialog(cx, move |dialog, _, cx| {
-            let is_saving = form.read(cx).is_saving();
-            let form_for_content = form.clone();
-            let form_for_save = form.clone();
+            let (is_saving, active_form) = {
+                let tabs = tabs.read(cx);
+                (tabs.is_saving(cx), tabs.active_form())
+            };
+            let tabs_for_content = tabs.clone();
+            let footer = DialogFooter::new()
+                .gap(active_theme(cx).tokens().spacing.sm)
+                .child(
+                    Button::new("plugin-settings-cancel")
+                        .outline()
+                        .control(cx)
+                        .label(cancel.clone())
+                        .disabled(is_saving)
+                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                )
+                .when_some(active_form, |footer, form| {
+                    footer.child(
+                        Button::new("plugin-settings-save")
+                            .primary()
+                            .control(cx)
+                            .label(if is_saving {
+                                saving.clone()
+                            } else {
+                                save.clone()
+                            })
+                            .busy(is_saving)
+                            .disabled(is_saving)
+                            .on_click(move |_, window, cx| {
+                                form.update(cx, |form, cx| form.submit(window, cx));
+                            }),
+                    )
+                });
             dialog
                 .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
                 .w(active_theme(cx).text_extent(560.))
                 .overlay_closable(!is_saving)
                 // min_h_0：窗口矮于对话框时让内容区收缩，交给表单内部滚动。
-                .content(move |content, _, _| content.min_h_0().child(form_for_content.clone()))
-                .footer(
-                    DialogFooter::new()
-                        .gap(active_theme(cx).tokens().spacing.sm)
-                        .child(
-                            Button::new("plugin-settings-cancel")
-                                .outline()
-                                .control(cx)
-                                .label(cancel.clone())
-                                .disabled(is_saving)
-                                .on_click(|_, window, cx| window.close_dialog(cx)),
-                        )
-                        .child(
-                            Button::new("plugin-settings-save")
-                                .primary()
-                                .control(cx)
-                                .label(if is_saving {
-                                    saving.clone()
-                                } else {
-                                    save.clone()
-                                })
-                                .busy(is_saving)
-                                .disabled(is_saving)
-                                .on_click(move |_, window, cx| {
-                                    form_for_save.update(cx, |form, cx| form.submit(window, cx));
-                                }),
-                        ),
-                )
+                .content(move |content, _, _| content.min_h_0().child(tabs_for_content.clone()))
+                .footer(footer)
         });
     }
 
@@ -1373,6 +1509,177 @@ impl ExtensionsView {
     }
 }
 
+impl ExtensionsView {
+    /// 插件的 settings 位置视图（需要 app 已注入视图工厂且插件已启用）。
+    fn settings_view<'a>(
+        &self,
+        plugin: &'a PluginDto,
+    ) -> Option<&'a fluxdown_protocol::PluginViewDeclDto> {
+        if self.plugin_view_factory.is_none() || !plugin.enabled {
+            return None;
+        }
+        plugin
+            .contributions
+            .views
+            .iter()
+            .find(|view| view.location == "settings")
+    }
+
+    fn open_consent(&self, plugin: PluginDto, window: &mut Window, cx: &mut Context<Self>) {
+        let request = ConsentRequest::for_plugin(&plugin, self.translator.read(cx));
+        let action = ConsentAction::Grant {
+            port: self.controller.port().clone(),
+            plugin: Box::new(plugin),
+        };
+        open_consent_dialog(request, action, self.translator.clone(), window, cx);
+    }
+
+    /// 打开审计对话框；`filter` = 预选插件。
+    fn open_audit_dialog(
+        &self,
+        filter: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        open_plugin_audit(
+            plugin_choices(self.controller.plugins()),
+            filter,
+            self.translator.clone(),
+            self.controller.port().clone(),
+            window,
+            cx,
+        );
+    }
+
+    fn show_plugin_detail(&self, identity: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plugin) = self.controller.plugin(identity) else {
+            return;
+        };
+        let detail = PluginDetail::from_plugin(plugin);
+        let translator = self.translator.read(cx).clone();
+        let choices = plugin_choices(self.controller.plugins());
+        let audit_translator = self.translator.clone();
+        let port = self.controller.port().clone();
+        let identity = identity.to_owned();
+        let open_audit: OpenAudit = Rc::new(move |window, cx| {
+            open_plugin_audit(
+                choices.clone(),
+                Some(identity.clone()),
+                audit_translator.clone(),
+                port.clone(),
+                window,
+                cx,
+            );
+        });
+        open_plugin_detail(detail, translator, Some(open_audit), window, cx);
+    }
+
+    /// 安装 / 更新 / 重载成功：等插件列表追上后再判定授权流程。
+    fn track_consent(&mut self, identity: String) {
+        let confirmed = self.plugins.market_confirmed.remove(&identity);
+        self.plugins.awaiting_consent.insert(identity, confirmed);
+    }
+
+    /// 列表中已追上、且确有待授权项的插件。
+    fn ready_consents(&self) -> Vec<String> {
+        self.plugins
+            .awaiting_consent
+            .keys()
+            .filter(|identity| {
+                self.controller
+                    .plugin(identity)
+                    .is_some_and(has_pending_consent)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// 列表整体替换后：已追上且无待授权项（或已不存在）的记录不再等待。
+    pub(crate) fn prune_awaiting_consent(&mut self) {
+        let controller = &self.controller;
+        self.plugins
+            .awaiting_consent
+            .retain(|identity, _| controller.plugin(identity).is_some_and(has_pending_consent));
+    }
+
+    /// 渲染中只读判定；有待处理项时经 `defer_in` 在渲染之外弹窗 / 调用授权。
+    fn schedule_ready_consents(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plugins.awaiting_consent.is_empty()
+            || self.controller.is_stale()
+            || self.ready_consents().is_empty()
+        {
+            return;
+        }
+        cx.defer_in(window, |this, window, cx| {
+            this.run_consent_flows(window, cx)
+        });
+    }
+
+    fn run_consent_flows(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for identity in self.ready_consents() {
+            let Some(confirmed) = self.plugins.awaiting_consent.remove(&identity) else {
+                continue;
+            };
+            let Some(plugin) = self.controller.plugin(&identity).cloned() else {
+                continue;
+            };
+            let flow = consent_flow(
+                &plugin,
+                confirmed
+                    .as_ref()
+                    .map(|(permissions, hosts)| (permissions.as_slice(), hosts.as_slice())),
+            );
+            match flow {
+                ConsentFlow::None => {}
+                ConsentFlow::Dialog => self.open_consent(plugin, window, cx),
+                ConsentFlow::Direct => self.grant_consent_directly(plugin, window, cx),
+            }
+        }
+        cx.notify();
+    }
+
+    /// 用户安装前已确认的集合正好等于待授权项：不再弹窗，直接授权；失败则回落到对话框。
+    fn grant_consent_directly(
+        &self,
+        plugin: PluginDto,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let future = grant_plugin_consent(self.controller.port(), &plugin);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = future.await;
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
+                if let Err(error) = result {
+                    let translator = this.translator.read(cx);
+                    let detail = error_text(translator, &error);
+                    let message =
+                        translator.text_with("pluginConsentFailed", &[("message", &detail)]);
+                    this.toast_error(message, window, cx);
+                    this.open_consent(plugin, window, cx);
+                }
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
+        })
+        .detach();
+    }
+}
+
+/// 插件有待授权的权限或网络主机。
+fn has_pending_consent(plugin: &PluginDto) -> bool {
+    !plugin.consent_pending.is_empty() || !plugin.consent_pending_hosts.is_empty()
+}
+
+/// 审计筛选候选：（identity，展示名）。
+fn plugin_choices(plugins: &[PluginDto]) -> Vec<(String, String)> {
+    plugins
+        .iter()
+        .map(|plugin| (plugin.identity.clone(), plugin.name.clone()))
+        .collect()
+}
+
 fn parse_market_entries(
     value: serde_json::Value,
 ) -> Result<Vec<MarketEntryDto>, fluxdown_protocol::RpcErrorData> {
@@ -1385,7 +1692,7 @@ fn parse_market_entries(
 }
 
 /// 列表卡片：一张 surface 卡片内纵向排列各行，行间 hairline 分隔（与下载表格同一「少线」风格）。
-fn list_card(rows: Vec<gpui::AnyElement>, frame: Frame<'_>, cx: &gpui::App) -> Div {
+pub(super) fn list_card(rows: Vec<gpui::AnyElement>, frame: Frame<'_>, cx: &gpui::App) -> Div {
     let count = rows.len();
     card(cx)
         .w_full()
@@ -1399,7 +1706,7 @@ fn list_card(rows: Vec<gpui::AnyElement>, frame: Frame<'_>, cx: &gpui::App) -> D
 }
 
 /// 列表行：横向排布、行内控件间距 `spacing.sm`，内边距 md / sm，悬停 `row_hover`。
-fn list_row(frame: Frame<'_>) -> Div {
+pub(super) fn list_row(frame: Frame<'_>) -> Div {
     let hover = frame.extended.colors.row_hover;
     h_flex()
         .w_full()

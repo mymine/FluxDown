@@ -134,7 +134,6 @@ impl GatewayService {
                     method::CAPABILITY_AGENT_BILLING.to_owned(),
                     method::CAPABILITY_AGENT_REFERRALS.to_owned(),
                     method::CAPABILITY_AGENT_EXTERNAL_CAPTURE.to_owned(),
-                    method::CAPABILITY_AGENT_DEVICE_LINK.to_owned(),
                 ],
             ),
             open_associations,
@@ -161,10 +160,15 @@ impl GatewayService {
         self
     }
 
-    /// 装配局域网直连服务（`agent.link.*`）。
+    /// 装配局域网直连服务（`agent.link.*`）。只有直连服务存在时才下发 `agent.deviceLink` 能力，
+    /// 客户端据此显示 / 隐藏直连入口（嵌入式移动宿主不带直连服务，不会宣告它）。
     #[must_use]
     pub fn with_link(mut self, link: Arc<LinkService>) -> Self {
         self.link = Some(link);
+        let capability = method::CAPABILITY_AGENT_DEVICE_LINK.to_owned();
+        if !self.hello.capabilities.contains(&capability) {
+            self.hello.capabilities.push(capability);
+        }
         self
     }
 
@@ -399,6 +403,10 @@ impl GatewayService {
             method::AGENT_DEVICE_DELETE => {
                 self.device_delete(params_or_empty(request.params)).await
             }
+            method::AGENT_DEVICE_DISCONNECT => {
+                self.device_disconnect(params_or_empty(request.params))
+                    .await
+            }
             method::AGENT_PLAN_LIST => cloud_value(self.cloud.plans().await),
             method::AGENT_ORDER_CREATE => cloud_value(
                 self.cloud
@@ -551,6 +559,7 @@ impl GatewayService {
             | method::AGENT_LINK_PAIR_FINISH
             | method::AGENT_LINK_APPROVE
             | method::AGENT_LINK_REMOVE
+            | method::AGENT_LINK_RENAME
             | method::AGENT_LINK_REFRESH
             | method::AGENT_LINK_DISPATCH => match &self.link {
                 Some(link) => link.rpc(&request.method, request.params).await,
@@ -996,6 +1005,29 @@ impl GatewayService {
                 .publish(fluxdown_protocol::AgentEvent::CloudDevicesChanged(devices));
         }
         Ok(value)
+    }
+
+    /// 让同账号另一台在线设备下线以释放在线名额。成功后本机若正处于在线名额受限的等待中，
+    /// 立即重连任务通道与配置同步，不必等下一个 30 秒重试。
+    async fn device_disconnect(
+        &self,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcErrorData> {
+        let epoch = self.cloud.request_epoch();
+        let id = required_string(&params, "id")?;
+        self.cloud
+            .at_epoch(epoch)
+            .disconnect_device(&id)
+            .await
+            .map_err(cloud_error_data)?;
+        let snapshot = agent_snapshot(&self.events)?;
+        if snapshot.cloud_connection.state != fluxdown_protocol::CloudConnectionState::Connected {
+            self.remote.request_reconnect();
+        }
+        if !snapshot.sync.connected {
+            self.sync.request_reconnect();
+        }
+        Ok(serde_json::json!({"ok": true}))
     }
 
     async fn order_get(
@@ -1576,6 +1608,8 @@ fn remote_error_data(error: RemoteError) -> RpcErrorData {
         RemoteError::Json(error) => internal_error("remote task response", error),
         RemoteError::State(error) => internal_error("agent state", error),
         RemoteError::Protocol(message) => internal_error("remote task protocol", message),
+        RemoteError::Kicked => RpcErrorData::new(ApplicationErrorCode::Conflict, false)
+            .with_reason(fluxdown_protocol::ErrorReason::OnlineDeviceLimit),
     }
 }
 
@@ -2480,6 +2514,21 @@ mod tests {
             allow_local_platform: bool,
             address: &str,
         ) -> Self {
+            Self::new_bound_link(label, server_mode, allow_local_platform, address, true).await
+        }
+
+        /// 不装配直连服务的网关（精简宿主）：不下发 `agent.deviceLink` 能力。
+        async fn new_without_link(label: &str) -> Self {
+            Self::new_bound_link(label, false, false, "127.0.0.1:0", false).await
+        }
+
+        async fn new_bound_link(
+            label: &str,
+            server_mode: bool,
+            allow_local_platform: bool,
+            address: &str,
+            attach_link: bool,
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "fluxdown_agent_{label}_{}_{}",
                 std::process::id(),
@@ -2497,6 +2546,7 @@ mod tests {
             let mut initial = crate::state::AgentState::default();
             initial.gateway.port = bound.port();
             initial.gateway.lan_enabled = !bound.ip().is_loopback();
+            initial.gateway.lan_active = !bound.ip().is_loopback();
             store.save(&initial).await.expect("save initial gateway");
             let endpoint_dir = dir.join("bearer-location");
             store
@@ -2590,6 +2640,7 @@ mod tests {
             let update = Arc::new(crate::update::UpdateService::unsupported(
                 events.clone(),
                 dir.join("update-data"),
+                crate::egress::Egress::system_default(),
             ));
             let link = crate::link::LinkService::new(crate::link::LinkServiceParts {
                 events: events.clone(),
@@ -2598,6 +2649,10 @@ mod tests {
                 tasks: Arc::new(crate::link::DaemonTaskCreator::new(daemon.clone())),
                 bound,
                 server_mode,
+                network: crate::link::LinkNetworkOptions {
+                    mdns: false,
+                    advertise: Vec::new(),
+                },
             });
             let api_host = Arc::new(crate::api_host::AgentApiHost::new(
                 daemon.clone(),
@@ -2615,28 +2670,29 @@ mod tests {
             api_config.token = api_token.clone();
             api_config.lan_enabled = !bound.ip().is_loopback();
             api_config.enforce_loopback_host = bound.ip().is_loopback();
-            let service = Arc::new(
-                GatewayService::new(
-                    daemon,
-                    events.clone(),
-                    auth,
-                    Arc::new(cloud_api),
-                    sync,
-                    remote,
-                    notify,
-                    capture,
-                    blobs.clone(),
-                    diagnostics.clone(),
-                    update,
-                    state.clone(),
-                    store.clone(),
-                    api_switches,
-                    api_token.clone(),
-                    local,
-                )
-                .with_server_mode(server_mode)
-                .with_link(link),
-            );
+            let mut gateway = GatewayService::new(
+                daemon,
+                events.clone(),
+                auth,
+                Arc::new(cloud_api),
+                sync,
+                remote,
+                notify,
+                capture,
+                blobs.clone(),
+                diagnostics.clone(),
+                update,
+                state.clone(),
+                store.clone(),
+                api_switches,
+                api_token.clone(),
+                local,
+            )
+            .with_server_mode(server_mode);
+            if attach_link {
+                gateway = gateway.with_link(link);
+            }
+            let service = Arc::new(gateway);
             let cancel = tokio_util::sync::CancellationToken::new();
             let server_handle = if server_mode {
                 let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
@@ -3712,6 +3768,72 @@ mod tests {
             );
         }
         harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn hello_advertises_the_device_link_capability_only_with_a_link_service() {
+        let device_link = fluxdown_protocol::method::CAPABILITY_AGENT_DEVICE_LINK;
+        let with_link = TestGateway::new("hello-with-link").await;
+        assert!(
+            with_link
+                .service
+                .hello
+                .capabilities
+                .iter()
+                .any(|capability| capability == device_link)
+        );
+        with_link.finish().await;
+
+        // 没有装配直连服务（精简宿主）：不宣告能力，客户端据此隐藏直连入口；RPC 也明确报不支持。
+        let without_link = TestGateway::new_without_link("hello-without-link").await;
+        let capabilities = &without_link.service.hello.capabilities;
+        assert!(
+            !capabilities
+                .iter()
+                .any(|capability| capability == device_link)
+        );
+        assert!(capabilities.iter().any(|capability| {
+            capability == fluxdown_protocol::method::CAPABILITY_AGENT_GATEWAY
+        }));
+        let response = without_link
+            .call(
+                fluxdown_protocol::method::AGENT_LINK_PAIRING_CODE,
+                serde_json::json!({}),
+            )
+            .await;
+        let RpcResponse::Failure(failure) = response else {
+            panic!("link RPC must fail without a link service: {response:?}");
+        };
+        assert_eq!(
+            failure.error.data.map(|data| data.code),
+            Some(ApplicationErrorCode::Unsupported)
+        );
+        without_link.finish().await;
+    }
+
+    #[tokio::test]
+    async fn gateway_status_distinguishes_the_configured_lan_flag_from_the_actual_binding() {
+        // 只监听回环：持久化的 `lanEnabled` 已开（下次启动才生效），但本次运行并不可被局域网访问。
+        let loopback = TestGateway::new("lan-active-loopback").await;
+        let status = loopback
+            .patch_gateway(serde_json::json!({ "lanEnabled": true }))
+            .await;
+        assert_eq!(status["lanEnabled"], true);
+        assert_eq!(status["lanActive"], false);
+        loopback.finish().await;
+
+        // 实际监听非回环地址：`lanActive` 为真，且随网关事件 / 状态一起下发。
+        let lan = TestGateway::new_bound("lan-active-lan", false, "0.0.0.0:0").await;
+        let status = lan
+            .patch_gateway(serde_json::json!({ "corsEnabled": false }))
+            .await;
+        assert_eq!(status["lanActive"], true);
+        let published = lan
+            .service
+            .events
+            .inspect(|snapshot| snapshot.gateway.clone());
+        assert!(published.lan_active);
+        lan.finish().await;
     }
 
     #[test]

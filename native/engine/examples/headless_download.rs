@@ -21,7 +21,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_config::BtConfig;
 use fluxdown_engine::proxy_config::ProxyConfig;
 use fluxdown_engine::{Engine, EngineConfig, NoopSelection, NoopSink};
 

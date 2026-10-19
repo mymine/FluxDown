@@ -5,6 +5,7 @@ import { CircleUser } from 'lucide-react'
 import { useState } from 'react'
 import { useT } from '../../../../i18n'
 import { useAgent, useConnection } from '../../../../lib/rpc'
+import { maxOnlineDevices } from '../../../../lib/cloud-presence'
 import type { CloudDevice, LinkDeviceInfo, SyncStatusDto } from '../../../../lib/rpc'
 import { Button, Card } from '../../../../ui'
 import { SettingsPage } from '../../kit'
@@ -56,9 +57,9 @@ export function AccountSettings() {
     <SettingsPage title={t('settingsCatAccount')} description={t('settingsCatAccountDesc')}>
       {session ? <ProfileCard session={session} disabled={disabled} /> : <HeroCard disabled={disabled} />}
       {session ? <SecurityCard session={session} disabled={disabled} /> : null}
-      {session ? <DevicesCard devices={devices} disabled={disabled} connection={cloudConnection} /> : null}
+      {session ? <DevicesCard devices={devices} disabled={disabled} connection={cloudConnection} maxOnline={maxOnlineDevices(session.entitlements)} /> : null}
       <PairedDevicesCard devices={linked} disabled={disabled} />
-      <CloudFeaturesCard loggedIn={session !== null} sync={sync} devices={devices} disabled={disabled} connection={cloudConnection} />
+      <CloudFeaturesCard loggedIn={session !== null} sync={sync} devices={devices} entitlements={session?.entitlements} disabled={disabled} connection={cloudConnection} />
     </SettingsPage>
   )
 }

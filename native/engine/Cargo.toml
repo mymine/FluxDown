@@ -27,10 +27,10 @@ fluxdown_link = { version = "0.1.0", path = "../link", optional = true }
 futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
-igd-next = { version = "0.17.1", features = ["aio_tokio"] }
+igd-next = { version = "0.17.1", features = ["aio_tokio"], optional = true }
 m3u8-rs = "6"
 md-5 = "0.10"
-md4 = "0.10"
+md4 = { version = "0.10", optional = true }
 rand = "0.9"
 # 与 feed-rs 同版本：feed 扩展命名空间（Mikan `<torrent><pubDate>`）的二次扫描。
 quick-xml = { version = "0.41", features = ["encoding"] }
@@ -56,7 +56,7 @@ fs2 = "0.4.3"
 fluxdown_logfile = { version = "0.1.0", path = "../logfile" }
 
 [target."cfg(windows)".dependencies]
-librqbit = { version = "9", default-features = false, features = ["default-tls"] }
+librqbit = { version = "9", default-features = false, features = ["default-tls"], optional = true }
 reqwest = { version = "0.12", features = ["stream", "native-tls", "cookies", "json", "socks"] }
 # 固定 0.59：0.61 引入 windows-link(raw-dylib)，与 cdylib 构建在 CI 上不兼容
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
@@ -64,7 +64,7 @@ winreg = "0.55"
 
 [target."cfg(not(windows))".dependencies]
 libc = "0.2"
-librqbit = { version = "9", default-features = false, features = ["rust-tls"] }
+librqbit = { version = "9", default-features = false, features = ["rust-tls"], optional = true }
 # native roots 保留 Linux/macOS 的本地 CA；bundled WebPKI roots 为 Android/iOS
 # 提供公共 CA 兜底，避免系统证书探测返回空库时所有 HTTPS 请求 UnknownIssuer。
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "cookies", "json", "socks", "charset", "http2", "system-proxy", "macos-system-configuration"] }
@@ -83,3 +83,29 @@ components = ["dep:zip"]
 # 冻结的 native/server 使用的引擎数据库存储后端（`link::DbLinkStorage`）。
 # 当前 agent 的互联状态独立持久化；保留此 feature 以维持旧 server 的源码契约。
 link = ["dep:fluxdown_link"]
+# P2P 能力（BitTorrent / eD2K）。默认开启；App Store 的 iOS 商店构建通过
+# `--no-default-features` 在**编译期**整体剔除（不链接 librqbit，也不残留休眠的 P2P 代码）。
+# 关闭后 magnet / .torrent / ed2k 任务一律被明确拒绝（见 `download_manager::UNSUPPORTED_PROTOCOL_MESSAGE`），
+# 其余协议行为不变。
+default = ["bt", "ed2k"]
+# BitTorrent：librqbit 会话、做种、tracker 订阅、种子元数据探测。
+bt = ["dep:librqbit"]
+# eD2K / Kad：协议栈、服务器订阅、UPnP 端口映射。
+ed2k = ["dep:igd-next", "dep:md4"]
+
+# 仅依赖 P2P 模块的探针 / 端到端示例：对应 feature 关闭时不参与构建。
+[[example]]
+name = "ed2k_e2e"
+required-features = ["ed2k"]
+
+[[example]]
+name = "kad_probe"
+required-features = ["ed2k"]
+
+[[example]]
+name = "peer_probe"
+required-features = ["ed2k"]
+
+[[example]]
+name = "prod_download"
+required-features = ["ed2k"]

@@ -2,7 +2,7 @@
 //!
 //! 对话框 UI 只负责渲染与发起 `agent.link.*` 调用，状态转换与边界判断集中在这里以便单测。
 
-use fluxdown_protocol::{LinkDeviceInfo, LinkDiscoveredPeer, LinkPairingCodeDto};
+use fluxdown_protocol::{LinkDeviceInfo, LinkDiscoveredPeer};
 
 /// 配对码位数（对端设备设置里展示的数字码）。
 pub(crate) const PAIRING_CODE_LEN: usize = 6;
@@ -123,11 +123,6 @@ pub(crate) fn group_sas(sas: &str) -> String {
         .join(" ")
 }
 
-/// 本机网关只监听回环时配对码没有可供对端输入的地址：提示开启局域网访问。
-pub(crate) fn needs_lan_hint(code: &LinkPairingCodeDto, lan_enabled: bool) -> bool {
-    code.addresses.is_empty() && !lan_enabled
-}
-
 /// 发起端配对流程。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PairFlow {
@@ -226,6 +221,10 @@ mod tests {
             last_seen_at: 0,
             default_save_dir: None,
             path_style: None,
+            custom_name: None,
+            app_version: None,
+            cloud_device_id: None,
+            revoked: false,
         }
     }
 
@@ -295,21 +294,6 @@ mod tests {
         assert_eq!(group_sas("1234567"), "123 456 7");
         assert_eq!(group_sas(" 12 34 "), "123 4");
         assert_eq!(group_sas(""), "");
-    }
-
-    #[test]
-    fn lan_hint_only_when_no_address_and_lan_access_off() {
-        let mut code = LinkPairingCodeDto {
-            code: "123456".to_owned(),
-            expires_at_unix_ms: 0,
-            addresses: Vec::new(),
-            fingerprint: String::new(),
-            device_name: String::new(),
-        };
-        assert!(needs_lan_hint(&code, false));
-        assert!(!needs_lan_hint(&code, true));
-        code.addresses.push("http://192.168.1.2:17800".to_owned());
-        assert!(!needs_lan_hint(&code, false));
     }
 
     #[test]

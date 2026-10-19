@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use fluxdown_protocol::{
-    ApplicationErrorCode, QueueDto, RpcErrorData, RssSourceDto, RssValidateRequest,
+    ApplicationErrorCode, PluginDto, QueueDto, RpcErrorData, RssSourceDto, RssValidateRequest,
     RssValidateResponse, method,
 };
 use fluxdown_ui_components::{
@@ -28,7 +28,13 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::RssPort;
+use crate::{
+    RssPort,
+    provider::{
+        BUILTIN_PROVIDER_ID, ProviderChoice, ProviderKind, normalize_provider_id, provider_choices,
+        validate_provider_config,
+    },
+};
 
 const INTERVALS: [i32; 7] = [10, 30, 60, 120, 360, 720, 1440];
 
@@ -51,9 +57,12 @@ struct Editor {
     port: Arc<dyn RssPort>,
     existing: Option<RssSourceDto>,
     queues: Vec<QueueDto>,
+    choices: Vec<ProviderChoice>,
+    provider_id: String,
     tab: Tab,
     name: Entity<InputState>,
     url: Entity<InputState>,
+    provider_config: Entity<InputState>,
     save_dir: Entity<InputState>,
     include: Entity<InputState>,
     exclude: Entity<InputState>,
@@ -84,6 +93,7 @@ pub(super) fn open_editor(
     port: Arc<dyn RssPort>,
     source: Option<RssSourceDto>,
     queues: Vec<QueueDto>,
+    plugins: Vec<PluginDto>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -97,7 +107,7 @@ pub(super) fn open_editor(
             })
             .to_owned(),
     );
-    let editor = cx.new(|cx| Editor::new(translator, port, source, queues, window, cx));
+    let editor = cx.new(|cx| Editor::new(translator, port, source, queues, plugins, window, cx));
     let url = editor.read(cx).url.clone();
     window.open_dialog(cx, move |dialog, _, cx| {
         let editor = editor.clone();
@@ -118,6 +128,7 @@ impl Editor {
         port: Arc<dyn RssPort>,
         existing: Option<RssSourceDto>,
         queues: Vec<QueueDto>,
+        plugins: Vec<PluginDto>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -138,6 +149,11 @@ impl Editor {
         let url = input(
             source.map_or_else(String::new, |s| s.url.clone()),
             "rssUrlHint",
+            cx,
+        );
+        let provider_config = input(
+            source.map_or_else(String::new, |s| s.provider_config.clone()),
+            "rssProviderConfigPlaceholder",
             cx,
         );
         let save_dir = input(
@@ -194,7 +210,7 @@ impl Editor {
             "rssMaxPerFetchLabel",
             cx,
         );
-        for field in [&url, &cookies, &user_agent, &proxy] {
+        for field in [&url, &provider_config, &cookies, &user_agent, &proxy] {
             cx.subscribe(field, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.validated = None;
@@ -205,6 +221,9 @@ impl Editor {
             .detach();
         }
         cx.observe(&translator, |_, _, cx| cx.notify()).detach();
+        let provider_id =
+            normalize_provider_id(source.map_or("", |s| s.provider_id.as_str())).to_owned();
+        let choices = provider_choices(&plugins, &provider_id);
         let queue_id = source
             .map(|s| s.queue_id.clone())
             .filter(|id| !id.is_empty())
@@ -230,8 +249,11 @@ impl Editor {
             notify_on_download: source.is_none_or(|s| s.notify_on_download),
             existing,
             queues,
+            choices,
+            provider_id,
             name,
             url,
+            provider_config,
             save_dir,
             include,
             exclude,
@@ -259,10 +281,36 @@ impl Editor {
 
     fn request(&self, cx: &App) -> RssValidateRequest {
         RssValidateRequest {
+            provider_id: self.provider_id.clone(),
+            provider_config: if self.provider_id == BUILTIN_PROVIDER_ID {
+                String::new()
+            } else {
+                Self::value(&self.provider_config, cx)
+            },
             url: Self::value(&self.url, cx),
             cookies: Self::value(&self.cookies, cx),
             user_agent: Self::value(&self.user_agent, cx),
             proxy_url: Self::value(&self.proxy, cx),
+        }
+    }
+
+    /// 插件 provider 的配置必须留空或为合法 JSON；非法时回到基础页提示。
+    fn check_provider_config(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.provider_id == BUILTIN_PROVIDER_ID
+            || validate_provider_config(&Self::value(&self.provider_config, cx)).is_some()
+        {
+            return true;
+        }
+        self.tab = Tab::Basic;
+        self.fail("rssProviderConfigInvalid", cx);
+        false
+    }
+
+    fn provider_label(&self, choice: &ProviderChoice, cx: &App) -> SharedString {
+        match choice.kind {
+            ProviderKind::Builtin => self.t("rssProviderBuiltin", cx),
+            ProviderKind::Plugin => SharedString::from(choice.name.clone()),
+            ProviderKind::Missing => SharedString::from(choice.id.clone()),
         }
     }
 
@@ -279,6 +327,9 @@ impl Editor {
         if request.url.is_empty() {
             self.tab = Tab::Basic;
             self.fail("rssFeedRequired", cx);
+            return;
+        }
+        if !self.check_provider_config(cx) {
             return;
         }
         let Ok(params) = serde_json::to_value(&request) else {
@@ -333,6 +384,9 @@ impl Editor {
         if request.url.is_empty() {
             self.tab = Tab::Basic;
             self.fail("rssFeedRequired", cx);
+            return;
+        }
+        if !self.check_provider_config(cx) {
             return;
         }
         if self.existing.is_none()
@@ -403,6 +457,8 @@ impl Editor {
             position: 0,
             unread_count: 0,
         });
+        source.provider_id = self.provider_id.clone();
+        source.provider_config = request.provider_config;
         source.url = request.url;
         source.name = Self::value(&self.name, cx);
         if self.existing.is_none() && source.name.is_empty() {
@@ -592,7 +648,51 @@ impl Editor {
         )
     }
 
+    /// 来源类型：没有任何可用插件 provider 时整行隐藏，界面与仅内置 RSS 时一致。
+    fn render_provider_field(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.choices.len() <= 1 {
+            return None;
+        }
+        let current = self.choices.iter().find(|c| c.id == self.provider_id);
+        let label = current.map_or_else(
+            || SharedString::from(self.provider_id.clone()),
+            |choice| self.provider_label(choice, cx),
+        );
+        let hint = match current.map(|c| c.kind) {
+            Some(ProviderKind::Plugin) => Some(self.t("rssProviderPluginHint", cx)),
+            Some(ProviderKind::Missing) => Some(SharedString::from(
+                self.t("rssProviderUnavailable", cx)
+                    .replace("{id}", &self.provider_id),
+            )),
+            _ => None,
+        };
+        let options = self
+            .choices
+            .iter()
+            .map(|choice| (choice.id.clone(), self.provider_label(choice, cx)))
+            .collect();
+        Some(form_field(
+            self.t("rssProviderLabel", cx),
+            self.menu(
+                "rss-editor-provider",
+                label,
+                options,
+                |this, value| {
+                    if this.provider_id != value {
+                        this.provider_id = value;
+                        this.validated = None;
+                        this.error = None;
+                    }
+                },
+                cx,
+            ),
+            hint,
+            cx,
+        ))
+    }
+
     fn render_basic(&self, cx: &mut Context<Self>) -> Div {
+        let provider_field = self.render_provider_field(cx);
         let theme = active_theme(cx);
         let tokens = theme.tokens().clone();
         let tertiary = theme.extended().colors.text_tertiary;
@@ -641,8 +741,16 @@ impl Editor {
         } else {
             None
         };
+        let builtin = self.provider_id == BUILTIN_PROVIDER_ID;
         let url_field = form_field(
-            self.t("rssUrlLabel", cx),
+            self.t(
+                if builtin {
+                    "rssUrlLabel"
+                } else {
+                    "rssProviderUrlLabel"
+                },
+                cx,
+            ),
             input_with_action(
                 Input::new(&self.url).control(cx).w_full(),
                 Button::new("rss-editor-validate")
@@ -658,7 +766,19 @@ impl Editor {
             cx,
         );
 
-        let mut body = form(cx).child(url_field);
+        let mut body = form(cx);
+        if let Some(provider_field) = provider_field {
+            body = body.child(provider_field);
+        }
+        body = body.child(url_field);
+        if !builtin {
+            body = body.child(form_field(
+                self.t("rssProviderConfigLabel", cx),
+                Input::new(&self.provider_config).control(cx).w_full(),
+                Some(self.t("rssProviderConfigHint", cx)),
+                cx,
+            ));
+        }
         if let Some(feed) = self.validated.as_ref().filter(|_| self.existing.is_none()) {
             body = body.child(
                 card(cx)
@@ -941,7 +1061,9 @@ impl Render for Editor {
 }
 
 fn same_request(a: &RssValidateRequest, b: &RssValidateRequest) -> bool {
-    a.url == b.url
+    a.provider_id == b.provider_id
+        && a.provider_config == b.provider_config
+        && a.url == b.url
         && a.cookies == b.cookies
         && a.user_agent == b.user_agent
         && a.proxy_url == b.proxy_url

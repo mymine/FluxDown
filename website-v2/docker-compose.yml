@@ -1,7 +1,6 @@
-# 主站：与 website/（v1 旧站，project=fluxdown，容器 fluxdown-website，宿主端口 4321）并行部署，
-# project / 镜像 / 容器名 / 宿主端口都必须与 v1 区分，否则会互相覆盖。
-# 反代：https://fluxdown.zerx.dev/ → 127.0.0.1:4322（根部署）；/v2/ 旧预览地址由反代 301 到根。
-# 宿主端口沿用预览期分配、不与 v1 对调：两条部署流水线执行顺序不定，对调会让先部署的一方撞端口。
+# 官网（根部署）。反代：https://fluxdown.com/ → 127.0.0.1:4322（旧域名 fluxdown.zerx.dev 同指此端口，登录入口反代 302 到新域名）；
+# 旧地址 /v1/（已下线的旧站存档）与 /v2/（预览期）由反代 301 到根。
+# project / 镜像 / 容器名 / 宿主端口沿用预览期命名与分配；改动须同步服务器反代与 deploy.sh 的兜底清理。
 name: fluxdown-v2
 services:
   website:

@@ -5,6 +5,7 @@ import {
   looksLikeRealFilename,
   mimeToExtension,
   parseContentDispositionFilename,
+  queryDispositionFilename,
   readDispositionHeader,
   resolveDownloadFilename,
 } from "./filename";
@@ -277,5 +278,38 @@ describe("extractCleanFilename mime fallback for batch items", () => {
     expect(
       extractCleanFilename(undefined, "https://cdn/x/abc123", "application/zip"),
     ).toBe("abc123.zip");
+  });
+});
+
+describe("queryDispositionFilename", () => {
+  // 与引擎 naming 测试同一组样例（GitHub release / S3 / Azure）。
+  const github =
+    "https://release-assets.githubusercontent.com/github-production-release-asset/212613049/55d46ea0-2e36-4071-bd9b-6536b7dae14d" +
+    "?sp=r&sv=2018-11-09&rscd=attachment%3B+filename%3Dgh_2.62.0_macOS_arm64.zip&rsct=application%2Foctet-stream";
+
+  test("reads Azure rscd and S3 response-content-disposition", () => {
+    expect(queryDispositionFilename(github)).toBe("gh_2.62.0_macOS_arm64.zip");
+    expect(
+      queryDispositionFilename(
+        "https://bucket.s3.amazonaws.com/key/abc123?response-content-disposition=attachment%3B%20filename%3D%22a%20b.zip%22&X-Amz-Signature=deadbeef",
+      ),
+    ).toBe("a b.zip");
+    expect(
+      queryDispositionFilename(
+        "https://e.com/o?Response-Content-Disposition=attachment%3B%20filename%2A%3DUTF-8%27%27%25E4%25BD%25A0%25E5%25A5%25BD.zip",
+      ),
+    ).toBe("你好.zip");
+  });
+
+  test("no filename in the query disposition yields empty", () => {
+    expect(queryDispositionFilename("https://e.com/f.bin?rscd=inline")).toBe("");
+    expect(queryDispositionFilename("https://e.com/f.bin")).toBe("");
+    expect(queryDispositionFilename("https://e.com/f.bin#rscd=attachment%3Bfilename%3Dx.zip")).toBe("");
+  });
+
+  test("signed CDN link without a browser name uses the query name, not the object id", () => {
+    expect(extractCleanFilename("", github, "application/octet-stream")).toBe("gh_2.62.0_macOS_arm64.zip");
+    // 浏览器定下的真实名仍然优先。
+    expect(extractCleanFilename("/dl/renamed.zip", github)).toBe("renamed.zip");
   });
 });

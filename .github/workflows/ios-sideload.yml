@@ -1,0 +1,128 @@
+# 原生 iOS App（mobile/FluxDown）侧载版：full flavor（本机引擎含 BitTorrent / eD2K）**未签名** IPA，
+# 供 AltStore / SideStore / Sideloadly 等用户自签安装。商店构建（store flavor）见 ios-testflight.yml，两者互相独立。
+# 流程与本机一致，全部在 mobile/FluxDown/scripts/sideload.sh：
+#   build-core.sh --release --flavor full → xcodebuild archive（CODE_SIGNING_ALLOWED=NO、FLUX_FLAVOR_CONDITIONS=FULL_P2P）
+#   → 打包 Payload/FluxDown.app 为 .ipa。不需要任何签名密钥。
+# 触发：
+#   - 推送 v* tag：版本号取 tag（vX.Y.Z-rc.N → X.Y.Z）；IPA 作为 artifact，并挂到同名 GitHub Release
+#     （release.yml 先建草稿；release 尚不存在则只留 artifact，可手动重跑本 workflow 补挂）。
+#   - 手动：gh workflow run ios-sideload.yml --ref main -f version=X.Y.Z [-f release_tag=vX.Y.Z]
+#     release_tag 留空 = 只出 artifact，不挂 Release。
+# 构建号 = UTC 时间 YYYYMMDD.HHMMSS（只用于 CFBundleVersion，侧载不需要唯一性之外的约束）。
+# Secrets：FLUXCLOUD_BASE_URL（可选，编译期写入核心）。
+name: iOS Sideload (unsigned IPA)
+run-name: >-
+  ${{ inputs.version != ''
+  && format('iOS Sideload {0}', inputs.version)
+  || format('iOS Sideload {0}', github.ref_name) }}
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "CFBundleShortVersionString（X.Y.Z）"
+        required: true
+        type: string
+      release_tag:
+        description: "挂载到的 GitHub Release tag（如 v1.2.3；留空 = 只出 artifact）"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-sideload-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sideload:
+    name: Build unsigned sideload IPA
+    # 与商店构建同一镜像要求：工程是 Xcode 27 格式（objectVersion 110）且用了 iOS 27 SDK API。
+    runs-on: xcode-27
+    timeout-minutes: 120
+    env:
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "10"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version, build number and release tag
+        id: meta
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+            RELEASE_TAG="$INPUT_RELEASE_TAG"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+            VERSION="${VERSION%%-*}"
+            RELEASE_TAG="$GITHUB_REF_NAME"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::版本号须为 X.Y.Z（得到 '$VERSION'）"
+            exit 1
+          fi
+          {
+            echo "version=$VERSION"
+            echo "build=$(date -u +%Y%m%d.%H%M%S)"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Select newest Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-sideload
+          cache-on-failure: true
+
+      - name: Build unsigned IPA
+        env:
+          FLUXCLOUD_BASE_URL_SECRET: ${{ secrets.FLUXCLOUD_BASE_URL }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          BUILD: ${{ steps.meta.outputs.build }}
+        run: |
+          if [ -n "$FLUXCLOUD_BASE_URL_SECRET" ]; then export FLUXCLOUD_BASE_URL="$FLUXCLOUD_BASE_URL_SECRET"; fi
+          mobile/FluxDown/scripts/sideload.sh --version "$VERSION" --build "$BUILD"
+          echo "### iOS sideload ${VERSION} (${BUILD}) — 未签名 IPA（full flavor），见 artifact" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-sideload-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.build }}
+          path: mobile/FluxDown/build/sideload/FluxDown-*-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to GitHub Release
+        if: steps.meta.outputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::warning::release $TAG 尚不存在，未挂载侧载 IPA（artifact 已保留；release 建好后重跑本 workflow 补挂）"
+            exit 0
+          fi
+          ASSET="$RUNNER_TEMP/FluxDown-${VERSION}-ios-sideload-unsigned.ipa"
+          cp mobile/FluxDown/build/sideload/FluxDown-*-unsigned.ipa "$ASSET"
+          gh release upload "$TAG" "$ASSET" --clobber

@@ -1156,6 +1156,8 @@ pub(crate) struct SettingsTab {
     sections: Vec<SettingsSection>,
     /// 由 capability 注入的整页视图（账户 / 扩展）。
     view: Option<gpui::AnyView>,
+    /// 注入视图占满内容区高度并自管滚动（宿主不再包滚动容器）。
+    fill: bool,
 }
 
 impl SettingsTab {
@@ -1165,6 +1167,7 @@ impl SettingsTab {
             label: label.into(),
             sections: Vec::new(),
             view: None,
+            fill: false,
         }
     }
 
@@ -1213,11 +1216,19 @@ impl SettingsTab {
             label: self.label.clone(),
             sections,
             view: None,
+            fill: false,
         })
     }
 
     fn render(&self, key: &str, width: f32, window: &mut Window, cx: &mut App) -> AnyElement {
         if let Some(view) = self.view.clone() {
+            if self.fill {
+                return v_flex()
+                    .size_full()
+                    .min_h_0()
+                    .child(view)
+                    .into_any_element();
+            }
             return div().w_full().child(view).into_any_element();
         }
         // 单分组 Tab 里分组标题与 Tab 标签同名时省略标题，避免视觉重复。
@@ -1310,6 +1321,24 @@ impl SettingsPage {
     pub(crate) fn tab(mut self, tab: SettingsTab) -> Self {
         self.tabs.push(tab);
         self
+    }
+
+    /// 注入视图的 Tab 改为占满内容区高度、由视图自管滚动（固定头部 + 局部滚动）。
+    #[must_use]
+    pub(crate) fn fill_height(mut self) -> Self {
+        for tab in &mut self.tabs {
+            tab.fill = tab.view.is_some();
+        }
+        self
+    }
+
+    /// 指定子 Tab 是否占满内容区高度（未知 id 按首个 Tab）。
+    pub(crate) fn tab_fills_height(&self, tab_id: &str) -> bool {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .or_else(|| self.tabs.first())
+            .is_some_and(|tab| tab.fill)
     }
 
     pub(crate) fn nav_icon(&self) -> Icon {

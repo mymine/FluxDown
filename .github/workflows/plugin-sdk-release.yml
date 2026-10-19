@@ -1,0 +1,48 @@
+# 发布 fluxdown-plugin-sdk 到 npm。只由 `plugin-sdk-v*` tag 触发，与应用发布（v* tag）互不影响。
+# 前置：包归属 npm 用户 `zerx-lab`（`@fluxdown` 作用域属他人），仓库 secret `NPM_TOKEN` 为该账号的发布令牌。
+name: Plugin SDK Release
+
+on:
+  push:
+    tags: ["plugin-sdk-v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish fluxdown-plugin-sdk
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/plugin-sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify tag matches package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          EXPECTED="${TAG#plugin-sdk-v}"
+          ACTUAL="$(node -p "require('./package.json').version")"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::tag ${TAG} expects version ${EXPECTED}, package.json has ${ACTUAL}"
+            exit 1
+          fi
+
+      - run: bun install --frozen-lockfile
+      - run: bun run gen:check
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run build
+
+      - name: Publish
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

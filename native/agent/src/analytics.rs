@@ -14,7 +14,7 @@ const BAKED_APP_KEY: &str = match option_env!("FLUXDOWN_ANALYTICS_APP_KEY") {
     None => "",
 };
 const DEFAULT_ENDPOINT: &str =
-    "https://ops.zerx.dev/api/zerx.v1.AnalyticsIngestService/TrackEvents";
+    "https://ops.fluxdown.com/api/zerx.v1.AnalyticsIngestService/TrackEvents";
 
 pub struct AnalyticsWorker {
     state: Arc<Mutex<AgentState>>,

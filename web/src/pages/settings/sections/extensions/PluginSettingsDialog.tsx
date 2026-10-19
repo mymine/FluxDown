@@ -11,7 +11,9 @@ import type { TFunction } from '../../../../i18n'
 import { copyText } from '../../../../lib/copy'
 import { RpcError, rpc } from '../../../../lib/rpc'
 import type { PluginDto, SettingFieldDto } from '../../../../lib/rpc'
-import { Button, Dialog, DialogFooter, FieldError, FormField, Icon, Input, OptionGroup, OptionRow, Select, Switch, Textarea, toast } from '../../../../ui'
+import { Button, Dialog, DialogFooter, FieldError, FormField, Icon, Input, OptionGroup, OptionRow, SegmentedTabs, Select, Switch, Textarea, toast } from '../../../../ui'
+import { activeSettingsViewOf } from '../../../plugins/contributions'
+import { PluginViewHost } from '../../../plugins/view/PluginViewHost'
 import { extensionErrorText } from './errors'
 import { initialFieldValue, rangeHint, validateField } from './logic'
 import type { FieldError as FieldErrorInfo } from './logic'
@@ -132,6 +134,11 @@ function SettingsBody({ plugin, onClose }: { plugin: PluginDto; onClose: () => v
   const [errors, setErrors] = useState<Record<string, FieldErrorInfo>>({})
   const [serverError, setServerError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
+  // 插件的设置视图（可移植实现）：有则以分段标签与「基础设置」表单并列。
+  const settingsView = activeSettingsViewOf(plugin)
+  const hasBasic = plugin.settings.length > 0
+  const [tab, setTab] = useState<'view' | 'basic'>(settingsView ? 'view' : 'basic')
+  const activeTab = settingsView && hasBasic ? tab : settingsView ? 'view' : 'basic'
 
   const setValue = (key: string, value: string) => {
     setValues((current) => ({ ...current, [key]: value }))
@@ -234,18 +241,40 @@ function SettingsBody({ plugin, onClose }: { plugin: PluginDto; onClose: () => v
       onOpenChange={(open) => !open && !saving && onClose()}
       modalLocked={saving}
       title={t('pluginSettingsDialogTitle', { name: plugin.name })}
+      size={activeTab === 'view' ? 'lg' : undefined}
       footer={
-        <DialogFooter>
-          <Button variant="outline" onClick={onClose} disabled={saving}>
-            {t('cancel')}
-          </Button>
-          <Button variant="primary" onClick={() => void submit()} loading={saving}>
-            {saving ? t('pluginSettingsSaving') : t('pluginSettingsSaveButton')}
-          </Button>
-        </DialogFooter>
+        activeTab === 'view' ? (
+          <DialogFooter>
+            <Button variant="outline" onClick={onClose}>
+              {t('close')}
+            </Button>
+          </DialogFooter>
+        ) : (
+          <DialogFooter>
+            <Button variant="outline" onClick={onClose} disabled={saving}>
+              {t('cancel')}
+            </Button>
+            <Button variant="primary" onClick={() => void submit()} loading={saving}>
+              {saving ? t('pluginSettingsSaving') : t('pluginSettingsSaveButton')}
+            </Button>
+          </DialogFooter>
+        )
       }
     >
-      <div className="flex w-full flex-col gap-4 py-1">
+      {settingsView && hasBasic ? (
+        <div className="flex pb-2">
+          <SegmentedTabs
+            items={[
+              { value: 'view' as const, label: t('pluginSettingsViewTab') },
+              { value: 'basic' as const, label: t('pluginSettingsBasicTab') },
+            ]}
+            value={activeTab}
+            onValueChange={setTab}
+          />
+        </div>
+      ) : null}
+      {settingsView && activeTab === 'view' ? <PluginViewHost identity={plugin.identity} view={settingsView.id} /> : null}
+      <div className={activeTab === 'basic' ? 'flex w-full flex-col gap-4 py-1' : 'hidden'}>
         {serverError ? (
           <div role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
             {serverError}

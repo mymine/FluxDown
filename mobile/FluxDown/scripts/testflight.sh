@@ -17,6 +17,8 @@
 #       环境变量 APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_PATH（.p8）；
 #       可选 FLUXCLOUD_BASE_URL（编译期写入核心，见 build-core.sh）；FLUXDOWN_APP_VERSION 缺省取 --version，
 #       写入核心的协议握手 / 云端 / UA 版本（与 Android package.sh、桌面打包一致）。
+#       商店构建固定 store flavor（build-core.sh --flavor store + FLUX_FLAVOR_CONDITIONS= 置空 FULL_P2P）；
+#       --skip-core 时核对核心 flavor 标记，非 store 直接拒绝；侧载构建见 sideload.sh。
 set -euo pipefail
 
 TEAM_ID="KD4N89AAF5"
@@ -98,9 +100,13 @@ if [ -n "$PROFILE" ]; then
   echo "==> installed provisioning profile $UUID"
 fi
 
+# 商店构建固定 store flavor：核心编译期不含 P2P，App 不定义 FULL_P2P。
 if [ "$SKIP_CORE" = 0 ]; then
-  FLUXDOWN_APP_VERSION="${FLUXDOWN_APP_VERSION:-$VERSION}" "$SCRIPT_DIR/build-core.sh" --release
+  FLUXDOWN_APP_VERSION="${FLUXDOWN_APP_VERSION:-$VERSION}" "$SCRIPT_DIR/build-core.sh" --release --flavor store
 fi
+CORE_FLAVOR="$(cat "$IOS_ROOT/FluxKit/Artifacts/flavor" 2>/dev/null || true)"
+[ "$CORE_FLAVOR" = "store" ] \
+  || { echo "core xcframework is flavor '${CORE_FLAVOR:-unknown}', expected 'store'; rerun without --skip-core" >&2; exit 1; }
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -111,7 +117,16 @@ xcodebuild archive -quiet \
   -project "$IOS_ROOT/FluxDown.xcodeproj" -scheme FluxDown -configuration Release \
   -destination "generic/platform=iOS" -archivePath "$OUT/FluxDown.xcarchive" \
   MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD" \
+  FLUX_FLAVOR_CONDITIONS= \
   CODE_SIGNING_ALLOWED=NO
+
+# 商店二进制不得带 P2P 入口声明（预处理 Info.plist 按 FLUX_FLAVOR_CONDITIONS 剔除）：归档产物再核一遍。
+ARCHIVED_PLIST="$OUT/FluxDown.xcarchive/Products/Applications/FluxDown.app/Info.plist"
+[ -f "$ARCHIVED_PLIST" ] || { echo "archive has no Info.plist at $ARCHIVED_PLIST" >&2; exit 1; }
+if plutil -p "$ARCHIVED_PLIST" | grep -qiE 'magnet|ed2k|torrent'; then
+  echo "store archive Info.plist still declares P2P entries (FLUX_FLAVOR_CONDITIONS not empty?)" >&2
+  exit 1
+fi
 
 cat > "$WORK/ExportOptions.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

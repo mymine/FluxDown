@@ -41,6 +41,9 @@ pub type BtHandle = Arc<ManagedTorrent>;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
+// 配置类型的权威定义在始终编译的 `bt_config`。此处保留重导出仅为冻结的
+// `native/server`（按指令不改动，仍从本模块引用）；该 crate 删除后随之移除。
+pub use crate::bt_config::{BtConfig, BtMseMode};
 use crate::bt_seeding::{SeedingManager, SeedingRegistration, UnregisteredSeed};
 use crate::db::Db;
 use crate::downloader::{DownloadError, ProgressUpdate, SegmentProgressInfo};
@@ -60,13 +63,6 @@ use crate::selection::{HostSelection, SelectionOutcome};
 #[inline]
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
-}
-
-/// Returns `true` if the URL looks like a magnet link.
-pub fn is_magnet_url(url: &str) -> bool {
-    url.get(..8)
-        .map(|prefix| prefix.eq_ignore_ascii_case("magnet:?"))
-        .unwrap_or(false)
 }
 
 /// Torrent input source — either a magnet URI or raw .torrent file bytes.
@@ -311,41 +307,6 @@ const PUBLIC_TRACKERS: &[&str] = &[
     "http://tracker.bt4g.com:2095/announce",
 ];
 
-// ---------------------------------------------------------------------------
-// BT configuration — user-settable via the Settings page
-// ---------------------------------------------------------------------------
-/// FluxDown-owned MSE policy. Keeping this type at the engine boundary avoids
-/// exposing the concrete BitTorrent backend to host crates.
-///
-/// ```
-/// use fluxdown_engine::bt_downloader::BtMseMode;
-///
-/// assert_eq!(BtMseMode::from("forced"), BtMseMode::Forced);
-/// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum BtMseMode {
-    /// Reject encrypted peer handshakes and use plaintext only.
-    Disabled,
-    /// Prefer encrypted handshakes while retaining plaintext compatibility.
-    #[default]
-    Enabled,
-    /// Require encryption for every peer connection.
-    Forced,
-}
-
-impl From<&str> for BtMseMode {
-    fn from(value: &str) -> Self {
-        let value = value.trim();
-        if value.eq_ignore_ascii_case("disabled") {
-            Self::Disabled
-        } else if value.eq_ignore_ascii_case("forced") {
-            Self::Forced
-        } else {
-            Self::Enabled
-        }
-    }
-}
-
 impl From<BtMseMode> for librqbit::MseMode {
     fn from(value: BtMseMode) -> Self {
         match value {
@@ -389,69 +350,6 @@ fn probe_listener_port(port: u16) -> std::io::Result<()> {
             Ok(())
         }
         Err(error) => Err(error),
-    }
-}
-
-/// User-configurable BT session settings, loaded from the DB config table.
-#[derive(Debug, Clone)]
-pub struct BtConfig {
-    pub enabled: bool,
-    pub enable_dht: bool,
-    pub enable_upnp: bool,
-    /// Listen and connect over uTP in addition to TCP (`ListenerMode::TcpAndUtp`).
-    /// Many peers (uTorrent / qBittorrent / BitComet) are reachable over uTP
-    /// only from behind NAT; #825 measured ~2× live peers with it on.
-    pub enable_utp: bool,
-    pub port_start: u16,
-    pub port_end: u16,
-    /// User-supplied extra tracker URLs (newline-separated).
-    /// These are **merged** with the built-in `PUBLIC_TRACKERS` list.
-    pub custom_trackers: String,
-    /// Trackers fetched from subscription sources (newline-separated cache,
-    /// see `tracker_subscription`).  Empty when the subscription feature is
-    /// disabled.  Merged + deduped with `custom_trackers` at session build.
-    pub subscription_trackers: String,
-    /// Stop seeding when the total share ratio reaches this value (0 = unlimited).
-    pub seed_ratio_limit: f64,
-    /// Stop seeding when the post-completion share ratio reaches this value
-    /// (`(uploaded - uploaded_at_completion) / downloaded`, 0 = unlimited).
-    pub seed_post_ratio_limit: f64,
-    /// Stop seeding after this many minutes (0 = unlimited).
-    pub seed_time_limit_minutes: u64,
-    /// Stop seeding after this many minutes of zero upload speed (0 = unlimited).
-    pub seed_inactive_time_limit_minutes: u64,
-    /// How to combine the ratio, seed-time and inactive-time limits.
-    pub seed_limit_operator: crate::bt_seeding::SeedingLimitOperator,
-    /// What to do once a seeding limit is reached.
-    pub seed_then_action: String,
-    /// Max simultaneously active seeders (0 = unlimited). Completed torrents
-    /// beyond the cap wait in a FIFO seeding queue until a slot frees up.
-    pub seed_max_active: usize,
-    /// MSE (Message Stream Encryption) policy for BT peer connections.
-    /// Emergency escape hatch settable via config API/CLI; no Settings UI.
-    pub mse_mode: BtMseMode,
-}
-
-impl Default for BtConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            enable_dht: true,
-            enable_upnp: true,
-            enable_utp: true,
-            port_start: 6881,
-            port_end: 6891,
-            custom_trackers: String::new(),
-            subscription_trackers: String::new(),
-            seed_ratio_limit: 0.0,
-            seed_post_ratio_limit: 0.0,
-            seed_time_limit_minutes: 0,
-            seed_inactive_time_limit_minutes: 0,
-            seed_limit_operator: crate::bt_seeding::SeedingLimitOperator::Or,
-            seed_then_action: "stop".to_string(),
-            seed_max_active: 0,
-            mse_mode: BtMseMode::Enabled,
-        }
     }
 }
 
@@ -3163,39 +3061,58 @@ fn compute_bt_display_progress(
 // bitfield and the data disagree.
 // ---------------------------------------------------------------------------
 
+/// Where the piece verifier reads one torrent file's bytes from.
+pub(crate) enum VerifySource {
+    /// BEP-47 padding file: virtual zeros, never stored.
+    Zeros,
+    /// Regular on-disk file.
+    File(PathBuf),
+    /// Boundary bytes of an unselected file, kept in the parts sidecar blob
+    /// (read with the file's own index as `file_id`).
+    Sidecar(Arc<crate::bt_partfile::BoundaryReader>),
+    /// Bytes not available locally. A required piece touching them cannot
+    /// be judged and is counted as skipped, never as bad.
+    Unavailable,
+}
+
 /// One torrent file as seen by the piece verifier.
-struct VerifyFileSpec {
-    /// Absolute on-disk path (`None` for BEP-47 padding files, whose bytes
-    /// are virtual zeros and are never stored).
-    path: Option<PathBuf>,
+pub(crate) struct VerifyFileSpec {
+    pub(crate) source: VerifySource,
     /// Length in bytes inside the torrent's piece space.
-    len: u64,
+    pub(crate) len: u64,
     /// Whether the file is part of the user's selection.  A piece is
     /// *required* (and therefore verified) iff it overlaps at least one
     /// selected file — the same rule librqbit's chunk tracker uses to compute
     /// `finished`, so verification can never demand pieces the engine does
     /// not promise (which would loop forever in the repair path).
-    selected: bool,
+    pub(crate) selected: bool,
 }
 
-/// Outcome of a full piece re-hash of the staging directory.
-struct VerifyOutcome {
+/// Outcome of a full piece re-hash.
+pub(crate) struct VerifyOutcome {
     /// Indices of required pieces that are provably wrong: SHA1 mismatch or
     /// unreadable/short data.
-    bad: Vec<u32>,
+    pub(crate) bad: Vec<u32>,
     /// Number of required pieces hashed and found correct.
-    checked: u64,
-    /// Pieces not verified because no selected file overlaps them.
-    skipped: u64,
+    pub(crate) checked: u64,
+    /// Pieces not verified: no selected file overlaps them, or part of their
+    /// bytes is [`VerifySource::Unavailable`].
+    pub(crate) skipped: u64,
+    /// Selected files (layout indices, ascending) overlapped by a bad piece.
+    pub(crate) damaged_files: Vec<usize>,
+    /// `is_cancelled` fired before every piece was visited.
+    pub(crate) cancelled: bool,
 }
 
 /// Walk all pieces of the torrent layout `files` (in torrent order) and
 /// SHA1-check every required piece.  `expected_hash_matches(piece, digest)`
 /// compares against the torrent's piece table (`None` = piece index unknown,
-/// treated as bad — the metadata and layout must agree).
-fn verify_pieces_core(
+/// treated as bad — the metadata and layout must agree).  `is_cancelled` is
+/// polled once per piece.
+pub(crate) fn verify_pieces_core(
     piece_length: u32,
     files: &[VerifyFileSpec],
+    is_cancelled: impl Fn() -> bool,
     mut expected_hash_matches: impl FnMut(u32, [u8; 20]) -> Option<bool>,
 ) -> VerifyOutcome {
     use sha1::Digest;
@@ -3207,11 +3124,14 @@ fn verify_pieces_core(
     let mut handles: Vec<Option<std::fs::File>> = Vec::new();
     handles.resize_with(files.len(), || None);
     let mut open_failed = vec![false; files.len()];
+    let mut damaged = vec![false; files.len()];
 
     let mut outcome = VerifyOutcome {
         bad: Vec::new(),
         checked: 0,
         skipped: 0,
+        damaged_files: Vec::new(),
+        cancelled: false,
     };
     let mut buf = vec![0u8; 256 * 1024];
     // Reused span buffer: (file index, offset in file, span length).
@@ -3222,6 +3142,10 @@ fn verify_pieces_core(
     let mut file_pos = 0u64;
 
     for piece_idx in 0..total_pieces {
+        if is_cancelled() {
+            outcome.cancelled = true;
+            break;
+        }
         let piece_len = piece_length.min(total - piece_idx * piece_length);
 
         // Collect this piece's spans, advancing the cursor.
@@ -3243,7 +3167,11 @@ fn verify_pieces_core(
             file_pos += span;
         }
 
-        if !required {
+        if !required
+            || spans
+                .iter()
+                .any(|&(fi, _, _)| matches!(files[fi].source, VerifySource::Unavailable))
+        {
             outcome.skipped += 1;
             continue;
         }
@@ -3251,10 +3179,8 @@ fn verify_pieces_core(
         let mut hasher = sha1::Sha1::new();
         let mut readable = true;
         for &(fi, offset, span) in &spans {
-            let file = &files[fi];
-            let ok = match &file.path {
-                // Padding file — virtual zeros.
-                None => {
+            let ok = match &files[fi].source {
+                VerifySource::Zeros => {
                     buf.fill(0);
                     let mut left = span;
                     while left > 0 {
@@ -3264,7 +3190,7 @@ fn verify_pieces_core(
                     }
                     true
                 }
-                Some(path) => hash_file_span(
+                VerifySource::File(path) => hash_file_span(
                     &mut handles[fi],
                     &mut open_failed[fi],
                     path,
@@ -3274,6 +3200,10 @@ fn verify_pieces_core(
                     &mut hasher,
                 )
                 .is_ok(),
+                VerifySource::Sidecar(reader) => {
+                    hash_sidecar_span(reader, fi, offset, span, &mut buf, &mut hasher)
+                }
+                VerifySource::Unavailable => false,
             };
             if !ok {
                 readable = false;
@@ -3281,19 +3211,50 @@ fn verify_pieces_core(
             }
         }
 
-        if !readable {
-            outcome.bad.push(piece_idx as u32);
-            continue;
-        }
-        let digest: [u8; 20] = hasher.finalize().into();
-        if expected_hash_matches(piece_idx as u32, digest) == Some(true) {
+        let good = readable && {
+            let digest: [u8; 20] = hasher.finalize().into();
+            expected_hash_matches(piece_idx as u32, digest) == Some(true)
+        };
+        if good {
             outcome.checked += 1;
         } else {
             outcome.bad.push(piece_idx as u32);
+            for &(fi, _, _) in &spans {
+                damaged[fi] |= files[fi].selected;
+            }
         }
     }
 
+    outcome.damaged_files = damaged
+        .iter()
+        .enumerate()
+        .filter_map(|(fi, &hit)| hit.then_some(fi))
+        .collect();
     outcome
+}
+
+/// Feed `len` bytes of an unselected file's sidecar boundary range into `hasher`.
+fn hash_sidecar_span(
+    reader: &crate::bt_partfile::BoundaryReader,
+    file_id: usize,
+    offset: u64,
+    len: u64,
+    buf: &mut [u8],
+    hasher: &mut sha1::Sha1,
+) -> bool {
+    use sha1::Digest;
+
+    let mut done = 0u64;
+    while done < len {
+        let chunk = (len - done).min(buf.len() as u64) as usize;
+        if let Err(error) = reader.read(file_id, offset + done, &mut buf[..chunk]) {
+            log_warn!("[BT] sidecar boundary read failed (file_id={file_id}): {error:#}");
+            return false;
+        }
+        hasher.update(&buf[..chunk]);
+        done += chunk as u64;
+    }
+    true
 }
 
 /// Feed `len` bytes of `path` starting at `offset` into `hasher`.
@@ -3379,11 +3340,11 @@ async fn verify_staged_pieces(
                     .iter()
                     .enumerate()
                     .map(|(i, fi)| VerifyFileSpec {
-                        path: if fi.attrs.padding {
-                            None
+                        source: if fi.attrs.padding {
+                            VerifySource::Zeros
                         } else {
                             let staged_path = stage_dir.join(&fi.relative_filename);
-                            Some(resolve_completion_verify_path(
+                            VerifySource::File(resolve_completion_verify_path(
                                 staged_path,
                                 &completion_moves,
                                 allow_dst_fallback,
@@ -3396,6 +3357,7 @@ async fn verify_staged_pieces(
                 verify_pieces_core(
                     meta.lengths().default_piece_length(),
                     &files,
+                    || false,
                     |idx, digest| meta.info.info().compare_hash(idx, digest),
                 )
             })
@@ -3502,7 +3464,7 @@ impl librqbit::storage::StorageFactory for PathGuardFactory {
 /// `windows_rules` 额外拒绝组件内的 `:`（盘符前缀 / ADS）、控制字符与
 /// 设备保留名——这些在 Windows 上会改写基路径或落到设备，而在其他平台
 /// 是合法文件名，故不对非 Windows 强加。
-fn torrent_relative_path_is_safe(rel: &Path, windows_rules: bool) -> bool {
+pub(crate) fn torrent_relative_path_is_safe(rel: &Path, windows_rules: bool) -> bool {
     use std::path::Component;
     if rel.as_os_str().is_empty() || rel.is_absolute() {
         return false;
@@ -5508,6 +5470,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     task_id: task_id.clone(),
                     downloaded_bytes: final_total,
                     download_baseline: None,
+                    transfer_bytes: None,
                     total_bytes: final_total,
                     status: STATUS_COMPLETED,
                     error_message: String::new(),
@@ -7000,13 +6963,16 @@ mod tests {
         let hashes = [sha1_of(b"0123"), sha1_of(b"4567"), sha1_of(b"89")];
 
         let files = [super::VerifyFileSpec {
-            path: Some(path),
+            source: super::VerifySource::File(path),
             len: content.len() as u64,
             selected: true,
         }];
-        let outcome = super::verify_pieces_core(4, &files, |idx, digest| {
-            hashes.get(idx as usize).map(|h| *h == digest)
-        });
+        let outcome = super::verify_pieces_core(
+            4,
+            &files,
+            || false,
+            |idx, digest| hashes.get(idx as usize).map(|h| *h == digest),
+        );
         assert!(outcome.bad.is_empty(), "bad: {:?}", outcome.bad);
         assert_eq!(outcome.checked, 3);
         assert_eq!(outcome.skipped, 0);
@@ -7214,13 +7180,16 @@ mod tests {
         let hashes = [sha1_of(b"0123"), sha1_of(b"4567"), sha1_of(b"89")];
 
         let files = [super::VerifyFileSpec {
-            path: Some(path),
+            source: super::VerifySource::File(path),
             len: good.len() as u64,
             selected: true,
         }];
-        let outcome = super::verify_pieces_core(4, &files, |idx, digest| {
-            hashes.get(idx as usize).map(|h| *h == digest)
-        });
+        let outcome = super::verify_pieces_core(
+            4,
+            &files,
+            || false,
+            |idx, digest| hashes.get(idx as usize).map(|h| *h == digest),
+        );
         assert_eq!(outcome.bad, vec![1]);
         assert_eq!(outcome.checked, 2);
 
@@ -7242,11 +7211,11 @@ mod tests {
 
         // Missing file entirely.
         let files = [super::VerifyFileSpec {
-            path: Some(dir.join("nonexistent.bin")),
+            source: super::VerifySource::File(dir.join("nonexistent.bin")),
             len: 10,
             selected: true,
         }];
-        let outcome = super::verify_pieces_core(4, &files, |_, _| Some(true));
+        let outcome = super::verify_pieces_core(4, &files, || false, |_, _| Some(true));
         assert_eq!(outcome.bad, vec![0, 1, 2]);
 
         // Truncated file: only 5 of 10 bytes on disk → pieces 1 and 2
@@ -7255,13 +7224,16 @@ mod tests {
         std::fs::write(&path, b"01234")
             .unwrap_or_else(|error| panic!("test filesystem operation failed: {error}"));
         let files = [super::VerifyFileSpec {
-            path: Some(path),
+            source: super::VerifySource::File(path),
             len: 10,
             selected: true,
         }];
-        let outcome = super::verify_pieces_core(4, &files, |idx, digest| {
-            Some(idx == 0 && digest == sha1_of(b"0123"))
-        });
+        let outcome = super::verify_pieces_core(
+            4,
+            &files,
+            || false,
+            |idx, digest| Some(idx == 0 && digest == sha1_of(b"0123")),
+        );
         assert_eq!(outcome.bad, vec![1, 2]);
         assert_eq!(outcome.checked, 1);
 
@@ -7293,19 +7265,22 @@ mod tests {
 
         let files = [
             super::VerifyFileSpec {
-                path: Some(sel),
+                source: super::VerifySource::File(sel),
                 len: 6,
                 selected: true,
             },
             super::VerifyFileSpec {
-                path: Some(unsel),
+                source: super::VerifySource::File(unsel),
                 len: 6,
                 selected: false,
             },
         ];
-        let outcome = super::verify_pieces_core(4, &files, |idx, digest| {
-            hashes.get(idx as usize).map(|h| *h == digest)
-        });
+        let outcome = super::verify_pieces_core(
+            4,
+            &files,
+            || false,
+            |idx, digest| hashes.get(idx as usize).map(|h| *h == digest),
+        );
         assert!(outcome.bad.is_empty(), "bad: {:?}", outcome.bad);
         assert_eq!(outcome.checked, 2, "pieces 0 and 1 are required");
         assert_eq!(outcome.skipped, 1, "piece 2 overlaps no selected file");
@@ -7331,19 +7306,22 @@ mod tests {
 
         let files = [
             super::VerifyFileSpec {
-                path: Some(path),
+                source: super::VerifySource::File(path),
                 len: 2,
                 selected: true,
             },
             super::VerifyFileSpec {
-                path: None,
+                source: super::VerifySource::Zeros,
                 len: 2,
                 selected: false,
             },
         ];
-        let outcome = super::verify_pieces_core(4, &files, |idx, digest| {
-            hashes.get(idx as usize).map(|h| *h == digest)
-        });
+        let outcome = super::verify_pieces_core(
+            4,
+            &files,
+            || false,
+            |idx, digest| hashes.get(idx as usize).map(|h| *h == digest),
+        );
         assert!(outcome.bad.is_empty(), "bad: {:?}", outcome.bad);
         assert_eq!(outcome.checked, 1);
 

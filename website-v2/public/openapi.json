@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "FluxDown API",
-    "description": "FluxDown 桌面应用的本机 HTTP API。仅监听 `127.0.0.1`（默认端口 17800，可在 设置 → API 服务 中修改）。\n\n- **takeover**（脚本接管）：油猴脚本提交下载，进入快速下载确认流程；需 `X-FluxDown-Client` 头\n- **aria2**：aria2 JSON-RPC 兼容垫片，「发送到 aria2」类脚本与 AriaNg 可直接对接\n- **management**（管理 API）：任务查询/创建/暂停/恢复/删除与队列查询，供 MCP/自动化客户端使用；强制要求 token（`Authorization: Bearer <token>` 或 `X-FluxDown-Token` 头）",
+    "description": "FluxDown HTTP API，用于提交下载、管理任务和连接自动化客户端。本机默认地址为 `http://127.0.0.1:17800`，端口可在「设置 → API 服务」中修改。\n\n## 接入方式\n\n- **脚本接管（takeover）**：接收浏览器脚本提交的下载请求，进入下载确认流程；需提供 `X-FluxDown-Client` 请求头。\n- **aria2**：提供兼容的 JSON-RPC 接口，可连接 AriaNg 等 aria2 客户端。\n- **MCP**：供 AI 客户端查询和调用下载工具。\n- **管理 API（management）**：直接创建和管理下载任务，无需界面确认；支持队列查询与站点凭据管理。\n- **任务组、插件与 RSS**：管理多文件下载、插件和自动订阅下载。\n- **设备互联（link）**：发现、配对设备，并向已配对设备发送下载任务。\n\n## 访问认证\n\n管理 API、MCP、任务组、插件和 RSS 接口必须提供访问令牌：使用 `Authorization: Bearer <token>` 或 `X-FluxDown-Token: <token>` 请求头。设备互联的配对和设备通信接口使用独立认证机制，具体要求见各接口说明。",
     "license": {
       "name": "MIT",
       "identifier": "MIT"
@@ -21,7 +21,7 @@
         "tags": [
           "groups"
         ],
-        "summary": "列出全部任务组。",
+        "summary": "获取任务组列表",
         "operationId": "api_list_groups",
         "responses": {
           "200": {
@@ -61,7 +61,8 @@
         "tags": [
           "groups"
         ],
-        "summary": "创建多文件任务组（建组 + N 子任务），返回新组 ID。`items` 为空 → 400。",
+        "summary": "创建任务组",
+        "description": "根据文件清单创建任务组及其子任务，成功后返回任务组 ID。\n`items` 不能为空，否则返回 HTTP 400。",
         "operationId": "api_create_group",
         "requestBody": {
           "content": {
@@ -130,7 +131,8 @@
         "tags": [
           "groups"
         ],
-        "summary": "删除任务组（批量删成员），可选同时删除磁盘文件。",
+        "summary": "删除任务组",
+        "description": "删除任务组及组内任务，可选择同时删除已下载的文件。",
         "operationId": "api_delete_group",
         "parameters": [
           {
@@ -199,7 +201,8 @@
         "tags": [
           "groups"
         ],
-        "summary": "恢复组内全部成员。",
+        "summary": "恢复任务组",
+        "description": "恢复组内全部任务。",
         "operationId": "api_group_continue",
         "parameters": [
           {
@@ -259,7 +262,8 @@
         "tags": [
           "groups"
         ],
-        "summary": "暂停组内全部成员。",
+        "summary": "暂停任务组",
+        "description": "暂停组内全部任务。",
         "operationId": "api_group_pause",
         "parameters": [
           {
@@ -319,7 +323,8 @@
         "tags": [
           "management"
         ],
-        "summary": "应用信息（名称与版本号）。",
+        "summary": "获取应用信息",
+        "description": "返回应用名称与版本号。",
         "operationId": "api_info",
         "responses": {
           "200": {
@@ -368,7 +373,7 @@
         "tags": [
           "link"
         ],
-        "summary": "生成一次性配对码（**需 management token**）。供 web/CLI 让 headless 设备出示。",
+        "summary": "生成配对码",
         "description": "生成一次性配对码，供发起方在 pair/hello 出示。**需 management token**。",
         "operationId": "api_link_generate_code",
         "responses": {
@@ -406,7 +411,7 @@
         "tags": [
           "link"
         ],
-        "summary": "停止 mDNS 广播（撤销「可被发现」状态）；配对码本身若未过期仍可用\n（手动地址/已知连接仍能核对），只是不再出现在局域网 mDNS 扫描里。",
+        "summary": "停止设备广播",
         "description": "停止 mDNS 广播（撤销「可被发现」状态）；配对码本身未过期仍可用，只是不再出现在局域网扫描里。**需 management token**。",
         "operationId": "api_link_stop_advertising",
         "responses": {
@@ -446,7 +451,7 @@
         "tags": [
           "link"
         ],
-        "summary": "已配对设备列表（含并发在线探测）。",
+        "summary": "获取已配对设备",
         "description": "已配对设备列表（含并发在线探测）。**需 management token**。",
         "operationId": "api_link_devices",
         "responses": {
@@ -486,7 +491,7 @@
         "tags": [
           "link"
         ],
-        "summary": "解除配对（删除设备）。",
+        "summary": "解除设备配对",
         "description": "解除配对（删除设备记录及双方链路密钥）。**需 management token**。",
         "operationId": "api_link_remove_device",
         "parameters": [
@@ -547,7 +552,7 @@
         "tags": [
           "link"
         ],
-        "summary": "下发下载任务给已配对设备（管理面，token 鉴权；区别于数据面链路 HMAC 鉴权的\n`POST /api/v1/link/tasks`）。",
+        "summary": "向设备发送下载任务",
         "description": "下发下载任务给已配对设备（管理面，token 鉴权；区别于数据面链路 HMAC 鉴权的 `POST /api/v1/link/tasks`）。**需 management token**。",
         "operationId": "api_link_device_tasks",
         "parameters": [
@@ -618,7 +623,7 @@
         "tags": [
           "link"
         ],
-        "summary": "当前发现快照（发起方侧 UI 轮询）。",
+        "summary": "获取发现的设备",
         "description": "当前发现快照（发起方侧 UI 轮询）。**需 management token**。",
         "operationId": "api_link_discovered",
         "responses": {
@@ -658,7 +663,7 @@
         "tags": [
           "link"
         ],
-        "summary": "本地设备发现开关：`start` 幂等且清空发现快照；`stop` 停止 mDNS 浏览。",
+        "summary": "启停设备发现",
         "description": "本地设备发现开关：`start` 幂等且清空发现快照，`stop` 停止 mDNS 浏览。**需 management token**。",
         "operationId": "api_link_discovery",
         "requestBody": {
@@ -718,15 +723,15 @@
         "tags": [
           "link"
         ],
-        "summary": "已配对设备经已认证链路交换设备信息（默认下载目录 / 路径风格）。",
-        "description": "数据面：已配对设备交换设备信息（默认下载目录 / 路径风格）。**无 management token**，鉴权靠 `X-FluxLink-*` 头（同 `/api/v1/link/tasks`）。请求体与响应体都是 AEAD 密文（`application/octet-stream`）；旧版对端没有该端点（404）。",
+        "summary": "交换设备信息",
+        "description": "数据面（v2）：已配对设备双向交换设备信息（名称 / 平台 / 版本 / 回连地址 ≤4 / 云设备 ID / 默认下载目录 / 路径风格）。**无 management token**，鉴权与封装规则同 `/api/v1/link/tasks`。请求体与成功响应体都是 AEAD 密文（`application/octet-stream`，响应头 `X-FluxLink-Enc: v2`）。",
         "operationId": "api_link_info",
         "responses": {
           "200": {
-            "description": "用链路密钥加密的本机信息（二进制）"
+            "description": "用链路密钥封装的本机信息（二进制）"
           },
           "401": {
-            "description": "缺少/无效链路鉴权头",
+            "description": "鉴权失败。JSON `{\"reason\":\"notPaired\"|\"clockSkew\"|\"unauthorized\",\"serverTime\":秒}`，未认证、仅作诊断",
             "content": {
               "application/json": {
                 "schema": {
@@ -743,7 +748,7 @@
         "tags": [
           "link"
         ],
-        "summary": "批准/拒绝一次入站配对核验（响应本机收到的 `IncomingPairing` 通知；区别于\n发起方视角、核对 SAS 后调用的 [`api_link_pair_finish`]）。",
+        "summary": "审核收到的配对",
         "description": "批准/拒绝一次入站配对核验（响应本机收到的 `IncomingPairing` 通知；区别于发起方视角、核对 SAS 后调用的 pair/finish）。**需 management token**。",
         "operationId": "api_link_pair_approve",
         "requestBody": {
@@ -803,7 +808,7 @@
         "tags": [
           "link"
         ],
-        "summary": "发起配对：向 `host:port` 发送 `hello`（带配对码），返回待确认令牌 + SAS +\n对端信息，供 UI 展示 SAS 核对后调 [`api_link_pair_finish`]。",
+        "summary": "发起设备配对",
         "description": "发起配对：向 `host:port` 发送 hello（带配对码），返回待确认令牌 + SAS，供 UI 展示核对后调用 pair/finish。**需 management token**。",
         "operationId": "api_link_pair_begin",
         "requestBody": {
@@ -873,7 +878,7 @@
         "tags": [
           "link"
         ],
-        "summary": "处理配对 `confirm`（SAS 核对后确认/拒绝）。",
+        "summary": "接收配对确认",
         "description": "配对第三步：核对 SAS 后确认/拒绝（响应方内部会话，由 pair/hello 建立、pair/reveal 揭示后的 sessionId 守卫；未揭示的会话上 confirm=true 属协议违规）。**无 token 鉴权**。",
         "operationId": "api_link_pair_confirm",
         "requestBody": {
@@ -908,7 +913,7 @@
         "tags": [
           "link"
         ],
-        "summary": "SAS 核对后确认/拒绝配对（管理面版本，区别于响应方内部 `pair/confirm`）。",
+        "summary": "确认发起的配对",
         "description": "SAS 核对后确认/拒绝配对（管理面视角，区别于响应方内部 `pair/confirm`）。**需 management token**。",
         "operationId": "api_link_pair_finish",
         "requestBody": {
@@ -968,7 +973,7 @@
         "tags": [
           "link"
         ],
-        "summary": "处理配对 `hello`（发起方 → 本机）。",
+        "summary": "接收配对请求",
         "description": "配对握手第一步（发起方 → 响应方）。**无 token 鉴权**：由响应方 UI 展示的一次性配对码守卫，重复/过期码拒绝。请求只携带发起方临时公钥与随机数的承诺；响应方回出本次会话全新的临时公钥与随机数（不含 SAS）。`protocolVersion` 与响应方不一致（含旧版发起方）一律以版本不兼容拒绝。",
         "operationId": "api_link_pair_hello",
         "requestBody": {
@@ -1010,7 +1015,7 @@
         "tags": [
           "link"
         ],
-        "summary": "处理配对 `reveal`（发起方揭示 hello 里承诺的临时公钥）。",
+        "summary": "验证配对公钥",
         "description": "配对握手第二步（发起方 → 响应方）：揭示 `pair/hello` 里承诺过的临时公钥与随机数，响应方核对承诺后返回对完整握手转录的身份签名。**无 token 鉴权**：由 `pair/hello` 建立的 sessionId 与公钥承诺守卫，承诺不符即作废会话。",
         "operationId": "api_link_pair_reveal",
         "requestBody": {
@@ -1052,7 +1057,7 @@
         "tags": [
           "link"
         ],
-        "summary": "手动地址探测（mDNS 失效兜底）；结果不入发现快照。",
+        "summary": "探测设备地址",
         "description": "手动地址探测（mDNS 失效兜底）；结果不入发现快照，直接返回给调用方。**需 management token**。",
         "operationId": "api_link_probe",
         "requestBody": {
@@ -1122,19 +1127,12 @@
         "tags": [
           "link"
         ],
-        "summary": "已配对设备下发下载任务：从 `X-FluxLink-*` 头取鉴权凭据 → 校验 → 建任务。",
-        "description": "数据面：已配对设备下发下载任务。**无 management token**，鉴权靠 `X-FluxLink-Device`/`X-FluxLink-Ts`/`X-FluxLink-Nonce`/`X-FluxLink-Auth` 头做每对设备独立密钥的 HMAC 校验。\n\n请求体是对明文 JSON 任务描述做 AEAD 加密后的**二进制密文**（`Content-Type: application/octet-stream`），非普通 JSON；宿主校验鉴权头后解密再反序列化。",
+        "summary": "接收设备下载任务",
+        "description": "数据面（v2）：已配对设备下发下载任务（一次性投递）。**无 management token**，鉴权靠 `X-FluxLink-Device`/`X-FluxLink-Ts`/`X-FluxLink-Nonce`/`X-FluxLink-Tag`/`X-FluxLink-Enc: v2` 头：Tag 是每对设备独立密钥对 `fluxlink-v2\\n{METHOD}\\n{path}\\n{ts}\\n{nonce}\\n{sender_fp}\\n{receiver_fp}\\n{hex(sha256(密文 body))}` 的 HMAC-SHA256（绑定收发双方指纹）。\n\n请求体是对明文 JSON 任务描述做 ChaCha20-Poly1305 加密后的**二进制密文**（`Content-Type: application/octet-stream`，AAD 绑定方向、方法、路径、收发双方指纹与 nonce），非普通 JSON。**成功响应同样是封装后的二进制密文**（响应头 `X-FluxLink-Enc: v2`，AAD 绑定方向与请求 nonce，明文为 `{\"taskId\":…}`），发起方解封失败按鉴权失败处理。`Enc` 缺失或不是 `v2`（含旧的 `v1`）一律 401。",
         "operationId": "api_link_create_task",
         "responses": {
           "200": {
-            "description": "创建成功",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CreatedTask"
-                }
-              }
-            }
+            "description": "创建成功：封装后的 `{\"taskId\":…}`（二进制）"
           },
           "400": {
             "description": "载荷非法（含解密失败）",
@@ -1147,7 +1145,32 @@
             }
           },
           "401": {
-            "description": "缺少/无效链路鉴权头",
+            "description": "鉴权失败。JSON `{\"reason\":\"notPaired\"|\"clockSkew\"|\"unauthorized\",\"serverTime\":秒}`，未认证、仅作诊断",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/link/unpair": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "接收解除配对通知",
+        "description": "数据面（v2）：已配对设备通知本机它已解除与本机的配对。**无 management token**，鉴权与封装规则同 `/api/v1/link/tasks`。收到后本机把该设备记录标记为已撤销（拒绝其入站请求、不再向它下发），幂等；请求与成功响应体都是 AEAD 密文（`application/octet-stream`，响应头 `X-FluxLink-Enc: v2`）。",
+        "operationId": "api_link_unpair",
+        "responses": {
+          "200": {
+            "description": "用链路密钥封装的确认（二进制）"
+          },
+          "401": {
+            "description": "鉴权失败。JSON `{\"reason\":\"notPaired\"|\"clockSkew\"|\"unauthorized\",\"serverTime\":秒}`，未认证、仅作诊断",
             "content": {
               "application/json": {
                 "schema": {
@@ -1164,7 +1187,8 @@
         "tags": [
           "plugins"
         ],
-        "summary": "拉取去中心化插件市场索引。",
+        "summary": "获取插件市场索引",
+        "description": "获取去中心化插件市场的索引条目。",
         "operationId": "api_market_list",
         "responses": {
           "200": {
@@ -1206,7 +1230,8 @@
         "tags": [
           "plugins"
         ],
-        "summary": "从市场安装某插件最新版。",
+        "summary": "安装市场插件",
+        "description": "从插件市场安装指定插件的最新版本。",
         "operationId": "api_market_install",
         "requestBody": {
           "content": {
@@ -1265,7 +1290,7 @@
         "tags": [
           "plugins"
         ],
-        "summary": "列出全部已安装插件。",
+        "summary": "获取已安装插件",
         "operationId": "api_list_plugins",
         "responses": {
           "200": {
@@ -1307,7 +1332,8 @@
         "tags": [
           "plugins"
         ],
-        "summary": "从 zip 安装插件（≤4MB，受全局请求体上限约束）。",
+        "summary": "安装插件包",
+        "description": "从 ZIP 文件安装插件。请求体不得超过全局大小限制（4 MB）。",
         "operationId": "api_install_plugin",
         "responses": {
           "200": {
@@ -1356,7 +1382,8 @@
         "tags": [
           "plugins"
         ],
-        "summary": "dev 安装插件（引用目录，不拷贝）。",
+        "summary": "从本地目录加载插件",
+        "description": "用于插件开发。直接引用指定目录，不复制文件。",
         "operationId": "api_install_plugin_dev",
         "requestBody": {
           "content": {
@@ -1415,7 +1442,7 @@
         "tags": [
           "plugins"
         ],
-        "summary": "卸载插件。",
+        "summary": "卸载插件",
         "operationId": "api_uninstall_plugin",
         "parameters": [
           {
@@ -1465,7 +1492,8 @@
         "tags": [
           "plugins"
         ],
-        "summary": "驱动插件登录流程（二维码/账号登录）。认证结果只返回交互状态，凭据由引擎保存。",
+        "summary": "执行插件登录",
+        "description": "支持二维码或账号登录。响应仅包含交互状态，认证凭据由引擎保存。",
         "operationId": "api_plugin_auth",
         "parameters": [
           {
@@ -1535,7 +1563,7 @@
         "tags": [
           "plugins"
         ],
-        "summary": "启用/禁用插件。",
+        "summary": "启用或禁用插件",
         "operationId": "api_set_plugin_enabled",
         "parameters": [
           {
@@ -1595,7 +1623,8 @@
         "tags": [
           "plugins"
         ],
-        "summary": "批量更新插件设置（all-or-nothing）。请求体为 `{key: value}` 字符串映射。",
+        "summary": "更新插件设置",
+        "description": "请求体为 `{key: value}` 字符串映射。批量更新采用原子操作：全部成功或全部不生效。",
         "operationId": "api_update_plugin_settings",
         "parameters": [
           {
@@ -1655,7 +1684,8 @@
         "tags": [
           "management"
         ],
-        "summary": "列出全部命名队列。",
+        "summary": "获取队列列表",
+        "description": "列出全部命名队列。",
         "operationId": "api_list_queues",
         "responses": {
           "200": {
@@ -1697,7 +1727,8 @@
         "tags": [
           "groups"
         ],
-        "summary": "前置预解析清单（多文件清单，只读、不建任务、不写库）。强制鉴权——\n会触发插件网络调用（网盘 API），与管理 API 其余端点同一门禁。",
+        "summary": "预览下载文件",
+        "description": "解析链接并返回多文件清单，不创建下载任务，也不写入数据库。\n解析可能通过插件调用网盘等外部服务，因此必须提供管理 API 访问令牌。",
         "operationId": "api_resolve_preview",
         "requestBody": {
           "content": {
@@ -1756,7 +1787,7 @@
         "tags": [
           "rss"
         ],
-        "summary": "列出全部 RSS 订阅。",
+        "summary": "获取 RSS 订阅列表",
         "operationId": "api_list_rss_sources",
         "responses": {
           "200": {
@@ -1796,7 +1827,8 @@
         "tags": [
           "rss"
         ],
-        "summary": "新建 RSS 订阅，返回新订阅 ID。`url` 为空 → 400。",
+        "summary": "创建 RSS 订阅",
+        "description": "创建订阅并返回订阅 ID。`url` 不能为空，否则返回 HTTP 400。",
         "operationId": "api_create_rss_source",
         "requestBody": {
           "content": {
@@ -1848,7 +1880,8 @@
         "tags": [
           "rss"
         ],
-        "summary": "只读验证一个 feed 地址（新建订阅向导）。抓取失败**不是** HTTP 错误：\n这是一次诊断调用，失败原因本身就是有效载荷，仍回 200 + `error` 非空。",
+        "summary": "验证订阅地址",
+        "description": "获取并验证 RSS 内容，不创建订阅。\n抓取失败时仍返回 HTTP 200，具体原因通过响应中的 `error` 字段提供。",
         "operationId": "api_validate_rss_feed",
         "requestBody": {
           "content": {
@@ -1907,7 +1940,8 @@
         "tags": [
           "rss"
         ],
-        "summary": "更新订阅配置。运行态字段（`lastFetchAt`/`failCount` 等）写入被忽略。",
+        "summary": "更新 RSS 订阅",
+        "description": "更新订阅配置。`lastFetchAt`、`failCount` 等运行状态字段不会被写入。",
         "operationId": "api_update_rss_source",
         "parameters": [
           {
@@ -1985,7 +2019,8 @@
         "tags": [
           "rss"
         ],
-        "summary": "删除订阅（级联删条目）。已建下载任务保留——用户要的是不再抓新条目，\n不是撤销已下载的东西。",
+        "summary": "删除 RSS 订阅",
+        "description": "删除订阅及其条目，保留已创建的下载任务。",
         "operationId": "api_delete_rss_source",
         "parameters": [
           {
@@ -2045,7 +2080,8 @@
         "tags": [
           "rss"
         ],
-        "summary": "一个订阅的条目流（新→旧）。",
+        "summary": "获取订阅条目",
+        "description": "返回指定订阅的条目，按时间从新到旧排列。",
         "operationId": "api_list_rss_items",
         "parameters": [
           {
@@ -2108,7 +2144,8 @@
         "tags": [
           "rss"
         ],
-        "summary": "对条目执行手动操作（下载 / 忽略 / 全部标记已读）。guid 在请求体里，\n不进路径段——真实 feed 的 guid 常常是一整条 URL。",
+        "summary": "操作订阅条目",
+        "description": "支持下载、忽略和全部标记已读。条目标识 `guid` 可能包含完整 URL，\n因此通过请求体传递，而非 URL 路径。",
         "operationId": "api_rss_item_action",
         "parameters": [
           {
@@ -2188,7 +2225,8 @@
         "tags": [
           "rss"
         ],
-        "summary": "立即抓取一个订阅。抓取异步派发，本端点只表示「已受理」，结果走\n`rssSourcesChanged` / `rssItemsChanged` 事件；该订阅已在抓取时同样视为成功，\n仅订阅不存在返回 404。",
+        "summary": "刷新 RSS 订阅",
+        "description": "异步获取订阅的最新内容。成功响应仅表示请求已受理，不代表刷新完成；\n结果通过 `rssSourcesChanged` / `rssItemsChanged` 事件通知。\n订阅正在刷新时仍返回成功；订阅不存在时返回 HTTP 404。",
         "operationId": "api_refresh_rss_source",
         "parameters": [
           {
@@ -2248,7 +2286,8 @@
         "tags": [
           "management"
         ],
-        "summary": "列出已保存的站点凭据；只返回站点和用户名，不返回密码。",
+        "summary": "获取站点凭据列表",
+        "description": "仅返回已保存的站点和用户名，不包含密码。",
         "operationId": "api_list_site_auth",
         "responses": {
           "200": {
@@ -2288,7 +2327,8 @@
         "tags": [
           "management"
         ],
-        "summary": "保存单个站点 HTTP Basic 凭据。",
+        "summary": "保存站点凭据",
+        "description": "保存单个站点的 HTTP Basic 认证凭据。",
         "operationId": "api_save_site_auth",
         "requestBody": {
           "content": {
@@ -2347,8 +2387,8 @@
         "tags": [
           "management"
         ],
-        "summary": "读取单个站点凭据详情。只允许按站点定向读取，不进入通用配置快照。",
-        "description": "**`pass` 字段是明文密码**（未脱敏）：仅供编辑对话框回填原值，调用方不应\n在列表页/日志里回显；列表接口 [`api_list_site_auth`] 本就不含密码（L-1）。",
+        "summary": "获取站点凭据",
+        "description": "按站点读取凭据详情，不包含在通用配置快照中。\n**`pass` 字段为明文密码**，仅用于编辑表单回填，不应显示在列表或写入日志。\n凭据列表接口不返回密码。",
         "operationId": "api_get_site_auth",
         "parameters": [
           {
@@ -2406,7 +2446,7 @@
         "tags": [
           "management"
         ],
-        "summary": "删除单个站点凭据。",
+        "summary": "删除站点凭据",
         "operationId": "api_delete_site_auth",
         "parameters": [
           {
@@ -2466,7 +2506,8 @@
         "tags": [
           "management"
         ],
-        "summary": "列出全部任务，可按状态过滤。",
+        "summary": "获取任务列表",
+        "description": "列出全部下载任务，支持按状态筛选。",
         "operationId": "api_list_tasks",
         "parameters": [
           {
@@ -2521,7 +2562,8 @@
         "tags": [
           "management"
         ],
-        "summary": "直接创建下载任务（不弹确认框），返回新任务 ID。",
+        "summary": "创建下载任务",
+        "description": "直接创建下载任务，不显示确认对话框。成功后返回任务 ID。",
         "operationId": "api_create_task",
         "requestBody": {
           "content": {
@@ -2590,7 +2632,7 @@
         "tags": [
           "management"
         ],
-        "summary": "恢复全部已暂停任务。",
+        "summary": "恢复全部已暂停任务",
         "operationId": "api_continue_all",
         "responses": {
           "200": {
@@ -2629,7 +2671,8 @@
         "tags": [
           "management"
         ],
-        "summary": "暂停全部活跃任务（pending / downloading / preparing）。",
+        "summary": "暂停全部任务",
+        "description": "暂停处于等待、下载或准备状态（`pending` / `downloading` / `preparing`）的任务。",
         "operationId": "api_pause_all",
         "responses": {
           "200": {
@@ -2668,7 +2711,8 @@
         "tags": [
           "management"
         ],
-        "summary": "按 ID 查询单个任务。",
+        "summary": "获取任务详情",
+        "description": "按任务 ID 查询单个下载任务。",
         "operationId": "api_get_task",
         "parameters": [
           {
@@ -2726,7 +2770,8 @@
         "tags": [
           "management"
         ],
-        "summary": "删除任务，可选同时删除磁盘文件。",
+        "summary": "删除下载任务",
+        "description": "删除任务记录，可选择同时删除已下载的文件。",
         "operationId": "api_delete_task",
         "parameters": [
           {
@@ -2795,7 +2840,7 @@
         "tags": [
           "management"
         ],
-        "summary": "恢复单个任务。",
+        "summary": "恢复下载任务",
         "operationId": "api_continue_task",
         "parameters": [
           {
@@ -2855,7 +2900,8 @@
         "tags": [
           "plugins"
         ],
-        "summary": "任务级逃生舱：忽略插件重试，按原始链接重跑。",
+        "summary": "使用原始链接重试",
+        "description": "忽略当前任务的插件重试流程，改用原始下载链接重新执行。",
         "operationId": "api_ignore_plugin_retry",
         "parameters": [
           {
@@ -2905,7 +2951,7 @@
         "tags": [
           "management"
         ],
-        "summary": "暂停单个任务。",
+        "summary": "暂停下载任务",
         "operationId": "api_pause_task",
         "parameters": [
           {
@@ -2965,7 +3011,7 @@
         "tags": [
           "management"
         ],
-        "summary": "重命名任务文件。",
+        "summary": "重命名任务文件",
         "operationId": "api_rename_task",
         "parameters": [
           {
@@ -3055,7 +3101,7 @@
         "tags": [
           "management"
         ],
-        "summary": "更换任务下载源地址。",
+        "summary": "更换下载地址",
         "operationId": "api_change_task_url",
         "parameters": [
           {
@@ -3145,7 +3191,8 @@
         "tags": [
           "takeover"
         ],
-        "summary": "提交单个外部下载请求。用 `Bytes` 而非 `Json` 提取：油猴脚本可能不带\n`application/json` Content-Type（保留旧实现的宽容行为）。",
+        "summary": "提交下载请求",
+        "description": "提交单个外部下载请求，进入下载确认流程。\n支持未设置 `application/json` Content-Type 的脚本请求。",
         "operationId": "takeover_download",
         "requestBody": {
           "content": {
@@ -3211,7 +3258,8 @@
         "tags": [
           "takeover"
         ],
-        "summary": "批量提交外部下载请求。支持 `{\"urls\":[...]}` 与 `{\"items\":[{...}]}` 两种形态，\n合并为单次确认。鉴权与 `/download` 相同。",
+        "summary": "批量提交下载请求",
+        "description": "支持 `{\"urls\":[...]}` 与 `{\"items\":[{...}]}` 两种请求格式，\n多个请求合并为一次确认。鉴权方式与 `/download` 相同。",
         "operationId": "takeover_download_batch",
         "responses": {
           "200": {
@@ -3247,7 +3295,8 @@
         "tags": [
           "aria2"
         ],
-        "summary": "aria2 客户端约定：HTTP 层始终 200，错误在 JSON-RPC envelope 内表达。",
+        "summary": "调用 aria2 接口",
+        "description": "提供 aria2 兼容的 JSON-RPC 调用。HTTP 状态码始终为 200，\n调用错误通过 JSON-RPC 响应的错误字段返回。",
         "operationId": "jsonrpc",
         "responses": {
           "200": {
@@ -3266,7 +3315,8 @@
         "tags": [
           "mcp"
         ],
-        "summary": "MCP（Model Context Protocol）端点。强制 token 鉴权（Bearer /\nX-FluxDown-Token，复用管理 API 门禁）。请求返回 `200 application/json`\nJSON-RPC 响应；通知（无 `id`）返回 `202 Accepted` 空体。",
+        "summary": "调用 MCP 接口",
+        "description": "通过 MCP（Model Context Protocol）供 AI 客户端查询和调用下载工具。\n\n**鉴权**：必须提供访问令牌，使用 `Authorization: Bearer <token>`\n或 `X-FluxDown-Token` 请求头，与管理 API 使用相同的鉴权规则。\n\n**响应**：带 `id` 的请求返回 HTTP 200 与 JSON-RPC 响应\n（`Content-Type: application/json`）；不带 `id` 的通知返回 HTTP 202，无响应体。",
         "operationId": "mcp",
         "responses": {
           "200": {
@@ -3311,7 +3361,8 @@
         "tags": [
           "system"
         ],
-        "summary": "探活。返回应用名、版本号与 `pong`；宿主配置了 Web UI 语言时附带 `language`\n（无鉴权——登录前的前端靠它决定界面默认语言；经 [`ApiHost::web_language`]\n实时求值，配置变更无需重启）。",
+        "summary": "检查服务状态",
+        "description": "返回应用名称、版本号与 `pong`；配置了 Web UI 语言时附带 `language`。\n无需鉴权，可用于连接检测和登录前的语言设置。",
         "operationId": "ping",
         "responses": {
           "200": {
@@ -3746,6 +3797,27 @@
           "lastSeenAt"
         ],
         "properties": {
+          "appVersion": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "对端自报的客户端版本（经已认证链路获取）。"
+          },
+          "cloudDeviceId": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "对端已登录云账号时经已认证链路自报的云设备 id。客户端仅当本机云设备名册里存在同 id\n设备时把两者合并为同一台设备展示；直连设备本身永不注册到云端、不占云端设备名额。"
+          },
+          "customName": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "本机给该设备设置的备注名（`agent.link.rename`，仅本机可见）；`name` 已是生效名\n（备注名优先，否则对端自报名）。"
+          },
           "defaultSaveDir": {
             "type": [
               "string",
@@ -3787,6 +3859,10 @@
               "string",
               "null"
             ]
+          },
+          "revoked": {
+            "type": "boolean",
+            "description": "对端已解除与本机的配对（对端经已认证链路通知）：不可再下发，只能删除或重新配对。"
           }
         }
       },
@@ -4216,6 +4292,13 @@
           "name": {
             "type": "string"
           },
+          "networkHosts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "插件桌面视图声明的网络主机（授权界面展示）。"
+          },
           "permissions": {
             "type": "array",
             "items": {
@@ -4344,6 +4427,86 @@
           }
         }
       },
+      "PluginCommandDeclDto": {
+        "type": "object",
+        "description": "命令贡献声明。",
+        "required": [
+          "id",
+          "title"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "palette": {
+            "type": "boolean"
+          },
+          "taskMenu": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "PluginContributionsDto": {
+        "type": "object",
+        "description": "插件贡献点（镜像 `engine::plugin::ContributesDecl`）。",
+        "properties": {
+          "commands": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PluginCommandDeclDto"
+            }
+          },
+          "sniffRules": {
+            "type": "boolean",
+            "description": "是否贡献浏览器扩展嗅探规则。"
+          },
+          "views": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PluginViewDeclDto"
+            }
+          }
+        }
+      },
+      "PluginDesktopEntryDto": {
+        "type": "object",
+        "description": "视图的桌面增强入口。",
+        "required": [
+          "entry"
+        ],
+        "properties": {
+          "entry": {
+            "type": "string",
+            "description": "包内相对路径（`.js` / `.mjs`），默认导出继承 `View` 的类。"
+          },
+          "height": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "初始窗口高度（逻辑像素，仅 `window` 视图）。"
+          },
+          "networkHosts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "界面脚本可直连的网络主机（gpui-shell 网络授权只接受逐个主机名）。"
+          },
+          "width": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "float",
+            "description": "初始窗口宽度（逻辑像素，仅 `window` 视图）。"
+          }
+        }
+      },
       "PluginDto": {
         "type": "object",
         "description": "已安装插件视图（列表/设置表单）。",
@@ -4362,6 +4525,24 @@
             "type": "boolean",
             "description": "是否声明平台登录入口。"
           },
+          "consentPending": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "尚未授权的权限（授权流程启用前恒为空）。"
+          },
+          "consentPendingHosts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "尚未授权的网络主机（授权流程启用前恒为空）。"
+          },
+          "contributions": {
+            "$ref": "#/components/schemas/PluginContributionsDto",
+            "description": "manifest `contributes`：视图 / 命令 / 嗅探规则贡献点。"
+          },
           "description": {
             "type": "string"
           },
@@ -4370,7 +4551,7 @@
           },
           "disabledReason": {
             "type": "string",
-            "description": "`None` / `Manual` / `CircuitBreaker`。"
+            "description": "`None` / `Manual` / `CircuitBreaker` / `Revoked`。"
           },
           "enabled": {
             "type": "boolean"
@@ -4392,12 +4573,37 @@
           "name": {
             "type": "string"
           },
+          "networkHosts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "全部桌面视图声明的网络主机（排序去重）。"
+          },
+          "packageDir": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "插件包在 daemon 主机上的绝对目录（仅已加载插件有值）；本机桌面端据此读取 `desktop.entry`。"
+          },
           "permissions": {
             "type": "array",
             "items": {
               "type": "string"
             },
             "description": "manifest 声明的能力权限（如 `[\"ffmpeg\"]`，供 UI 展示授权徽章）。"
+          },
+          "resolverUrls": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "manifest resolvers[0].match.urls（glob，语义见 url_glob_match）。"
+          },
+          "risk": {
+            "type": "string",
+            "description": "风险等级（由权限推导）：`standard` / `elevated` / `full`。"
           },
           "settings": {
             "type": "array",
@@ -4423,6 +4629,42 @@
             "description": "manifest 声明的订阅 provider ID，供订阅创建界面生成可选来源。"
           },
           "version": {
+            "type": "string"
+          }
+        }
+      },
+      "PluginViewDeclDto": {
+        "type": "object",
+        "description": "视图贡献声明。",
+        "required": [
+          "id",
+          "title",
+          "location"
+        ],
+        "properties": {
+          "desktop": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginDesktopEntryDto",
+                "description": "桌面增强实现（仅 GPUI 桌面端经 gpui-shell 运行，daemon 不执行）。"
+              }
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string",
+            "description": "`activity` / `settings` / `taskDetail` / `window`。"
+          },
+          "portable": {
+            "type": "boolean",
+            "description": "是否有可移植实现（由 main 内的 `flux.ui.view` 提供）：无 `desktop` 的视图恒为 true，\n带 `desktop` 的视图仅在 manifest 显式 `portable: true` 时为 true。"
+          },
+          "title": {
             "type": "string"
           }
         }
@@ -4928,13 +5170,21 @@
       },
       "RssValidateRequest": {
         "type": "object",
-        "description": "验证一个 feed 地址（`POST /api/v1/rss/validate`，只读、不落库）。",
+        "description": "验证一个订阅地址（`POST /api/v1/rss/validate`，只读、不落库）。",
         "required": [
           "url"
         ],
         "properties": {
           "cookies": {
             "type": "string"
+          },
+          "providerConfig": {
+            "type": "string",
+            "description": "provider 专属配置 JSON；缺省为空。"
+          },
+          "providerId": {
+            "type": "string",
+            "description": "订阅来源 provider；缺省/空为内置 RSS provider。"
           },
           "proxyUrl": {
             "type": "string"
@@ -5331,39 +5581,39 @@
   "tags": [
     {
       "name": "system",
-      "description": "探活与基础信息"
+      "description": "服务状态"
     },
     {
       "name": "takeover",
-      "description": "浏览器脚本接管（Tampermonkey / Violentmonkey）"
+      "description": "浏览器脚本下载接管"
     },
     {
       "name": "aria2",
-      "description": "aria2 JSON-RPC 兼容"
+      "description": "aria2 兼容接口"
     },
     {
       "name": "mcp",
-      "description": "MCP（Model Context Protocol）—— AI 客户端工具调用"
+      "description": "MCP 工具调用"
     },
     {
       "name": "management",
-      "description": "管理 API（强制 token）"
+      "description": "下载任务与站点凭据管理"
     },
     {
       "name": "groups",
-      "description": "任务组与前置预解析（多文件任务组；强制 token）"
+      "description": "任务组与文件预览"
     },
     {
       "name": "plugins",
-      "description": "插件系统（安装/启停/设置/卸载；强制 token）"
+      "description": "插件安装与管理"
     },
     {
       "name": "rss",
-      "description": "RSS 订阅自动下载（订阅 CRUD / 条目流 / 手动操作 / feed 验证；强制 token）"
+      "description": "RSS 订阅与自动下载"
     },
     {
       "name": "link",
-      "description": "设备互联（配对/发现/数据面下发；`pair/hello`·`pair/reveal`·`pair/confirm`·`link/tasks` 无 token，由一次性码/会话/链路 HMAC 守卫，其余强制 management token）"
+      "description": "设备发现、配对与任务传输"
     }
   ]
 }

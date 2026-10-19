@@ -257,6 +257,31 @@ describe('runImport', () => {
     expect(report.notSubmitted).toBe(10)
     expect(report.failed).toBe(0)
   })
+
+  test('非安全上下文（明文 HTTP 访问，无 crypto.randomUUID）仍能生成 batchId', async () => {
+    // 浏览器只在安全上下文暴露 randomUUID；getRandomValues 不受限制。
+    const own = Object.getOwnPropertyDescriptor(crypto, 'randomUUID')
+    Object.defineProperty(crypto, 'randomUUID', { value: undefined, configurable: true, writable: true })
+    try {
+      const seen: string[] = []
+      const report = await runImport({
+        common,
+        items: items(300),
+        call: async (params) => {
+          seen.push(params.batchId)
+          return createdAll(params)
+        },
+        sleep: instant,
+      })
+      expect(report.succeeded).toBe(300)
+      expect(seen).toHaveLength(2)
+      expect(new Set(seen).size).toBe(2)
+      expect(seen.every((batchId) => batchId.length > 0 && batchId.length <= 128)).toBe(true)
+    } finally {
+      if (own) Object.defineProperty(crypto, 'randomUUID', own)
+      else Reflect.deleteProperty(crypto, 'randomUUID')
+    }
+  })
 })
 
 describe('buildBatch', () => {

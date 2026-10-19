@@ -1,8 +1,5 @@
 package com.fluxdown.app.feature.settings
 
-import android.net.Uri
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.StringRes
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -35,12 +32,9 @@ import com.fluxdown.app.nav.SettingsPage
 import com.fluxdown.app.shell.LocalAppContainer
 import com.fluxdown.app.shell.hostState
 import com.fluxdown.app.ui.defaultLocalSaveDir
-import com.fluxdown.app.ui.isLocalDirWritable
 import com.fluxdown.app.ui.label
-import com.fluxdown.app.ui.canRequestStorageAccess
 import com.fluxdown.app.ui.publicDownloadSaveDir
-import com.fluxdown.app.ui.rememberStorageAccessPrompt
-import com.fluxdown.app.ui.treeUriToPath
+import com.fluxdown.app.ui.rememberLocalDirectoryPicker
 import com.fluxdown.core.host.HostException
 import com.fluxdown.core.protocol.ConnPolicySummary
 import com.fluxdown.core.protocol.HostMethod
@@ -416,14 +410,7 @@ private fun RemoteSaveDirField(ctx: SettingsCtx, onBrowse: () -> Unit) {
     }
 }
 
-/**
- * 本机主机的保存目录：只读展示 + 系统目录选择器（SAF，映射为绝对路径）+ 快捷“系统 Download/FluxDown”
- * + 偏离默认时一键恢复。不提供手填：手填路径极易写成不可写目录（引擎下载时才报 EPERM）。
- *
- * 能否写入只看系统真实结果（[isLocalDirWritable]）；共享存储里需要“所有文件访问”的目录，
- * 不可写时引导授权，而不是在应用层另设白名单。系统选择器本身禁止选 Download 根 / Android/data
- * 等目录（Android 11+ 隐私限制），可在其下新建子文件夹选择，或直接用快捷项。
- */
+/** 本机目录浏览与授权共用同一入口；不使用禁止选择 Download 根目录的 SAF。 */
 @Composable
 private fun LocalSaveDirPicker(ctx: SettingsCtx) {
     val context = LocalContext.current
@@ -432,57 +419,29 @@ private fun LocalSaveDirPicker(ctx: SettingsCtx) {
     val current = ctx.form.string("default_save_dir")
     val defaultDir = remember(context) { defaultLocalSaveDir(context).path }
     val publicDir = remember { publicDownloadSaveDir().path }
-    val notWritable = str(R.string.mobileSaveDirNotWritable)
-    val unmappable = str(R.string.mobilePickDirUnmappable)
-    // 授权后以同一目录重试：已授权时 canRequestStorageAccess 为 false，仍不可写只提示，不会循环弹授权
-    var retry: (String) -> Unit = {}
-    val promptAccess = rememberStorageAccessPrompt { retry(it) }
-
-    fun apply(dir: String) {
-        when {
-            isLocalDirWritable(dir) -> if (dir != current) {
-                haptics.tick()
-                ctx.editor.set("default_save_dir", dir)
-            }
-            canRequestStorageAccess(context, dir) -> {
-                haptics.reject()
-                promptAccess(dir)
-            }
-            else -> {
-                haptics.reject()
-                overlays.toast(notWritable.fill("dir" to dir), FluxToastKind.Error)
-            }
+    val pickDirectory = rememberLocalDirectoryPicker { dir ->
+        if (!ctx.readOnly && dir != current) {
+            haptics.tick()
+            ctx.editor.set("default_save_dir", dir)
         }
     }
-    retry = ::apply
-
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        val path = treeUriToPath(uri)
-        if (path == null) {
-            haptics.reject()
-            overlays.toast(unmappable, FluxToastKind.Warn)
-        } else {
-            apply(path)
-        }
-    }
-    val shown = current.ifEmpty { defaultDir }.trimEnd('/')
+    val shown = current.ifEmpty { defaultDir }.trimEnd('/').ifEmpty { "/" }
     val modified = shown != defaultDir.trimEnd('/')
 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         FluxField(
-            value = shown,
+            value = remember(shown) { com.fluxdown.app.ui.friendlyLocalPath(context, shown) },
             onValueChange = {},
             readOnly = true,
-            mono = true,
+            mono = false,
             singleLine = false,
             enabled = !ctx.readOnly,
             trailing = {
                 Row {
                     if (modified) {
-                        FluxFieldAction(FluxIcons.RotateCcw, str(R.string.restoreDefaultPath), onClick = { apply(defaultDir) })
+                        FluxFieldAction(FluxIcons.RotateCcw, str(R.string.restoreDefaultPath), onClick = { pickDirectory(defaultDir) })
                     }
-                    FluxFieldAction(FluxIcons.FolderOpen, str(R.string.browse), onClick = { launcher.launch(null) })
+                    FluxFieldAction(FluxIcons.FolderOpen, str(R.string.browse), onClick = { pickDirectory(shown) })
                 }
             },
         )
@@ -490,7 +449,7 @@ private fun LocalSaveDirPicker(ctx: SettingsCtx) {
             FluxPill(
                 text = str(R.string.mobileUsePublicDownloadDir),
                 selected = false,
-                onClick = { apply(publicDir) },
+                onClick = { pickDirectory(publicDir) },
                 icon = FluxIcons.Download,
                 small = true,
                 toggleable = false,

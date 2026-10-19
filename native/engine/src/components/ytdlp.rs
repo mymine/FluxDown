@@ -223,12 +223,13 @@ mod install {
     /// 列出近期可安装版本（排除 draft/prerelease；GitHub 返回即按新→旧）。
     pub async fn list_ytdlp_versions(
         db: &Db,
-        client: &reqwest::Client,
+        egress: &crate::egress::Egress,
     ) -> Result<YtdlpVersions, ComponentError> {
         platform_asset().ok_or(ComponentError::Unsupported)?;
+        let client = super::super::egress_client(egress).await?;
         let mirror_base = super::super::component_mirror_base(db).await;
         let releases =
-            super::super::fetch_versions_json(client, "ytdlp", RELEASES_API, &mirror_base).await?;
+            super::super::fetch_versions_json(&client, "ytdlp", RELEASES_API, &mirror_base).await?;
         let empty = Vec::new();
         let arr = releases.as_array().unwrap_or(&empty);
         let versions: Vec<String> = arr
@@ -254,18 +255,19 @@ mod install {
     pub async fn install_ytdlp(
         db: &Db,
         data_dir: &Path,
-        client: &reqwest::Client,
+        egress: &crate::egress::Egress,
         version: Option<&str>,
         progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<YtdlpStatus, ComponentError> {
         let asset = platform_asset().ok_or(ComponentError::Unsupported)?;
+        let client = super::super::egress_client(egress).await?;
         let mirror_base = super::super::component_mirror_base(db).await;
         let url = match version {
             Some(tag) => format!("{RELEASE_TAG_API}{tag}"),
             None => RELEASE_LATEST_API.to_string(),
         };
         let release =
-            super::super::fetch_github_json_with_mirror(client, &url, &mirror_base).await?;
+            super::super::fetch_github_json_with_mirror(&client, &url, &mirror_base).await?;
         let chosen_ver = release["tag_name"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -288,8 +290,9 @@ mod install {
         // 版本 JSON 可能经镜像而来：资产与校验文件都必须落在上游发布路径下。
         super::super::require_upstream_asset_url(&dl_url, UPSTREAM_DOWNLOAD_PREFIX)?;
         super::super::require_upstream_asset_url(&sums_url, UPSTREAM_DOWNLOAD_PREFIX)?;
+        // 校验和是完整性锚：只走代理，不交给插件改写。
         let expected_sha256 =
-            super::super::fetch_expected_sha256(client, &sums_url, &mirror_base, asset).await?;
+            super::super::fetch_expected_sha256(&client, &sums_url, &mirror_base, asset).await?;
 
         // 单文件二进制：流式下载到 bin/ 下临时文件，哈希 + 探版都通过后才原子替换
         // 目标，失败不碰原有托管二进制。Windows 上临时文件须保留 `.exe` 才能探版。
@@ -303,9 +306,10 @@ mod install {
         } else {
             "yt-dlp.download"
         });
+        let route = egress.route_verified(&dl_url).await;
         super::super::download_to_file(
-            client,
-            &dl_url,
+            &client,
+            &route,
             &mirror_base,
             &tmp,
             &expected_sha256,

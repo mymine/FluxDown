@@ -33,6 +33,7 @@ import { useConflictTaskIds } from '../dialogs/fileConflict'
 import { FileCell, KindGlyph, ProgressCell, StatusCell } from './cells'
 import { formatEta } from './text'
 import type { Translate } from './text'
+import { usePluginTaskCommands } from '../../plugins/usePluginContributions'
 import { buildGroupMenu, buildTaskMenu } from './menus'
 import { SelectionHeaderBar } from '../selection'
 import { TaskEmpty } from './TaskEmpty'
@@ -350,6 +351,9 @@ export function TaskTable() {
   ctxRef.current = ctx
   const tRef = useRef(t)
   tRef.current = t
+  const pluginCommands = usePluginTaskCommands()
+  const pluginCommandsRef = useRef(pluginCommands)
+  pluginCommandsRef.current = pluginCommands
   const onClick = useCallback((event: MouseEvent, view: DownloadTaskView) => {
     ctxRef.current.clickSelect(view.key, { shift: event.shiftKey, secondary: event.ctrlKey || event.metaKey })
   }, [])
@@ -369,6 +373,7 @@ export function TaskTable() {
       queueName: current.queueName,
       showDetail: current.showDetail,
       selection: { multiSelect: current.multiSelect, enterMultiSelect: current.enterMultiSelect, selectAll: current.selectAll },
+      pluginCommands: pluginCommandsRef.current,
     })
   }, [])
 

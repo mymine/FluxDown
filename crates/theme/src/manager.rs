@@ -299,10 +299,23 @@ pub fn sync_system_theme(window: &mut Window, cx: &mut App) {
     }
 }
 
-/// 重新查询平台可用字体并重装当前主题（不修改保存的偏好）。
-pub fn refresh_font_family(cx: &mut App) {
+/// 用当前状态的主题文件与外观重新安装（不修改保存的偏好）：重新查询平台可用字体，
+/// 并在脚本改写了 gpui-component / gpui-base 全局主题后恢复 FluxDown 投影。
+pub fn reinstall_current(cx: &mut App) {
     let state = active_theme(cx);
     install(state.documents.clone(), state.appearance.clone(), None, cx);
+}
+
+/// 当前主题完整已解析 token：注册表路径 → wire 值（颜色为 `#rrggbbaa`，长度 / 圆角 / 字重 / 比例
+/// 为数值，字体为字符串，阴影为层数组）。
+#[must_use]
+pub fn resolved_token_map(cx: &App) -> BTreeMap<String, Value> {
+    active_theme(cx)
+        .resolved()
+        .token_values()
+        .into_iter()
+        .map(|(path, value)| (path.to_owned(), value.to_json()))
+        .collect()
 }
 
 fn install(
@@ -463,5 +476,87 @@ fn shift_toward_contrast(color: gpui::Hsla, amount: f32) -> gpui::Hsla {
     gpui::Hsla {
         l: (color.l + delta).clamp(0., 1.),
         ..color
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::TestApp;
+
+    use super::*;
+    use crate::value::number_value;
+    use crate::{TOKENS, color_hex};
+
+    fn app() -> TestApp {
+        let mut app = TestApp::new();
+        app.update(|cx| {
+            gpui_component::init(cx);
+            init(cx);
+        });
+        app
+    }
+
+    fn is_hex8(value: &Value) -> bool {
+        value.as_str().is_some_and(|text| {
+            text.len() == 9
+                && text.starts_with('#')
+                && text[1..]
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+    }
+
+    #[test]
+    fn token_map_covers_registry_with_wire_values() {
+        let app = app();
+        let map = app.read(resolved_token_map);
+        assert_eq!(map.len(), TOKENS.len());
+        assert!(
+            is_hex8(&map["colors.primary"]),
+            "{:?}",
+            map["colors.primary"]
+        );
+        assert!(map["spacing.md"].is_number());
+        assert!(
+            map["typography.sans"]
+                .as_str()
+                .is_some_and(|f| !f.is_empty())
+        );
+    }
+
+    #[test]
+    fn token_map_matches_active_theme() {
+        let app = app();
+        app.read(|cx| {
+            let map = resolved_token_map(cx);
+            let theme = active_theme(cx);
+            assert_eq!(
+                map["colors.primary"],
+                Value::from(color_hex(theme.tokens().colors.primary))
+            );
+            assert_eq!(
+                map["colors.chrome"],
+                Value::from(color_hex(theme.extended().colors.chrome))
+            );
+            assert_eq!(
+                map["spacing.md"],
+                number_value(theme.tokens().spacing.md.as_f32())
+            );
+        });
+    }
+
+    #[test]
+    fn reinstall_current_restores_projected_theme() {
+        let mut app = app();
+        app.update(|cx| {
+            gpui_base::Theme::global_mut(cx).tokens.colors.primary = gpui::red();
+            reinstall_current(cx);
+        });
+        app.read(|cx| {
+            assert_eq!(
+                gpui_base::Theme::global(cx).tokens.colors.primary,
+                active_theme(cx).tokens().colors.primary
+            );
+        });
     }
 }

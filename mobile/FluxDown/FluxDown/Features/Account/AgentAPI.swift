@@ -191,6 +191,11 @@ struct AgentAPI: Sendable {
         try await session.callVoid(HostMethod.agentLinkRemove, params: LinkDeviceParams(fingerprint: fingerprint))
     }
 
+    /// 设置 / 清除本机备注名（`name` 空白 = 清除）。
+    func linkRename(fingerprint: String, name: String?) async throws(HostError) -> LinkDeviceInfo {
+        try await session.call(HostMethod.agentLinkRename, params: LinkRenameParams(fingerprint: fingerprint, name: name))
+    }
+
     /// 探测全部已配对设备在线状态（同时推送快照里的 `linkDevices`）。
     func linkRefresh() async throws(HostError) -> [LinkDeviceInfo] {
         try await session.call(HostMethod.agentLinkRefresh)

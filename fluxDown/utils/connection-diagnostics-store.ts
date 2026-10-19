@@ -7,7 +7,7 @@ const EVENTS = [
   "native.connected", "native.request_failed", "native.retry",
 ] as const;
 const ACTIONS = ["ping", "warmup", "tasks", "download", "batch_download", "task_op", "open_file", "reveal_file"];
-export type DiagnosticSource = "background" | "popup" | "options";
+export type DiagnosticSource = "background" | "popup" | "options" | "sidepanel";
 export interface ConnectionDiagnostic {
   event: typeof EVENTS[number];
   action?: string;
@@ -70,7 +70,7 @@ export class ConnectionDiagnosticsStore {
     const cutoff = this.now() - DIAGNOSTIC_MAX_AGE_MS;
     return stored.slice(-MAX_DIAGNOSTIC_ENTRIES).flatMap((item) => {
       const event = normalize(item);
-      if (!event || !["background", "popup", "options"].includes(item.source) ||
+      if (!event || !["background", "popup", "options", "sidepanel"].includes(item.source) ||
           !Number.isFinite(item.firstAt) || !Number.isFinite(item.lastAt) ||
           item.firstAt > item.lastAt || item.lastAt < cutoff ||
           !Number.isSafeInteger(item.count) || item.count < 1) return [];

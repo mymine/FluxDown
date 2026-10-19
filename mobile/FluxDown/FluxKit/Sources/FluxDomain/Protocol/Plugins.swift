@@ -391,6 +391,43 @@ public struct PluginIgnoreRetryParams: Codable, Sendable, Hashable {
     }
 }
 
+/// `daemon.plugin.siteDefaults` 的一行（`PluginSiteDefaultDto`）。
+/// `automatic == true`：无人值守下载自动选定、尚未被用户确认。
+public struct PluginSiteDefault: Codable, Sendable, Hashable, Identifiable {
+    public var site: String
+    public var identity: String
+    public var candidates: [String]
+    public var automatic: Bool
+
+    public var id: String { site }
+
+    public init(site: String, identity: String, candidates: [String], automatic: Bool) {
+        self.site = site
+        self.identity = identity
+        self.candidates = candidates
+        self.automatic = automatic
+    }
+}
+
+/// `daemon.plugin.setSiteDefault`：`identity == nil` 移除条目（编码为 JSON `null`，不能省略键）。
+public struct PluginSetSiteDefaultParams: Codable, Sendable, Hashable {
+    public var site: String
+    public var identity: String?
+
+    public init(site: String, identity: String?) {
+        self.site = site
+        self.identity = identity
+    }
+
+    private enum CodingKeys: String, CodingKey { case site, identity }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(site, forKey: .site)
+        try container.encode(identity, forKey: .identity)
+    }
+}
+
 /// `WsServerMsg::PluginAutoDisabled`（`HostNoticeName.pluginAutoDisabled` 的载荷）。
 public struct PluginAutoDisabledNotice: Codable, Sendable, Hashable {
     public var identity: String
@@ -572,8 +609,8 @@ public enum PluginMarket {
         }
     }
 
-    /// 每个插件一条（`crates/extensions/src/market.rs::latest_per_plugin`）：优先最新可安装版本；
-    /// 全部撤回时取 sequence 最大者（仅用于展示撤回标记）。顺序为各插件在索引中首次出现的位置。
+    /// 每个插件一条（`crates/extensions/src/market.rs::latest_per_plugin`）：最新可安装版本；
+    /// 全部撤回（下架）的插件不出现。顺序为各插件在索引中首次出现的位置。
     public static func latestPerPlugin(_ entries: [MarketEntry]) -> [MarketEntry] {
         var order: [String] = []
         var best: [String: MarketEntry] = [:]
@@ -588,7 +625,7 @@ public enum PluginMarket {
             let better = a != b ? a : entry.sequence > current.sequence
             if better { best[entry.pluginId] = entry }
         }
-        return order.compactMap { best[$0] }
+        return order.compactMap { best[$0] }.filter(\.installable)
     }
 
     /// `MAJOR.MINOR.PATCH`（可带前导 `v`，忽略预发布 / 构建后缀）；无法解析为 nil。

@@ -183,7 +183,7 @@ class ExternalDownloadActivity : ComponentActivity() {
 
     /** 本机建了任务：趁窗口仍可见拉起前台服务（Android 12+ 禁止后台启动），服务在本机空闲后自行停止。 */
     private fun keepLocalDownloadsAlive(container: AppContainer) {
-        if (container.host.value is HostRef.Local) DownloadServiceController.start(this)
+        if (container.host.value is HostRef.Local) DownloadServiceController.start(this, "external download")
     }
 
     /** 分享取文本，VIEW 取 data 与浏览器 extra。 */

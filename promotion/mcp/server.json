@@ -3,7 +3,7 @@
   "name": "io.github.zerx-lab/fluxdown",
   "title": "FluxDown",
   "description": "Control the FluxDown download manager: add, list, pause, resume and remove downloads, browse named queues, and manage RSS subscriptions.",
-  "websiteUrl": "https://fluxdown.zerx.dev",
+  "websiteUrl": "https://fluxdown.com",
   "repository": {
     "url": "https://github.com/zerx-lab/FluxDown",
     "source": "github"

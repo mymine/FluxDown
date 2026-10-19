@@ -2,7 +2,7 @@
 
 use fluxdown_ui_downloads::actions as dl;
 use fluxdown_ui_i18n::Translator;
-use gpui::{App, Entity, KeyBinding, Menu, MenuItem, SharedString, Window};
+use gpui::{App, Entity, Menu, MenuItem, SharedString, Window};
 
 use crate::{
     actions::{
@@ -14,58 +14,7 @@ use crate::{
     windows::{WindowKey, WindowRegistry, confirm_active_tasks},
 };
 
-const WEBSITE_URL: &str = "https://fluxdown.zerx.dev";
-
-fn primary() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "cmd"
-    } else {
-        "ctrl"
-    }
-}
-
-/// 注册全局键位。字母键只在下载页上下文生效（页面内再按聚焦输入框二次拦截）。
-///
-/// macOS 的 ⌘W / ⌘M / ⌘H / ⌃⌘F 由 AppKit 经菜单 key equivalent 分发，gpui 不会自动
-/// 提供；须像 Zed 一样显式绑定并在菜单树里给出对应项。
-pub fn bind_keys(cx: &mut App) {
-    let p = primary();
-    let dl_ctx = Some(dl::KEY_CONTEXT);
-    let mut bindings = vec![
-        KeyBinding::new(&format!("{p}-n"), dl::NewDownload, None),
-        KeyBinding::new(&format!("{p}-,"), OpenSettings, None),
-        KeyBinding::new(&format!("{p}-k"), ToggleCommandPalette, None),
-        KeyBinding::new(&format!("{p}-f"), dl::FocusSearch, dl_ctx),
-        KeyBinding::new(&format!("{p}-a"), dl::SelectAllTasks, dl_ctx),
-        KeyBinding::new("delete", dl::DeleteSelected, dl_ctx),
-        KeyBinding::new("backspace", dl::DeleteSelected, dl_ctx),
-        KeyBinding::new(&format!("{p}-backspace"), dl::DeleteSelected, dl_ctx),
-        KeyBinding::new("shift-delete", dl::DeleteSelectedWithFiles, dl_ctx),
-        KeyBinding::new("space", dl::TogglePauseSelected, dl_ctx),
-        KeyBinding::new("shift-d", dl::CycleDensity, dl_ctx),
-        KeyBinding::new("g", dl::CycleGroupBy, dl_ctx),
-        KeyBinding::new("s", dl::CycleSort, dl_ctx),
-        KeyBinding::new(&format!("{p}-i"), dl::ToggleDetailPanel, dl_ctx),
-        KeyBinding::new("escape", dl::ClearSelection, dl_ctx),
-        KeyBinding::new(
-            "space",
-            gpui_component::dialog::Confirm { secondary: false },
-            Some(fluxdown_ui_components::DIALOG_PRIMARY_KEY_CONTEXT),
-        ),
-    ];
-    if cfg!(target_os = "macos") {
-        bindings.extend([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-w", CloseWindow, None),
-            KeyBinding::new("cmd-m", MinimizeWindow, None),
-            KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
-            KeyBinding::new("cmd-h", Hide, None),
-            KeyBinding::new("alt-cmd-h", HideOthers, None),
-        ]);
-    }
-    cx.bind_keys(bindings);
-    fluxdown_ui_command_palette::bind_keys(cx);
-}
+const WEBSITE_URL: &str = "https://fluxdown.com";
 
 fn t(translator: &Translator, key: &str) -> SharedString {
     SharedString::from(translator.text(key).to_owned())
@@ -121,6 +70,7 @@ pub fn build_menus(translator: &Translator) -> Vec<Menu> {
         MenuItem::action(t(translator, "renameTask"), dl::RenameSelected),
         MenuItem::action(t(translator, "webChangeUrl"), dl::ChangeSelectedUrl),
         MenuItem::action(t(translator, "editThreads"), dl::ChangeSelectedSegments),
+        MenuItem::action(t(translator, "verifyTaskIntegrity"), dl::VerifySelected),
         MenuItem::action(t(translator, "redownloadTask"), dl::RedownloadSelected),
         MenuItem::action(t(translator, "boostDownload"), dl::ToggleBoostSelected),
         MenuItem::action(t(translator, "menuOpenInWindow"), dl::OpenSelectedInWindow),
@@ -178,7 +128,7 @@ pub fn install(cx: &mut App, translator: &Entity<Translator>) {
     .detach();
 }
 
-fn apply_menus(translator: &Entity<Translator>, cx: &mut App) {
+pub(crate) fn apply_menus(translator: &Entity<Translator>, cx: &mut App) {
     let translator = translator.read(cx).clone();
     cx.set_menus(build_menus(&translator));
 }

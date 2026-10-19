@@ -9,7 +9,7 @@
 | 仓库 | `zerx-lab/FluxDown` | — |
 | Star | **1002**（fork 51） | `gh api repos/zerx-lab/FluxDown` |
 | License | AGPL-3.0 | 同上 |
-| 官网 | https://fluxdown.zerx.dev（README 第 19 行的 Website 链接） | `FluxDown/README.md:19` |
+| 官网 | https://fluxdown.com（README 第 19 行的 Website 链接） | `FluxDown/README.md:19` |
 | GitHub 仓库 homepage 字段 | `https://www.fluxdown.com` | `gh api` — 两个域名均实测 HTTP 200 |
 | crates.io | **无 crate**（`crates.io/api/v1/crates/fluxdown` → "crate `fluxdown` does not exist"） | 实测 |
 | 定位 | Rust + Tokio 引擎 / GPUI PC / Kotlin Compose Android / SwiftUI iOS 的多协议下载管理器，开源 IDM 替代 | 当前架构见根 `README.md` |
@@ -280,7 +280,7 @@ README 原文（https://github.com/fluttergems/fluttergems）：
 ## 提交前的收尾检查（跨清单通用）
 
 1. **去重**：对 4 个目标仓库的 README/source.md 做过 `fluxdown|zerx` 全文检索，**零命中** —— 目前均未收录，不会撞重复条目。
-2. **homepage 字段口径不一致**：GitHub 仓库 homepage 字段是 `https://www.fluxdown.com`，而 README 正文链接的是 `https://fluxdown.zerx.dev`（两者实测均 HTTP 200）。审阅者通常点仓库右侧的 homepage，建议提交前统一成一个域名，避免「链接对不上」的观感问题。
+2. **homepage 字段口径不一致**：GitHub 仓库 homepage 字段是 `https://www.fluxdown.com`，而 README 正文链接的是 `https://fluxdown.com`（两者实测均 HTTP 200）。审阅者通常点仓库右侧的 homepage，建议提交前统一成一个域名，避免「链接对不上」的观感问题。
 3. **一条目一 PR**：awesome-rust、awesome-flutter、awesome-oss-alternatives 均明文要求 individual PR，不要合并提交。
 4. **不要自动化批量投**：4 个仓库全部由个人维护者人工 review，同一账号同日群发多仓 PR 极易被判定为 spam。建议按 P0 → P1 分批、间隔提交。
 
@@ -329,4 +329,4 @@ README 原文（https://github.com/fluttergems/fluttergems）：
 ### 遗留事项
 
 - awesome-open-source-flutter-apps 需等 issue #777 的分类答复后补提 PR。
-- 收尾检查第 2 条（GitHub homepage 字段 `www.fluxdown.com` 与 README 的 `fluxdown.zerx.dev` 不一致）**仍未处理**；本次全部对外提交统一使用 `https://fluxdown.zerx.dev`。
+- 收尾检查第 2 条（GitHub homepage 字段 `www.fluxdown.com` 与 README 的 `fluxdown.com` 不一致）**仍未处理**；本次全部对外提交统一使用 `https://fluxdown.com`。

@@ -1,8 +1,10 @@
 //! 链接预探测（#402）：链接框里恰好一条 http(s) 链接时，文本稳定后经 `daemon.link.probe`
 //! （daemon 只发一次 HEAD，不消耗一次性令牌）提前显示文件名与大小。
 //!
-//! 探测结果只用于展示和「文件名」输入框的占位提示：绝不写入用户输入，也不进入提交请求
-//! （提交时文件名仍由引擎决定）；失败 / 超时 / 非下载资源一律只显示中性提示，不阻断提交。
+//! 探测到的文件名会预填进「文件名」输入框供用户直接改（只在框为空、或仍是上次预填值时写，
+//! 用户改过的内容绝不覆盖；链接变化后清掉仍未改动的预填值）。未改动的预填值不进入提交请求
+//! （提交时文件名仍由引擎决定），改过才作为显式文件名提交；失败 / 超时 / 非下载资源一律只显示
+//! 中性提示，不阻断提交。
 
 use std::{collections::HashMap, time::Duration};
 
@@ -13,7 +15,10 @@ use gpui::{App, Context, Div, SharedString, Task, Window};
 use super::NewDownloadView;
 use crate::{
     controller::{DownloadsCommand, DownloadsResult},
-    model::new_download::UrlEntry,
+    model::{
+        aria2c::{FieldFill, plan_field_fill},
+        new_download::UrlEntry,
+    },
 };
 
 /// 链接停止变化多久后才发探测（逐键输入时不逐字符发请求）。
@@ -107,6 +112,8 @@ pub(super) struct LinkProbe {
     tasks: Vec<Task<()>>,
     /// 「文件名」输入框当前生效的占位提示。
     placeholder: SharedString,
+    /// 上次预填进「文件名」输入框的探测名；用户改过后忘记，不再认领该字段。
+    filled: Option<String>,
 }
 
 impl LinkProbe {
@@ -118,6 +125,7 @@ impl LinkProbe {
             cache: HashMap::new(),
             tasks: Vec::new(),
             placeholder,
+            filled: None,
         }
     }
 
@@ -162,7 +170,7 @@ impl NewDownloadView {
                 }
             }
         }
-        self.apply_rename_placeholder(window, cx);
+        self.sync_rename(window, cx);
     }
 
     fn spawn_probe(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -212,7 +220,7 @@ impl NewDownloadView {
                 if this.probe.generation == generation && this.probe.status == ProbeStatus::Probing
                 {
                     this.probe.status = ProbeStatus::Unavailable;
-                    this.apply_rename_placeholder(window, cx);
+                    this.sync_rename(window, cx);
                     cx.notify();
                 }
             }) else {
@@ -245,32 +253,70 @@ impl NewDownloadView {
             None => ProbeStatus::Unavailable,
         };
         self.probe.status = status;
-        self.apply_rename_placeholder(window, cx);
+        self.sync_rename(window, cx);
         cx.notify();
     }
 
-    /// 「文件名」输入框的占位：探测到名称且用户没有用 `out=` 指定时显示探测名，否则回到
-    /// 默认的「自动识别文件名」。仅提示，不写入输入值。
-    pub(super) fn rename_placeholder(&self) -> SharedString {
-        match (&self.probe.status, self.entries.as_slice()) {
-            (ProbeStatus::Found(info), [entry])
-                if !info.file_name.is_empty() && entry.file_name.is_empty() =>
-            {
-                SharedString::from(info.file_name.clone())
-            }
-            _ => self.strings.rename_placeholder.clone(),
+    /// 「文件名」可预填的名字：恰好一条链接时，优先用链接自带的 `out=`（含浏览器捕获名），
+    /// 否则用探测到的名称。
+    fn probed_file_name(&self) -> Option<&str> {
+        let [entry] = self.entries.as_slice() else {
+            return None;
+        };
+        if !entry.file_name.is_empty() {
+            return Some(entry.file_name.as_str());
+        }
+        match &self.probe.status {
+            ProbeStatus::Found(info) if !info.file_name.is_empty() => Some(info.file_name.as_str()),
+            _ => None,
         }
     }
 
-    fn apply_rename_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let placeholder = self.rename_placeholder();
-        if placeholder == self.probe.placeholder {
-            return;
+    /// 「文件名」输入框的占位：有探测名时显示探测名（用户清空预填值后仍能看到自动识别结果），
+    /// 否则回到默认的「自动识别文件名」。
+    pub(super) fn rename_placeholder(&self) -> SharedString {
+        self.probed_file_name().map_or_else(
+            || self.strings.rename_placeholder.clone(),
+            |name| SharedString::from(name.to_owned()),
+        )
+    }
+
+    /// 提交用的文件名：仍是未改动的预填探测名时视为空（交给引擎定名，与不预填时行为一致）。
+    pub(super) fn rename_value(&self, cx: &App) -> String {
+        let value = self.rename.read(cx).value().trim().to_owned();
+        if self.probe.filled.as_deref() == Some(value.as_str()) {
+            String::new()
+        } else {
+            value
         }
-        self.probe.set_placeholder(placeholder.clone());
-        self.rename.update(cx, |input, cx| {
-            input.set_placeholder(placeholder, window, cx)
-        });
+    }
+
+    /// 探测结果变化后同步「文件名」输入框：占位提示 + 预填可编辑的探测名。
+    fn sync_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = self.rename_placeholder();
+        if placeholder != self.probe.placeholder {
+            self.probe.set_placeholder(placeholder.clone());
+            self.rename.update(cx, |input, cx| {
+                input.set_placeholder(placeholder, window, cx)
+            });
+        }
+        let hint = self.probed_file_name().unwrap_or_default().to_owned();
+        let current = self.rename.read(cx).value().to_string();
+        match plan_field_fill(&current, self.probe.filled.as_deref(), &hint) {
+            FieldFill::Keep => {}
+            FieldFill::Forget => self.probe.filled = None,
+            FieldFill::Set(value) => {
+                // `set_value` 不发 Change，不会被当成用户编辑。
+                self.rename
+                    .update(cx, |input, cx| input.set_value(value.clone(), window, cx));
+                self.probe.filled = Some(value);
+            }
+            FieldFill::Clear => {
+                self.rename
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.probe.filled = None;
+            }
+        }
     }
 
     /// 链接输入区下方的一行状态：探测中 / 已识别（文件名 + 大小，0 = 未知）/ 无法获取。

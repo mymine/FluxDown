@@ -6,7 +6,7 @@ mod market;
 mod pages;
 mod ui;
 
-use std::{future::Future, pin::Pin, sync::Arc};
+use std::{future::Future, pin::Pin, rc::Rc, sync::Arc};
 
 use fluxdown_protocol::{
     AgentSnapshot, ApplicationErrorCode, ErrorReason, RpcErrorData, ServiceEvent,
@@ -15,8 +15,8 @@ use fluxdown_ui_components::segmented_tabs;
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window, div,
-    prelude::FluentBuilder as _,
+    AnyView, App, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, SharedString,
+    Styled, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{WindowExt as _, h_flex, notification::Notification, v_flex};
 
@@ -25,6 +25,18 @@ pub use controller::{ExtensionsController, ExtensionsSignal};
 use pages::{managed_components::ComponentUi, plugins::PluginsUi};
 
 pub type PortFuture<T> = Pin<Box<dyn Future<Output = Result<T, RpcErrorData>> + Send + 'static>>;
+
+/// 由 app 注入的插件视图工厂：`(插件, 视图声明, 任务 id, window, cx)` → 视图。
+/// 扩展页的插件设置对话框用它渲染 `location == "settings"` 的视图。
+pub type PluginViewFactory = Rc<
+    dyn Fn(
+        &fluxdown_protocol::PluginDto,
+        &fluxdown_protocol::PluginViewDeclDto,
+        Option<String>,
+        &mut Window,
+        &mut App,
+    ) -> AnyView,
+>;
 
 pub trait ExtensionsPort: Send + Sync {
     fn call(
@@ -59,7 +71,20 @@ pub struct ExtensionsView {
     last_error: Option<String>,
     plugins: PluginsUi,
     components: [ComponentUi; 2],
+    plugin_view_factory: Option<PluginViewFactory>,
 }
+
+/// 需要宿主（app）完成的动作：capability 不直接开窗。
+#[derive(Clone, Debug)]
+pub enum ExtensionsEvent {
+    /// 打开插件某个视图的桌面界面（`contributes.views[].desktop`，window 位置）。
+    OpenPluginView {
+        plugin: fluxdown_protocol::PluginDto,
+        view: String,
+    },
+}
+
+impl EventEmitter<ExtensionsEvent> for ExtensionsView {}
 
 impl ExtensionsView {
     pub fn new(
@@ -75,12 +100,20 @@ impl ExtensionsView {
             last_error: None,
             plugins: PluginsUi::default(),
             components: [ComponentUi::default(), ComponentUi::default()],
+            plugin_view_factory: None,
         }
+    }
+
+    /// 注入插件视图工厂（app 在装配时调用）。
+    pub fn set_plugin_view_factory(&mut self, factory: PluginViewFactory, cx: &mut Context<Self>) {
+        self.plugin_view_factory = Some(factory);
+        cx.notify();
     }
 
     pub fn replace_snapshot(&mut self, snapshot: &AgentSnapshot, cx: &mut Context<Self>) {
         self.last_error = None;
         self.controller.replace_snapshot(snapshot);
+        self.prune_awaiting_consent();
         cx.notify();
     }
 
@@ -109,6 +142,9 @@ impl ExtensionsView {
             Some(ExtensionsSignal::PluginAutoDisabled { .. }) => {}
             None => {}
         }
+        if ExtensionsController::replaces_plugins(event) {
+            self.prune_awaiting_consent();
+        }
         let cleared_error = !self.controller.is_stale() && self.last_error.take().is_some();
         // 无关事件（如下载进度帧）不重绘，保住 retained 渲染的复用。
         if relevant || cleared_error {
@@ -130,6 +166,8 @@ impl ExtensionsView {
     pub(crate) fn show_tab(&mut self, tab: ExtensionsTab, cx: &mut Context<Self>) {
         if self.tab != tab {
             self.tab = tab;
+            // 每次进入插件页都重新读取站点默认插件（下载过程中可能新增自动记录）。
+            self.plugins.site_defaults.requested = false;
             cx.notify();
         }
     }

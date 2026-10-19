@@ -9,6 +9,7 @@ export * from './event';
 export * from './method';
 export * from './params';
 export * from './plugin';
+export * from './pluginView';
 export * from './queue';
 export * from './rpc';
 export * from './rss';

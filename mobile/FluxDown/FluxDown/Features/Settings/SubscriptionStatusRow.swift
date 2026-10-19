@@ -1,6 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
+#if FULL_P2P
 
 /// 订阅状态行（BT Tracker / eD2K 服务器共用）：已订阅条数 + 更新时间（或失败原因）+「立即更新」。
 ///
@@ -84,3 +85,4 @@ struct SubscriptionStatusRow: View {
         }
     }
 }
+#endif

@@ -328,6 +328,22 @@ public enum SelectionKind: Sendable, Hashable {
     case bt([BtFile])
     case variant([VariantOption])
     case fileExists(FileConflict)
+    case plugin(site: String, url: String, candidates: [PluginCandidate])
+}
+
+/// 同站点多个插件命中时的候选插件（按 identity 升序）。
+public struct PluginCandidate: Sendable, Hashable {
+    public var identity: String
+    public var name: String
+    public var version: String
+    public var description: String
+
+    public init(identity: String, name: String, version: String, description: String) {
+        self.identity = identity
+        self.name = name
+        self.version = version
+        self.description = description
+    }
 }
 
 public struct HlsOption: Sendable, Hashable {
@@ -389,6 +405,7 @@ public enum SelectionOutcome: Sendable, Hashable {
     case bt(indices: [Int32])
     case variant(index: Int32)
     case fileExists(action: FileExistsAction)
+    case plugin(identity: String, remember: Bool)
     case cancelled
 }
 
@@ -519,10 +536,21 @@ public struct LinkDevice: Sendable, Hashable, Identifiable {
     public var defaultSaveDir: String?
     /// 设备自报的路径风格；nil = 未上报（按 `platform` 推断，见 ``effectivePathStyle``）。
     public var pathStyle: PathStyle?
+    /// 本机备注名（`name` 已是生效名）。
+    public var customName: String?
+    public var appVersion: String?
+    /// 对端已登录云账号时的云设备 id；与云名册同 id 时合并为一条。
+    public var cloudDeviceId: String?
+    /// 对端已解除配对：不可再下发，只能删除。
+    public var revoked: Bool
+    public var pairedAt: Int64
+    public var lastSeenAt: Int64
 
     public init(
         fingerprint: String, name: String, platform: String?, online: Bool,
-        defaultSaveDir: String? = nil, pathStyle: PathStyle? = nil
+        defaultSaveDir: String? = nil, pathStyle: PathStyle? = nil,
+        customName: String? = nil, appVersion: String? = nil, cloudDeviceId: String? = nil, revoked: Bool = false,
+        pairedAt: Int64 = 0, lastSeenAt: Int64 = 0
     ) {
         self.fingerprint = fingerprint
         self.name = name
@@ -530,6 +558,12 @@ public struct LinkDevice: Sendable, Hashable, Identifiable {
         self.online = online
         self.defaultSaveDir = defaultSaveDir
         self.pathStyle = pathStyle
+        self.customName = customName
+        self.appVersion = appVersion
+        self.cloudDeviceId = cloudDeviceId
+        self.revoked = revoked
+        self.pairedAt = pairedAt
+        self.lastSeenAt = lastSeenAt
     }
 
     public var id: String { fingerprint }

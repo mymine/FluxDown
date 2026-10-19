@@ -382,7 +382,6 @@ private fun NewDownloadContent(
     val pasted = str(R.string.mobilePasted)
     val importNone = str(R.string.importTxtNoUrls)
     val importFound = str(R.string.importTxtFound)
-    val unmappable = str(R.string.mobilePickDirUnmappable)
     val noEntries = form.entries.isEmpty()
     val hasText = form.urlText.isNotBlank()
     val busy = form.submitting
@@ -435,13 +434,8 @@ private fun NewDownloadContent(
             }
         }
     }
-    val dirLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        val path = com.fluxdown.app.ui.treeUriToPath(uri)
-        if (path == null) {
-            haptics.reject()
-            overlays.toast(unmappable, FluxToastKind.Warn)
-        } else {
+    val pickDirectory = com.fluxdown.app.ui.rememberLocalDirectoryPicker { path ->
+        if (container.host.value is HostRef.Local && target == null && !form.submitting) {
             form.saveDir = path
         }
     }
@@ -563,15 +557,19 @@ private fun NewDownloadContent(
         }
 
         // 保存目录
+        val saveDirShown = remember(form.saveDir, remoteHost) {
+            if (remoteHost) form.saveDir else com.fluxdown.app.ui.friendlyLocalPath(context, form.saveDir)
+        }
         FluxField(
-            value = form.saveDir,
+            value = saveDirShown,
             onValueChange = { form.saveDir = it },
             label = str(R.string.saveDir),
-            mono = true,
+            mono = remoteHost,
+            readOnly = !remoteHost,
             error = if (form.saveDirValid) null else str(R.string.mobileSaveDirInvalid),
             enabled = !busy,
             trailing = if (remoteHost) null else ({
-                FluxFieldAction(FluxIcons.FolderOpen, str(R.string.browse), onClick = { dirLauncher.launch(null) })
+                FluxFieldAction(FluxIcons.FolderOpen, str(R.string.browse), onClick = { pickDirectory(form.saveDir) })
             }),
         )
 

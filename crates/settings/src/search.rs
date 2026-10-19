@@ -9,7 +9,7 @@ use gpui::{App, Entity, SharedString};
 use crate::sections::SectionContext;
 use crate::store::SettingsStore;
 use crate::ui::SettingsPage;
-use crate::view::{ActivityBarToggle, build_pages};
+use crate::view::{ActivityBarToggle, ReferralPage, build_pages};
 
 /// 面包屑分隔符。
 const CRUMB_SEPARATOR: &str = " › ";
@@ -45,16 +45,29 @@ pub fn search_index(
     translator: &Entity<Translator>,
     store: &Entity<SettingsStore>,
     activity_bar: &[ActivityBarToggle],
+    referral_visible: bool,
     cx: &mut App,
 ) -> Vec<SettingsSearchEntry> {
     let current = translator.read(cx).clone();
-    let mut entries = flatten(&pages_for(&current, store, activity_bar, cx));
+    let mut entries = flatten(&pages_for(
+        &current,
+        store,
+        activity_bar,
+        referral_visible,
+        cx,
+    ));
     if current.locale() == "en" {
         return entries;
     }
     let mut english = current;
     english.set_locale("en");
-    let english = flatten(&pages_for(&english, store, activity_bar, cx));
+    let english = flatten(&pages_for(
+        &english,
+        store,
+        activity_bar,
+        referral_visible,
+        cx,
+    ));
     // 两次构建读同一份设置状态，结构应逐项一致；不一致（构建期间状态变化）时放弃别名。
     let aligned = english.len() == entries.len()
         && english.iter().zip(&entries).all(|(en, local)| {
@@ -75,10 +88,16 @@ fn pages_for(
     translator: &Translator,
     store: &Entity<SettingsStore>,
     activity_bar: &[ActivityBarToggle],
+    referral_visible: bool,
     cx: &mut App,
 ) -> Vec<SettingsPage> {
     let ctx = SectionContext { store, translator };
-    build_pages(&ctx, activity_bar, None, None, cx)
+    let referral = if referral_visible {
+        ReferralPage::Shown(None)
+    } else {
+        ReferralPage::Hidden
+    };
+    build_pages(&ctx, activity_bar, None, None, referral, cx)
 }
 
 fn flatten(pages: &[SettingsPage]) -> Vec<SettingsSearchEntry> {

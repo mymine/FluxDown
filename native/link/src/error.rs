@@ -56,6 +56,16 @@ pub enum LinkError {
     #[error("link authentication failed")]
     Unauthorized,
 
+    /// 请求时间戳与本机时钟相差超出容忍窗口（响应方诊断用，401 响应的 `reason=clockSkew`）。
+    /// 与 [`LinkError::Unauthorized`] 一样按鉴权失败处理，但调用方可据此提示「设备时间差异过大」。
+    #[error("link request timestamp is outside the allowed clock skew")]
+    ClockSkew,
+
+    /// 对端 FluxDown 版本过旧：数据面链路协议版本低于本机要求（两端需升级到同一代）。
+    /// 发起方在发出任何数据面请求之前就据 `/ping` 的 `linkProtocol` 判定。
+    #[error("peer link protocol is outdated; update FluxDown on both devices")]
+    PeerOutdated,
+
     /// 目标设备当前不可达（所有传输策略都失败）。
     #[error("peer unreachable")]
     Unreachable,

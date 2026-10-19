@@ -2,5 +2,10 @@
   "extends": "./.wxt/tsconfig.json",
   "compilerOptions": {
     "isolatedModules": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
   },
+  // 测试由 bun 运行（bun 自带 TS 剥离），仓库不引入 bun 类型包，typecheck 只覆盖产品代码。
+  // 覆盖 exclude 会替换基础配置的值，因此同时保留 .output。
+  "exclude": [".output", "node_modules", "**/*.test.ts", "**/*.test.tsx", "**/*.test-util.ts"],
 }

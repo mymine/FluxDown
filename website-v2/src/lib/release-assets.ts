@@ -7,8 +7,6 @@
  *   只有哨兵齐全的组件才算发布完整——部分上传（中途失败）的组件不会被选中。
  * - 拆分 release（历史）：`vX.Y.Z` 仅桌面端，另有 `server-v*` / `cli-v*` / `mobile-v*` /
  *   `extension-v*` 组件 release；没有哨兵，按资产名判定组件归属。
- *
- * website 与 website-v2 各持一份，内容逐字一致（两站独立部署），改一处须同步另一处。
  */
 
 export interface GitHubAsset {

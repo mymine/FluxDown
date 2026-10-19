@@ -457,7 +457,7 @@ fn dynamic_min_split_bytes(throughput_bps: f64) -> i64 {
 /// Maximum number of concurrently active/pending segments (= connections) per
 /// task. 用户显式线程数的硬上限；与 `fluxdown_protocol::MAX_TASK_SEGMENTS` 一致。
 /// Auto 模式不受此值放大：advisor 与 [`HINT_UNCAP_MAX`] 仍各自封顶 64。
-const MAX_SEGMENTS: i32 = 512;
+pub(crate) const MAX_SEGMENTS: i32 = 512;
 
 // ---------------------------------------------------------------------------
 // 渐进启动 / 自适应连接调度
@@ -1980,6 +1980,9 @@ pub async fn run_coordinated_download(
             domain_conn_hint(url),
             cap,
         );
+        if let Some(limit) = spec.connection_cap() {
+            cap = cap.min(limit.max(1));
+        }
         if cap > before_uncap {
             log_info!(
                 "[adaptive] task {} hint 解封：cap {} -> {}（hint={:?}）",
@@ -3575,6 +3578,9 @@ pub async fn run_coordinated_download(
                                         throughput,
                                         remaining,
                                     );
+                                    let uncapped = spec
+                                        .connection_cap()
+                                        .map_or(uncapped, |l| uncapped.min(l.max(1)));
                                     if uncapped > worker_cap {
                                         log_info!(
                                             "[adaptive] task {} 任务内解封：{} -> {} conns \
@@ -5410,6 +5416,9 @@ async fn do_segment_with_retry(
             {
                 return Err(e);
             }
+            // 插件在凭据刷新阶段以 `onFailure: "fail"` 中止任务：重试不会改变插件的决定，
+            // 立即作为任务级失败上抛。
+            Err(e) if crate::downloader::is_plugin_abort(&e) => return Err(e),
             // 本地磁盘写满：腾出空间前不会自愈，退避重试只会空烧预算。立即作为
             // 致命错误上抛（任务级自动重试的瞬时错误白名单也不含它）。
             Err(e) if is_disk_full(&e) => {
@@ -5617,9 +5626,16 @@ async fn do_segment(
     // hint 模式跳过了探测，反机器人质询只能在真实请求上首次暴露：换中性 UA 重发
     // 同一请求（`escape_bot_challenge` 保证每个请求最多重发一次，循环必然收敛）。
     let mut used = spec.current();
+    let mut refreshed = false;
     let resp = loop {
-        let target = direct.as_deref().unwrap_or(url);
-        let mut req = crate::downloader::build_request(client, target, reqwest::Method::GET, used);
+        // 仅任务 URL 经凭据刷新改写；重定向终点 `direct` 保持不变。
+        let routed = if direct.is_none() {
+            spec.route_url(url)
+        } else {
+            None
+        };
+        let target = direct.as_deref().or(routed.as_deref()).unwrap_or(url);
+        let mut req = crate::downloader::build_request(client, target, reqwest::Method::GET, &used);
         if !plain_first {
             req = req.header("Range", &range);
         }
@@ -5664,19 +5680,33 @@ async fn do_segment(
             }
         };
         request_path.record_setup(sent_at.elapsed());
-        match spec.escape_bot_challenge(used, &resp, db, task_id).await {
+        match spec.escape_bot_challenge(&used, &resp, db, task_id).await {
             Some(neutral) => {
                 drop(resp);
                 used = neutral;
             }
-            None => break resp,
+            None => {
+                // 被拒（401 / 403 / 410）且有插件声明 refresh：换发凭据后重发同一请求，
+                // 每个请求至多一次，不消耗段重试预算。
+                if !refreshed
+                    && !resp.status().is_success()
+                    && let Some(fresh) = spec.refresh_after_rejection(&used, resp.status()).await?
+                {
+                    refreshed = true;
+                    drop(resp);
+                    used = fresh;
+                    continue;
+                }
+                break resp;
+            }
         }
     };
     let resp = resp.error_for_status()?;
+    spec.confirm(&used);
     if reuse_redirect
         && direct.is_none()
         && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
-        && request_path::reuse_is_safe(url, resp.url(), used)
+        && request_path::reuse_is_safe(url, resp.url(), &used)
     {
         request_path.learn_redirect(url, resp.url().as_str());
     }
@@ -6559,6 +6589,7 @@ mod tests {
             referrer: String::new(),
             extra_headers: std::collections::HashMap::new(),
             body: None,
+            ..Default::default()
         };
         let result = super::run_coordinated_download(
             "second",
@@ -6724,6 +6755,7 @@ mod tests {
                 referrer: String::new(),
                 extra_headers: std::collections::HashMap::new(),
                 body: None,
+                ..Default::default()
             },
         ));
         let pool = crate::cdn::NodePool::single(
@@ -6790,6 +6822,338 @@ mod tests {
             );
         }
         assert_eq!(disk.len(), TOTAL as usize);
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove fixture directory");
+    }
+
+    #[tokio::test]
+    async fn connection_cap_bounds_concurrent_workers() {
+        use crate::events::{EngineEvent, EventSink};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Sink;
+        impl EventSink for Sink {
+            fn emit(&self, _: EngineEvent) {}
+        }
+        const TOTAL: i64 = 4 * 1024 * 1024;
+        let db = crate::db::Db::connect("sqlite::memory:")
+            .await
+            .expect("open DB");
+        db.insert_task(
+            "cap",
+            "http://localhost/f",
+            "f",
+            "",
+            8,
+            TOTAL,
+            "",
+            "",
+            "",
+            1,
+        )
+        .await
+        .expect("insert task");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP server");
+        let url = format!(
+            "http://{}/f",
+            listener.local_addr().expect("server address")
+        );
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let server = {
+            let active = active.clone();
+            let peak = peak.clone();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let active = active.clone();
+                    let peak = peak.clone();
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut buf = [0; 1024];
+                        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let n = socket.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&buf[..n]);
+                        }
+                        let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                        let (start, end) = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("range: bytes="))
+                            .and_then(|r| r.trim().split_once('-'))
+                            .map(|(s, e)| {
+                                (
+                                    s.parse::<i64>().unwrap_or(0),
+                                    e.parse::<i64>().unwrap_or(TOTAL - 1).min(TOTAL - 1),
+                                )
+                            })
+                            .unwrap_or((0, TOTAL - 1));
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        // 持有连接一小段时间，让并发窗口可被观测。
+                        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                        let header = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{TOTAL}\r\nConnection: close\r\n\r\n",
+                            end - start + 1
+                        );
+                        let body = vec![0x5a; (end - start + 1) as usize];
+                        if socket.write_all(header.as_bytes()).await.is_ok()
+                            && let Err(error) = socket.write_all(&body).await
+                        {
+                            tracing::debug!(%error, "test client closed");
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            })
+        };
+        let dir = std::env::temp_dir().join(format!("fluxdown_coord_cap_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fixture directory");
+        let dest = dir.join("f.fdownloading");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let spec = Arc::new(
+            crate::downloader::DownloadSpec::new(crate::downloader::RequestSpec::empty_get())
+                .with_connection_cap(2),
+        );
+        let pool = crate::cdn::NodePool::single(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("build client"),
+        );
+        let limiter = crate::speed_limiter::SpeedLimiter::new(0);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let total = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            super::run_coordinated_download(
+                "cap",
+                &url,
+                &dest,
+                TOTAL,
+                false,
+                8,
+                pool,
+                &db,
+                &tx,
+                &cancel,
+                &limiter,
+                &spec,
+                &Sink,
+                "",
+                "",
+                super::ReportScope::whole_task(),
+                1,
+                false,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("download finishes")
+        .expect("download succeeds");
+        assert_eq!(total, TOTAL);
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "peak concurrent connections {} exceeded cap 2",
+            peak.load(Ordering::SeqCst)
+        );
+        server.abort();
+        drop(tx);
+        drain.abort();
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove fixture directory");
+    }
+
+    #[tokio::test]
+    async fn coordinator_refreshes_rejected_segment_credentials() {
+        use crate::downloader::test_support::{RefreshScript, params_with_interceptor};
+        use crate::events::{EngineEvent, EventSink};
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Sink;
+        impl EventSink for Sink {
+            fn emit(&self, _: EngineEvent) {}
+        }
+        const TOTAL: i64 = 4 * 1024 * 1024;
+        fn byte_at(i: i64) -> u8 {
+            (i % 251) as u8
+        }
+        let db = crate::db::Db::connect("sqlite::memory:")
+            .await
+            .expect("open DB");
+        db.insert_task(
+            "tokens",
+            "http://localhost/f",
+            "f",
+            "",
+            4,
+            TOTAL,
+            "",
+            "",
+            "",
+            1,
+        )
+        .await
+        .expect("insert task");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP server");
+        let url = format!(
+            "http://{}/f",
+            listener.local_addr().expect("server address")
+        );
+        // 每个 X-Token 只接受一次请求；记录被接受的令牌序列。
+        let spent = Arc::new(Mutex::new(HashSet::<String>::new()));
+        let accepted = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server = {
+            let spent = spent.clone();
+            let accepted = accepted.clone();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let spent = spent.clone();
+                    let accepted = accepted.clone();
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut buf = [0; 1024];
+                        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let n = socket.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            request.extend_from_slice(&buf[..n]);
+                        }
+                        let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                        let token = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("x-token:"))
+                            .map(|t| t.trim().to_string())
+                            .unwrap_or_default();
+                        let fresh = !token.is_empty()
+                            && spent.lock().expect("spent lock").insert(token.clone());
+                        if !fresh {
+                            let denied = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            if let Err(error) = socket.write_all(denied.as_bytes()).await {
+                                tracing::debug!(%error, "test client closed");
+                            }
+                            return;
+                        }
+                        accepted.lock().expect("accepted lock").push(token);
+                        let (start, end) = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("range: bytes="))
+                            .and_then(|r| r.trim().split_once('-'))
+                            .map(|(s, e)| {
+                                (
+                                    s.parse::<i64>().unwrap_or(0),
+                                    e.parse::<i64>().unwrap_or(TOTAL - 1).min(TOTAL - 1),
+                                )
+                            })
+                            .unwrap_or((0, TOTAL - 1));
+                        let header = format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{TOTAL}\r\nConnection: close\r\n\r\n",
+                            end - start + 1
+                        );
+                        let body: Vec<u8> = (start..=end).map(byte_at).collect();
+                        if socket.write_all(header.as_bytes()).await.is_ok()
+                            && let Err(error) = socket.write_all(&body).await
+                        {
+                            tracing::debug!(%error, "test client closed");
+                        }
+                    });
+                }
+            })
+        };
+        let script = Arc::new(RefreshScript::new(std::time::Duration::ZERO, |n| {
+            Some(format!(r#"{{"setHeaders":{{"X-Token":"tok{n}"}}}}"#))
+        }));
+        let params = params_with_interceptor(&url, script.clone())
+            .await
+            .expect("build params");
+        let mut base = crate::downloader::RequestSpec::empty_get();
+        base.extra_headers
+            .insert("X-Token".to_string(), "tok0".to_string());
+        // 单连接：段按序下载，每段的请求都撞上已用掉的令牌，必须经刷新换发后才能完成。
+        let spec = Arc::new(
+            crate::downloader::DownloadSpec::new(base)
+                .with_connection_cap(1)
+                .with_refresher(crate::intercept::Refresher::for_params(
+                    &params,
+                    crate::intercept::ProtocolKind::Http,
+                )),
+        );
+        let dir =
+            std::env::temp_dir().join(format!("fluxdown_coord_refresh_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fixture directory");
+        let dest = dir.join("f.fdownloading");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let pool = crate::cdn::NodePool::single(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("build client"),
+        );
+        let limiter = crate::speed_limiter::SpeedLimiter::new(0);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let total = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            super::run_coordinated_download(
+                "tokens",
+                &url,
+                &dest,
+                TOTAL,
+                false,
+                4,
+                pool,
+                &db,
+                &tx,
+                &cancel,
+                &limiter,
+                &spec,
+                &Sink,
+                "",
+                "",
+                super::ReportScope::whole_task(),
+                1,
+                false,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("download finishes")
+        .expect("download succeeds");
+        assert_eq!(total, TOTAL);
+        let written = std::fs::read(&dest).expect("read downloaded file");
+        assert_eq!(written.len() as i64, TOTAL);
+        assert!(
+            written
+                .iter()
+                .enumerate()
+                .all(|(i, b)| *b == byte_at(i as i64)),
+            "downloaded bytes differ from the served file"
+        );
+        let accepted = accepted.lock().expect("accepted lock").clone();
+        let distinct: HashSet<&String> = accepted.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            accepted.len(),
+            "token accepted twice: {accepted:?}"
+        );
+        assert!(
+            script.calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "rejected segments must have triggered a refresh"
+        );
+        server.abort();
+        drop(tx);
+        drain.abort();
         tokio::fs::remove_dir_all(dir)
             .await
             .expect("remove fixture directory");

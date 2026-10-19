@@ -13,7 +13,10 @@ use gpui::{
     ClickEvent, Context, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement,
     SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, white,
 };
-use gpui_component::{Icon, Sizable as _, h_flex, spinner::Spinner, tooltip::Tooltip, v_flex};
+use gpui_component::{
+    Disableable as _, Icon, Sizable as _, h_flex, spinner::Spinner, switch::Switch,
+    tooltip::Tooltip, v_flex,
+};
 
 use crate::assets::{CLOUD_ICON_PATH, CROWN_ICON_PATH, REFRESH_ICON_PATH};
 use crate::profile_edit::{ProfileField, can_edit_origin_id};
@@ -68,6 +71,8 @@ pub(crate) struct ProfileState {
     pub refreshing: bool,
     /// 卡片底部常驻错误行。
     pub last_error: Option<SharedString>,
+    /// 「推介有奖」入口开关当前值（设备本地偏好 `ui.show_settings_referral`）。
+    pub show_referral: bool,
 }
 
 pub(crate) fn render(
@@ -82,6 +87,7 @@ pub(crate) fn render(
         disabled,
         refreshing,
         last_error,
+        show_referral,
     } = state;
     let display_name = display_name(session);
     let initial = avatar_initial(&display_name);
@@ -299,6 +305,18 @@ pub(crate) fn render(
         .flex_col()
         .gap(tokens.spacing.md)
         .child(row)
+        .child(crate::ui::row_divider(cx))
+        .child(plan_row(
+            translator, tokens, &extended, session, disabled, cx,
+        ))
+        .child(crate::ui::row_divider(cx))
+        .child(referral_row(
+            translator,
+            tokens,
+            show_referral,
+            disabled,
+            cx,
+        ))
         .when_some(last_error, |this, error| {
             this.child(
                 div()
@@ -307,6 +325,115 @@ pub(crate) fn render(
                     .child(error),
             )
         })
+}
+
+/// 「套餐」行：当前套餐名 + 徽标 + 「升级套餐」。
+fn plan_row(
+    translator: &Translator,
+    tokens: &SemanticThemeTokens,
+    extended: &ExtendedTokens,
+    session: &AgentSessionDto,
+    disabled: bool,
+    cx: &mut Context<AccountView>,
+) -> impl IntoElement {
+    let plan = session.current_plan.as_ref();
+    let plan_name = plan
+        .map(|plan| {
+            if plan.name.is_empty() {
+                plan.code.clone()
+            } else {
+                plan.name.clone()
+            }
+        })
+        .unwrap_or_else(|| "—".to_owned());
+    let badge =
+        plan.and_then(|plan| plan_badge(tokens, extended, plan, session.user.membership_ordinal));
+
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap(tokens.spacing.md)
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .items_center()
+                .gap(tokens.spacing.sm)
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(tokens.typography.sm.size)
+                        .line_height(tokens.typography.sm.line_height)
+                        .text_color(tokens.colors.muted_foreground)
+                        .child(t(translator, "accountPlanLabel")),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(tokens.typography.sm.size)
+                        .line_height(tokens.typography.sm.line_height)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(tokens.colors.foreground)
+                        .child(plan_name),
+                )
+                .when_some(badge, |this, badge| this.child(badge)),
+        )
+        .child(
+            button(
+                "account-plan-upgrade",
+                t(translator, "accountPlanUpgrade"),
+                ButtonVariant::Primary,
+                cx,
+            )
+            .disabled(disabled)
+            .on_click(cx.listener(|view, _: &ClickEvent, window, cx| {
+                view.open_plan_purchase(window, cx);
+            })),
+        )
+}
+
+/// 「推介有奖」入口开关（紧随套餐行）：设备本地偏好 `ui.show_settings_referral`，只控制设置侧栏
+/// 是否出现该页，不进云同步目录；写偏好由 app 响应 `ShowReferralRequested`。
+fn referral_row(
+    translator: &Translator,
+    tokens: &SemanticThemeTokens,
+    checked: bool,
+    disabled: bool,
+    cx: &mut Context<AccountView>,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap(tokens.spacing.md)
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(tokens.typography.sm.size)
+                        .line_height(tokens.typography.sm.line_height)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(tokens.colors.foreground)
+                        .child(t(translator, "accountFeatureReferral")),
+                )
+                .child(
+                    div()
+                        .text_size(tokens.typography.xs.size)
+                        .line_height(tokens.typography.xs.line_height)
+                        .text_color(tokens.colors.muted_foreground)
+                        .child(t(translator, "accountFeatureReferralDesc")),
+                ),
+        )
+        .child(
+            Switch::new("account-referral-visible")
+                .checked(checked)
+                .disabled(disabled)
+                .on_click(cx.listener(|view, checked: &bool, _, cx| {
+                    view.request_show_referral(*checked, cx);
+                })),
+        )
 }
 
 /// 套餐徽标：`badge` 为空则不渲染（免费/专业版等服务端未配置徽标的套餐）。

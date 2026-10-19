@@ -32,6 +32,10 @@ pub struct PersistedSyncEntry {
     pub version: u64,
     pub dirty: bool,
     pub deleted: bool,
+    /// 该键当前值的编辑时刻（unix 毫秒）：本机编辑取按 FluxCloud 时钟校正的本机时间，云端回写取云端
+    /// `editedAt`；推送时作为冲突裁决依据。播种不是真实编辑，为 `None`。旧状态文件缺省为 `None`。
+    #[serde(default)]
+    pub edited_at_ms: Option<i64>,
 }
 
 /// 单个账号的同步水位与条目；账号切换 / 登出时暂存，重新登录同一账号时恢复。
@@ -739,6 +743,7 @@ mod tests {
             version: 1,
             dirty: true,
             deleted: false,
+            edited_at_ms: None,
         }
     }
 

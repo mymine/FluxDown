@@ -1,0 +1,24 @@
+import { useDaemon } from '../lib/rpc'
+import { ACTIVITY_ENTRIES } from './activity'
+import type { ChromeZone } from './chromeLayout'
+import { useChromeEdit, useChromeLayout } from './chromeStore'
+import { useActivityEntryVisible } from './useVisibleActivityEntries'
+
+const selectDiskKnown = (daemon: { runtimeStats: { diskFreeBytes: number | null } }) => daemon.runtimeStats.diskFreeBytes != null
+
+/**
+ * 某区域里当前应显示的条目 id（布局顺序）：
+ * - `ui.show_activity_*` 偏好关闭的入口无论放在哪都不显示；
+ * - 剩余空间 daemon 未上报时不占位（编辑态保留，便于拖动）。
+ */
+export function useChromeZoneItems(zone: ChromeZone): readonly string[] {
+  const layout = useChromeLayout()
+  const { editing } = useChromeEdit()
+  const entryVisible = useActivityEntryVisible()
+  const diskKnown = useDaemon(selectDiskKnown, false)
+  return layout[zone].filter((id) => {
+    const entry = ACTIVITY_ENTRIES.find((item) => item.id === id)
+    if (entry) return entryVisible(entry)
+    return id !== 'diskFree' || diskKnown || editing
+  })
+}

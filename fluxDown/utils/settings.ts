@@ -3,18 +3,24 @@
  */
 
 import { browser } from "wxt/browser";
-import { isDomainExcluded, normalizeDomainList } from "./domain-exclusion";
+import { normalizeDomainList } from "./domain-exclusion";
+import {
+  DEFAULT_SITE_PROFILE,
+  loadSiteProfiles,
+  profileFor,
+  saveSiteProfiles,
+} from "./site-profiles";
+import type { SiteProfile } from "./site-profiles";
 import { RemoteSettingsStore } from "./remote-settings";
 import type { RemoteSettings } from "./remote-settings";
 import type { RemotePingResult, RemoteServerConfig } from "./remote-server";
 
 /**
  * 拦截模式：
- * - 'extension': 仅按文件扩展名拦截（旧行为）
  * - 'smart': 智能模式 — 结合扩展名 + MIME 类型 + 文件名 + 文件大小综合判断
- * - 'all': 拦截所有下载（除排除域名外）
+ * - 'all': 拦截所有下载（除站点配置为「不接管」的站点外）
  */
-export type InterceptMode = "extension" | "smart" | "all";
+export type InterceptMode = "smart" | "all";
 
 /**
  * 远程下载源投递模式：
@@ -41,8 +47,6 @@ export interface FluxDownSettings {
    * 的 MIME/大小正向规则——优先级高于所有正向匹配（#177）。
    */
   excludeExtensions: string[];
-  /** 排除的域名列表 */
-  excludeDomains: string[];
   /**
    * 是否接管页面内 magnet: 链接点击（阻止浏览器交给系统默认磁力
    * 处理程序，改由 FluxDown 下载）。关闭后点击磁力链接走系统默认
@@ -64,10 +68,34 @@ export interface FluxDownSettings {
   resourceSniffing: boolean;
   /** 是否在视频元素上显示浮动下载按钮 */
   showFloatingButton: boolean;
-  /** 是否显示底部资源面板 */
-  showResourcePanel: boolean;
   /** 是否嗅探图片资源（默认关闭，开启后显示 >100KB 的图片） */
   sniffImages: boolean;
+  /** 是否显示页内悬浮球与资源面板 */
+  showPageDot: boolean;
+  /** 视频浮钮触发方式：hover = 悬停在播放器上时显示；always = 正在播放的视频常显 */
+  floatButtonTrigger: "hover" | "always";
+  /** 视频浮钮贴在播放元素的哪个角 */
+  floatButtonPosition: "top-right" | "top-left" | "bottom-right" | "bottom-left";
+  /** 是否在资源列表中显示低置信度项 */
+  showLowConfidence: boolean;
+
+  // === 失败回退与询问 ===
+
+  /** 桌面端业务拒绝 / 创建失败时回退浏览器下载 */
+  fallbackOnReject: boolean;
+  /** 用户在桌面端取消（拒绝）确认框后回退浏览器下载（需桌面端 v2 且非远程模式） */
+  fallbackOnCancel: boolean;
+  /** 同一站点 7 天内被取消 ≥ 3 次后询问是否不再接管该站点 */
+  askExcludeAfterCancels: boolean;
+  /** 是否创建右键菜单 */
+  contextMenuEnabled: boolean;
+
+  // === 嗅探规则同步 ===
+
+  /** 是否从桌面端同步官方 / 社区规则包 */
+  ruleSyncEnabled: boolean;
+  /** 是否启用社区规则包 */
+  communityRulesEnabled: boolean;
 
   // === 远程下载源设置 ===
 
@@ -213,7 +241,6 @@ const DEFAULT_SETTINGS: FluxDownSettings = {
   ],
   customExtensions: [],
   excludeExtensions: [],
-  excludeDomains: [],
   interceptMagnet: true,
 
   // 任务发送通知（本地默认关闭，按需开启；远程默认开启）
@@ -223,8 +250,21 @@ const DEFAULT_SETTINGS: FluxDownSettings = {
   // 资源嗅探 & 页面内 UI
   resourceSniffing: true,
   showFloatingButton: true,
-  showResourcePanel: true,
+  showPageDot: true,
+  floatButtonTrigger: "hover",
+  floatButtonPosition: "top-right",
+  showLowConfidence: false,
   sniffImages: false,
+
+  // 失败回退与询问
+  fallbackOnReject: true,
+  fallbackOnCancel: false,
+  askExcludeAfterCancels: true,
+  contextMenuEnabled: true,
+
+  // 嗅探规则同步
+  ruleSyncEnabled: true,
+  communityRulesEnabled: true,
 
   // 远程下载源
   remoteMode: "off",
@@ -267,16 +307,79 @@ function hasRemoteFields(s: object): boolean {
   );
 }
 
+/** v1 把「悬浮球可见」单独存在 local，v2 并入 settings.showPageDot。 */
+const LEGACY_DOT_VISIBLE_KEY = "fluxdown_dot_visible";
+
+type StoredSettings = Partial<Omit<FluxDownSettings, "remoteVerified">> & {
+  remoteVerified?: string | boolean;
+  /** v1 遗留字段 */
+  excludeDomains?: unknown;
+  showResourcePanel?: unknown;
+};
+
+let legacyMigration: Promise<boolean> | null = null;
+
+/**
+ * v1 → v2 一次性迁移（依据旧字段是否存在，幂等）：
+ * 1. sync 的 `excludeDomains` 逐项写成「不接管」站点配置，已有的站点不覆盖；
+ * 2. local 的 `fluxdown_dot_visible === false` 转为 `showPageDot = false` 并删除该键；
+ * 3. 去掉旧字段后回写 sync。
+ */
+async function migrateLegacyFields(
+  stored: StoredSettings | undefined,
+): Promise<boolean> {
+  const hasLegacy =
+    !!stored && ("excludeDomains" in stored || "showResourcePanel" in stored);
+  const dotRaw =
+    !stored || hasLegacy
+      ? (await browser.storage.local.get(LEGACY_DOT_VISIBLE_KEY))?.[
+          LEGACY_DOT_VISIBLE_KEY
+        ]
+      : undefined;
+  if (!hasLegacy && dotRaw === undefined) return false;
+
+  const legacyDomains = Array.isArray(stored?.excludeDomains)
+    ? normalizeDomainList(
+        stored.excludeDomains.filter((d): d is string => typeof d === "string"),
+      )
+    : [];
+  if (legacyDomains.length > 0) {
+    const profiles = await loadSiteProfiles();
+    const now = Date.now();
+    for (const domain of legacyDomains) {
+      if (domain in profiles) continue;
+      profiles[domain] = { ...DEFAULT_SITE_PROFILE, intercept: "never", updatedAt: now };
+    }
+    await saveSiteProfiles(profiles);
+  }
+
+  // 回写前重读最新 sync 值，只删旧字段（不用读取时的快照整份覆盖），
+  // 避免并发的其它上下文迁移或用户刚保存的设置被回滚。
+  const latest = (await browser.storage.sync.get("settings"))?.settings as
+    | StoredSettings
+    | undefined;
+  const latestHasLegacy =
+    !!latest && ("excludeDomains" in latest || "showResourcePanel" in latest);
+  if (latestHasLegacy || dotRaw === false) {
+    const { excludeDomains: _d, showResourcePanel: _p, ...rest } = latest ?? {};
+    const next: StoredSettings = { ...rest };
+    if (dotRaw === false) next.showPageDot = false;
+    await browser.storage.sync.set({
+      settings: omitRemote({ ...DEFAULT_SETTINGS, ...next } as FluxDownSettings),
+    });
+  }
+  if (dotRaw !== undefined) {
+    await browser.storage.local.remove(LEGACY_DOT_VISIBLE_KEY);
+  }
+  return true;
+}
+
 /**
  * 加载设置
  */
 export async function loadSettings(): Promise<FluxDownSettings> {
-  const syncResult = await browser.storage.sync.get("settings");
-  const stored = syncResult?.settings as
-    | (Partial<Omit<FluxDownSettings, "remoteVerified">> & {
-        remoteVerified?: string | boolean;
-      })
-    | undefined;
+  let syncResult = await browser.storage.sync.get("settings");
+  let stored = syncResult?.settings as StoredSettings | undefined;
   const hasLegacyRemote = stored && hasRemoteFields(stored);
   const remote = await remoteSettingsStore.load(
     hasLegacyRemote ? stored : undefined,
@@ -290,17 +393,32 @@ export async function loadSettings(): Promise<FluxDownSettings> {
     });
   }
 
-  const merged: FluxDownSettings = {
-    ...DEFAULT_SETTINGS,
-    ...(stored ?? {}),
-    ...remote,
-  };
-  // 迁移：旧版"仅扩展名"模式的设置项已移除，归一化为智能模式，
-  // 否则 popup 下拉框（已无该选项）会显示空白、拦截逻辑走废弃分支。
+  // v1 → v2 迁移（并发的 loadSettings 共用同一次迁移）。
+  legacyMigration ??= migrateLegacyFields(stored).finally(() => {
+    legacyMigration = null;
+  });
+  if (await legacyMigration) {
+    syncResult = await browser.storage.sync.get("settings");
+    stored = syncResult?.settings as StoredSettings | undefined;
+  }
+
+  return { ...migrateSettings(stored), ...remote };
+}
+
+/**
+ * 把任意来源（备份导入、旧版本落盘）的设置对象规整为当前版本：
+ * 合并默认值、去掉 v1 遗留字段、归一化已移除的拦截模式。纯函数。
+ */
+export function migrateSettings(raw: unknown): FluxDownSettings {
+  const source =
+    raw && typeof raw === "object" && !Array.isArray(raw)
+      ? (raw as StoredSettings)
+      : {};
+  const { excludeDomains: _d, showResourcePanel: _p, ...current } = source;
+  const merged = { ...DEFAULT_SETTINGS, ...current } as FluxDownSettings;
   if ((merged.interceptMode as string) === "extension") {
     merged.interceptMode = "smart";
   }
-  merged.excludeDomains = normalizeDomainList(merged.excludeDomains ?? []);
   return merged;
 }
 
@@ -388,6 +506,7 @@ export interface DownloadItemInfo {
 export function shouldIntercept(
   item: DownloadItemInfo,
   settings: FluxDownSettings,
+  profiles: Record<string, SiteProfile> = {},
 ): boolean {
   if (!settings.enabled) return false;
 
@@ -402,27 +521,28 @@ export function shouldIntercept(
     return false;
   }
 
-  // 检查域名排除：下载 URL 主机或来源页主机任一命中即放行，
-  // 这样「排除当前站点」对托管在 CDN/对象存储上的下载同样有效。
+  // 站点配置：下载 URL 主机或来源页主机任一为 never 即放行（「不接管当前站点」
+  // 对托管在 CDN/对象存储上的下载同样有效）；任一为 always 则跳过 smart 判定。
+  let forceIntercept = false;
+  let urlHost: string;
   try {
-    const hostname = new URL(url).hostname;
-    if (isDomainExcluded(hostname, settings.excludeDomains)) {
-      return false;
-    }
+    urlHost = new URL(url).hostname;
   } catch {
     // URL 解析失败，不拦截
     return false;
   }
+  const hosts = [urlHost];
   if (referrerUrl) {
     try {
-      if (
-        isDomainExcluded(new URL(referrerUrl).hostname, settings.excludeDomains)
-      ) {
-        return false;
-      }
+      hosts.push(new URL(referrerUrl).hostname);
     } catch {
       // referrer 解析失败：忽略
     }
+  }
+  for (const host of hosts) {
+    const { intercept } = profileFor(profiles, host).profile;
+    if (intercept === "never") return false;
+    if (intercept === "always") forceIntercept = true;
   }
 
   // 检查排除扩展名（#177）：优先级高于 customExtensions/BUILTIN_EXTENSIONS
@@ -445,14 +565,9 @@ export function shouldIntercept(
 
   // === 按模式判断 ===
 
-  if (settings.interceptMode === "all") {
-    // "拦截所有"模式：只要过了域名和大小过滤就拦截
+  if (forceIntercept || settings.interceptMode === "all") {
+    // 「拦截所有」模式 / 站点强制接管：只要过了大小与排除扩展名过滤就拦截
     return true;
-  }
-
-  if (settings.interceptMode === "extension") {
-    // "仅扩展名"模式：只看 URL 路径或 filename 的扩展名
-    return matchByExtension(url, filename, effectiveExtensions(settings));
   }
 
   // === smart 模式（默认）===

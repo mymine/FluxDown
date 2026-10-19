@@ -180,29 +180,44 @@ nonisolated struct TaskSourceComposition: Equatable {
     var accelPercentText: String { "\(Int((accelShare * 100).rounded()))%" }
 }
 
-/// 速度页统计：近 60 秒（`SpeedHistory.capacity`）平均 / 峰值。
-nonisolated struct TaskSpeedStats: Equatable {
-    let samples: Int
-    let average: Int64
-    let peak: Int64
+/// 速度页持久化曲线（`daemon.task.speedHistory`）：同一页内刷新串行（不重叠），
+/// 失败（含旧主机缺方法）保留上一份有效数据；页面只展示 `taskId` 与当前任务一致的数据。
+@MainActor
+@Observable
+final class TaskSpeedHistoryModel {
+    private(set) var history: TaskSpeedHistory?
 
-    init(history: SpeedHistory?) {
-        guard let history, history.count > 0 else {
-            samples = 0
-            average = 0
-            peak = 0
+    /// 轮询周期：下载中每 2 秒重取一次。
+    static let pollInterval: Duration = .seconds(2)
+
+    /// 取一次；已被取消（任务 / 下载态变化、页面消失）则丢弃回包。
+    func refresh(taskId: String, session: any HostSession) async {
+        let result: TaskSpeedHistory?
+        do {
+            result = try await session.call(HostMethod.daemonTaskSpeedHistory, params: TaskSpeedHistoryQuery(taskId: taskId))
+        } catch {
             return
         }
-        var sum: Int64 = 0
-        var peak: Int64 = 0
-        for index in 0..<history.count {
-            let value = history.downAt(index)
-            sum += value
-            peak = max(peak, value)
+        if Task.isCancelled { return }
+        apply(result, for: taskId)
+    }
+
+    /// 接收回包：`null`（无记录）清空曲线；回包任务与请求任务不符则丢弃。
+    func apply(_ result: TaskSpeedHistory?, for taskId: String) {
+        guard result == nil || result?.taskId == taskId else { return }
+        history = result
+    }
+
+    /// 先取一次，下载中则每 2 秒再取；任务 / 下载态变化时由 `.task(id:)` 取消并重启，
+    /// 因此离开下载态会再取一次最终曲线。
+    func run(taskId: String, downloading: Bool, session: any HostSession) async {
+        await refresh(taskId: taskId, session: session)
+        guard downloading else { return }
+        while !Task.isCancelled {
+            try? await Task.sleep(for: Self.pollInterval)
+            if Task.isCancelled { return }
+            await refresh(taskId: taskId, session: session)
         }
-        samples = history.count
-        average = sum / Int64(history.count)
-        self.peak = peak
     }
 }
 

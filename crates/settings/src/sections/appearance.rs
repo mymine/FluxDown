@@ -38,7 +38,7 @@ use crate::ui::{Control, SettingsPage, SettingsSection, meta_text, row_button};
 use fluxdown_ui_components::{ButtonVariant, ControlExt as _, FluxIcon};
 
 /// 官方主题画廊地址。
-const THEME_GALLERY_URL: &str = "https://fluxdown.zerx.dev/themes";
+const THEME_GALLERY_URL: &str = "https://fluxdown.com/themes";
 
 pub(crate) const LOCALE_KEY: &str = "general.locale";
 

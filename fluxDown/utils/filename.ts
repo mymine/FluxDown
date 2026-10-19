@@ -701,15 +701,49 @@ function urlLastSegment(url: string): string {
 }
 
 /**
+ * URL 查询里的 `response-content-disposition`（S3/OSS/COS/GCS）/ `rscd`（Azure SAS，
+ * GitHub release 资产即此类）→ 文件名（未 sanitize；无名返回 ""）。服务器会原样回显该值，
+ * 是确定性证据。与引擎 `naming::query_disposition_name` 同一规则：参数名不区分大小写，
+ * 值按 `application/x-www-form-urlencoded` 解码（`+` = 空格、`%XX` = 字节）后按
+ * Content-Disposition 解析。
+ */
+export function queryDispositionFilename(url: string): string {
+  const queryStart = url.indexOf("?");
+  if (queryStart < 0) return "";
+  const query = url.slice(queryStart + 1).split("#")[0];
+  const hints: NameHints = { host: urlHostOf(url) };
+  for (const pair of query.split("&")) {
+    const eq = pair.indexOf("=");
+    if (eq < 0) continue;
+    const key = pair.slice(0, eq).toLowerCase();
+    if (key !== "response-content-disposition" && key !== "rscd") continue;
+    const bytes = percentDecodeLatin1(pair.slice(eq + 1).replace(/\+/g, " "));
+    const name = parseContentDispositionFilename(bytesToLatin1(bytes), true, hints);
+    if (name) return name;
+  }
+  return "";
+}
+
+function urlHostOf(url: string): string | undefined {
+  try {
+    return new URL(url).hostname || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * 从浏览器的 downloadItem.filename（本地保存路径）和 URL 中提取有意义的文件名。
  *
  * 策略：
  * 1. 浏览器文件名有合法扩展名 → 使用；
- * 2. URL 最后一段有合法扩展名 → 使用；
- * 3. 放宽：浏览器文件名 / URL 最后一段（无扩展名也可，如 "download-no-header"）；
- * 4. 以上任何一步选中的名字若是动态页面/脚本端点（attachment.php 等），或
+ * 2. URL 查询里的 `response-content-disposition` / `rscd` 给出的名字 → 使用
+ *    （预签名 CDN 链接的路径末段是对象 ID，见 `queryDispositionFilename`）；
+ * 3. URL 最后一段有合法扩展名 → 使用；
+ * 4. 放宽：浏览器文件名 / URL 最后一段（无扩展名也可，如 "download-no-header"）；
+ * 5. 以上任何一步选中的名字若是动态页面/脚本端点（attachment.php 等），或
  *    无法确定 → 返回 ""，交给引擎探测服务器的 Content-Disposition；
- * 5. 选中的名字没有合理扩展名且 `mimeType` 可映射 → 追加对应扩展名
+ * 6. 选中的名字没有合理扩展名且 `mimeType` 可映射 → 追加对应扩展名
  *    （如 X.com 图片 `/media/<id>?format=jpg` + image/jpeg → `<id>.jpg`）。
  */
 export function extractCleanFilename(
@@ -722,6 +756,11 @@ export function extractCleanFilename(
     : "";
   if (browserBase && looksLikeRealFilename(browserBase)) {
     return browserBase;
+  }
+
+  const queryName = queryDispositionFilename(url);
+  if (queryName && !hasScriptExtension(queryName)) {
+    return queryName;
   }
 
   const segment = urlLastSegment(url);

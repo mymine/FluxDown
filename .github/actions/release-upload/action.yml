@@ -1,6 +1,6 @@
 # 把一个组件的产物上传到统一的 vX.Y.Z GitHub Release（release.yml 各 upload-* job 共用）
 #
-# 完成哨兵契约（官网 website*/src/lib/release-assets.ts 依赖，改动须同步）：
+# 完成哨兵契约（官网 website-v2/src/lib/release-assets.ts 依赖，改动须同步）：
 #   每个组件最后上传 SHA256SUMS-<组件>.txt；官网只把「有哨兵」的组件视为已发布。
 # 顺序：记录并删除旧哨兵 → 上传产物（--clobber 覆盖同名）→ 删除旧哨兵清单里本次
 # 不再产出的资产 → 上传新哨兵。上传中途失败不会暴露半套资产；补发期间官网自动

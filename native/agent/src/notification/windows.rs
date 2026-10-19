@@ -1,6 +1,6 @@
 //! Windows completion toasts use a dedicated protocol and expiring opaque local tokens.
 //! No callbacks, polling, runtime, COM activator, or file paths in activation URIs.
-//! Requires windows 0.61.3: Data_Xml_Dom, Foundation, UI_Notifications, Win32_System_WinRT.
+//! Requires windows 0.61.3: Data_Xml_Dom, Foundation, UI_Notifications.
 
 #[path = "windows_activation.rs"]
 mod activation;
@@ -17,7 +17,12 @@ pub(super) fn show(
     body: &str,
     actions: Option<&super::CompletionActions>,
 ) -> Result<(), String> {
-    // Use a short-lived dedicated thread to avoid changing the caller's COM apartment.
+    // Use a short-lived dedicated thread that has never initialized COM: windows-core then
+    // joins the process MTA through `CoIncrementMTAUsage`, which it never releases. That keeps
+    // its process-wide cached activation factories valid for every later toast. Never pair
+    // RoInitialize/RoUninitialize per toast: tearing down the last apartment in the process
+    // (headless `--server` has no other) unloads the WinRT servers behind those cached
+    // factories, and the next toast dereferences a dangling factory (0xC0000005).
     // It is joined before returning: no per-toast resident thread or callback lifetime.
     let data_dir = data_dir.to_owned();
     let title = title.to_owned();
@@ -77,36 +82,16 @@ fn escape_xml(value: &str) -> String {
 
 #[cfg(windows)]
 mod runtime {
-    use std::marker::PhantomData;
     use std::path::Path;
-    use std::rc::Rc;
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::Foundation::{DateTime, IReference, PropertyValue};
     use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
-    use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
     use windows::core::{HSTRING, Interface};
 
     use super::super::{CompletionActions, WINDOWS_AUMID};
     use super::{activation, toast_xml};
 
     const GROUP: &str = "completion";
-    // Apartment teardown must stay on the thread that initialized WinRT.
-    struct Apartment(PhantomData<Rc<()>>);
-    impl Apartment {
-        fn new() -> Result<Self, String> {
-            // SAFETY: this fresh dedicated thread has no COM apartment; Drop balances each
-            // successful initialization on the same thread after all WinRT objects are dropped.
-            unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
-                .map_err(|error| format!("could not initialize notification WinRT: {error}"))?;
-            Ok(Self(PhantomData))
-        }
-    }
-    impl Drop for Apartment {
-        fn drop(&mut self) {
-            // SAFETY: only constructed after successful initialization on this thread.
-            unsafe { RoUninitialize() };
-        }
-    }
 
     pub(super) fn show(
         data_dir: &Path,
@@ -114,7 +99,6 @@ mod runtime {
         body: &str,
         actions: Option<&CompletionActions>,
     ) -> Result<(), String> {
-        let _apartment = Apartment::new()?;
         // Hold the emission lease through Show: concurrent emitters cannot reuse a slot
         // between token creation and delivery. File close releases the cross-process lock.
         let stored = actions

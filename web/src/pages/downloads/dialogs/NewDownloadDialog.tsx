@@ -32,7 +32,7 @@ import { capturesShown, closeNewDownload } from './store'
 import type { NewDownloadSession } from './store'
 import { isTorrentFile, submitTorrentFiles } from './torrents'
 import { accountErrorKey } from '../../settings/sections/account/errorText'
-import { buildRemoteTargets, checkRemoteSaveDir, LOCAL_TARGET, linkDispatchParams, pathExample, remoteDispatchParams, summarizeDispatch } from './target'
+import { buildRemoteTargets, checkRemoteSaveDir, dispatchRoute, LOCAL_TARGET, linkDispatchParams, pathExample, remoteDispatchParams, resolveTargetValue, summarizeDispatch } from './target'
 import type { RemoteTarget } from './target'
 import { queueLabel } from './utils'
 
@@ -91,7 +91,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
   )
   const [targetValue, setTargetValue] = useState(LOCAL_TARGET)
   // 目标设备消失（登出 / 解除配对）时回落到本服务器。
-  const target: RemoteTarget | null = remoteTargets.find((item) => item.value === targetValue) ?? null
+  const target: RemoteTarget | null = resolveTargetValue(targetValue, remoteTargets)
   const [remoteSaveDir, setRemoteSaveDir] = useState('')
 
   const [text, setText] = useState(() => session.initialUrls.join('\n'))
@@ -311,17 +311,19 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     setFailures([])
     setPhase('submitting')
     const renamed = entries.length === 1 ? rename.trim() : ''
+    const route = dispatchRoute(remote)
     const results = await Promise.allSettled(
       entries.map((entry) => {
         const input = { url: entry.url, fileName: renamed !== '' ? renamed : entry.fileName }
-        return remote.kind === 'cloud'
+        return route.via === 'cloud'
           ? rpc.agent.remote.dispatch(remoteDispatchParams(remote.id, input, remoteSaveDir))
-          : rpc.agent.link.dispatch(linkDispatchParams(remote.id, input, remoteSaveDir))
+          : rpc.agent.link.dispatch(linkDispatchParams(route.fingerprint, input, remoteSaveDir))
       }),
     )
     const summary = summarizeDispatch(results)
     if (summary.failed === 0) {
-      toast.key(remote.online === false ? 'downloadToDispatchedOffline' : 'downloadToDispatched', 'success', { count: summary.ok, device: remote.name })
+      if (route.via === 'link') toast.key('linkDispatchedToDevice', 'success', { device: remote.name })
+      else toast.key(remote.online === false ? 'downloadToDispatchedOffline' : 'downloadToDispatched', 'success', { count: summary.ok, device: remote.name })
       closeNewDownload()
       return
     }

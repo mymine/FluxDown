@@ -8,9 +8,12 @@ fluxdown_engine = { version = "0.1.0", path = "../engine", default-features = fa
 fluxdown_protocol = { version = "0.1.0", path = "../protocol" }
 
 [features]
-default = []
+# 默认与 engine 一致开启 P2P；商店构建经上游 crate 的 `--no-default-features` 整体关闭。
+default = ["bt", "ed2k"]
 plugins = ["fluxdown_engine/plugins"]
 components = ["fluxdown_engine/components"]
+bt = ["fluxdown_engine/bt"]
+ed2k = ["fluxdown_engine/ed2k"]
 
 [lints]
 workspace = true

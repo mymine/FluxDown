@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_config::BtConfig;
 use fluxdown_engine::events::{EngineEvent, EventSink};
 use fluxdown_engine::plugin::manifest::PluginManifest;
 use fluxdown_engine::proxy_config::ProxyConfig;

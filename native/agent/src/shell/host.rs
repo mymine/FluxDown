@@ -12,7 +12,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::time::Instant;
 
 use fluxdown_protocol::TrayUnavailableReason;
@@ -24,6 +24,8 @@ use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use super::{ShellHost, TrayAction, TrayAvailability, TrayModel, TrayPort};
+#[cfg(target_os = "macos")]
+use crate::hotkey::{HotkeyBinding, HotkeyPort, HotkeySink, MainThreadHost};
 use crate::runtime::AgentResult;
 
 /// 系统注销时等待完全退出（daemon 优雅关停）的上限；Windows 约 5s 后强制结束进程。
@@ -47,6 +49,12 @@ const THEME_POLL_INTERVAL: Duration = Duration::from_secs(5);
 enum HostEvent {
     Apply(TrayModel),
     RuntimeFinished,
+    /// 在主线程创建全局热键后端（仅 macOS）。
+    #[cfg(target_os = "macos")]
+    HotkeySpawn(Arc<dyn HotkeySink>),
+    /// 向主线程的全局热键后端整表下发绑定（仅 macOS）。
+    #[cfg(target_os = "macos")]
+    HotkeyApply(Vec<HotkeyBinding>),
 }
 
 struct ProxyPort(Mutex<EventLoopProxy<HostEvent>>);
@@ -60,6 +68,40 @@ impl TrayPort for ProxyPort {
         if proxy.send_event(HostEvent::Apply(model.clone())).is_err() {
             tracing::trace!("tray event loop closed before model update");
         }
+    }
+}
+
+/// 把全局热键后端放进主线程事件循环（macOS）：后端对象留在循环闭包里，这里只投递消息。
+/// 同一通道 FIFO，保证创建先于其后的 `apply`。
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct HotkeyLink(Arc<Mutex<EventLoopProxy<HostEvent>>>);
+
+#[cfg(target_os = "macos")]
+impl HotkeyLink {
+    fn send(&self, event: HostEvent) {
+        let proxy = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if proxy.send_event(event).is_err() {
+            tracing::debug!("tray event loop closed before hotkey message");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl MainThreadHost for HotkeyLink {
+    fn spawn(&self, sink: Arc<dyn HotkeySink>) -> Box<dyn HotkeyPort> {
+        self.send(HostEvent::HotkeySpawn(sink));
+        Box::new(self.clone())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl HotkeyPort for HotkeyLink {
+    fn apply(&self, bindings: Vec<HotkeyBinding>) {
+        self.send(HostEvent::HotkeyApply(bindings));
     }
 }
 
@@ -100,6 +142,9 @@ where
     let mut spawn_error: Option<std::io::Error> = None;
     #[cfg(windows)]
     let mut theme_deadline = Instant::now() + THEME_POLL_INTERVAL;
+    // 全局热键后端（Carbon / NSEvent，只能在主线程）；宿主要求时在这里创建，随循环结束释放。
+    #[cfg(target_os = "macos")]
+    let mut hotkeys: Option<crate::platform::hotkey::macos::Backend> = None;
 
     event_loop.run_return(|event, _, control_flow| {
         if !matches!(
@@ -129,11 +174,17 @@ where
                 };
                 let port = (availability == TrayAvailability::Available)
                     .then(|| Arc::new(ProxyPort(Mutex::new(proxy.clone()))) as Arc<dyn TrayPort>);
+                #[cfg(target_os = "macos")]
+                let hotkey_host: Option<Arc<dyn MainThreadHost>> =
+                    Some(Arc::new(HotkeyLink(Arc::new(Mutex::new(proxy.clone())))));
+                #[cfg(not(target_os = "macos"))]
+                let hotkey_host: Option<Arc<dyn crate::hotkey::MainThreadHost>> = None;
                 let host = ShellHost {
                     availability,
                     port,
                     actions: Some(actions_rx),
                     autostart,
+                    hotkey_host,
                 };
                 let (done_tx, rx) = std_mpsc::channel();
                 let finished_proxy = proxy.clone();
@@ -170,6 +221,34 @@ where
                     ui.sync_taskbar_theme();
                 }
             }
+            #[cfg(target_os = "macos")]
+            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
+                if let Some(backend) = hotkeys.as_mut() {
+                    backend.on_timer(Instant::now());
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(HostEvent::HotkeySpawn(sink)) => {
+                if hotkeys.is_some() {
+                    tracing::debug!("global hotkey backend already running; spawn ignored");
+                } else if let Some(main_thread) = objc2::MainThreadMarker::new() {
+                    hotkeys = Some(crate::platform::hotkey::macos::Backend::new(
+                        main_thread,
+                        sink,
+                    ));
+                } else {
+                    tracing::error!("global hotkey backend requested off the main thread");
+                    sink.report(
+                        fluxdown_protocol::shortcuts::GlobalShortcutBackend::Unavailable,
+                        Vec::new(),
+                    );
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(HostEvent::HotkeyApply(bindings)) => match hotkeys.as_mut() {
+                Some(backend) => backend.apply(bindings),
+                None => tracing::debug!("global hotkey table dropped: backend not running"),
+            },
             Event::UserEvent(HostEvent::Apply(model)) => {
                 if let Some(ui) = ui.as_mut() {
                     ui.apply(&model);
@@ -214,6 +293,17 @@ where
                 ui = None;
             }
             _ => {}
+        }
+        #[cfg(target_os = "macos")]
+        if !matches!(
+            *control_flow,
+            ControlFlow::Exit | ControlFlow::ExitWithCode(_)
+        ) && let Some(deadline) = hotkeys
+            .as_ref()
+            .and_then(crate::platform::hotkey::macos::Backend::next_deadline)
+        {
+            // 仅在有待授权的双击条目时才设定时器；否则保持纯事件驱动。
+            *control_flow = ControlFlow::WaitUntil(deadline);
         }
     });
 

@@ -92,3 +92,52 @@ pub struct TaskActivityPage {
     pub newest_id: Option<i64>,
     pub truncated: bool,
 }
+
+/// 查询单任务的速度历史（`daemon.task.speedHistory`）。
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSpeedHistoryQuery {
+    pub task_id: String,
+}
+
+/// 任务整个下载期的速度曲线与统计，由 daemon 持久化，任务完成后仍可回看。
+///
+/// 横轴只计下载态（status=1）秒数：暂停、排队、做种时间不计入。曲线点数有上限，
+/// 点数满额时相邻两点合并、`bucket_secs` 翻倍，因此任意时长的任务都覆盖全程。
+/// 「重新下载」会清空历史；从未在记录功能上线后下载过的任务无历史（RPC 返回 `null`）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSpeedHistoryDto {
+    pub task_id: String,
+    /// 每个点覆盖的下载秒数（1、2、4…）。
+    pub bucket_secs: u32,
+    /// 每个点的平均速率（字节/秒），最旧在前；末点可能是仍在累积、不足 `bucket_secs` 秒的当前桶。
+    pub samples: Vec<i64>,
+    /// 累计下载秒数。
+    pub active_secs: i64,
+    /// 下载期间按逐秒速率累计的传输字节。
+    pub transferred_bytes: i64,
+    /// 逐秒速率峰值（字节/秒）。
+    pub peak_bps: i64,
+}
+
+impl TaskSpeedHistoryDto {
+    /// 下载期平均速率（字节/秒）；尚无下载秒数时为 0。
+    ///
+    /// ```
+    /// use fluxdown_protocol::TaskSpeedHistoryDto;
+    /// let history = TaskSpeedHistoryDto { active_secs: 4, transferred_bytes: 1000, ..Default::default() };
+    /// assert_eq!(history.average_bps(), 250);
+    /// assert_eq!(TaskSpeedHistoryDto::default().average_bps(), 0);
+    /// ```
+    #[must_use]
+    pub fn average_bps(&self) -> i64 {
+        if self.active_secs > 0 {
+            self.transferred_bytes / self.active_secs
+        } else {
+            0
+        }
+    }
+}

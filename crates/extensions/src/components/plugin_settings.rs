@@ -534,6 +534,95 @@ impl Render for PluginSettingsForm {
     }
 }
 
+/// 设置对话框内容：「插件设置」（插件视图）与「基础设置」（manifest 设置表单）两个 tab；
+/// 只有一个可用内容时不显示 tab 栏。
+pub struct PluginSettingsTabs {
+    translator: Entity<Translator>,
+    view: Option<gpui::AnyView>,
+    form: Option<Entity<PluginSettingsForm>>,
+    /// 0 = 插件设置视图，1 = 基础设置；仅在两者都存在时可切换。
+    selected: usize,
+}
+
+impl PluginSettingsTabs {
+    pub fn new(
+        translator: Entity<Translator>,
+        view: Option<gpui::AnyView>,
+        form: Option<Entity<PluginSettingsForm>>,
+    ) -> Self {
+        Self {
+            translator,
+            view,
+            form,
+            selected: 0,
+        }
+    }
+
+    /// 当前显示的是否为基础设置表单。
+    fn showing_form(&self) -> bool {
+        self.form.is_some() && (self.view.is_none() || self.selected == 1)
+    }
+
+    /// 当前 tab 是基础设置时返回其表单（保存按钮只对它生效）。
+    pub fn active_form(&self) -> Option<Entity<PluginSettingsForm>> {
+        if self.showing_form() {
+            self.form.clone()
+        } else {
+            None
+        }
+    }
+
+    pub fn is_saving(&self, cx: &gpui::App) -> bool {
+        self.form
+            .as_ref()
+            .is_some_and(|form| form.read(cx).is_saving())
+    }
+}
+
+impl Render for PluginSettingsTabs {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active_theme(cx);
+        let translator = self.translator.read(cx);
+        let both = self.view.is_some() && self.form.is_some();
+        let labels = [
+            SharedString::from(translator.text("pluginSettingsViewTab").to_owned()),
+            SharedString::from(translator.text("pluginSettingsBasicTab").to_owned()),
+        ];
+        let tabs = cx.entity();
+        let body = if self.showing_form() {
+            self.form.clone().map(|form| form.into_any_element())
+        } else {
+            self.view.clone().map(|view| {
+                div()
+                    .w_full()
+                    .h(theme.text_extent(420.))
+                    .overflow_hidden()
+                    .child(view)
+                    .into_any_element()
+            })
+        };
+        v_flex()
+            .w_full()
+            .min_h_0()
+            .gap(theme.tokens().spacing.md)
+            .when(both, |this| {
+                this.child(fluxdown_ui_components::segmented_tabs(
+                    "plugin-settings-tabs",
+                    labels,
+                    self.selected,
+                    move |index, _, cx| {
+                        tabs.update(cx, |this, cx| {
+                            this.selected = index;
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                ))
+            })
+            .children(body)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use fluxdown_protocol::{SettingFieldDto, SettingOptionDto};

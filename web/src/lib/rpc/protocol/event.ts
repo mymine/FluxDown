@@ -24,6 +24,7 @@ import type { RssSourceDto } from './rss';
 import type { SelectionRequestDto } from './selection';
 import type { TaskActivityDto, TaskDto, TaskRuntimeDto } from './task';
 import type { CloudNotifyStateDto, TaskNoticeDto } from './cloudNotify';
+import type { PluginViewFrameDto } from './pluginView';
 import type { WebhookDeliveryDto } from './webhook';
 import type { WsServerMsg } from './ws';
 
@@ -109,7 +110,13 @@ export type DaemonEvent =
   | { type: 'selectionPending'; data: SelectionRequestDto }
   | { type: 'selectionResolved'; data: { requestId: string } }
   /** 任务生命周期语义事件：只供 agent 消费，不转发给 UI，不改变快照。 */
-  | { type: 'taskNotice'; data: TaskNoticeDto };
+  | { type: 'taskNotice'; data: TaskNoticeDto }
+  /** 可移植插件视图的增量帧：不改变快照；客户端按 `session` 过滤，忽略未知会话。 */
+  | { type: 'pluginViewFrame'; data: PluginViewFrameDto }
+  /** 可移植视图会话已结束（`reason`：`closed` / `expired` / `pluginUnloaded`）；不改变快照。 */
+  | { type: 'pluginViewClosed'; data: { session: string; reason: string } }
+  /** 插件经 `flux.ui.toast` 请求的提示；不改变快照。 */
+  | { type: 'pluginToast'; data: { identity: string; level: string; text: string } };
 
 /** agent 自有或转发的状态变化事件（`type` + `data` 相邻标记）。 */
 export type AgentEvent =

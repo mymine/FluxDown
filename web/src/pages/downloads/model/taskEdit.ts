@@ -35,6 +35,11 @@ export function canChangeSegments(view: EditFacts): boolean {
   return view.source === 'local' && view.state !== 'completed' && !isBtUrl(view.url)
 }
 
+/** 「完整性校验」：本地已完成的 BT 任务且目标文件未丢失（镜像 GPUI `can_verify_integrity`；调用方保证单选）。 */
+export function canVerifyIntegrity(view: EditFacts & Pick<DownloadTaskView, 'fileMissing'>): boolean {
+  return view.source === 'local' && view.state === 'completed' && isBtUrl(view.url) && !view.fileMissing
+}
+
 /** 线程数输入 → 线程数：`0..=MAX_TASK_SEGMENTS` 的整数（0 = 自动）；空串 / 非数字 / 超限 → null。 */
 export function parseTaskSegments(input: string): number | null {
   const text = input.trim()

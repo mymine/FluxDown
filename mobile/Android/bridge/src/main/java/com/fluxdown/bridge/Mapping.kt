@@ -17,6 +17,7 @@ import com.fluxdown.core.model.Category
 import com.fluxdown.core.model.CloudDevice
 import com.fluxdown.core.model.FileExistsAction
 import com.fluxdown.core.model.HlsOption
+import com.fluxdown.core.model.PluginCandidate
 import com.fluxdown.core.model.HostInfo
 import com.fluxdown.core.model.LinkDevice
 import com.fluxdown.core.model.Queue
@@ -246,6 +247,11 @@ internal fun SelectionKindDto.toCore(): SelectionKind = when (this) {
         renamePreview = renamePreview,
         actions = actions.map { it.toCore() },
     )
+    is SelectionKindDto.Plugin -> SelectionKind.Plugin(
+        site = site,
+        url = url,
+        candidates = candidates.map { PluginCandidate(it.identity, it.name, it.version, it.description) },
+    )
 }
 
 internal fun FileExistsActionDto.toCore(): FileExistsAction = when (this) {
@@ -266,6 +272,7 @@ internal fun SelectionOutcomeDto.toCore(): SelectionOutcome = when (this) {
     is SelectionOutcomeDto.Variant -> SelectionOutcome.Variant(index)
     is SelectionOutcomeDto.FileExists -> SelectionOutcome.FileExists(action.toCore())
     is SelectionOutcomeDto.Cancelled -> SelectionOutcome.Cancelled
+    is SelectionOutcomeDto.Plugin -> SelectionOutcome.Plugin(identity, remember)
 }
 
 internal fun SelectionOutcome.toDto(): SelectionOutcomeDto = when (this) {
@@ -273,6 +280,7 @@ internal fun SelectionOutcome.toDto(): SelectionOutcomeDto = when (this) {
     is SelectionOutcome.Bt -> SelectionOutcomeDto.Bt(indices)
     is SelectionOutcome.Variant -> SelectionOutcomeDto.Variant(index)
     is SelectionOutcome.FileExists -> SelectionOutcomeDto.FileExists(action.toDto())
+    is SelectionOutcome.Plugin -> SelectionOutcomeDto.Plugin(identity, remember)
     SelectionOutcome.Cancelled -> SelectionOutcomeDto.Cancelled
 }
 
@@ -307,6 +315,12 @@ internal fun LinkDeviceDto.toCore() = LinkDevice(
     online = online,
     defaultSaveDir = defaultSaveDir,
     pathStyle = pathStyle,
+    customName = customName,
+    appVersion = appVersion,
+    cloudDeviceId = cloudDeviceId,
+    revoked = revoked,
+    pairedAt = pairedAt,
+    lastSeenAt = lastSeenAt,
 )
 
 internal fun CategoryDto.toCore() = Category(

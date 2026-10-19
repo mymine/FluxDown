@@ -118,6 +118,10 @@ pub(crate) async fn run_with(
     )
     .await?;
     let bound = listener.local_addr()?;
+    // 本次运行的网关是否实际可被局域网访问：监听了非回环地址，或 server 模式（由
+    // `FLUXDOWN_BIND` 决定、通常在容器 / 反代后面）。与持久化的 `lan_enabled`（下次启动才
+    // 生效）区分开，界面据此决定是否展示配对码或提示「重启后生效」。
+    state.gateway.lan_active = server_config.is_some() || !bound.ip().is_loopback();
     let bearer_override = std::env::var_os("FLUXDOWN_AGENT_TOKEN_FILE").map(PathBuf::from);
     let bearer = load_or_create_bearer(store.data_dir(), bearer_override.as_deref()).await?;
     let endpoint_dir = server.is_none().then(|| match bearer_override.as_deref() {
@@ -218,6 +222,7 @@ pub(crate) async fn run_with(
         tasks: Arc::new(crate::link::DaemonTaskCreator::new(daemon.clone())),
         bound,
         server_mode: server.is_some(),
+        network: crate::link::LinkNetworkOptions::from_env(),
     });
     let link_task = tokio::spawn(link.clone().run(cancel.clone()));
     let analytics_task = tokio::spawn(
@@ -299,6 +304,8 @@ pub(crate) async fn run_with(
         shell.clone(),
     ));
     let blobs = Arc::new(crate::capture::DaemonBlobClient::new(&daemon_config)?);
+    // 已装插件的市场撤回：低频触发 daemon 拉索引（桌面与 server 宿主；embedded 不接入）。
+    crate::plugin_revocation::spawn(daemon.clone(), cancel.clone());
     let nmh_task = if server.is_some() {
         // server 模式没有浏览器扩展中继：不启动 NMH IPC 也不注册 native messaging host；
         // 占位任务永不完成，退出时 abort。
@@ -307,7 +314,11 @@ pub(crate) async fn run_with(
         // NMH 需要实时速度（扩展弹窗）：自持一个任务事件泵，与网关的泵互不依赖。
         let task_events = crate::task_events::TaskEventHub::spawn(&events);
         let nmh = crate::nmh::NmhService::new(daemon.clone(), capture.clone())
-            .with_task_events(task_events);
+            .with_task_events(task_events)
+            .with_sniff_rules(Arc::new(crate::sniff_rules::SniffRuleStore::new(
+                store.data_dir().join("sniff-rules"),
+                crate::egress::Egress::daemon(daemon.clone()),
+            )));
         let nmh_cancel = cancel.clone();
         let (endpoint_ready, endpoint_live) = tokio::sync::oneshot::channel();
         // 浏览器扩展靠 NMH 注册找到中继：端点开始监听后再按归属规则自愈，并存安装的中继
@@ -354,6 +365,7 @@ pub(crate) async fn run_with(
             events: events.clone(),
             data_dir: store.data_dir().to_path_buf(),
             target: update_target,
+            egress: crate::egress::Egress::daemon(daemon.clone()),
             request_restart: {
                 let lifecycle = lifecycle.clone();
                 Box::new(move || lifecycle.request_restart())

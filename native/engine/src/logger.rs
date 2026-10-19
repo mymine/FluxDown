@@ -526,11 +526,16 @@ fn parse_level_filter(value: Option<&str>) -> tracing_subscriber::filter::LevelF
 /// librqbit 按单个 peer / 单次 announce 打 INFO/WARN（MSE 握手成败、tracker
 /// announce 成功）。实测 18 个种子约 40 行/秒，几分钟就把 2MB 的轮转日志冲掉，
 /// 真正有用的诊断随之被挤出保留窗口。默认把这些目标压到更高等级。
+#[cfg(feature = "bt")]
 const NOISY_TARGET_DIRECTIVES: &[&str] = &[
     "librqbit::peer_connection=error",
     "librqbit::mse=warn",
     "librqbit_tracker_comms=warn",
 ];
+
+/// 无 `bt` feature 时不链接 librqbit，没有需要压制的目标。
+#[cfg(not(feature = "bt"))]
+const NOISY_TARGET_DIRECTIVES: &[&str] = &[];
 
 /// 组装全局过滤器。`rust_log` 为 `RUST_LOG` 的值：非空时完全由它决定，不叠加
 /// 任何内置指令；否则以 `level` 为默认级别，且仅在 INFO/WARN 下压制
@@ -947,6 +952,7 @@ mod tests {
         assert!(!s.contains("pass"), "{s}");
     }
 
+    #[cfg_attr(not(feature = "bt"), allow(unused_imports))]
     use super::{
         AppLogWriterFactory, AppLogger, LoggerInitError, build_env_filter, format_error_chain,
         install_panic_hook, list_log_files_in, parse_level_filter, parse_log_name, report_error,
@@ -982,6 +988,7 @@ mod tests {
         assert_eq!(parse_level_filter(Some("verbose")), LevelFilter::INFO);
     }
 
+    #[cfg(feature = "bt")]
     #[test]
     fn default_filter_silences_per_peer_bt_noise_but_yields_to_explicit_config() {
         use tracing::Level;

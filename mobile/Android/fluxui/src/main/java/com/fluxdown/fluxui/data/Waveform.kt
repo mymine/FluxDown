@@ -54,6 +54,10 @@ class WaveSeries(
 private const val MIB = 1024f * 1024f
 private const val MINI_POINTS = 30
 
+/** 非 mini 波形的上下内边距 / 右侧给头点留出的宽度；叠层（刻度、读数）与曲线共用同一几何。 */
+internal val WAVE_PAD = 8.dp
+internal val WAVE_HEAD_INSET = 4.dp
+
 /**
  * 实时速度波形（品牌签名之二）：点阵网格 → 面积纯色（低 α）→ 上行虚线 → 主线 → 头部光点，
  * 左侧 0→28% 渐隐（内容遮罩）。曲线为 Catmull-Rom → 三次贝塞尔（张力 .18）。
@@ -69,6 +73,8 @@ fun Waveform(
     samples: () -> WaveSeries,
     modifier: Modifier = Modifier,
     mini: Boolean = false,
+    /** 左侧 0→28% 渐隐；整段历史曲线（起点有意义）传 false。 */
+    fadeStart: Boolean = true,
 ) {
     val colors = FluxTheme.colors
     val latest = rememberUpdatedState(samples)
@@ -81,8 +87,8 @@ fun Waveform(
             .drawWithCache {
                 val w = size.width
                 val h = size.height
-                val pad = (if (mini) 3.dp else 8.dp).toPx()
-                val chartW = if (mini) w else (w - 4.dp.toPx()).coerceAtLeast(1f)
+                val pad = (if (mini) 3.dp else WAVE_PAD).toPx()
+                val chartW = if (mini) w else (w - WAVE_HEAD_INSET.toPx()).coerceAtLeast(1f)
                 val line = Path()
                 val area = Path()
                 val upPath = Path()
@@ -157,7 +163,7 @@ fun Waveform(
                             drawCircle(hi, headR, Offset.Zero)
                         }
                     }
-                    drawRect(maskBrush, size = Size(w, h), blendMode = BlendMode.DstIn)
+                    if (fadeStart) drawRect(maskBrush, size = Size(w, h), blendMode = BlendMode.DstIn)
                 }
             },
     )
@@ -176,9 +182,19 @@ private fun autoMax(down: FloatArray, dOff: Int, dN: Int, up: FloatArray, uOff: 
     return m * 1.18f
 }
 
-private fun yOf(v: Float, h: Float, pad: Float, max: Float): Float {
+internal fun yOf(v: Float, h: Float, pad: Float, max: Float): Float {
     val r = if (max <= 0f) 0f else (v / max).coerceIn(0f, 1f)
     return h - pad - r * (h - pad * 2.2f)
+}
+
+/** 曲线第 [i] 个点（共 [n] 个）的 x；与 [buildSmooth] 等距布点一致，n<2 时为 0。 */
+internal fun waveXAt(i: Int, chartW: Float, n: Int): Float = if (n < 2) 0f else i * chartW / (n - 1)
+
+/** 把触点 x 吸附到最近的采样点下标（0 基）；n<=0 返回 -1。 */
+internal fun waveIndexAt(x: Float, chartW: Float, n: Int): Int {
+    if (n <= 0) return -1
+    if (n == 1 || chartW <= 0f) return 0
+    return Math.round(x / chartW * (n - 1)).coerceIn(0, n - 1)
 }
 
 /** Catmull-Rom → 三次贝塞尔（张力 .18），点 i 取 `a[off + i]`；n<2 时画一条水平线。 */

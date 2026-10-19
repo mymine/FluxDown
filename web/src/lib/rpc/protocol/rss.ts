@@ -96,8 +96,12 @@ export interface RssItemDto {
   reason: string;
 }
 
-/** feed 验证请求（只读，不落库）。 */
+/** 订阅地址验证请求（只读，不落库）；`providerId` 缺省为内置 RSS。 */
 export interface RssValidateRequest {
+  /** 订阅来源 provider；缺省 / 空 = 内置 `rss`。 */
+  providerId?: string;
+  /** provider 专属配置 JSON 字符串；缺省为空。 */
+  providerConfig?: string;
   url: string;
   cookies?: string;
   userAgent?: string;

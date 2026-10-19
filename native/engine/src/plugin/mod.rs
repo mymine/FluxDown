@@ -19,24 +19,36 @@
 //! - [`semver`]：engine-local `parse_semver`/`satisfies_min`（三段版本比较）。
 //! - [`runtime`]：抽象层 —— `ScriptRuntime`/`PluginBridge` trait + 跨 JS 边界结构体，
 //!   本文件禁止出现任何 rquickjs 类型，未来可换 deno_core。
-//! - [`quickjs`]：v1 唯一实现 `QuickJsScriptRuntime`，rquickjs 类型仅存在于本文件。
+//! - [`quickjs`]：v1 唯一的短调用实现 `QuickJsScriptRuntime`，rquickjs 类型仅存在于本文件与
+//!   [`quickjs_host`]。
+//! - [`quickjs_host`]：常驻宿主（`main`）的 QuickJS actor。
+//! - [`manager`]（含 `host_manager` 子模块）：宿主侧——会话、激活 / 回收、渲染节流、命令与 RPC。
 //! - [`bridge`]：`EngineBridge` 实现 `PluginBridge`（网络出口守卫 + flux.* API）。
 //! - [`manager`]：`PluginManager`（Arc 共享，插件装载/启停/resolve/notify）。
 
+pub mod audit;
 pub mod bridge;
+pub mod consent;
+#[cfg(test)]
+mod consent_tests;
 pub mod dependencies;
 pub mod install;
 pub mod manager;
 pub mod manifest;
 pub mod market;
 pub mod quickjs;
+pub mod quickjs_host;
 pub mod runtime;
 pub mod semver;
+pub mod sniff_pack;
+mod tool_path;
+pub use manager::routing;
 pub use manager::{DisabledReason, LoadedPlugin, PluginInfo, PluginLoadStatus, PluginManager};
 pub use manifest::{PluginManifest, SettingField, SettingType, SettingWidget, SubscriptionDecl};
 pub use market::{MarketClient, MarketEntry, MarketError, MarketIndex};
 pub use runtime::{
-    AuthRequest, AuthResult, CancelReason, ExecutionBudget, ManifestItem, ManifestVariant,
-    PluginBridge, PluginError, PluginEvent, PluginLogLevel, ResolveManifest, ResolveRequest,
-    ResolveResult, ResolveVariant, ScriptRuntime, SubscriptionRequest,
+    AuthRequest, AuthResult, CancelReason, ExecutionBudget, HostCall, HostEvents, HostFuture,
+    HostReply, ManifestItem, ManifestVariant, PluginBridge, PluginError, PluginEvent, PluginHost,
+    PluginLogLevel, PluginTaskPort, ResolveManifest, ResolveRequest, ResolveResult, ResolveVariant,
+    ScriptRuntime, SubscriptionRequest,
 };

@@ -48,9 +48,6 @@ fluxDown/.output/
 fluxDown/.wxt/
 fluxDown/dist/
 
-# Vercel
-website/.vercel/
-
 # Sisyphus
 .sisyphus/
 
@@ -70,7 +67,6 @@ website/.vercel/
 .augment/settings.local.json
 skills-lock.json
 
-website/fluxdown-website-latest.tar
 /docs/
 
 # ── 敏感信息（开源清理，严禁入库）──
@@ -86,7 +82,6 @@ scripts/notify_config.json
 scripts/.send_progress
 scripts/filter_repo_replacements.txt
 fluxDown/stats.html
-website/.vscode/launch.json
 design/
 .promo/
 assets/screenshot/

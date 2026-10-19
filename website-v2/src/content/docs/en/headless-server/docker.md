@@ -119,6 +119,32 @@ On first open of the Web UI (`http://<NAS-IP>:17800`), the initialization wizard
 
 Upgrade by manually installing a newer `.spk` over the existing one — the database, access key, and settings in `var` are preserved. The package now ships `fluxdown-agent` + `fluxdownd` (the start script runs `fluxdown-agent --server`; the log file is still `var/fluxdown-server.log`). Uninstalling from Package Center stops the service and removes the package.
 
+## fnOS (native .fpk app)
+
+Every Server release ships native fnOS app packages — no Docker required:
+
+| Package | CPU |
+|---|---|
+| `FluxDown-Server-<ver>-fnos-x64.fpk` | Intel / AMD (x86) |
+| `FluxDown-Server-<ver>-fnos-arm64.fpk` | ARM64 |
+
+### Install
+
+1. Open **App Center → Manual install**, pick the `.fpk` for your CPU, and follow the prompts (manually installed third-party apps are not reviewed by the fnOS App Center).
+2. Start the app, then click the **FluxDown** desktop icon — it opens the Web UI on port `17800` (`http://<NAS-IP>:17800`) in a new tab.
+3. On first launch, set your access key (8+ characters, letters and digits). You can change it later under **Settings → Security & access**.
+
+### Permissions and data location
+
+- The service runs as the dedicated app user `fluxdown` (not root).
+- Installation creates the shared folder `fluxdown` and grants the app read/write access; it is the default save location.
+- To save into another shared folder, add it under **App settings → Authorized directories** for FluxDown. Unauthorized folders show "the service process cannot read this directory" in the save-location picker.
+- The database, access key, and log (`fluxdown-server.log`) live in the app data directory `/var/apps/fluxdown/var`.
+
+### Upgrading
+
+In-app update only announces new versions; it never replaces the binaries. Manually install the newer `.fpk` from the App Center over the existing install — the database, access key, and settings are kept.
+
 ## Exposing it safely
 
 The image binds `0.0.0.0:17800` inside the container, mapped to the host. As with any headless deployment, the access key is the only thing guarding full remote control — see the [reverse proxy & TLS guidance](/docs/en/headless-server/setup/) before exposing it beyond a trusted LAN.

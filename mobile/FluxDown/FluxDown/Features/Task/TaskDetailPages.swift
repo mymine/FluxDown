@@ -210,27 +210,41 @@ struct TaskDetailSpeedPage: View {
 
     @Environment(AppContainer.self) private var container
     @State private var showsSegments = false
+    @State private var speed = TaskSpeedHistoryModel()
 
     private var task: DownloadTask { model.task }
 
+    private struct RunKey: Equatable {
+        let taskId: String
+        let downloading: Bool
+    }
+
     var body: some View {
-        let history = container.store.state.taskSpeedHistory[task.taskId]
-        let stats = TaskSpeedStats(history: history)
+        let history = speed.history?.taskId == task.taskId ? speed.history : nil
         let current = Format.speedOrZero(model.speedDown)
-        let average = Format.speedOrZero(stats.average)
-        let peak = Format.speedOrZero(stats.peak)
+        let average = Format.speedOrZero(history?.averageBps ?? 0)
+        let peak = Format.speedOrZero(history?.peakBps ?? 0)
+        let activeTime = TaskDetailText.durationMeasure(history?.activeSecs ?? 0)
 
         Section {
-            TaskStatTiles(items: [
-                TaskStatItem(label: L("infoSpeed"), measure: current, tint: model.isTransferring ? Color.accentColor : nil),
-                TaskStatItem(label: L("mobileSpeedAvgRecent"), measure: average),
-                TaskStatItem(label: L("mobileSpeedPeakRecent"), measure: peak),
-            ])
+            VStack(spacing: 10) {
+                TaskStatTiles(items: [
+                    TaskStatItem(label: L("infoSpeed"), measure: current, tint: model.isTransferring ? Color.accentColor : nil),
+                    TaskStatItem(label: L("speedAverage"), measure: average),
+                ])
+                TaskStatTiles(items: [
+                    TaskStatItem(label: L("speedPeak"), measure: peak),
+                    TaskStatItem(label: L("speedActiveTime"), measure: activeTime),
+                ])
+            }
             .taskDetailBareRow()
         }
 
         Section {
-            chart(history: history, stats: stats)
+            chart(history: history)
+                .task(id: RunKey(taskId: task.taskId, downloading: model.isTransferring)) {
+                    await speed.run(taskId: task.taskId, downloading: model.isTransferring, session: container.session)
+                }
         }
 
         if model.isTransferring, let runtime = model.runtime {
@@ -251,22 +265,26 @@ struct TaskDetailSpeedPage: View {
     }
 
     @ViewBuilder
-    private func chart(history: SpeedHistory?, stats: TaskSpeedStats) -> some View {
-        if let history, stats.samples >= 2 {
+    private func chart(history: TaskSpeedHistory?) -> some View {
+        if let history, history.hasCurve {
+            let end = TaskDetailText.duration(history.activeSecs)
+            let bucket = Double(history.bucketSecs)
+            let elapsed = history.elapsedSeconds
             VStack(spacing: 4) {
                 SpeedAreaChart(
-                    down: history.downSamples.map(Double.init),
+                    down: history.samples.map(Double.init),
                     valueFormat: { Format.speedOrZero(Int64($0)).description },
                     title: L("infoSpeed"),
                     downLabel: L("mobileActivityDownload"),
-                    upLabel: L("mobileActivityUpload"),
-                    timeLabel: "\(L("mobileSpeedAxisStart")) – \(L("mobileSpeedAxisNow"))"
+                    timeLabel: "\(L("speedAxisStart")) – \(end)",
+                    xValueLabel: { TaskDetailText.duration(Int64($0 * bucket)) },
+                    readoutTime: { clockDurationText(elapsed[$0]) }
                 )
-                .frame(height: 130)
+                .frame(height: 162)
                 HStack {
-                    Text(L("mobileSpeedAxisStart"))
+                    Text(L("speedAxisStart"))
                     Spacer()
-                    Text(L("mobileSpeedAxisNow"))
+                    Text(end)
                 }
                 .font(.caption2)
                 .foregroundStyle(.secondary)

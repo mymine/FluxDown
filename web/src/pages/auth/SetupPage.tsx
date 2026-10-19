@@ -6,6 +6,7 @@ import { Copy, Dices, Eye, EyeOff } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useT } from '../../i18n'
 import { SetupError, fetchSetupStatus, saveToken, submitSetup } from '../../lib/access'
+import { copyText } from '../../lib/copy'
 import { errorMessage } from '../../lib/rpc/error'
 import { ACCESS_KEY_MAX_LEN, ACCESS_KEY_MIN_LEN, randomAccessKey, validateAccessKey } from '../../lib/token-policy'
 import type { AccessKeyIssue } from '../../lib/token-policy'
@@ -55,10 +56,8 @@ export function SetupPage() {
   }
 
   const copy = () => {
-    navigator.clipboard
-      .writeText(key)
-      .then(() => toast.success(t('webCopied')))
-      .catch((cause: unknown) => toast.error(cause))
+    copyText(key)
+    toast.success(t('webCopied'))
   }
 
   const submit = async () => {

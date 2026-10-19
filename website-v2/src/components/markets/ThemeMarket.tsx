@@ -2,7 +2,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { markets } from "@/i18n/messages/markets";
 import type { Lang } from "@/i18n/config";
-import { THEMES_REPO, THEMES_REPO_URL, filterThemes, themeAssetUrl, type ThemeIndex } from "./theme-data";
+import { filterThemes, themeAssetUrl, type ThemeIndex } from "./theme-data";
+import { THEMES_REPO, githubUrl } from "@/lib/ecosystem";
 import { GridFill, SearchField, SkeletonGrid, StateMessage } from "./MarketUI";
 import { ThemeCard } from "./ThemeCard";
 import { ThemeLightbox, type LightboxState } from "./ThemeLightbox";
@@ -50,7 +51,7 @@ export default function ThemeMarket({ lang }: { lang: Lang }) {
             tone="danger"
             title={t.themes.loadError}
             hint={t.common.retryHint}
-            link={{ href: THEMES_REPO_URL, label: `github.com/${THEMES_REPO}` }}
+            link={{ href: githubUrl(THEMES_REPO), label: `github.com/${THEMES_REPO}` }}
           />
         )}
         {index && filtered.length === 0 && <StateMessage title={t.themes.empty} />}

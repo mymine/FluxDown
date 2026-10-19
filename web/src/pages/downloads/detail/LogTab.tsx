@@ -1,8 +1,7 @@
 import { useT } from '../../../i18n'
 import { Button } from '../../../ui'
 import type { TaskActivityDto } from '../../../lib/rpc'
-import { stateLabel } from '../state'
-import type { TaskState } from '../model/task'
+import { statusCodeLabel } from '../table/text'
 import { Note } from './DetailRow'
 import { useActivity } from './useActivity'
 
@@ -18,23 +17,8 @@ const KIND_KEY: Record<string, string> = {
   nic_links: 'detailActivityKindNicLinks',
   nic_off: 'detailActivityKindNicOff',
   retry: 'detailActivityKindRetry',
+  plugin: 'detailActivityKindPlugin',
   journal_overflow: 'detailActivityKindJournalOverflow',
-}
-
-function activityState(status: number): TaskState {
-  switch (status) {
-    case 0:
-    case 5:
-      return 'pending'
-    case 1:
-      return 'downloading'
-    case 2:
-      return 'paused'
-    case 3:
-      return 'completed'
-    default:
-      return 'failed'
-  }
 }
 
 const pad = (n: number, w = 2) => String(n).padStart(w, '0')
@@ -55,7 +39,7 @@ export function LogTab({ taskId }: { taskId: string }) {
   const describe = (entry: TaskActivityDto): string => {
     const kindKey = KIND_KEY[entry.kind] ?? 'detailActivityKindUnknown'
     const label = t(kindKey)
-    if (entry.kind === 'status' && entry.status !== null) return `${label}: ${stateLabel(t, activityState(entry.status))}`
+    if (entry.kind === 'status' && entry.status !== null) return `${label}: ${statusCodeLabel(t, entry.status)}`
     if (kindKey === 'detailActivityKindUnknown') {
       return entry.message === '' ? `${label} (${entry.kind})` : `${label} (${entry.kind}): ${entry.message}`
     }

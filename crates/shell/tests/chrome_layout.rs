@@ -1,0 +1,71 @@
+//! 布局模型用例：与 Web `web/src/shell/chromeLayout.test.ts` 共用同一份 fixtures。
+
+use fluxdown_ui_shell::{ChromeFamilies, ChromeFamily, ChromeItemSpec, ChromeLayout, ChromeZone};
+use serde_json::Value;
+
+const CASES: &str = include_str!("fixtures/chrome_layout_cases.json");
+
+/// 用例里的目录；任一字段缺失或未知区域 / 承载条时为 `None`。
+fn catalog(cases: &Value) -> Option<Vec<ChromeItemSpec>> {
+    cases["catalog"]
+        .as_array()?
+        .iter()
+        .map(|item| {
+            let families = item["families"]
+                .as_array()?
+                .iter()
+                .map(|family| family.as_str().and_then(ChromeFamily::from_key))
+                .try_fold(ChromeFamilies::default(), |families, family| {
+                    family.map(|family| families.with(family))
+                })?;
+            Some(ChromeItemSpec::new(
+                item["id"].as_str()?.to_owned(),
+                ChromeZone::from_key(item["defaultZone"].as_str()?)?,
+                families,
+            ))
+        })
+        .collect()
+}
+
+fn stored(case: &Value) -> Option<&Value> {
+    Some(&case["stored"]).filter(|value| !value.is_null())
+}
+
+#[test]
+fn normalize_cases() {
+    let cases: Value = serde_json::from_str(CASES).expect("fixture json");
+    let catalog = catalog(&cases).expect("fixture catalog");
+    for case in cases["normalize"].as_array().expect("normalize cases") {
+        let layout = ChromeLayout::from_value(stored(case), &catalog);
+        assert_eq!(layout.to_value(), case["expected"], "{}", case["name"]);
+    }
+}
+
+#[test]
+fn move_cases() {
+    let cases: Value = serde_json::from_str(CASES).expect("fixture json");
+    let catalog = catalog(&cases).expect("fixture catalog");
+    for case in cases["moves"].as_array().expect("move cases") {
+        let mut layout = ChromeLayout::from_value(stored(case), &catalog);
+        let movement = &case["move"];
+        let zone = movement["zone"].as_str().and_then(ChromeZone::from_key);
+        let changed = layout.move_item(
+            &catalog,
+            movement["id"].as_str().expect("move id"),
+            zone.expect("move zone"),
+            movement["target"].as_str(),
+        );
+        assert_eq!(Value::Bool(changed), case["changed"], "{}", case["name"]);
+        assert_eq!(layout.to_value(), case["expected"], "{}", case["name"]);
+    }
+}
+
+#[test]
+fn serialized_layout_round_trips() {
+    let cases: Value = serde_json::from_str(CASES).expect("fixture json");
+    let catalog = catalog(&cases).expect("fixture catalog");
+    let mut layout = ChromeLayout::default_for(&catalog);
+    assert!(layout.move_item(&catalog, "limit", ChromeZone::TitleLeading, None));
+    let restored = ChromeLayout::from_value(Some(&layout.to_value()), &catalog);
+    assert_eq!(restored, layout);
+}

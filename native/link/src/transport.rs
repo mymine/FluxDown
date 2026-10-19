@@ -27,6 +27,9 @@ pub struct PeerConn {
     pub base_url: String,
     /// 本次连接实际走的传输类型（日志/诊断）。
     pub kind: TransportKind,
+    /// 对端 `/ping` 自报的数据面链路协议版本（旧版对端没有该字段 = 0）。发起方据此在发出
+    /// 数据面请求之前判定 [`LinkError::PeerOutdated`]。
+    pub link_protocol: u32,
 }
 
 /// 到达已知设备数据面的策略。
@@ -75,14 +78,20 @@ impl Transport for DirectTransport {
     }
 
     async fn connect(&self, peer: &PeerRecord) -> Result<PeerConn, LinkError> {
-        // 依次尝试全部 Direct 候选而非只试第一个：候选列表现在可能同时
-        // 保留 mDNS 新发现的地址（未探测、纯启发式排序，见
-        // `crate::discovery::pick_best_v4` 文档）与配对时验证过的
-        // 旧地址——只试首个会让一次误选直接判死本该可达的设备。任一候选
-        // 连通即返回；全部候选都失败才 `Unreachable`。
+        // 依次尝试全部 Direct 候选而非只试第一个：候选列表可能同时保留 mDNS 新发现的地址
+        // （未探测、纯启发式排序，见 `crate::discovery::pick_best_v4` 文档）、对端自报的地址与
+        // 配对时验证过的旧地址——只试首个会让一次误选直接判死本该可达的设备。任一候选
+        // 连通即返回；全部候选都失败才失败。
         //
         // 每个候选失败的**根因**（DNS / 连接被拒 / TLS / 非 2xx / 非 JSON）都记进日志，
         // 不再被 `continue` 吞掉——「设备显示离线」时才有线索可查。
+        //
+        // `/ping` 指纹不符（旧地址被 DHCP 回收给了同网段另一台 FluxDown 设备）只说明**这个
+        // 候选**不是目标：记录后继续试后面的候选，否则旧 IP 上的别的设备会永远挡住新地址。
+        // 全部候选耗尽、没有任何候选通过，且出现过不符时才返回 `IdentityMismatch`（留下
+        // 「地址上是别人」的线索）；这不会把冒充降级成成功——通过的候选必须指纹一致，数据面
+        // 的响应还要经链路密钥解封（见 `LinkManager::post_sealed`）。
+        let mut mismatch: Option<String> = None;
         for candidate in peer
             .candidates
             .iter()
@@ -129,14 +138,8 @@ impl Transport for DirectTransport {
                 );
                 continue;
             }
-            // TOFU 身份复核（`PeerRecord::identity_pub` 文档承诺的「后续
-            // 连接重校验」在此落地）：地址可能因 DHCP 回收复用、或被中间
-            // 人篡改指向别的设备，`/ping` 200 响应不代表就是配对时那台
-            // ——必须比对指纹。JSON 解析失败视同该候选不可达（换一个候选
-            // 或许能解决）；解析成功但指纹不符是明确的身份冒充信号，必须
-            // 立即上抛终止整条尝试链，不能继续试其它候选——否则攻击者能
-            // 靠混入一个抢答的候选，把本该立即中止的身份冒充错误悄悄
-            // 降级成一次普通的「不可达，换个候选」。
+            // TOFU 身份复核：`/ping` 200 响应不代表就是配对时那台——必须比对指纹。JSON 解析
+            // 失败视同该候选不可达。
             let body = match resp.json::<serde_json::Value>().await {
                 Ok(body) => body,
                 Err(error) => {
@@ -149,26 +152,47 @@ impl Transport for DirectTransport {
                     continue;
                 }
             };
-            verify_ping_identity(&body, &peer.fingerprint, addr)?;
-            return Ok(PeerConn {
-                base_url: address.base_url(),
-                kind: TransportKind::Direct,
-            });
+            match verify_ping_identity(&body, &peer.fingerprint, addr) {
+                Ok(link_protocol) => {
+                    return Ok(PeerConn {
+                        base_url: address.base_url(),
+                        kind: TransportKind::Direct,
+                        link_protocol,
+                    });
+                }
+                Err(LinkError::IdentityMismatch(_)) => {
+                    tracing::debug!(
+                        fingerprint = %peer.fingerprint,
+                        candidate = addr,
+                        "link candidate answered with another device identity; trying the next candidate"
+                    );
+                    mismatch.get_or_insert_with(|| addr.to_owned());
+                }
+                Err(other) => return Err(other),
+            }
         }
-        Err(LinkError::Unreachable)
+        match mismatch {
+            Some(addr) => Err(LinkError::IdentityMismatch(addr)),
+            None => Err(LinkError::Unreachable),
+        }
     }
 }
 
 /// 从 `/ping` 响应体校验对端身份指纹——[`DirectTransport::connect`] 的 TOFU
 /// 复核核心逻辑，抽成纯函数便于单测（无需起真实 HTTP 服务器即可覆盖比对
-/// 分支）。指纹一致才算通过；缺字段或不一致一律视为身份不符。
+/// 分支）。指纹一致才算通过，并返回对端自报的 `linkProtocol`（旧版对端没有 = 0）；
+/// 缺字段或不一致一律视为身份不符。
 fn verify_ping_identity(
     body: &serde_json::Value,
     expect_fp: &str,
     addr: &str,
-) -> Result<(), LinkError> {
+) -> Result<u32, LinkError> {
     match body.get("linkFingerprint").and_then(|v| v.as_str()) {
-        Some(fp) if fp == expect_fp => Ok(()),
+        Some(fp) if fp == expect_fp => Ok(body
+            .get("linkProtocol")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|version| u32::try_from(version).ok())
+            .unwrap_or(0)),
         _ => Err(LinkError::IdentityMismatch(addr.to_string())),
     }
 }
@@ -228,19 +252,16 @@ impl TransportStack {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::types::{PeerCandidate, PeerInfo, PeerRecord};
+    use crate::types::{PeerCandidate, PeerRecord};
 
     fn peer_with(candidates: Vec<PeerCandidate>) -> PeerRecord {
         PeerRecord {
             fingerprint: "fp".to_string(),
             identity_pub: vec![0u8; 32],
             name: "n".to_string(),
-            platform: None,
             link_secret: vec![0u8; 32],
             candidates,
-            paired_at: 0,
-            last_seen_at: 0,
-            info: PeerInfo::default(),
+            ..PeerRecord::default()
         }
     }
 
@@ -283,8 +304,17 @@ mod tests {
 
     #[test]
     fn verify_ping_identity_accepts_matching_fingerprint() {
-        let body = serde_json::json!({ "linkFingerprint": "abc123" });
-        assert!(verify_ping_identity(&body, "abc123", "10.0.0.1:1").is_ok());
+        let body = serde_json::json!({ "linkFingerprint": "abc123", "linkProtocol": 2 });
+        assert_eq!(
+            verify_ping_identity(&body, "abc123", "10.0.0.1:1").unwrap(),
+            2
+        );
+        // 旧版对端没有 linkProtocol：按 0 处理（发起方据此判 PeerOutdated）。
+        let legacy = serde_json::json!({ "linkFingerprint": "abc123" });
+        assert_eq!(
+            verify_ping_identity(&legacy, "abc123", "10.0.0.1:1").unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -303,5 +333,89 @@ mod tests {
         let body = serde_json::json!({ "success": true });
         let err = verify_ping_identity(&body, "abc123", "10.0.0.1:1").unwrap_err();
         assert!(matches!(err, LinkError::IdentityMismatch(_)));
+    }
+
+    /// 起一个只会回应 `/ping` 的假对端，声称自己的指纹是 `fingerprint`。
+    async fn fake_ping_server(fingerprint: &str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = serde_json::json!({
+            "success": true,
+            "app": "FluxDown",
+            "linkFingerprint": fingerprint,
+            "linkProtocol": 2,
+        })
+        .to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 2048];
+                    if let Err(error) = socket.read(&mut buf).await {
+                        tracing::debug!(%error, "fake ping client closed early");
+                        return;
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if let Err(error) = socket.write_all(response.as_bytes()).await {
+                        tracing::debug!(%error, "fake ping client closed before the reply");
+                        return;
+                    }
+                    if let Err(error) = socket.shutdown().await {
+                        tracing::debug!(%error, "fake ping shutdown failed");
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn direct(addr: &std::net::SocketAddr) -> PeerCandidate {
+        PeerCandidate {
+            kind: TransportKind::Direct,
+            address: addr.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_skips_a_candidate_that_now_belongs_to_another_device() {
+        // 旧 IP 被同网段另一台 FluxDown 设备占用（指纹不符）：不能挡住后面的新地址。
+        let squatter = fake_ping_server("someone-else").await;
+        let target = fake_ping_server("fp").await;
+        let transport = DirectTransport::new(reqwest::Client::new());
+        let conn = transport
+            .connect(&peer_with(vec![direct(&squatter), direct(&target)]))
+            .await
+            .unwrap();
+        assert_eq!(conn.base_url, format!("http://{target}"));
+        assert_eq!(conn.link_protocol, 2);
+    }
+
+    #[tokio::test]
+    async fn connect_reports_identity_mismatch_only_when_every_candidate_failed() {
+        let squatter = fake_ping_server("someone-else").await;
+        let transport = DirectTransport::new(reqwest::Client::new());
+        // 只有冒充者：全部失败且出现过不符 → IdentityMismatch。
+        let err = transport
+            .connect(&peer_with(vec![direct(&squatter)]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LinkError::IdentityMismatch(_)), "{err:?}");
+        // 不符之后的候选不可达（端口无人监听）：仍是 IdentityMismatch，而不是被吞成离线。
+        let closed = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let err = transport
+            .connect(&peer_with(vec![direct(&squatter), direct(&closed)]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, LinkError::IdentityMismatch(_)), "{err:?}");
     }
 }

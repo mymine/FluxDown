@@ -1,6 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
+#if FULL_P2P
 
 /// S6 · BitTorrent 设置（常规 · Tracker · 做种）。
 /// 行与 GPUI `sections/bt.rs` 同序同键同范围；全部写入走 `ConfigEditor`（云同步键 ☁︎ 由目录决定）。
@@ -247,3 +248,4 @@ extension BtPage {
     /// 设置首页该分类行的读数（nil = 使用分类说明文案）。
     static func readout(_ ctx: SettingsSearchContext) -> String? { BtSettingsRow.readout(ctx.form) }
 }
+#endif

@@ -65,7 +65,9 @@ struct GeneralPage: View {
             if let item = GeneralRow.analytics.item {
                 ConfigToggleRow(item: item).disabled(readOnly)
             }
+            #if FULL_P2P
             GeneralLinkHandlingRows()
+            #endif
         } header: {
             Text(L(GeneralRow.Group.system.titleKey))
         }
@@ -102,6 +104,7 @@ struct GeneralPage: View {
     }
 }
 
+#if FULL_P2P
 // MARK: - 链接与文件打开方式（只读）
 
 /// 读取 Info.plist 的静态声明：`magnet:` / `ed2k://` / `.torrent`。iOS 无法检测是否被其它 App 抢占，只展示本 App 是否声明。
@@ -132,6 +135,7 @@ private struct GeneralLinkHandlingRows: View {
         }
     }
 }
+#endif
 
 // MARK: - 搜索 / 读数
 
@@ -139,7 +143,7 @@ extension GeneralPage {
     /// 设置搜索索引：本页所有行（偏好键恒可用，没有条件隐藏的行）。
     static func searchEntries(_ ctx: SettingsSearchContext) -> [SettingsEntry] {
         let name = L("settingsCatGeneral")
-        return GeneralRow.allCases.filter { FeatureFlags.webhooks || $0 != .activityWebhooks }.map { row in
+        return GeneralRow.allCases.filter { $0.isAvailable && (FeatureFlags.webhooks || $0 != .activityWebhooks) }.map { row in
             SettingsEntry(
                 id: row.id, route: .general, title: L(row.titleKey), detail: row.detailKey.map { L($0) } ?? "",
                 breadcrumb: "\(name) › \(L(row.group.titleKey))", symbol: row.symbol

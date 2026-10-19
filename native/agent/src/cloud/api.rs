@@ -77,6 +77,22 @@ impl CloudApi {
         .await
     }
 
+    /// `POST /devices/{id}/disconnect`：让同账号的另一台在线设备下线、释放在线名额（不删除设备）。
+    pub async fn disconnect_device(&self, id: &str) -> Result<Value, CloudError> {
+        self.authed(
+            Method::POST,
+            &format!("/api/v1/devices/{}/disconnect", encode(id)),
+            None::<&Value>,
+        )
+        .await
+    }
+
+    /// 按 FluxCloud 时钟估计的当前 unix 毫秒；供配置同步的编辑时间戳使用。
+    #[must_use]
+    pub fn server_now_ms(&self) -> i64 {
+        self.client.server_now_ms()
+    }
+
     pub async fn remote_tasks(&self) -> Result<Value, CloudError> {
         self.authed(Method::GET, "/api/v1/tasks/remote", None::<&Value>)
             .await

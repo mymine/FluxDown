@@ -210,6 +210,18 @@ export interface CreatedTask {
   taskId: string;
 }
 
+export type TaskVerifyStatus = 'intact' | 'damaged' | 'unverifiable';
+
+/** `daemon.task.verify` 结果（BT 已完成任务的分块完整性校验）。 */
+export interface TaskVerifyResult {
+  status: TaskVerifyStatus;
+  totalPieces: number;
+  verifiedPieces: number;
+  badPieces: number;
+  skippedPieces: number;
+  damagedFiles: string[];
+}
+
 /** `daemon.task.createMany` 单次调用的条目上限（`CREATE_TASKS_MAX_ITEMS`）；更大的导入须按块拆分。 */
 export const CREATE_TASKS_MAX_ITEMS = 512;
 /** `daemon.task.createMany` 幂等键 `batchId` 的最大长度（字节，`CREATE_TASKS_BATCH_ID_MAX_LEN`）。 */
@@ -269,4 +281,23 @@ export interface DownloadRequest {
   method?: string | null;
   body?: RequestBody | null;
   audioUrl?: string | null;
+}
+
+/** `daemon.task.speedHistory` 参数。 */
+export interface TaskSpeedHistoryQuery {
+  taskId: string;
+}
+
+/** 任务全生命周期速度曲线与统计；结果为 null = 无记录。平均速度 = transferredBytes / activeSecs。 */
+export interface TaskSpeedHistoryDto {
+  taskId: string;
+  /** 每点覆盖秒数（1、2、4…，服务端点数封顶后相邻合并、宽度翻倍）。 */
+  bucketSecs: number;
+  /** 每点平均 bytes/s，最旧在前；末点可能是尚在累计的不完整桶。 */
+  samples: number[];
+  /** 处于下载态的总秒数（暂停 / 排队 / 做种不计）。 */
+  activeSecs: number;
+  transferredBytes: number;
+  /** 逐秒峰值速度。 */
+  peakBps: number;
 }

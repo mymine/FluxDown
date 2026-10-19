@@ -57,15 +57,12 @@ internal object Dispatcher {
 
     private suspend fun dispatch(item: DispatchItem, target: DispatchTarget, saveDir: String?, session: HostSession) {
         val url = item.entry.url
-        when (target.kind) {
-            DispatchTarget.Kind.Cloud -> session.callUnit(
-                HostMethod.agentRemoteDispatch,
-                RemoteDispatchParams(target.deviceId, url, item.fileName, saveDir).toJson(),
-            )
-            DispatchTarget.Kind.Link -> session.callUnit(
-                HostMethod.agentLinkDispatch,
-                LinkDispatchParams(target.deviceId, url, item.fileName, saveDir).toJson(),
-            )
+        // 独立直连条目 / 挂接且直连在线的云条目走局域网（一次性投递），其余走云
+        val fingerprint = target.linkRouteFingerprint
+        if (fingerprint != null) {
+            session.callUnit(HostMethod.agentLinkDispatch, LinkDispatchParams(fingerprint, url, item.fileName, saveDir).toJson())
+        } else {
+            session.callUnit(HostMethod.agentRemoteDispatch, RemoteDispatchParams(target.deviceId, url, item.fileName, saveDir).toJson())
         }
     }
 
@@ -74,6 +71,8 @@ internal object Dispatcher {
         val device = target.name
         if (summary.failures == 0) {
             val text = when {
+                // 直连是一次性投递：进度要到对端设备上看
+                target.routesViaLink -> context.str(R.string.linkDispatchedToDevice, "device" to device)
                 target.isCloud && target.isOffline ->
                     context.str(R.string.downloadToDispatchedOffline, "count" to summary.successes, "device" to device)
                 summary.successes == 1 -> context.str(R.string.dispatchedToDevice, "device" to device)
@@ -81,7 +80,7 @@ internal object Dispatcher {
             }
             return DispatchOutcome(text, partial = false, failure = null)
         }
-        val scene = if (target.isCloud) AccountErrorContext.General else AccountErrorContext.Pairing
+        val scene = if (target.routesViaLink) AccountErrorContext.Pairing else AccountErrorContext.General
         val reason = summary.firstError?.let { AccountText.error(context, it, scene) } ?: context.str(R.string.dispatchFailed)
         if (summary.successes > 0) {
             val partial = context.str(

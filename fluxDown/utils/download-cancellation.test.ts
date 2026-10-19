@@ -48,4 +48,24 @@ describe("cancelBeforeFilenameResolution", () => {
 
     expect(events).toEqual(["cancel", "suggest"]);
   });
+
+  test("reports a successful cancellation without waiting for history erase", async () => {
+    const events: string[] = [];
+
+    await expect(
+      cancelBeforeFilenameResolution(
+        9,
+        async () => {
+          events.push("cancel");
+        },
+        () => {
+          events.push("erase");
+          return Promise.withResolvers<never>().promise;
+        },
+        () => events.push("suggest"),
+      ),
+    ).resolves.toBe(true);
+
+    expect(events).toEqual(["cancel", "suggest", "erase"]);
+  });
 });

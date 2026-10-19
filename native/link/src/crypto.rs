@@ -4,8 +4,15 @@
 //! 全部基于已在引擎中的 `sha2 0.10`（digest 0.10）+ `hkdf 0.12` + `hmac 0.12`，
 //! 三者 digest 版本一致，避免类型 trait bound 冲突；数据面 body 加密另加
 //! `chacha20poly1305 0.10`（RustCrypto 同族，与前三者独立但风格一致）。
+//!
+//! # 数据面 v2
+//! - MAC 绑定方法、路径、时间戳、nonce、**收发双方指纹**与密文摘要，防止把 A→B 的请求
+//!   反射回 A（见 [`link_auth_tag`]）。
+//! - 请求体与**响应体**都用 ChaCha20-Poly1305 封装，AAD 分别绑定方向、方法、路径、双方指纹
+//!   与请求 nonce（见 [`request_aad`] / [`response_aad`]）：响应无法被旧响应 / 另一方向的
+//!   密文替换，发起方只在响应成功解封后才相信「对端确实是那台已配对设备」。
 
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use hmac::{Mac, SimpleHmac};
@@ -18,6 +25,14 @@ const SAS_MODULO: u32 = 1_000_000; // 10^SAS_DIGITS
 
 /// 数据面链路鉴权时间戳容忍窗口（秒）——防重放，两端时钟偏移容错。
 pub const LINK_AUTH_SKEW_SECS: i64 = 120;
+
+/// 数据面链路协议版本：`/ping` 的 `linkProtocol`。发起方在下发 / 交换信息 / 解除配对前
+/// 若对端版本低于它，直接 [`crate::LinkError::PeerOutdated`]，不发请求。
+pub const LINK_PROTOCOL_VERSION: u32 = 2;
+
+/// `X-FluxLink-Enc` 请求头 / 响应头的取值：数据面方案 v2。缺失或其它值（含 v1）一律拒绝，
+/// 不留降级回退路径。
+pub const LINK_ENC_V2: &str = "v2";
 
 /// 计算 Ed25519（或任意）公钥的展示指纹：`hex(sha256(pub))`（64 hex 小写）。
 ///
@@ -152,7 +167,48 @@ pub fn derive_link_aead_key(link_secret: &[u8]) -> [u8; 32] {
     okm
 }
 
-/// 加密数据面请求体（ChaCha20-Poly1305）：随机 12 字节 nonce，返回
+/// 数据面一次往返的公共绑定量：MAC 与两个方向的 AEAD AAD 都由它派生。
+///
+/// `sender_fp` / `receiver_fp` 是**请求**的发送方 / 接收方指纹；响应方向的 AAD 把二者对调
+/// （见 [`response_aad`]）。
+#[derive(Debug, Clone, Copy)]
+pub struct LinkExchange<'a> {
+    /// HTTP 方法（大写）。
+    pub method: &'a str,
+    /// 请求路径（不含反代子路径与查询串），如 `/api/v1/link/tasks`。
+    pub path: &'a str,
+    /// 请求 nonce：既是防重放键，也把响应绑定到这一次请求。
+    pub nonce: &'a str,
+    /// 请求发送方指纹。
+    pub sender_fp: &'a str,
+    /// 请求接收方指纹。
+    pub receiver_fp: &'a str,
+}
+
+/// 请求体 AEAD 的附加认证数据：
+/// `"fluxlink-v2-req\n{METHOD}\n{path}\n{sender_fp}\n{receiver_fp}\n{nonce}"`。
+#[must_use]
+pub fn request_aad(exchange: &LinkExchange<'_>) -> Vec<u8> {
+    format!(
+        "fluxlink-v2-req\n{}\n{}\n{}\n{}\n{}",
+        exchange.method, exchange.path, exchange.sender_fp, exchange.receiver_fp, exchange.nonce
+    )
+    .into_bytes()
+}
+
+/// 响应体 AEAD 的附加认证数据：
+/// `"fluxlink-v2-resp\n{METHOD}\n{path}\n{responder_fp}\n{requester_fp}\n{请求 nonce}"`
+/// （响应方 = 请求的接收方，请求方 = 请求的发送方）。
+#[must_use]
+pub fn response_aad(exchange: &LinkExchange<'_>) -> Vec<u8> {
+    format!(
+        "fluxlink-v2-resp\n{}\n{}\n{}\n{}\n{}",
+        exchange.method, exchange.path, exchange.receiver_fp, exchange.sender_fp, exchange.nonce
+    )
+    .into_bytes()
+}
+
+/// 加密数据面消息体（ChaCha20-Poly1305）：随机 12 字节 nonce，`aad` 参与认证，返回
 /// `nonce(12B) || ciphertext_with_tag`。
 ///
 /// 每次调用生成独立随机 nonce——同一密钥绝不复用 nonce，否则 ChaCha20-
@@ -165,11 +221,12 @@ pub fn derive_link_aead_key(link_secret: &[u8]) -> [u8; 32] {
 /// ```
 /// use fluxdown_link::crypto::{open_link_body, seal_link_body};
 /// let key = [1u8; 32];
-/// let sealed = seal_link_body(&key, b"hello");
-/// assert_eq!(open_link_body(&key, &sealed).as_deref(), Some(b"hello".as_slice()));
+/// let sealed = seal_link_body(&key, b"aad", b"hello");
+/// assert_eq!(open_link_body(&key, b"aad", &sealed).as_deref(), Some(b"hello".as_slice()));
+/// assert!(open_link_body(&key, b"other", &sealed).is_none());
 /// ```
 #[must_use]
-pub fn seal_link_body(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+pub fn seal_link_body(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce_bytes = [0u8; 12];
     rand::rng().fill_bytes(&mut nonce_bytes);
@@ -180,14 +237,20 @@ pub fn seal_link_body(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
     // 实践中不会失败；仍显式处理错误分支（clippy 禁 unwrap/expect）——
     // 失败时只返回裸 nonce（无密文/tag），对端 `open_link_body` 因长度
     // 不足直接拒绝，不会误用无效密文。
-    if let Ok(ciphertext) = cipher.encrypt(nonce, plaintext) {
+    if let Ok(ciphertext) = cipher.encrypt(
+        nonce,
+        Payload {
+            msg: plaintext,
+            aad,
+        },
+    ) {
         sealed.extend_from_slice(&ciphertext);
     }
     sealed
 }
 
-/// 解密数据面请求体：拆出前 12 字节 nonce，解密其余部分。长度不足（不足以
-/// 容纳 nonce + 至少一个认证 tag）或解密失败（tag 不匹配/密钥不对）均返回
+/// 解密数据面消息体：拆出前 12 字节 nonce，用 `aad` 解密其余部分。长度不足（不足以
+/// 容纳 nonce + 至少一个认证 tag）、AAD 不符或解密失败（tag 不匹配/密钥不对）均返回
 /// `None`，调用方一律按鉴权失败处理，不区分具体原因——避免向攻击者泄露
 /// 「是长度错还是密钥/篡改错」这类旁路信息。
 ///
@@ -195,57 +258,70 @@ pub fn seal_link_body(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
 ///
 /// 见 [`seal_link_body`] 的往返示例。
 #[must_use]
-pub fn open_link_body(key: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
+pub fn open_link_body(key: &[u8; 32], aad: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
     if sealed.len() < 12 + 16 {
         return None;
     }
     let (nonce_bytes, ciphertext) = sealed.split_at(12);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = Nonce::from_slice(nonce_bytes);
-    cipher.decrypt(nonce, ciphertext).ok()
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .ok()
 }
 
-/// 数据面链路鉴权标签：`HMAC-SHA256(link_secret, method\npath\nts\nnonce\nSHA256(body))` 的 hex。
+/// 数据面链路鉴权标签（v2）：对
+/// `"fluxlink-v2\n{METHOD}\n{path}\n{ts}\n{nonce}\n{sender_fp}\n{receiver_fp}\n{hex(sha256(密文 body))}"`
+/// 做 `HMAC-SHA256(link_secret, …)` 的 hex。
 ///
 /// 密钥永不上网络；只发送 HMAC 标签 + 明文 method/path/ts/nonce + 请求体，对端用存储
 /// 的同一 `link_secret` 重算比对（常量时间）。body 摘要纳入签名，防止 on-path 攻击者
-/// 保留头部改写请求体。适配任意传输（Direct/未来 iroh/relay）。
+/// 保留头部改写请求体；**收发双方指纹**纳入签名，两个方向共用同一 `link_secret` 也无法把
+/// 一方发出的请求原样反射给自己。适配任意传输（Direct/未来 iroh/relay）。
 ///
 /// # Examples
 ///
 /// ```
-/// use fluxdown_link::crypto::{link_auth_tag, verify_link_auth_tag};
+/// use fluxdown_link::crypto::{LinkExchange, link_auth_tag, verify_link_auth_tag};
 /// let key = [3u8; 32];
-/// let body = b"{}";
-/// let tag = link_auth_tag(&key, "POST", "/api/v1/link/tasks", 1000, "abc", body);
-/// assert!(verify_link_auth_tag(&key, "POST", "/api/v1/link/tasks", 1000, "abc", body, &tag));
-/// assert!(!verify_link_auth_tag(&key, "GET", "/api/v1/link/tasks", 1000, "abc", body, &tag));
+/// let exchange = LinkExchange {
+///     method: "POST",
+///     path: "/api/v1/link/tasks",
+///     nonce: "abc",
+///     sender_fp: "aa",
+///     receiver_fp: "bb",
+/// };
+/// let tag = link_auth_tag(&key, &exchange, 1000, b"{}");
+/// assert!(verify_link_auth_tag(&key, &exchange, 1000, b"{}", &tag));
+/// // 把收发双方对调（反射）→ 校验失败。
+/// let reflected = LinkExchange { sender_fp: "bb", receiver_fp: "aa", ..exchange };
+/// assert!(!verify_link_auth_tag(&key, &reflected, 1000, b"{}", &tag));
 /// ```
 #[must_use]
-pub fn link_auth_tag(
-    secret: &[u8],
-    method: &str,
-    path: &str,
-    ts: i64,
-    nonce: &str,
-    body: &[u8],
-) -> String {
+pub fn link_auth_tag(secret: &[u8], exchange: &LinkExchange<'_>, ts: i64, body: &[u8]) -> String {
     // HMAC 接受任意长度密钥，new_from_slice 对本用法永不返回 InvalidLength；
     // 仍显式处理错误分支（clippy 禁 unwrap/expect）——极端情况下返回空标签，
     // 校验侧 ct_eq 因长度不符必然 false，安全。
     let Ok(mut mac) = <SimpleHmac<Sha256> as Mac>::new_from_slice(secret) else {
         return String::new();
     };
-    mac.update(method.as_bytes());
-    mac.update(b"\n");
-    mac.update(path.as_bytes());
-    mac.update(b"\n");
-    mac.update(ts.to_string().as_bytes());
-    mac.update(b"\n");
-    mac.update(nonce.as_bytes());
-    mac.update(b"\n");
-    // body 摘要纳入签名，防止 on-path 攻击者保留头部改写请求体（url/saveDir）。
-    mac.update(&Sha256::digest(body));
+    let message = format!(
+        "fluxlink-v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        exchange.method,
+        exchange.path,
+        ts,
+        exchange.nonce,
+        exchange.sender_fp,
+        exchange.receiver_fp,
+        hex::encode(Sha256::digest(body)),
+    );
+    mac.update(message.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
 
@@ -253,14 +329,12 @@ pub fn link_auth_tag(
 #[must_use]
 pub fn verify_link_auth_tag(
     secret: &[u8],
-    method: &str,
-    path: &str,
+    exchange: &LinkExchange<'_>,
     ts: i64,
-    nonce: &str,
     body: &[u8],
     tag_hex: &str,
 ) -> bool {
-    let expected = link_auth_tag(secret, method, path, ts, nonce, body);
+    let expected = link_auth_tag(secret, exchange, ts, body);
     // hex::encode 输出等长，用 ct 比较避免时序侧信道。
     ct_eq(expected.as_bytes(), tag_hex.as_bytes())
 }
@@ -332,71 +406,107 @@ mod tests {
         assert!(!verify_eph_commitment(&flipped, &eph, &nonce));
     }
 
+    fn exchange() -> LinkExchange<'static> {
+        LinkExchange {
+            method: "POST",
+            path: "/api/v1/link/tasks",
+            nonce: "nonce1",
+            sender_fp: "sender",
+            receiver_fp: "receiver",
+        }
+    }
+
     #[test]
     fn auth_tag_roundtrip_and_tamper_detection() {
         let key = [3u8; 32];
         let body = br#"{"url":"http://x/f"}"#;
-        let tag = link_auth_tag(&key, "POST", "/api/v1/link/tasks", 1000, "nonce1", body);
-        assert!(verify_link_auth_tag(
-            &key,
-            "POST",
-            "/api/v1/link/tasks",
-            1000,
-            "nonce1",
-            body,
-            &tag
-        ));
+        let ex = exchange();
+        let tag = link_auth_tag(&key, &ex, 1000, body);
+        assert!(verify_link_auth_tag(&key, &ex, 1000, body, &tag));
         // 篡改任一字段都失败。
-        assert!(!verify_link_auth_tag(
-            &key,
-            "PUT",
-            "/api/v1/link/tasks",
-            1000,
-            "nonce1",
-            body,
-            &tag
-        ));
-        assert!(!verify_link_auth_tag(
-            &key, "POST", "/x", 1000, "nonce1", body, &tag
-        ));
-        assert!(!verify_link_auth_tag(
-            &key,
-            "POST",
-            "/api/v1/link/tasks",
-            1001,
-            "nonce1",
-            body,
-            &tag
-        ));
-        assert!(!verify_link_auth_tag(
-            &key,
-            "POST",
-            "/api/v1/link/tasks",
-            1000,
-            "nonce2",
-            body,
-            &tag
-        ));
+        for tampered in [
+            LinkExchange {
+                method: "PUT",
+                ..ex
+            },
+            LinkExchange { path: "/x", ..ex },
+            LinkExchange {
+                nonce: "nonce2",
+                ..ex
+            },
+            LinkExchange {
+                sender_fp: "other",
+                ..ex
+            },
+            LinkExchange {
+                receiver_fp: "other",
+                ..ex
+            },
+        ] {
+            assert!(!verify_link_auth_tag(&key, &tampered, 1000, body, &tag));
+        }
+        assert!(!verify_link_auth_tag(&key, &ex, 1001, body, &tag));
         // 篡改请求体（换 URL）→ 失败（body 已纳入签名）。
         assert!(!verify_link_auth_tag(
             &key,
-            "POST",
-            "/api/v1/link/tasks",
+            &ex,
             1000,
-            "nonce1",
             br#"{"url":"http://evil/f"}"#,
             &tag
         ));
         // 换密钥失败。
-        assert!(!verify_link_auth_tag(
-            &[4u8; 32],
-            "POST",
-            "/api/v1/link/tasks",
-            1000,
-            "nonce1",
-            body,
-            &tag
-        ));
+        assert!(!verify_link_auth_tag(&[4u8; 32], &ex, 1000, body, &tag));
+    }
+
+    #[test]
+    fn auth_tag_binds_direction_so_a_reflected_request_fails() {
+        // A→B 的请求被嗅探后原样发回 A（Device 头改成 B）：收发双方对调，MAC 必须失败。
+        let key = [3u8; 32];
+        let a_to_b = LinkExchange {
+            sender_fp: "A",
+            receiver_fp: "B",
+            ..exchange()
+        };
+        let reflected = LinkExchange {
+            sender_fp: "B",
+            receiver_fp: "A",
+            ..exchange()
+        };
+        let tag = link_auth_tag(&key, &a_to_b, 1000, b"body");
+        assert!(verify_link_auth_tag(&key, &a_to_b, 1000, b"body", &tag));
+        assert!(!verify_link_auth_tag(&key, &reflected, 1000, b"body", &tag));
+    }
+
+    #[test]
+    fn auth_tag_follows_the_documented_message_layout() {
+        // 线格式是跨端契约：HMAC 的输入必须逐字等于文档里的字符串。
+        let key = [5u8; 32];
+        let ex = exchange();
+        let body = b"ciphertext";
+        let message = format!(
+            "fluxlink-v2\nPOST\n/api/v1/link/tasks\n1000\nnonce1\nsender\nreceiver\n{}",
+            hex::encode(Sha256::digest(body))
+        );
+        let mut mac = <SimpleHmac<Sha256> as Mac>::new_from_slice(&key).unwrap();
+        mac.update(message.as_bytes());
+        assert_eq!(
+            link_auth_tag(&key, &ex, 1000, body),
+            hex::encode(mac.finalize().into_bytes())
+        );
+    }
+
+    #[test]
+    fn request_and_response_aad_differ_and_follow_the_documented_layout() {
+        let ex = exchange();
+        assert_eq!(
+            request_aad(&ex),
+            b"fluxlink-v2-req\nPOST\n/api/v1/link/tasks\nsender\nreceiver\nnonce1".to_vec()
+        );
+        // 响应方向：响应方（原接收方）在前，请求方在后。
+        assert_eq!(
+            response_aad(&ex),
+            b"fluxlink-v2-resp\nPOST\n/api/v1/link/tasks\nreceiver\nsender\nnonce1".to_vec()
+        );
     }
 
     #[test]
@@ -409,26 +519,42 @@ mod tests {
     #[test]
     fn seal_open_roundtrip() {
         let key = [9u8; 32];
+        let aad = b"aad";
         let plaintext = br#"{"url":"http://x/f","saveDir":"","fileName":""}"#;
-        let sealed = seal_link_body(&key, plaintext);
+        let sealed = seal_link_body(&key, aad, plaintext);
         // nonce(12) + 明文 + tag(16) 的开销下限。
         assert_eq!(sealed.len(), plaintext.len() + 12 + 16);
-        let opened = open_link_body(&key, &sealed).expect("decrypt should succeed");
+        let opened = open_link_body(&key, aad, &sealed).expect("decrypt should succeed");
         assert_eq!(opened, plaintext);
         // 每次调用随机 nonce：同一明文两次密封结果不同。
-        let sealed2 = seal_link_body(&key, plaintext);
+        let sealed2 = seal_link_body(&key, aad, plaintext);
         assert_ne!(sealed, sealed2);
+    }
+
+    #[test]
+    fn open_rejects_a_different_aad() {
+        // 请求 AAD 封装的密文不能当响应解开（方向 / nonce / 指纹任一不同都失败）。
+        let key = [9u8; 32];
+        let ex = exchange();
+        let sealed = seal_link_body(&key, &request_aad(&ex), b"hello");
+        assert!(open_link_body(&key, &request_aad(&ex), &sealed).is_some());
+        assert!(open_link_body(&key, &response_aad(&ex), &sealed).is_none());
+        let other_nonce = LinkExchange {
+            nonce: "nonce2",
+            ..ex
+        };
+        assert!(open_link_body(&key, &request_aad(&other_nonce), &sealed).is_none());
     }
 
     #[test]
     fn open_rejects_tampered_ciphertext() {
         let key = [9u8; 32];
         let plaintext = b"hello link";
-        let mut sealed = seal_link_body(&key, plaintext);
+        let mut sealed = seal_link_body(&key, b"aad", plaintext);
         // 翻转密文最后一字节（落在 Poly1305 tag 内）。
         let last = sealed.len() - 1;
         sealed[last] ^= 0xFF;
-        assert!(open_link_body(&key, &sealed).is_none());
+        assert!(open_link_body(&key, b"aad", &sealed).is_none());
     }
 
     #[test]
@@ -436,10 +562,10 @@ mod tests {
         let key = [9u8; 32];
         let other = [8u8; 32];
         let plaintext = b"hello link";
-        let sealed = seal_link_body(&key, plaintext);
-        assert!(open_link_body(&other, &sealed).is_none());
+        let sealed = seal_link_body(&key, b"aad", plaintext);
+        assert!(open_link_body(&other, b"aad", &sealed).is_none());
         // 长度不足（只剩 nonce、没有 tag）也必须拒绝。
-        assert!(open_link_body(&key, &sealed[..12]).is_none());
+        assert!(open_link_body(&key, b"aad", &sealed[..12]).is_none());
     }
 
     #[test]

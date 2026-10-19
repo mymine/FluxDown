@@ -43,6 +43,7 @@ pub fn open(cx: &mut App, task_id: String) {
                 crate::windows::group_detail::open(cx, group_id);
             })),
             on_user_started: Some(Rc::new(crate::progress_windows::user_started)),
+            plugin_tab_view: Some(crate::plugin_contributions::tab_view_factory()),
             ..DownloadHostActions::default()
         };
         let detail = cx.new(|cx| {
@@ -56,6 +57,7 @@ pub fn open(cx: &mut App, task_id: String) {
             )
         });
         attach(&session, &detail, cx);
+        crate::plugin_contributions::attach_detail_window(&detail, cx);
         let window_view = cx.new(|cx| {
             AuxiliaryWindowView::new(translator.clone(), "detail", detail.clone().into(), cx)
         });

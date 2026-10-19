@@ -293,6 +293,7 @@ impl RssView {
                 self.controller.port.clone(),
                 source,
                 self.controller.queues.clone(),
+                self.controller.plugins.clone(),
                 window,
                 cx,
             );

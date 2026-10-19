@@ -2,7 +2,7 @@
 //!
 //! # 形状
 //!
-//! 与 BT tracker 订阅（[`crate::tracker_subscription`]）、插件惰性解析同款的
+//! 与 BT tracker 订阅（`tracker_subscription`，仅 `bt` feature）、插件惰性解析同款的
 //! 「**actor tick → 纯函数判定 → off-actor 抓取 → mpsc 回流 → actor 落库**」
 //! 结构：
 //!
@@ -215,7 +215,7 @@ impl RssDownloadPlan {
     /// ```
     #[must_use]
     pub fn is_torrent_file(&self) -> bool {
-        if crate::bt_downloader::is_magnet_url(&self.url) {
+        if crate::bt_config::is_magnet_url(&self.url) {
             return false;
         }
         self.enclosure_type == TORRENT_MIME || url_looks_like_torrent(&self.url)
@@ -226,7 +226,7 @@ impl RssDownloadPlan {
 /// 字样外，认两种不含扩展名的常见种子下载形态：NexusPHP 的
 /// `download.php?…passkey=…` 与 Jackett 的 `/dl/<indexer>/?jackett_apikey=…`。
 fn url_looks_like_torrent(url: &str) -> bool {
-    if crate::bt_downloader::is_magnet_url(url) {
+    if crate::bt_config::is_magnet_url(url) {
         return false;
     }
     let lowered = url.to_ascii_lowercase();
@@ -590,10 +590,15 @@ impl RssManager {
     /// 返回 future 而不是自己 spawn：actor 侧的调用方（信号路径）直接
     /// [`tokio::spawn`] 走事件广播；请求-应答的调用方（REST/CLI）在 actor 之外
     /// `await` 它拿返回值。两条路共用同一段抓取+解析逻辑。
+    ///
+    /// `provider_id` 与订阅抓取同一路由：内置 `rss` 走 [`BuiltinRssProvider`]，
+    /// 其它 ID 走固定 map 或宿主注入的插件路由；空值按内置 RSS 处理。
     #[allow(clippy::too_many_arguments)]
     pub fn validate_future(
         &self,
         request_id: String,
+        provider_id: String,
+        provider_config: String,
         url: String,
         cookies: String,
         user_agent: String,
@@ -601,11 +606,16 @@ impl RssManager {
         proxy: &ProxyConfig,
         global_ua: &str,
     ) -> impl Future<Output = RssValidateOutcome> + Send + use<> {
+        let provider_id = if provider_id.trim().is_empty() {
+            RSS_PROVIDER_ID.to_string()
+        } else {
+            provider_id.trim().to_string()
+        };
         let base_request = FetchRequest {
             source_id: String::new(),
-            provider_id: RSS_PROVIDER_ID.to_string(),
+            provider_id: provider_id.clone(),
             url: url.clone(),
-            provider_config: String::new(),
+            provider_config: provider_config.trim().to_string(),
             cookies,
             user_agent: if user_agent.is_empty() {
                 global_ua.to_string()
@@ -617,22 +627,36 @@ impl RssManager {
         let direct_proxy = resolve_proxy(&proxy_url, proxy);
         // 新建订阅向导/REST 验证同样只拿到折算后的直连配置，Auto 模式下
         // 补一次候选代理重试，避免把「直连探测失败」误判为订阅地址本身
-        // 不可用（用户此前需手动切到 System 模式才能通过验证）。
-        let eligible = proxy_url.is_empty() && proxy.mode == ProxyMode::Auto;
+        // 不可用（用户此前需手动切到 System 模式才能通过验证）。插件 provider
+        // 不消费订阅级代理，与 `dispatch_fetch` 一样不做失败转移。
+        let eligible =
+            proxy_url.is_empty() && proxy.mode == ProxyMode::Auto && provider_id == RSS_PROVIDER_ID;
         let global_proxy = proxy.clone();
+        let provider = self
+            .providers
+            .get(&provider_id)
+            .cloned()
+            .or_else(|| self.fallback_provider.clone());
         async move {
-            let result = fetch_with_auto_failover(
-                &url,
-                direct_proxy,
-                eligible,
-                &global_proxy,
-                |proxy_cfg| {
-                    let mut req = base_request.clone();
-                    req.proxy = proxy_cfg;
-                    async move { fetch_feed(&req).await }
-                },
-            )
-            .await;
+            let result = match provider {
+                Some(provider) => {
+                    fetch_with_auto_failover(
+                        &url,
+                        direct_proxy,
+                        eligible,
+                        &global_proxy,
+                        |proxy_cfg| {
+                            let mut req = base_request.clone();
+                            req.proxy = proxy_cfg;
+                            provider.fetch(req)
+                        },
+                    )
+                    .await
+                }
+                None => Err(format!(
+                    "subscription provider not installed: {provider_id}"
+                )),
+            };
             match result {
                 Ok(feed) => RssValidateOutcome {
                     request_id,
@@ -662,6 +686,8 @@ impl RssManager {
     pub fn validate(
         &self,
         request_id: String,
+        provider_id: String,
+        provider_config: String,
         url: String,
         cookies: String,
         user_agent: String,
@@ -670,7 +696,15 @@ impl RssManager {
         global_ua: &str,
     ) {
         let fut = self.validate_future(
-            request_id, url, cookies, user_agent, proxy_url, proxy, global_ua,
+            request_id,
+            provider_id,
+            provider_config,
+            url,
+            cookies,
+            user_agent,
+            proxy_url,
+            proxy,
+            global_ua,
         );
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -2209,5 +2243,75 @@ mod tests {
         let mut new_url = old.clone();
         new_url.url = "https://b.test/rss".to_string();
         assert_eq!(runtime_reset_on_update(&old, &new_url), Some(false));
+    }
+
+    /// 记录收到的请求并返回固定 feed 的插件 provider 替身。
+    struct RecordingProvider {
+        seen: std::sync::Mutex<Vec<crate::subscription::SubscriptionFetchRequest>>,
+    }
+
+    impl crate::subscription::SubscriptionProvider for RecordingProvider {
+        fn id(&self) -> &str {
+            "*"
+        }
+
+        fn fetch(
+            &self,
+            request: crate::subscription::SubscriptionFetchRequest,
+        ) -> crate::subscription::SubscriptionFetchFuture {
+            self.seen.lock().expect("recording lock").push(request);
+            Box::pin(async move { Ok(feed(vec![parsed("g1", "Episode 1", 0, 1)])) })
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_routes_plugin_provider_with_its_config() {
+        let mut m = manager().await;
+        let provider = std::sync::Arc::new(RecordingProvider {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        m.set_fallback_provider(provider.clone());
+        let outcome = m
+            .validate_future(
+                "req".to_string(),
+                " demo-json ".to_string(),
+                " {\"quality\":\"hd\"} ".to_string(),
+                "https://feed.test/list".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                &ProxyConfig::default(),
+                "UA/1",
+            )
+            .await;
+        assert_eq!(outcome.error, "");
+        assert_eq!(outcome.feed_title, "Test Feed");
+        assert_eq!(outcome.items.len(), 1);
+        let seen = provider.seen.lock().expect("recording lock");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].provider_id, "demo-json");
+        assert_eq!(seen[0].provider_config, "{\"quality\":\"hd\"}");
+        assert_eq!(seen[0].url, "https://feed.test/list");
+        assert_eq!(seen[0].user_agent, "UA/1");
+    }
+
+    #[tokio::test]
+    async fn validate_unknown_provider_without_router_reports_not_installed() {
+        let m = manager().await;
+        let outcome = m
+            .validate_future(
+                String::new(),
+                "ghost".to_string(),
+                String::new(),
+                "https://feed.test/list".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                &ProxyConfig::default(),
+                "UA/1",
+            )
+            .await;
+        assert_eq!(outcome.error, "subscription provider not installed: ghost");
+        assert!(outcome.items.is_empty());
     }
 }

@@ -18,22 +18,56 @@ use gpui::{
     StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    Disableable as _, WindowExt as _,
+    Disableable as _, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     notification::Notification,
+    spinner::Spinner,
     v_flex,
 };
 
 use crate::errors::{ErrorContext, error_text};
 use crate::host::AccountHost;
+use std::sync::Arc;
+
 use crate::link::{
-    DiscoveredEntry, PairFlow, discovered_entries, group_sas, needs_lan_hint, now_unix_ms,
-    seconds_until, validate_pair_input,
+    DiscoveredEntry, PairFlow, discovered_entries, group_sas, now_unix_ms, seconds_until,
+    validate_pair_input,
 };
 use crate::verification::spawn_ticker;
-use crate::{AccountCommand, PortFuture, t, t_with};
+use crate::{AccountCommand, AccountPort, PortFuture, t, t_with};
+
+/// 发现开启（或「重新搜索」）后多久内列表为空仍算「搜索中」。
+const SCAN_WINDOW_MS: i64 = 8_000;
+
+fn discovery_params(enabled: bool) -> serde_json::Value {
+    serde_json::to_value(LinkDiscoveryParams { enabled }).unwrap_or_default()
+}
+
+/// 放弃一个已建立的发起端配对会话（`pairFinish(accept:false)`）；会话已过期视为已达成。
+async fn abandon_session(port: Arc<dyn AccountPort>, token: String) {
+    let params = serde_json::to_value(LinkPairFinishParams {
+        token,
+        accept: false,
+    })
+    .unwrap_or_default();
+    let result = port
+        .execute(AccountCommand::Link {
+            method: method::AGENT_LINK_PAIR_FINISH,
+            params,
+        })
+        .await;
+    if let Err(error) = result {
+        if error.reason == Some(fluxdown_protocol::ErrorReason::PairingSessionExpired) {
+            return;
+        }
+        eprintln!(
+            "abandoning local pairing session failed: {:?} ({:?})",
+            error.code, error.reason
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tab {
@@ -56,6 +90,12 @@ struct AddDeviceDialog {
     selected_address: Option<String>,
     closed: bool,
     seen_incoming: usize,
+    /// 本轮发现开始时间（Unix 毫秒）：8 秒内列表为空显示「搜索中」。
+    scan_started_ms: i64,
+    /// 「重新搜索」（stop → start）进行中。
+    rescanning: bool,
+    /// 发起流程代数：放弃 / 取消 / 离开页签时递增，迟到的异步响应据此识别并丢弃。
+    generation: u64,
 }
 
 /// 打开「添加设备」对话框。已登录时默认停在「账号」页，否则直接进「直连配对」。
@@ -109,19 +149,24 @@ impl AddDeviceDialog {
             selected_address: None,
             closed: false,
             seen_incoming,
+            scan_started_ms: now_unix_ms(),
+            rescanning: false,
+            generation: 0,
         };
         spawn_ticker(window, cx, |this: &mut Self, _, cx| {
             if this.closed {
                 return false;
             }
-            // 本机配对码到期自动换新（失败后不再自动重试，交给「重新生成」）。
+            // 本机配对码到期（或局域网刚生效而还没有码）自动换新；失败后不再自动重试，
+            // 交给「重新生成」。局域网未生效时不申请码。
             if this.direct_started
+                && this.lan_active(cx)
                 && !this.own_code_busy
                 && this.own_code_error.is_none()
                 && this
                     .own_code
                     .as_ref()
-                    .is_some_and(|code| seconds_until(code.expires_at_unix_ms, now_unix_ms()) == 0)
+                    .is_none_or(|code| seconds_until(code.expires_at_unix_ms, now_unix_ms()) == 0)
             {
                 this.refresh_own_code(cx);
             }
@@ -130,6 +175,22 @@ impl AddDeviceDialog {
             }
             true
         });
+        // 手动改地址后，发现列表的选中高亮不再对应当前输入。
+        cx.subscribe(
+            &this.address_input,
+            |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change)
+                    && this
+                        .selected_address
+                        .as_deref()
+                        .is_some_and(|selected| selected != input.read(cx).value().as_str())
+                {
+                    this.selected_address = None;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         if this.tab == Tab::Direct {
             this.start_direct(cx);
         }
@@ -157,20 +218,76 @@ impl AddDeviceDialog {
             return;
         }
         self.tab = tab;
-        if tab == Tab::Direct {
-            self.start_direct(cx);
+        match tab {
+            Tab::Direct => self.start_direct(cx),
+            // 离开直连页 = 对直连而言等同关闭对话框：停发现、撤回广播、放弃进行中的发起流程。
+            Tab::Account => self.stop_direct(cx),
         }
         cx.notify();
     }
 
-    /// 进入直连页：开启局域网发现并生成本机配对码。
+    fn lan_active(&self, cx: &App) -> bool {
+        self.host.read(cx).controller.lan_active()
+    }
+
+    /// 进入直连页：开启局域网发现；本机局域网已生效时才生成本机配对码
+    /// （未生效时本机只能作为发起方，对端无法回连）。
     fn start_direct(&mut self, cx: &mut Context<Self>) {
         if self.direct_started {
             return;
         }
         self.direct_started = true;
+        self.scan_started_ms = now_unix_ms();
         self.set_discovery(true, cx);
-        self.refresh_own_code(cx);
+        if self.lan_active(cx) {
+            self.refresh_own_code(cx);
+        }
+    }
+
+    /// 放弃当前发起流程：递增代数让迟到响应失效；核对中的会话立即释放。
+    fn abandon_flow(&mut self, cx: &mut Context<Self>) {
+        self.generation = self.generation.wrapping_add(1);
+        if let PairFlow::Verify { token, .. } = &self.flow {
+            let port = self.host.read(cx).port();
+            cx.background_spawn(abandon_session(port, token.clone()))
+                .detach();
+        }
+        self.flow = PairFlow::Form;
+    }
+
+    /// 收回发现与配对广播并放弃发起流程（离开直连页 / 关闭对话框）。幂等。
+    fn stop_direct(&mut self, cx: &mut Context<Self>) {
+        self.abandon_flow(cx);
+        if !std::mem::replace(&mut self.direct_started, false) {
+            return;
+        }
+        self.own_code = None;
+        self.own_code_error = None;
+        self.rescanning = false;
+        self.selected_address = None;
+        let discovery = self.link_call(
+            method::AGENT_LINK_DISCOVERY_SET,
+            discovery_params(false),
+            cx,
+        );
+        let stop = self.link_call(method::AGENT_LINK_STOP_PAIRING, serde_json::json!({}), cx);
+        cx.background_spawn(async move {
+            if let Err(error) = discovery.await {
+                // 发现停止失败也必须继续撤回配对广播。
+                eprintln!(
+                    "stopping local discovery failed: {:?} ({:?})",
+                    error.code, error.reason
+                );
+            }
+            if let Err(error) = stop.await {
+                eprintln!(
+                    "stopping local pairing broadcast failed: {:?} ({:?})",
+                    error.code, error.reason
+                );
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     fn set_discovery(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -203,7 +320,7 @@ impl AddDeviceDialog {
     }
 
     fn refresh_own_code(&mut self, cx: &mut Context<Self>) {
-        if self.own_code_busy {
+        if self.own_code_busy || !self.lan_active(cx) {
             return;
         }
         self.own_code_busy = true;
@@ -221,14 +338,17 @@ impl AddDeviceDialog {
             });
             let Ok(()) = this.update(cx, |this, cx| {
                 this.own_code_busy = false;
-                match result {
-                    Ok(code) => this.own_code = Some(code),
-                    Err(error) => {
-                        this.own_code_error = Some(error_text(
-                            this.host.read(cx).translator().read(cx),
-                            &error,
-                            ErrorContext::Pairing,
-                        ));
+                // 期间已离开直连页 / 关闭对话框：广播已撤回，结果作废（回到页签后由 ticker 重新申请）。
+                if this.direct_started && !this.closed {
+                    match result {
+                        Ok(code) => this.own_code = Some(code),
+                        Err(error) => {
+                            this.own_code_error = Some(error_text(
+                                this.host.read(cx).translator().read(cx),
+                                &error,
+                                ErrorContext::Pairing,
+                            ));
+                        }
                     }
                 }
                 cx.notify();
@@ -240,12 +360,62 @@ impl AddDeviceDialog {
         .detach();
     }
 
-    /// 重新扫描：先关再开，让 agent 重新发起一轮发现。
+    /// 重新扫描：串行 stop → start，让 agent 重新发起一轮发现。
     fn rescan(&mut self, cx: &mut Context<Self>) {
+        if self.rescanning || !self.direct_started {
+            return;
+        }
         self.error = None;
-        self.set_discovery(false, cx);
-        self.set_discovery(true, cx);
+        self.rescanning = true;
+        self.scan_started_ms = now_unix_ms();
         cx.notify();
+        let port = self.host.read(cx).port();
+        cx.spawn(async move |this, cx| {
+            let discovery = |enabled: bool| AccountCommand::Link {
+                method: method::AGENT_LINK_DISCOVERY_SET,
+                params: discovery_params(enabled),
+            };
+            if let Err(error) = port.execute(discovery(false)).await {
+                eprintln!(
+                    "stopping local discovery for rescan failed: {:?} ({:?})",
+                    error.code, error.reason
+                );
+            }
+            let still_open = this
+                .update(cx, |this, _| this.direct_started && !this.closed)
+                .unwrap_or(false);
+            let started = if still_open {
+                Some(port.execute(discovery(true)).await)
+            } else {
+                None
+            };
+            let leaked = this
+                .update(cx, |this, cx| {
+                    this.rescanning = false;
+                    let open = this.direct_started && !this.closed;
+                    let started_ok = matches!(started, Some(Ok(_)));
+                    if let Some(Err(error)) = started
+                        && open
+                    {
+                        this.error = Some(error_text(
+                            this.host.read(cx).translator().read(cx),
+                            &error,
+                            ErrorContext::Pairing,
+                        ));
+                    }
+                    cx.notify();
+                    started_ok && !open
+                })
+                .unwrap_or(false);
+            if leaked && let Err(error) = port.execute(discovery(false)).await {
+                // 重新搜索期间对话框被关闭：补一次停止，避免发现残留。
+                eprintln!(
+                    "stopping leaked local discovery failed: {:?} ({:?})",
+                    error.code, error.reason
+                );
+            }
+        })
+        .detach();
     }
 
     fn select_peer(
@@ -282,6 +452,8 @@ impl AddDeviceDialog {
         };
         self.error = None;
         self.flow = PairFlow::Beginning;
+        let generation = self.generation;
+        let port = self.host.read(cx).port();
         cx.notify();
         let params =
             serde_json::to_value(LinkPairBeginParams { address, code }).unwrap_or_default();
@@ -295,7 +467,12 @@ impl AddDeviceDialog {
                     )
                 })
             });
-            let Ok(()) = this.update_in(cx, |this, _, cx| {
+            let token = result.as_ref().ok().map(|response| response.token.clone());
+            let applied = this.update_in(cx, |this, _, cx| {
+                // 对话框已关 / 已离开页签 / 已取消：迟到的响应不再回写界面。
+                if this.closed || this.generation != generation {
+                    return false;
+                }
                 match result {
                     Ok(response) => {
                         let flow = std::mem::replace(&mut this.flow, PairFlow::Form);
@@ -311,10 +488,15 @@ impl AddDeviceDialog {
                     }
                 }
                 cx.notify();
-            }) else {
-                // 对话框或窗口已释放，停止回写异步结果。
-                return;
-            };
+                true
+            });
+            // 响应没有被界面接收（对话框已释放 / 已放弃）：立刻释放 agent 上的会话，
+            // 否则对端会留下一条陈旧的配对请求。
+            if !matches!(applied, Ok(true))
+                && let Some(token) = token
+            {
+                abandon_session(port, token).await;
+            }
         })
         .detach();
     }
@@ -325,33 +507,21 @@ impl AddDeviceDialog {
             return;
         };
         self.error = None;
+        if !accept {
+            // 放弃：只需通知 agent 释放会话，结果不影响界面。
+            self.flow = PairFlow::Form;
+            let port = self.host.read(cx).port();
+            cx.background_spawn(abandon_session(port, token)).detach();
+            cx.notify();
+            return;
+        }
         let flow = std::mem::replace(&mut self.flow, PairFlow::Form);
-        self.flow = if accept {
-            flow.confirming()
-        } else {
-            PairFlow::Form
-        };
+        self.flow = flow.confirming();
+        let generation = self.generation;
         cx.notify();
         let params =
             serde_json::to_value(LinkPairFinishParams { token, accept }).unwrap_or_default();
         let future = self.link_call(method::AGENT_LINK_PAIR_FINISH, params, cx);
-        if !accept {
-            // 放弃：只需通知 agent 释放会话，结果不影响界面。
-            cx.background_spawn(async move {
-                if let Err(error) = future.await {
-                    // 配对令牌已过期或会话已结束时，放弃操作本身已达成。
-                    if error.reason == Some(fluxdown_protocol::ErrorReason::PairingSessionExpired) {
-                        return;
-                    }
-                    eprintln!(
-                        "abandoning local pairing failed: {:?} ({:?})",
-                        error.code, error.reason
-                    );
-                }
-            })
-            .detach();
-            return;
-        }
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await.and_then(|value| {
                 serde_json::from_value::<LinkPairFinishResponse>(value).map_err(|_| {
@@ -362,6 +532,11 @@ impl AddDeviceDialog {
                 })
             });
             let Ok(()) = this.update_in(cx, |this, window, cx| {
+                // 用户已取消等待 / 离开页签 / 关闭对话框：结果不再回写界面
+                // （若对端仍确认，设备会出现在已配对列表里）。
+                if this.closed || this.generation != generation {
+                    return;
+                }
                 match result {
                     Ok(response) => {
                         let paired = response.paired;
@@ -397,54 +572,21 @@ impl AddDeviceDialog {
         .detach();
     }
 
-    /// 对话框关闭：收回发现与配对广播；SAS 核对中途关闭视为放弃。幂等。
+    /// 等待对端确认期间取消：回到表单并放弃等待。
+    fn cancel_waiting(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.flow, PairFlow::Finishing { .. }) {
+            self.generation = self.generation.wrapping_add(1);
+            self.flow = PairFlow::Form;
+            cx.notify();
+        }
+    }
+
+    /// 对话框关闭：收回发现与配对广播；发起流程中途关闭视为放弃。幂等。
     fn shutdown(&mut self, cx: &mut Context<Self>) {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
-        if let PairFlow::Verify { token, .. } = &self.flow {
-            let params = serde_json::to_value(LinkPairFinishParams {
-                token: token.clone(),
-                accept: false,
-            })
-            .unwrap_or_default();
-            let future = self.link_call(method::AGENT_LINK_PAIR_FINISH, params, cx);
-            cx.background_spawn(async move {
-                if let Err(error) = future.await {
-                    // 配对令牌已过期或会话已结束时，关闭清理无需再处理。
-                    if error.reason == Some(fluxdown_protocol::ErrorReason::PairingSessionExpired) {
-                        return;
-                    }
-                    eprintln!(
-                        "closing local pairing session failed: {:?} ({:?})",
-                        error.code, error.reason
-                    );
-                }
-            })
-            .detach();
-        }
-        if self.direct_started {
-            let params =
-                serde_json::to_value(LinkDiscoveryParams { enabled: false }).unwrap_or_default();
-            let discovery = self.link_call(method::AGENT_LINK_DISCOVERY_SET, params, cx);
-            let stop = self.link_call(method::AGENT_LINK_STOP_PAIRING, serde_json::json!({}), cx);
-            cx.background_spawn(async move {
-                if let Err(error) = discovery.await {
-                    // 发现停止失败也必须继续撤回配对广播。
-                    eprintln!(
-                        "stopping local discovery failed: {:?} ({:?})",
-                        error.code, error.reason
-                    );
-                }
-                if let Err(error) = stop.await {
-                    eprintln!(
-                        "stopping local pairing broadcast failed: {:?} ({:?})",
-                        error.code, error.reason
-                    );
-                }
-            })
-            .detach();
-        }
+        self.stop_direct(cx);
     }
 
     fn copy(&self, text: String, message_key: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -505,12 +647,42 @@ impl AddDeviceDialog {
         let tokens = active_theme(cx).tokens().clone();
         let extended = active_theme(cx).extended().clone();
         let translator = self.host.read(cx).translator().read(cx).clone();
-        let lan_enabled = self.host.read(cx).controller.lan_enabled();
+        let (lan_enabled, lan_active) = {
+            let controller = &self.host.read(cx).controller;
+            (controller.lan_enabled(), controller.lan_active())
+        };
         let mut section = v_flex()
             .w_full()
             .gap(tokens.spacing.sm)
-            .child(field_label(t(&translator, "localPairingMyCodeTitle"), cx))
-            .child(field_hint(t(&translator, "localPairingMyCodeHint"), cx));
+            .child(field_label(t(&translator, "localPairingMyCodeTitle"), cx));
+        if !lan_active {
+            // 本机局域网未生效：不展示也不申请配对码，只说明原因（未开启给「前往设置」，
+            // 已开启但未重启给重启提示）。
+            if lan_enabled {
+                return section
+                    .child(field_hint(t(&translator, "localPairingLanRestartHint"), cx))
+                    .into_any_element();
+            }
+            return section
+                .child(field_hint(
+                    t(&translator, "localPairingLanDisabledHint"),
+                    cx,
+                ))
+                .child(
+                    h_flex().w_full().justify_start().child(
+                        Button::new("add-device-open-lan-settings")
+                            .outline()
+                            .label(t(&translator, "localPairingOpenLanSettings"))
+                            .control(cx)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.host
+                                    .update(cx, |host, cx| host.request_open_lan_settings(cx));
+                            })),
+                    ),
+                )
+                .into_any_element();
+        }
+        section = section.child(field_hint(t(&translator, "localPairingMyCodeHint"), cx));
         if let Some(error) = self.own_code_error.clone() {
             section = section.child(field_error(error, cx));
         }
@@ -578,12 +750,9 @@ impl AddDeviceDialog {
                             ),
                     ),
             );
-            if needs_lan_hint(code, lan_enabled) {
-                section = section.child(field_error(
-                    t(&translator, "localPairingLanDisabledHint"),
-                    cx,
-                ));
-            } else if !code.addresses.is_empty() {
+            if code.addresses.is_empty() {
+                section = section.child(field_hint(t(&translator, "localPairingNoAddress"), cx));
+            } else {
                 section = section
                     .child(field_label(t(&translator, "localPairingMyAddresses"), cx))
                     .children(code.addresses.iter().map(|address| {
@@ -595,8 +764,6 @@ impl AddDeviceDialog {
                             .child(address.clone())
                     }))
                     .child(field_hint(t(&translator, "localDeviceAddressHint"), cx));
-            } else {
-                section = section.child(field_hint(t(&translator, "localPairingNoAddress"), cx));
             }
         } else if self.own_code_busy {
             section = section.child(field_hint(t(&translator, "localPairingDiscovering"), cx));
@@ -617,9 +784,10 @@ impl AddDeviceDialog {
         };
         let selectable = self.flow.can_begin();
         let mut list = v_flex().w_full().gap(tokens.spacing.xxs);
-        if entries.is_empty() {
-            list = list.child(field_hint(t(&translator, "localPairingNoDevices"), cx));
-        }
+        let has_entries = !entries.is_empty();
+        // 搜索中：发现开启 / 重新搜索后 8 秒内列表仍为空；之后仍为空才是「没有发现设备」。
+        let scanning = !has_entries
+            && (self.rescanning || now_unix_ms() - self.scan_started_ms < SCAN_WINDOW_MS);
         for (index, entry) in entries.into_iter().enumerate() {
             let selected = self.selected_address.as_deref() == Some(entry.address.as_str());
             let hover = extended.colors.row_hover;
@@ -671,12 +839,28 @@ impl AddDeviceDialog {
                     .w_full()
                     .items_center()
                     .justify_between()
-                    .child(field_hint(t(&translator, "localPairingDiscovering"), cx))
+                    .child(if has_entries {
+                        field_hint(t(&translator, "localPairingNearbyTitle"), cx).into_any_element()
+                    } else if scanning {
+                        h_flex()
+                            .items_center()
+                            .gap(tokens.spacing.xs)
+                            .child(
+                                Spinner::new()
+                                    .with_size(extended.icon.sm)
+                                    .color(tokens.colors.muted_foreground),
+                            )
+                            .child(field_hint(t(&translator, "localPairingDiscovering"), cx))
+                            .into_any_element()
+                    } else {
+                        field_hint(t(&translator, "localPairingNoDevices"), cx).into_any_element()
+                    })
                     .child(
                         Button::new("add-device-rescan")
                             .ghost()
                             .label(self.t("localPairingRetryScan", cx))
                             .control(cx)
+                            .disabled(self.rescanning)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.rescan(cx);
                             })),
@@ -689,9 +873,13 @@ impl AddDeviceDialog {
     fn render_pair_form(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let tokens = active_theme(cx).tokens().clone();
         let busy = self.flow.is_busy();
+        let lan_active = self.lan_active(cx);
         v_flex()
             .w_full()
             .gap(tokens.spacing.md)
+            .when(!lan_active, |column| {
+                column.child(field_hint(self.t("localPairingOneWayHint", cx), cx))
+            })
             .child(self.render_discovery(cx))
             .child(form_field(
                 self.t("localPairingManualAddress", cx),
@@ -782,9 +970,22 @@ impl AddDeviceDialog {
         let pair_section = match &self.flow {
             PairFlow::Form | PairFlow::Beginning => self.render_pair_form(cx),
             PairFlow::Verify { sas, peer_name, .. } => self.render_verify(sas, peer_name, cx),
-            PairFlow::Finishing { .. } => {
-                field_hint(t(&translator, "localPairingWaitingPeer"), cx).into_any_element()
-            }
+            PairFlow::Finishing { .. } => v_flex()
+                .w_full()
+                .gap(tokens.spacing.md)
+                .child(field_hint(t(&translator, "localPairingWaitingPeer"), cx))
+                .child(
+                    h_flex().w_full().justify_end().child(
+                        Button::new("add-device-finishing-cancel")
+                            .outline()
+                            .label(self.t("cancel", cx))
+                            .control(cx)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.cancel_waiting(cx);
+                            })),
+                    ),
+                )
+                .into_any_element(),
             PairFlow::Done { device_name } => v_flex()
                 .w_full()
                 .gap(tokens.spacing.md)

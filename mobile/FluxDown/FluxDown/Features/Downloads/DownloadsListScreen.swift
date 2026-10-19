@@ -340,7 +340,11 @@ struct DownloadsListScreen: View {
     @ViewBuilder
     private var emptyState: some View {
         if model.list.taskTotal == 0 {
-            EmptyStateView(L("emptyTitle"), message: L("iosEmptyDownloadsSub"), systemImage: FluxSymbol.downloads) {
+            EmptyStateView(
+                L("emptyTitle"),
+                message: L(BuildFlavor.key(full: "iosEmptyDownloadsSub", store: "iosEmptyDownloadsSubGeneric")),
+                systemImage: FluxSymbol.downloads
+            ) {
                 Button(L("newDownload"), systemImage: FluxSymbol.newDownload) { container.router.openNewDownload() }
             }
         } else if !model.filter.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

@@ -5,7 +5,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useT } from '../../../../i18n'
 import { RpcError, rpc } from '../../../../lib/rpc'
 import type { InstalledPlugin, MarketEntryDto, PluginDto } from '../../../../lib/rpc'
-import { Badge, Button, EmptyState, Icon, Input, Spinner, confirmDialog } from '../../../../ui'
+import { Badge, Button, EmptyState, Icon, Input, Spinner } from '../../../../ui'
 import { BlockTitle, ExtLink, IconButton, ListCard, ListRow } from './common'
 import { detailFromMarket } from './detail'
 import type { PluginDetail } from './detail'
@@ -13,13 +13,17 @@ import { extensionErrorText } from './errors'
 import {
   MARKET_PAGE_SIZE,
   filterMarket,
+  hostsToConfirm,
   installedVersionYanked,
   latestPerPlugin,
   marketAction,
-  permissionKeys,
   permissionsToConfirm,
+  riskOf,
   yankedLabelKey,
 } from './logic'
+import type { ConsentSet } from './logic'
+import { PluginConsentDialog, RiskBadge } from './PluginConsentDialog'
+import type { ConsentView } from './PluginConsentDialog'
 
 interface MarketState {
   loading: boolean
@@ -36,7 +40,7 @@ export function MarketSection({
 }: {
   stale: boolean
   plugins: readonly PluginDto[]
-  onInstalled: (result: InstalledPlugin) => void
+  onInstalled: (result: InstalledPlugin, confirmed: ConsentSet | null) => void | Promise<void>
   onInstallFailed: (error: unknown) => void
   onShowDetail: (detail: PluginDetail) => void
 }) {
@@ -45,6 +49,7 @@ export function MarketSection({
   const [query, setQuery] = useState('')
   const [limit, setLimit] = useState(MARKET_PAGE_SIZE)
   const [pending, setPending] = useState<ReadonlySet<string>>(new Set())
+  const [confirm, setConfirm] = useState<{ view: ConsentView; resolve: (ok: boolean) => void } | null>(null)
   const requested = useRef(false)
 
   const load = async () => {
@@ -70,23 +75,29 @@ export function MarketSection({
     const pluginId = entry.pluginId
     if (pending.has(pluginId)) return
     const permissions = permissionsToConfirm(entry, installed)
-    if (permissions.length > 0) {
+    const networkHosts = hostsToConfirm(entry, installed)
+    const confirmed: ConsentSet = { permissions, networkHosts }
+    if (permissions.length > 0 || networkHosts.length > 0) {
       const updating = installed !== undefined
-      const lines = permissions.map((permission) => {
-        const keys = permissionKeys(permission)
-        return keys ? `${t(keys.name)} — ${t(keys.desc)}` : `${permission} — ${t('pluginPermUnknownDesc')}`
-      })
       const name = entry.name === '' ? pluginId : entry.name
-      const ok = await confirmDialog({
-        title: t(updating ? 'pluginPermConfirmUpdateTitle' : 'pluginPermConfirmInstallTitle', { name }),
-        description: [t(updating ? 'pluginPermConfirmUpdateBody' : 'pluginPermConfirmInstallBody', { version: entry.version }), ...lines].join('\n'),
-        okLabel: t(updating ? 'pluginPermConfirmUpdateOk' : 'pluginPermConfirmInstallOk'),
+      const ok = await new Promise<boolean>((resolve) => {
+        setConfirm({
+          resolve,
+          view: {
+            title: t(updating ? 'pluginPermConfirmUpdateTitle' : 'pluginPermConfirmInstallTitle', { name }),
+            intro: t(updating ? 'pluginPermConfirmUpdateBody' : 'pluginPermConfirmInstallBody', { version: entry.version }),
+            permissions,
+            networkHosts,
+            risk: riskOf(entry.permissions),
+            okLabel: t(updating ? 'pluginPermConfirmUpdateOk' : 'pluginPermConfirmInstallOk'),
+          },
+        })
       })
       if (!ok) return
     }
     setPending((current) => new Set(current).add(pluginId))
     try {
-      onInstalled(await rpc.daemon.plugin.marketInstall({ pluginId, version: entry.version }))
+      await onInstalled(await rpc.daemon.plugin.marketInstall({ pluginId, version: entry.version }), confirmed)
     } catch (error) {
       // 用户确认的版本已不是最新：刷新目录，让下一次点击按新版本重新确认权限。
       if (error instanceof RpcError && error.reason === 'marketVersionChanged') await load()
@@ -169,6 +180,7 @@ export function MarketSection({
                         {entry.author ? <span className="text-xs text-muted-foreground">{entry.author}</span> : null}
                         {yankedKey ? <Badge tone="destructive">{t(yankedKey)}</Badge> : null}
                         {installedYankedKey ? <Badge tone="destructive">{t('pluginInstalledVersionYanked', { label: t(installedYankedKey) })}</Badge> : null}
+                        <RiskBadge risk={riskOf(entry.permissions)} />
                       </div>
                       {entry.homepage ? <ExtLink href={entry.homepage} /> : null}
                       {entry.description ? <div className="line-clamp-2 break-words text-xs text-muted-foreground">{entry.description}</div> : null}
@@ -225,6 +237,17 @@ export function MarketSection({
         }
       />
       {body}
+      <PluginConsentDialog
+        consent={confirm?.view ?? null}
+        onCancel={() => {
+          confirm?.resolve(false)
+          setConfirm(null)
+        }}
+        onOk={() => {
+          confirm?.resolve(true)
+          setConfirm(null)
+        }}
+      />
     </section>
   )
 }

@@ -4,10 +4,9 @@ import { Network, RefreshCw } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { useT } from '../../../../i18n'
 import { rpc } from '../../../../lib/rpc'
-import type { CloudConnectionDto, CloudDevice, SyncStatusDto } from '../../../../lib/rpc'
-import { cloudPresenceKnown } from '../../../../lib/cloud-presence'
+import type { CloudConnectionDto, CloudDevice, Entitlements, SyncStatusDto } from '../../../../lib/rpc'
+import { cloudPresenceKnown, maxOnlineDevices, onlineDeviceCount } from '../../../../lib/cloud-presence'
 import { Badge, Button, Card, Icon, Switch, Tooltip, toast } from '../../../../ui'
-import { otherDevices } from '../../../downloads/model/devices'
 import { accountErrorKey } from './errorText'
 import { useSyncSubtitle } from './syncSubtitle'
 import { SYNC_GROUPS, syncGroupState, syncPhase, toggleGroupParams } from './syncGroups'
@@ -36,12 +35,14 @@ export function CloudFeaturesCard({
   loggedIn,
   sync,
   devices,
+  entitlements,
   disabled,
   connection,
 }: {
   loggedIn: boolean
   sync: SyncStatusDto
   devices: readonly CloudDevice[]
+  entitlements: Entitlements | undefined
   disabled: boolean
   connection: CloudConnectionDto | undefined
 }) {
@@ -49,7 +50,8 @@ export function CloudFeaturesCard({
   const active = loggedIn && sync.enabled
   const phase = syncPhase(sync)
   const subtitle = useSyncSubtitle(loggedIn, sync)
-  const online = otherDevices(devices).filter((device) => device.isOnline).length
+  const online = onlineDeviceCount(devices)
+  const maxOnline = maxOnlineDevices(entitlements)
   const localOnlyKeys = sync.localOnlyKeys ?? []
 
   const run = async (action: () => Promise<unknown>) => {
@@ -113,7 +115,13 @@ export function CloudFeaturesCard({
             <div className="text-xs text-muted-foreground">{t('multiDeviceDesc')}</div>
           </div>
           {loggedIn ? (
-            <Badge>{cloudPresenceKnown(connection, !disabled) ? t('devicesOnlineCount', { count: online }) : t('devicePresenceUnknown')}</Badge>
+            <Badge>
+              {cloudPresenceKnown(connection, !disabled)
+                ? maxOnline === null
+                  ? t('devicesOnlineCount', { count: online })
+                  : t('devicesOnlineCountOf', { count: online, max: maxOnline })
+                : t('devicePresenceUnknown')}
+            </Badge>
           ) : null}
         </div>
       </Card>

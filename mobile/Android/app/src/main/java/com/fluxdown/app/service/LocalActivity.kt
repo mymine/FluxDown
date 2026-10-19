@@ -17,6 +17,8 @@ data class LocalActivity(
     val upBps: Long,
     /** 活跃任务（进度通知的进度条与明细行）。 */
     val transfers: List<Transfer> = emptyList(),
+    /** 会话处于 Stale：统计是断连前的值，前台服务只按有限宽限保留（见 DownloadService）。 */
+    val stale: Boolean = false,
 ) {
     /** 活跃 + 排队 + 待重试都算“还在工作”：进程必须保活。 */
     val busy: Boolean get() = active + pending + retryPending > 0
@@ -27,9 +29,12 @@ data class LocalActivity(
     companion object {
         val Idle = LocalActivity(active = 0, pending = 0, retryPending = 0, downBps = 0, upBps = 0)
 
-        /** 未连上（启动中 / 失联 / 失败）一律视为空闲，避免前台服务僵死。 */
+        /**
+         * 启动中 / 失败视为空闲，避免前台服务僵死。Stale（进程内会话短暂重连）沿用最后的统计：引擎仍在本进程里跑，
+         * 此时撤掉前台服务会让进程在后台失去保护，重连成功后也无人在后台补拉。
+         */
         fun from(state: HostState): LocalActivity {
-            if (state.connection != Connection.Live) return Idle
+            if (state.connection != Connection.Live && state.connection != Connection.Stale) return Idle
             val stats = state.stats
             return LocalActivity(
                 active = stats.activeTasks,
@@ -38,6 +43,7 @@ data class LocalActivity(
                 downBps = stats.totalDownloadBps,
                 upBps = stats.totalUploadBps,
                 transfers = state.transfers(),
+                stale = state.connection == Connection.Stale,
             )
         }
     }

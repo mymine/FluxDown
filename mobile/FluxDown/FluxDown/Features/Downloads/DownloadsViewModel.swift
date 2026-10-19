@@ -45,6 +45,7 @@ nonisolated struct PendingSelection: Equatable {
         case .bt: return plain("btFileSelectTitle")
         case .hls: return plain("hlsQualityTitle")
         case .variant: return plain("resolveVariantTitle")
+        case .plugin: return plain("pluginChoiceTitle")
         case let .fileExists(conflict):
             let conflicts = selections.fileConflicts
             let many = conflicts.count > 1

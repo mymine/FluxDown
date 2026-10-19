@@ -16,6 +16,8 @@ public enum HostMethod {
     public static let daemonTaskList = "daemon.task.list"
     public static let daemonTaskGet = "daemon.task.get"
     public static let daemonTaskActivity = "daemon.task.activity"
+    /// 任务整个生命周期的持久化速度曲线与统计（`{taskId}` → `TaskSpeedHistory?`，`null` = 无记录）。
+    public static let daemonTaskSpeedHistory = "daemon.task.speedHistory"
     public static let daemonTaskCreate = "daemon.task.create"
     public static let daemonTaskPause = "daemon.task.pause"
     public static let daemonTaskResume = "daemon.task.resume"
@@ -29,6 +31,7 @@ public enum HostMethod {
     public static let daemonTaskResumeAll = "daemon.task.resumeAll"
     public static let daemonTaskRescan = "daemon.task.rescan"
     public static let daemonTaskSetSeedLimits = "daemon.task.setSeedLimits"
+    public static let daemonTaskVerify = "daemon.task.verify"
     /// 批量暂停 / 恢复（`{taskIds}`）：整批只推一次任务快照；未知 id 忽略，空列表为空操作。
     public static let daemonTaskPauseMany = "daemon.task.pauseMany"
     public static let daemonTaskResumeMany = "daemon.task.resumeMany"
@@ -79,6 +82,7 @@ public enum HostMethod {
     public static let daemonRssValidate = "daemon.rss.validate"
     public static let daemonLinkProbe = "daemon.link.probe"
     public static let daemonPluginList = "daemon.plugin.list"
+    public static let daemonPluginSniffRules = "daemon.plugin.sniffRules"
     public static let daemonPluginAuth = "daemon.plugin.auth"
     public static let daemonPluginSetEnabled = "daemon.plugin.setEnabled"
     public static let daemonPluginUpdateSettings = "daemon.plugin.updateSettings"
@@ -90,6 +94,21 @@ public enum HostMethod {
     public static let daemonPluginMarketList = "daemon.plugin.marketList"
     public static let daemonPluginMarketInstall = "daemon.plugin.marketInstall"
     public static let daemonPluginIgnoreRetry = "daemon.plugin.ignoreRetry"
+    /// 站点默认插件列表（无参）→ `[PluginSiteDefault]`。
+    public static let daemonPluginSiteDefaults = "daemon.plugin.siteDefaults"
+    /// `PluginSetSiteDefaultParams`：确认 / 修改 / 移除（identity 为 null）站点默认插件。
+    public static let daemonPluginSetSiteDefault = "daemon.plugin.setSiteDefault"
+    public static let daemonPluginConsent = "daemon.plugin.consent"
+    public static let daemonPluginAuditList = "daemon.plugin.audit.list"
+    public static let daemonPluginAuditClear = "daemon.plugin.audit.clear"
+    public static let daemonPluginAuditRecord = "daemon.plugin.audit.record"
+    public static let daemonPluginViewOpen = "daemon.plugin.view.open"
+    public static let daemonPluginViewEvent = "daemon.plugin.view.event"
+    public static let daemonPluginViewClose = "daemon.plugin.view.close"
+    public static let daemonPluginViewSnapshot = "daemon.plugin.view.snapshot"
+    public static let daemonPluginViewKeepalive = "daemon.plugin.view.keepalive"
+    public static let daemonPluginCommand = "daemon.plugin.command"
+    public static let daemonPluginInvoke = "daemon.plugin.invoke"
     public static let daemonComponentGet = "daemon.component.get"
     public static let daemonComponentListVersions = "daemon.component.listVersions"
     public static let daemonComponentInstall = "daemon.component.install"
@@ -104,6 +123,7 @@ public enum HostMethod {
     public static let daemonCdnReportsPeek = "daemon.cdnReports.peek"
     public static let daemonCdnReportsAck = "daemon.cdnReports.ack"
     public static let daemonCdnConfigApply = "daemon.cdnConfig.apply"
+    public static let daemonEgressPlan = "daemon.egress.plan"
     public static let daemonBtTrackerSubscriptionRefresh = "daemon.bt.trackerSubscription.refresh"
     public static let daemonEd2kServerSubscriptionRefresh = "daemon.ed2k.serverSubscription.refresh"
     public static let daemonDiagnosticsDescribe = "daemon.diagnostics.describe"
@@ -146,6 +166,7 @@ public enum HostMethod {
     public static let agentRemoteReconnect = "agent.remote.reconnect"
     public static let agentDeviceRename = "agent.device.rename"
     public static let agentDeviceDelete = "agent.device.delete"
+    public static let agentDeviceDisconnect = "agent.device.disconnect"
     public static let agentPreferencesPatch = "agent.preferences.patch"
     public static let agentSyncGet = "agent.sync.get"
     public static let agentSyncEnable = "agent.sync.enable"
@@ -176,6 +197,8 @@ public enum HostMethod {
     public static let agentLinkApprove = "agent.link.approve"
     /// `LinkDeviceParams`：解除配对。
     public static let agentLinkRemove = "agent.link.remove"
+    /// `LinkRenameParams` → `LinkDeviceInfo`：设置 / 清除本机备注名。
+    public static let agentLinkRename = "agent.link.rename"
     /// 探测全部已配对设备在线状态 → `Vec<LinkDeviceInfo>`（同时推送 `LinkedDevicesChanged`）。
     public static let agentLinkRefresh = "agent.link.refresh"
     /// `LinkDispatchParams` → `LinkDispatchResult`：下发下载到已配对设备。

@@ -3,15 +3,8 @@ import { useEffect, useMemo, useState } from "react";
 import { markets } from "@/i18n/messages/markets";
 import type { Lang } from "@/i18n/config";
 import { cn } from "@/lib/utils";
-import {
-  PLUGIN_INDEX_REPO,
-  PLUGIN_REPO_URL,
-  filterPlugins,
-  groupPlugins,
-  pluginFilters,
-  type MarketIndex,
-  type PluginGroup,
-} from "./plugin-data";
+import { filterPlugins, groupPlugins, pluginFilters, type MarketIndex, type PluginGroup } from "./plugin-data";
+import { PLUGIN_INDEX_REPO, githubUrl } from "@/lib/ecosystem";
 import { GridFill, SearchField, SkeletonGrid, StateMessage } from "./MarketUI";
 import { PluginCard } from "./PluginCard";
 import { PluginDetail } from "./PluginDetail";
@@ -84,7 +77,7 @@ export default function PluginMarket({ lang }: { lang: Lang }) {
             tone="danger"
             title={t.plugins.loadError}
             hint={t.common.retryHint}
-            link={{ href: PLUGIN_REPO_URL, label: `github.com/${PLUGIN_INDEX_REPO}` }}
+            link={{ href: githubUrl(PLUGIN_INDEX_REPO), label: `github.com/${PLUGIN_INDEX_REPO}` }}
           />
         )}
         {groups && filtered.length === 0 && <StateMessage title={t.plugins.empty} />}

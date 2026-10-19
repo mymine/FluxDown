@@ -1,0 +1,60 @@
+{
+  "name": "fluxdown-plugin-sdk",
+  "version": "0.1.0",
+  "description": "Types, JSX runtime, manifest validator and CLI for building FluxDown plugins.",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "bin": {
+    "fluxdown-plugin": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./manifest": {
+      "types": "./dist/manifest.d.ts",
+      "default": "./dist/manifest.mjs"
+    },
+    "./ui/jsx-runtime": {
+      "types": "./dist/ui/jsx-runtime.d.ts",
+      "default": "./dist/ui/jsx-runtime.js"
+    },
+    "./ui/jsx-dev-runtime": {
+      "types": "./dist/ui/jsx-dev-runtime.d.ts",
+      "default": "./dist/ui/jsx-dev-runtime.js"
+    },
+    "./runtime": {
+      "types": "./dist/runtime.d.ts",
+      "default": "./dist/runtime.js"
+    },
+    "./types/desktop": {
+      "types": "./types/desktop.d.ts"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "types",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "gen": "bun scripts/gen-view-types.ts && bun scripts/gen-theme-types.ts",
+    "gen:check": "bun scripts/gen-view-types.ts --check && bun scripts/gen-theme-types.ts --check",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test",
+    "build": "bun scripts/build.ts",
+    "sync-index": "bun scripts/sync-index.ts"
+  },
+  "dependencies": {
+    "esbuild": "^0.28.2",
+    "fflate": "^0.8.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.3",
+    "typescript": "^7.0.2"
+  }
+}

@@ -350,7 +350,7 @@ async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String, Compo
 /// 24h 缓存，规避 GitHub 匿名 API 每 IP 60/h 限流与直连 api.github.com 的
 /// 网络问题），失败依次回退用户配置的镜像（若有）与直连 GitHub。
 #[cfg(feature = "components")]
-const MIRROR_BASE: &str = "https://fluxdown.zerx.dev/api/components";
+const MIRROR_BASE: &str = "https://fluxdown.com/api/components";
 
 /// 版本列表专用：优先经官网镜像 `MIRROR_BASE/<component>` 拉取（返回原样
 /// GitHub JSON）；失败则经 [`fetch_github_json_with_mirror`] 依次尝试用户
@@ -369,61 +369,67 @@ pub(crate) async fn fetch_versions_json(
     fetch_github_json_with_mirror(client, github_url, mirror_base).await
 }
 
-/// 流式下载 `url` 到 `dest` 并校验 SHA-256（`expected_sha256`，小写 hex），
+/// 流式下载载荷到 `dest` 并校验 SHA-256（`expected_sha256`，小写 hex），
 /// `progress(downloaded, total)` 上报进度（total=0 未知）。ffmpeg 归档 / yt-dlp
 /// 单二进制安装共用；每 256KB 上报一次避免信号风暴。
-/// 先按用户配置的 [`CONFIG_COMPONENT_MIRROR_BASE`] 改写 `url`（675#1，仅 https
-/// 镜像）：镜像下载失败或内容哈希不符都回退直连原始 `url`；直连内容仍不符则
-/// 删除 `dest` 并报错——调用方在校验通过前不得执行或落位该文件。
+///
+/// 依次尝试：用户配置的 [`CONFIG_COMPONENT_MIRROR_BASE`] 镜像（675#1，仅 https）→
+/// 统一出口的插件改写地址（[`crate::egress::Egress::route_verified`]，如 GitHub 加速）→
+/// 原始上游地址。任一来源下载失败或内容哈希不符都换下一个；最后一个仍不符则删除 `dest`
+/// 并报错——调用方在校验通过前不得执行或落位该文件。
 #[cfg(feature = "components")]
 pub(crate) async fn download_to_file(
     client: &reqwest::Client,
-    url: &str,
+    route: &crate::egress::EgressRoute,
     mirror_base: &str,
     dest: &std::path::Path,
     expected_sha256: &str,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<(), ComponentError> {
-    if let Some(mirrored) = https_mirror_url(url, mirror_base) {
-        match download_to_file_from(client, &mirrored, dest, progress).await {
+    let mut attempts = Vec::new();
+    if let Some(mirrored) = https_mirror_url(route.source_url(), mirror_base) {
+        attempts.push(crate::egress::EgressAttempt {
+            url: mirrored,
+            headers: Vec::new(),
+            plugin: None,
+        });
+    }
+    attempts.extend(route.attempts());
+    let mut last_error = ComponentError::NotFound("download source".to_string());
+    for attempt in &attempts {
+        match download_to_file_from(client, attempt, dest, progress).await {
             Ok(actual) if actual.eq_ignore_ascii_case(expected_sha256) => return Ok(()),
-            Ok(_) => crate::log_info!("[components] mirror content hash mismatch, retrying direct"),
-            Err(_) => {}
-        }
-    }
-    let actual = match download_to_file_from(client, url, dest, progress).await {
-        Ok(actual) => actual,
-        Err(e) => {
-            if let Err(cleanup_error) = tokio::fs::remove_file(dest).await
-                && cleanup_error.kind() != std::io::ErrorKind::NotFound
-            {
-                crate::logger::report_warning(
-                    "components",
-                    "remove_failed_download",
-                    &cleanup_error,
+            Ok(actual) => {
+                crate::log_info!(
+                    "[components] content hash mismatch from {} source, trying next",
+                    attempt.plugin.as_deref().unwrap_or("mirror/upstream")
                 );
+                last_error = ComponentError::Verify(format!(
+                    "sha256 mismatch for downloaded component (expected {expected_sha256}, got {actual})"
+                ));
             }
-            return Err(e);
+            Err(error) => {
+                crate::log_info!(
+                    "[components] download from {} source failed: {error}",
+                    attempt.plugin.as_deref().unwrap_or("mirror/upstream")
+                );
+                last_error = error;
+            }
         }
-    };
-    if !actual.eq_ignore_ascii_case(expected_sha256) {
-        if let Err(error) = tokio::fs::remove_file(dest).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            crate::logger::report_warning("components", "remove_unverified_download", &error);
-        }
-        return Err(ComponentError::Verify(format!(
-            "sha256 mismatch for downloaded component (expected {expected_sha256}, got {actual})"
-        )));
     }
-    Ok(())
+    if let Err(error) = tokio::fs::remove_file(dest).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logger::report_warning("components", "remove_unverified_download", &error);
+    }
+    Err(last_error)
 }
 
 /// 下载到 `dest`，返回内容的 SHA-256（小写 hex）。
 #[cfg(feature = "components")]
 async fn download_to_file_from(
     client: &reqwest::Client,
-    url: &str,
+    attempt: &crate::egress::EgressAttempt,
     dest: &std::path::Path,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
 ) -> Result<String, ComponentError> {
@@ -431,9 +437,11 @@ async fn download_to_file_from(
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
 
-    let resp = client
-        .get(url)
-        .header("User-Agent", "FluxDown")
+    let mut request = client.get(&attempt.url).header("User-Agent", "FluxDown");
+    for (name, value) in &attempt.headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let resp = request
         .send()
         .await
         .map_err(|e| ComponentError::Http(e.to_string()))?;
@@ -468,6 +476,19 @@ async fn download_to_file_from(
         .map_err(|e| ComponentError::Io(e.to_string()))?;
     progress(downloaded, total);
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// 组件安装的 HTTP 客户端：统一出口按当前全局代理装配。
+#[cfg(feature = "components")]
+pub(crate) async fn egress_client(
+    egress: &crate::egress::Egress,
+) -> Result<reqwest::Client, ComponentError> {
+    egress
+        .client_builder()
+        .await
+        .map_err(|e| ComponentError::Http(format!("{e:#}")))?
+        .build()
+        .map_err(|e| ComponentError::Http(e.to_string()))
 }
 
 #[cfg(test)]
@@ -607,7 +628,7 @@ mod tests {
     // 不匹配已知前缀的 URL 原样透传（不误伤第三方镜像/官网 URL）。
     #[test]
     fn apply_component_mirror_leaves_unrelated_urls_untouched() {
-        let url = "https://fluxdown.zerx.dev/api/components/ffmpeg";
+        let url = "https://fluxdown.com/api/components/ffmpeg";
         assert_eq!(
             apply_component_mirror(url, "https://ghproxy.example.com/gh"),
             url

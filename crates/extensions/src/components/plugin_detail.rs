@@ -3,11 +3,16 @@
 use std::rc::Rc;
 
 use fluxdown_protocol::{MarketEntryDto, PluginDto};
-use fluxdown_ui_components::{dialog_scroll_body, tabular_numbers};
+use fluxdown_ui_components::{ControlExt as _, dialog_scroll_body, tabular_numbers};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
-use gpui::{App, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div};
-use gpui_component::{WindowExt as _, h_flex, link::Link, v_flex};
+use gpui::{
+    App, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div,
+    prelude::FluentBuilder as _,
+};
+use gpui_component::{
+    WindowExt as _, button::Button, dialog::DialogFooter, h_flex, link::Link, v_flex,
+};
 
 use crate::{pages::Frame, ui};
 
@@ -26,6 +31,9 @@ pub struct PluginDetail {
     pub settings_count: usize,
     pub permissions: Vec<String>,
     pub yanked_label: Option<String>,
+    /// `standard|elevated|full`；空串按 standard。
+    pub risk: String,
+    pub network_hosts: Vec<String>,
 }
 
 impl PluginDetail {
@@ -38,6 +46,8 @@ impl PluginDetail {
             homepage: plugin.homepage.clone(),
             settings_count: plugin.settings.len(),
             permissions: plugin.permissions.clone(),
+            risk: plugin.risk.clone(),
+            network_hosts: plugin.network_hosts.clone(),
             ..Self::default()
         }
     }
@@ -60,6 +70,8 @@ impl PluginDetail {
             settings_count: 0,
             permissions: entry.permissions.clone(),
             yanked_label: yanked_label(translator, &entry.yanked),
+            risk: crate::market::risk_of(&entry.permissions).to_owned(),
+            network_hosts: entry.network_hosts.clone(),
         }
     }
 }
@@ -90,6 +102,26 @@ pub fn permission_label(translator: &Translator, permission: &str) -> (String, S
             translator.text("pluginPermAuthName").to_owned(),
             translator.text("pluginPermAuthDesc").to_owned(),
         ),
+        "tasks" => (
+            translator.text("pluginPermTasksName").to_owned(),
+            translator.text("pluginPermTasksDesc").to_owned(),
+        ),
+        "browserRules" => (
+            translator.text("pluginPermBrowserRulesName").to_owned(),
+            translator.text("pluginPermBrowserRulesDesc").to_owned(),
+        ),
+        "desktop" => (
+            translator.text("pluginPermDesktopName").to_owned(),
+            translator.text("pluginPermDesktopDesc").to_owned(),
+        ),
+        "background" => (
+            translator.text("pluginPermBackgroundName").to_owned(),
+            translator.text("pluginPermBackgroundDesc").to_owned(),
+        ),
+        "intercept" => (
+            translator.text("pluginPermInterceptName").to_owned(),
+            translator.text("pluginPermInterceptDesc").to_owned(),
+        ),
         other => (
             other.to_owned(),
             translator.text("pluginPermUnknownDesc").to_owned(),
@@ -97,10 +129,14 @@ pub fn permission_label(translator: &Translator, permission: &str) -> (String, S
     }
 }
 
+/// 详情对话框「审计记录」入口回调；仅已安装插件提供。
+pub type OpenAudit = Rc<dyn Fn(&mut Window, &mut App)>;
+
 /// 打开详情对话框；对话框构造器每帧重建，内容从共享的只读快照按需渲染。
 pub fn open_plugin_detail(
     detail: PluginDetail,
     translator: Translator,
+    open_audit: Option<OpenAudit>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -109,6 +145,9 @@ pub fn open_plugin_detail(
     window.open_dialog(cx, move |dialog, _, cx| {
         let detail = detail.clone();
         let translator = translator.clone();
+        let audit_label =
+            SharedString::from(translator.text("pluginAuditOpenForPlugin").to_owned());
+        let open_audit = open_audit.clone();
         dialog
             .title(fluxdown_ui_components::dialog_title(
                 detail.name.clone(),
@@ -122,6 +161,17 @@ pub fn open_plugin_detail(
                     render_detail(&detail, &translator, cx),
                     cx,
                 ))
+            })
+            .when_some(open_audit, |dialog, open_audit| {
+                dialog.footer(
+                    DialogFooter::new().child(
+                        Button::new("plugin-detail-audit")
+                            .outline()
+                            .control(cx)
+                            .label(audit_label.clone())
+                            .on_click(move |_, window, cx| open_audit(window, cx)),
+                    ),
+                )
             })
     });
 }
@@ -190,6 +240,7 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
                     .clone()
                     .map(|label| ui::tone_pill(label, tokens.colors.destructive, frame)),
             )
+            .children(ui::risk_pill("plugin-detail-risk", &detail.risk, frame))
             .children(
                 detail
                     .tags
@@ -255,6 +306,16 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
         content = content
             .child(section_title(text("pluginDetailPermissions")))
             .children(permissions);
+    }
+    if !detail.network_hosts.is_empty() {
+        content = content
+            .child(section_title(text("pluginConsentNetworkHosts")))
+            .children(
+                detail
+                    .network_hosts
+                    .iter()
+                    .map(|host| ui::body_text(host.clone(), frame)),
+            );
     }
     content
         .child(section_title(text("pluginDetailUsage")))

@@ -80,6 +80,8 @@ pub enum AgentStartError {
 /// 运行中的嵌入式 agent。
 pub struct EmbeddedAgent {
     service: Arc<GatewayService>,
+    /// 宿主自身下载（App 自更新）经它取 daemon 的统一出口方案。
+    daemon: Arc<DaemonClient>,
     cancel: CancellationToken,
     tasks: Vec<(&'static str, JoinHandle<()>)>,
     /// 持有 `agent.lock` 直到关停。
@@ -114,6 +116,8 @@ pub async fn start_embedded(
         Err(error) => return Err(error.into()),
     };
     let mut state = store.load().await?;
+    // 嵌入式宿主没有对外监听端口：不论持久化状态如何都不是局域网可达。
+    state.gateway.lan_active = false;
     let new_device = state.device_id.is_empty();
     if new_device {
         state.device_id = uuid::Uuid::new_v4().to_string();
@@ -228,6 +232,7 @@ pub async fn start_embedded(
             // 没有监听端口：互联只做出站（`reachable = false`）。
             bound: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             server_mode: false,
+            network: crate::link::LinkNetworkOptions::from_env(),
         })
     });
     if let Some(link) = &link {
@@ -262,6 +267,7 @@ pub async fn start_embedded(
     let update = Arc::new(crate::update::UpdateService::unsupported(
         events.clone(),
         store.data_dir().to_path_buf(),
+        crate::egress::Egress::daemon(daemon.clone()),
     ));
     let mut gateway = GatewayService::new(
         daemon.clone(),
@@ -312,6 +318,7 @@ pub async fn start_embedded(
 
     let agent = EmbeddedAgent {
         service,
+        daemon,
         cancel,
         tasks,
         store,
@@ -341,16 +348,25 @@ impl EmbeddedAgent {
         self.service.connect_local(hello, self.cancel.clone()).await
     }
 
+    /// 宿主自身下载（原生 App 自更新）的统一出口来源：本机 daemon 的 `daemon.egress.plan`。
+    /// agent 停止后调用失败，调用方按系统默认网络处理。
+    #[must_use]
+    pub fn egress_source(&self) -> Arc<dyn crate::egress::EgressSource> {
+        self.daemon.clone()
+    }
+
     /// 停止 agent 并等待全部后台任务结束。已有的 [`LocalConnection`] 的事件流以 `Closed`
     /// 结束；它们持有的服务引用随连接丢弃而释放，重新启动前必须先丢弃所有连接，否则
     /// 数据目录锁（`agent.lock`）会保持到最后一个连接释放。
     pub async fn shutdown(self) {
         let Self {
             service,
+            daemon,
             cancel,
             tasks,
             store,
         } = self;
+        drop(daemon);
         cancel.cancel();
         for (task, handle) in tasks {
             match handle.await {

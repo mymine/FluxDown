@@ -4,10 +4,15 @@ use std::{ops::Range, time::Instant};
 
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, ElementId, Entity, EventEmitter, IntoElement,
-    ParentElement as _, Pixels, RenderOnce, Styled as _, Window, div, px,
+    AnyElement, App, AppContext as _, Context, ElementId, Entity, EventEmitter,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, RenderOnce,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, percentage, px,
 };
-use gpui_component::{ResizableState, h_flex, h_resizable, resizable_panel};
+use gpui_component::{
+    Icon, ResizableState, h_flex, h_resizable, resizable_panel, tooltip::Tooltip,
+};
+
+use crate::{FluxIcon, toolbar_action_button};
 
 use motion::SidebarMotion;
 
@@ -18,6 +23,39 @@ pub struct SidebarChange {
     pub width: Pixels,
     /// 用户手动收起状态，与内容是否可见独立。
     pub collapsed: bool,
+}
+
+/// 侧栏收起 / 展开按钮：展开时放在侧栏标题行右端，收起后由 shell 放在顶栏最左。
+///
+/// `label` 同时作为提示与无障碍名称；点击等价于 [`SidebarState::toggle`]。
+pub fn sidebar_toggle_button(
+    id: &'static str,
+    label: SharedString,
+    sidebar: &Entity<SidebarState>,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let state = sidebar.clone();
+    div()
+        .id(SharedString::from(format!("{id}-tooltip")))
+        .flex_none()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .tooltip({
+            let label = label.clone();
+            move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+        })
+        .child(
+            toolbar_action_button(
+                id,
+                label,
+                Icon::new(FluxIcon::PanelRight)
+                    .size(active_theme(cx).extended().icon.md)
+                    .rotate(percentage(0.5)),
+                false,
+                false,
+                cx,
+            )
+            .on_click(move |_, _, cx| state.update(cx, |state, cx| state.toggle(cx))),
+        )
 }
 
 /// 页面独立的侧栏状态，供页面布局和 shell 顶栏按钮共享。

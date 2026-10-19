@@ -115,7 +115,7 @@ export type WsServerMsg =
       options: ResolveVariantOptionDto[];
     }
   | { type: 'pong' }
-  /** 插件因熔断被自动禁用（`reason` 固定 `CircuitBreaker`）。 */
+  /** 插件被自动禁用（`reason` 为 `CircuitBreaker` 熔断或 `Revoked` 被插件市场撤回）。 */
   | { type: 'pluginAutoDisabled'; identity: string; reason: string }
   /** BT 重复添加：占位任务 `taskId` 已被删除，已有任务为 `existingTaskId`。 */
   | {

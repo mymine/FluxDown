@@ -8,6 +8,8 @@ mod port;
 mod push_view;
 mod search;
 mod sections;
+mod shortcut_display;
+mod shortcut_record;
 mod store;
 mod theme_library;
 mod ui;
@@ -18,12 +20,15 @@ mod view;
 pub use port::{PortFuture, SettingsPort};
 pub use push_view::{PushHost, PushView, WindowAction};
 pub use search::{SettingsSearchEntry, SettingsTarget, search_index};
+pub use shortcut_display::{shortcut_label, shortcut_recording};
 pub use store::{SettingsError, SettingsErrorKind, SettingsStore};
 pub use theme_library::sync_theme_library;
 pub use update_prompt::{
     UPDATE_PROMPT_WINDOW_HEIGHT, UPDATE_PROMPT_WINDOW_WIDTH, UpdatePromptEvent, UpdatePromptView,
 };
-pub use view::{ActivityBarToggle, SettingsContentSlots, SettingsView};
+pub use view::{
+    ActivityBarToggle, SettingsContentSlots, SettingsView, SlotVisibility, VisibleSlot,
+};
 
 /// 打开分类编辑对话框（`id = None` 新建；未知 id 视为新建）。供 app 把下载侧栏的
 /// 「编辑分类」接到设置能力，而不让下载 crate 依赖设置 crate。

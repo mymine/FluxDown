@@ -139,12 +139,17 @@ struct RootView: View {
         }
     }
 
-    /// N4：`magnet:` / `ed2k://` / `fluxdown://…?url=` 唤起 → 预填「新建下载」；
-    /// N3：「文件」App 里「用 FluxDown 打开」`.torrent` → 直接导入（不支持的文件给出提示）。
+    /// N4：`fluxdown://…?url=` 唤起 → 预填「新建下载」（full 另接 `magnet:` / `ed2k://`）；
+    /// N3：「文件」App 里「用 FluxDown 打开」文件 → full 直接导入 `.torrent`，store 与不支持的文件一律给出提示。
     private func handle(_ url: URL) {
         if url.isFileURL {
             container.router.tab = .downloads
+            #if FULL_P2P
             TorrentImport.openFromSystem(url, container: container)
+            #else
+            FluxHaptic.warning.play()
+            container.toasts.show(text: L("unsupportedDropHintGeneric"), tone: .warning)
+            #endif
             return
         }
         var link = url.absoluteString

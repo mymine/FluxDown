@@ -17,10 +17,13 @@ import {
   SquareCheck,
   RotateCw,
   Rows3,
+  ShieldCheck,
   Trash2,
   Zap,
 } from 'lucide-react'
 import type { QueueDto } from '../../../lib/rpc'
+import { runPluginCommand } from '../../plugins/commands'
+import type { PluginCommandRef } from '../../plugins/contributions'
 import type { MenuEntry } from '../../../ui'
 import {
   canOpenTaskFile,
@@ -46,9 +49,10 @@ import {
   retryFailedInGroup,
   revealTaskFile,
   toggleBoost,
+  verifyTaskIntegrity,
 } from '../model/actions'
 import { remoteCan } from '../model/batchPlan'
-import { canChangeSegments, canChangeUrl } from '../model/taskEdit'
+import { canChangeSegments, canChangeUrl, canVerifyIntegrity } from '../model/taskEdit'
 import type { DownloadTaskView } from '../model/task'
 import type { GroupSummary } from '../state'
 import { openChangeSegments, openChangeUrl, openGroupDetail, openRename } from '../dialogs'
@@ -72,10 +76,28 @@ interface TaskMenuContext {
   queueName: (queueId: string) => string
   showDetail: (taskId: string) => void
   selection?: SelectionEntries
+  /** 插件贡献的任务右键命令（`taskMenu: true`），位于选择组与删除组之间。 */
+  pluginCommands?: readonly PluginCommandRef[]
 }
 
 /** 任务行右键菜单：多选时每一项都要求对全部选中任务成立（交集语义），resume/pause 例外。 */
-export function buildTaskMenu({ t, views, queues, queueName, showDetail, selection }: TaskMenuContext): MenuEntry[] {
+/** 插件命令分组（含前置分隔线）；无命令返回空数组。 */
+export function pluginTaskMenuEntries(t: Translate, commands: readonly PluginCommandRef[], taskIds: readonly string[]): MenuEntry[] {
+  if (commands.length === 0) return []
+  return [
+    { type: 'separator', key: 'sep-plugin' },
+    ...commands.map(
+      (ref): MenuEntry => ({
+        type: 'item',
+        key: `plugin:${ref.identity}:${ref.command.id}`,
+        label: `${ref.pluginName}: ${ref.command.title}`,
+        onSelect: () => void runPluginCommand(t, ref.identity, ref.command.id, [...taskIds]),
+      }),
+    ),
+  ]
+}
+
+export function buildTaskMenu({ t, views, queues, queueName, showDetail, selection, pluginCommands = [] }: TaskMenuContext): MenuEntry[] {
   if (views.length === 0) return []
   const entries: MenuEntry[] = []
   const only = views.length === 1 ? views[0] : undefined
@@ -149,6 +171,15 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
       onSelect: () => openChangeSegments(only.taskId),
     })
   }
+  if (only && canVerifyIntegrity(only)) {
+    entries.push({
+      type: 'item',
+      key: 'verify-integrity',
+      label: t('verifyTaskIntegrity'),
+      icon: ShieldCheck,
+      onSelect: () => void verifyTaskIntegrity(only),
+    })
+  }
   if (views.every(canRedownload)) {
     entries.push({
       type: 'item',
@@ -186,6 +217,8 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
       onSelect: selection.selectAll,
     })
   }
+  const localTaskIds = views.filter((view) => view.source === 'local').map((view) => view.taskId)
+  if (localTaskIds.length > 0) entries.push(...pluginTaskMenuEntries(t, pluginCommands, localTaskIds))
   entries.push({ type: 'separator', key: 'sep-delete' })
   entries.push({
     type: 'item',

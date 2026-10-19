@@ -7,7 +7,7 @@ use fluxdown_ui_components::FluxIcon;
 use fluxdown_ui_downloads::{DownloadHostActions, DownloadView};
 use fluxdown_ui_rss::RssView;
 use fluxdown_ui_settings::{PushHost, PushView};
-use fluxdown_ui_shell::{ShellAction, ShellRoute, ShellView, main_window_options};
+use fluxdown_ui_shell::{ShellAction, ShellChrome, ShellRoute, ShellView, main_window_options};
 use gpui::{App, AppContext as _, Window, WindowHandle, px, size};
 use gpui_component::{Icon, Root};
 
@@ -122,7 +122,11 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
                             cx,
                         )
                     });
-                    actions.push(ShellAction::view(button_id, button.into()).optional(optional));
+                    actions.push(
+                        ShellAction::view(button_id, entry.label_key(), button.into())
+                            .layout_id(entry.layout_id())
+                            .optional(optional),
+                    );
                 }
                 ActivityEntry::Settings => actions.push(
                     ShellAction::new(
@@ -132,14 +136,24 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
                         Icon::new(FluxIcon::Settings),
                         move |_, cx| crate::windows::settings::open(cx),
                     )
+                    .layout_id(entry.layout_id())
                     .optional(optional),
                 ),
             }
         }
-        let shell = cx.new(|cx| ShellView::new(translator.clone(), routes, actions, cx));
+        let chrome = ShellChrome {
+            widgets: crate::chrome_layout::widgets(&downloads.downgrade()),
+            catalog: crate::chrome_layout::catalog(),
+            on_layout_change: Rc::new(|value, cx| {
+                Desktop::set_pref(cx, crate::chrome_layout::CHROME_LAYOUT_PREF, value);
+            }),
+        };
+        let shell = cx.new(|cx| ShellView::new(translator.clone(), routes, actions, chrome, cx));
         shell.update(cx, |shell, cx| {
+            shell.observe_widget_source(&downloads, cx);
             let preferences = Desktop::preferences(cx).clone();
             activity::apply_visibility(shell, &preferences, cx);
+            crate::chrome_layout::apply(shell, &preferences, cx);
         });
 
         let settings_for_categories = settings_store.clone();
@@ -177,6 +191,8 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
                 shutdown_status,
                 shutdown: shutdown_port,
                 on_user_started: Some(Rc::new(crate::progress_windows::user_started)),
+                run_plugin_command: Some(crate::plugin_contributions::command_runner()),
+                plugin_tab_view: Some(crate::plugin_contributions::tab_view_factory()),
             });
         });
 
@@ -187,6 +203,7 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
             desktop.main_downloads = Some(downloads.downgrade());
             desktop.main_shell = Some(shell.downgrade());
         }
+        crate::plugin_contributions::attach_main_window(cx);
 
         let root = cx.new(|cx| Root::new(shell, window, cx));
         WindowRegistry::persist_bounds(RememberedWindow::Main, client, &root, window, cx);

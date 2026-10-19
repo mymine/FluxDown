@@ -1,6 +1,6 @@
 # 原生 iOS App（mobile/FluxDown，Bundle ID com.fluxdown.app）→ TestFlight。
 # 流程与本机一致，全部在 mobile/FluxDown/scripts/testflight.sh：
-#   build-core.sh --release → xcodebuild archive（不签名）→ exportArchive（Apple Distribution + App Store 描述文件）
+#   build-core.sh --release --flavor store → xcodebuild archive（不签名）→ exportArchive（Apple Distribution + App Store 描述文件）
 #   → altool 上传 → asc.py 等待处理完成、写「测试内容」、加入测试组（含外部组时提交 Beta 审核）。
 # 触发：
 #   - 推送 v* tag：版本号取 tag（vX.Y.Z-rc.N → X.Y.Z）。内部组「Internal」已开自动分发，
@@ -9,6 +9,8 @@
 #     upload=false 只做 altool --validate-app 演练，不消耗构建号、不出现在 TestFlight。
 #   - 被 test-package.yml（target=ios / all）以 workflow_call 复用，可指定构建 ref。
 # 构建号 = UTC 时间 YYYYMMDD.HHMMSS：跨 workflow / 重跑都唯一且递增（run_number 各 workflow 独立计数会撞号）。
+# 只出商店构建（store flavor：核心 build-core.sh --flavor store = --no-default-features，App 不定义 FULL_P2P）；
+# 侧载未签名 IPA（full flavor）见 ios-sideload.yml。
 # Secrets：IOS_DIST_CERT_P12_BASE64 / IOS_DIST_CERT_PASSWORD / IOS_APPSTORE_PROFILE_BASE64
 #          APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64（与 macOS 公证共用）/ FLUXCLOUD_BASE_URL
 # 证书与描述文件 2027-09-12 到期，续期步骤见 .omp/knowledge/ops.md「iOS TestFlight」。

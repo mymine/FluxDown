@@ -21,6 +21,7 @@ use crate::{
 
 const HLS_VARIANT_SIZE: gpui::Size<gpui::Pixels> = size(px(520.), px(440.));
 const BT_SIZE: gpui::Size<gpui::Pixels> = size(px(760.), px(580.));
+const PLUGIN_SIZE: gpui::Size<gpui::Pixels> = size(px(560.), px(560.));
 
 /// 订阅会话：回放启动时已挂起的选择，跟随新到达/已解决的请求开关窗口。
 pub fn install(cx: &mut App) {
@@ -92,7 +93,13 @@ fn open(cx: &mut App, request: SelectionRequestDto) {
         SelectionKind::Hls { .. } => "hlsQualityTitle",
         SelectionKind::Bt { .. } => "btFileSelectTitle",
         SelectionKind::Variant { .. } => "resolveVariantTitle",
+        SelectionKind::Plugin { .. } => "pluginChoiceTitle",
         SelectionKind::FileExists { .. } => return,
+    };
+    let window_size = if matches!(request.kind, SelectionKind::Plugin { .. }) {
+        PLUGIN_SIZE
+    } else {
+        HLS_VARIANT_SIZE
     };
     let is_bt = matches!(request.kind, SelectionKind::Bt { .. });
     let display_id = WindowRegistry::handle(cx, &WindowKey::Main)
@@ -114,7 +121,7 @@ fn open(cx: &mut App, request: SelectionRequestDto) {
     } else {
         options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(
             display_id,
-            HLS_VARIANT_SIZE,
+            window_size,
             cx,
         )));
     }

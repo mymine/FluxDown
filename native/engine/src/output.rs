@@ -20,6 +20,7 @@ pub(crate) async fn ensure_parent(path: &Path) -> io::Result<()> {
     ensure_dir(parent).await
 }
 
+#[cfg(any(feature = "bt", test))]
 /// Synchronous counterpart used by blocking protocol completion paths.
 pub(crate) fn ensure_dir_sync(dir: &Path) -> io::Result<()> {
     if dir.as_os_str().is_empty() {

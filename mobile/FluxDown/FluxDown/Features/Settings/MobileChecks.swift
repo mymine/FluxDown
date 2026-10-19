@@ -9,14 +9,19 @@ import os
 // 级别判定是纯函数（`MobileChecks`），探测（写入 / 空闲空间 / `NWPathMonitor`）在 `MobileCheckRunner`。
 
 nonisolated enum MobileCheckID: String, CaseIterable, Sendable {
-    case notifications, background, storage, links, network, localNetwork, engine
+    case notifications, background, storage, network, localNetwork, engine
+    #if FULL_P2P
+    case links
+    #endif
 
     var titleKey: String {
         switch self {
         case .notifications: "mobileDiagCheckNotifications"
         case .background: "mobileDiagCheckBackground"
         case .storage: "mobileDiagCheckStorage"
+        #if FULL_P2P
         case .links: "mobileDiagCheckLinks"
+        #endif
         case .network: "mobileDiagCheckNetwork"
         case .localNetwork: "mobileDiagCheckLocalNetwork"
         case .engine: "mobileDiagCheckEngine"
@@ -156,6 +161,7 @@ nonisolated enum MobileChecks {
         return MobileCheck(id: .storage, level: .ok, detail: detail)
     }
 
+    #if FULL_P2P
     // MARK: 链接与文件
 
     /// Info.plist `CFBundleURLTypes` 声明的全部 URL scheme（小写）。
@@ -202,6 +208,7 @@ nonisolated enum MobileChecks {
             hint: level == .warn ? L("mobileDiagLinksHint") : ""
         )
     }
+    #endif
 
     // MARK: 网络
 
@@ -386,17 +393,7 @@ enum MobileCheckRunner {
         let measuredFree = await deviceFree
         let free = engineFree ?? measuredFree
 
-        let info = Bundle.main.infoDictionary ?? [:]
-        let queryable = MobileChecks.queryableSchemes(in: info)
-        var handlers: [String: Bool] = [:]
-        for scheme in ["magnet", "ed2k"] where queryable.contains(scheme) {
-            if let url = URL(string: "\(scheme):?") { handlers[scheme] = UIApplication.shared.canOpenURL(url) }
-        }
-
-        var failureText: String?
-        if case let .failed(error) = state.connection { failureText = ErrorText.describe(error) }
-
-        return [
+        var checks: [MobileCheck] = [
             MobileChecks.notifications(service.authorization),
             MobileChecks.background(
                 refresh: UIApplication.shared.backgroundRefreshStatus,
@@ -404,14 +401,27 @@ enum MobileCheckRunner {
                 continueInBackground: DeviceSettings.shared.continueInBackground
             ),
             MobileChecks.storage(writable: await writable, freeBytes: free),
-            MobileChecks.links(
-                declaredSchemes: MobileChecks.declaredURLSchemes(in: info),
-                torrentDeclared: MobileChecks.declaresTorrentDocument(in: info),
-                handlers: handlers
-            ),
-            MobileChecks.network(await path),
-            MobileChecks.localNetwork(),
-            MobileChecks.engine(connection: state.connection, info: state.info, failureText: failureText),
         ]
+        #if FULL_P2P
+        let info = Bundle.main.infoDictionary ?? [:]
+        let queryable = MobileChecks.queryableSchemes(in: info)
+        var handlers: [String: Bool] = [:]
+        for scheme in ["magnet", "ed2k"] where queryable.contains(scheme) {
+            if let url = URL(string: "\(scheme):?") { handlers[scheme] = UIApplication.shared.canOpenURL(url) }
+        }
+        checks.append(MobileChecks.links(
+            declaredSchemes: MobileChecks.declaredURLSchemes(in: info),
+            torrentDeclared: MobileChecks.declaresTorrentDocument(in: info),
+            handlers: handlers
+        ))
+        #endif
+
+        var failureText: String?
+        if case let .failed(error) = state.connection { failureText = ErrorText.describe(error) }
+
+        checks.append(MobileChecks.network(await path))
+        checks.append(MobileChecks.localNetwork())
+        checks.append(MobileChecks.engine(connection: state.connection, info: state.info, failureText: failureText))
+        return checks
     }
 }

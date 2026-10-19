@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://fluxdown.zerx.dev/schemas/gpui-theme.v2.json",
+  "$id": "https://fluxdown.com/schemas/gpui-theme.v2.json",
   "title": "FluxDown GPUI Theme",
   "type": "object",
   "properties": {

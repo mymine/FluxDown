@@ -27,6 +27,7 @@ pub mod file_conflict;
 pub mod group_detail;
 pub mod main;
 pub mod new_download;
+pub mod plugin;
 pub mod progress;
 pub mod queue_manager;
 pub mod selection;
@@ -55,6 +56,8 @@ pub enum WindowKey {
     Progress(String),
     /// 「发现新版本」提醒（不依赖主窗口，托盘驻留时由 agent 拉起界面后单独弹出）。
     UpdatePrompt,
+    /// 插件桌面界面（contributes.views 的 desktop 入口，gpui-shell 运行），key 为 `<identity>/<viewId>`。
+    Plugin(String),
 }
 
 pub struct WindowRegistry {

@@ -227,6 +227,22 @@ pub enum DaemonEvent {
     /// 任务生命周期语义事件（与 webhook 同源）。只供 agent 消费云端推送，agent 不转发给 UI；
     /// 不改变 daemon 快照。
     TaskNotice(crate::TaskNoticeDto),
+    /// 常驻插件宿主的可移植视图增量帧。不改变 daemon 快照；agent 原样转发给全部 UI
+    /// 连接，客户端按 `session` 过滤、忽略未知会话。
+    PluginViewFrame(crate::PluginViewFrameDto),
+    /// 可移植视图会话已结束（`reason`：`closed` / `expired` / `pluginUnloaded`）。
+    /// 不改变 daemon 快照；agent 原样转发。
+    PluginViewClosed {
+        session: String,
+        reason: String,
+    },
+    /// 插件经 `flux.ui.toast` 请求的提示（`level`：`info` / `success` / `warning` /
+    /// `error`）。不改变 daemon 快照；agent 原样转发。
+    PluginToast {
+        identity: String,
+        level: String,
+        text: String,
+    },
 }
 
 /// agent 自有或转发的状态变化事件。
@@ -387,7 +403,11 @@ pub fn apply_daemon_event(snapshot: &mut DaemonSnapshot, event: &DaemonEvent) {
                 .task_runtime
                 .insert(runtime.task_id.clone(), runtime);
         }
-        DaemonEvent::TaskActivityAdded(_) | DaemonEvent::TaskNotice(_) => {}
+        DaemonEvent::TaskActivityAdded(_)
+        | DaemonEvent::TaskNotice(_)
+        | DaemonEvent::PluginViewFrame(_)
+        | DaemonEvent::PluginViewClosed { .. }
+        | DaemonEvent::PluginToast { .. } => {}
         DaemonEvent::SnapshotReplaced(replacement) => snapshot.clone_from(replacement),
         DaemonEvent::Engine(message) => apply_engine_message(snapshot, message),
         DaemonEvent::TaskChanged(task) => apply_task_changed(snapshot, task),

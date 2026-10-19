@@ -1,4 +1,6 @@
-//! 状态栏：左 = 全局速度 + 全部暂停 / 全部开始；右 = 限速、代理、完成后关机、剩余空间。
+//! 下载能力提供给 shell 的可摆放控件：全局速度、全部暂停 / 全部开始、限速、代理、
+//! 完成后关机、剩余空间。默认摆在状态栏，用户可经 chrome 布局拖到顶栏 / 活动栏；
+//! 控件窗口级显示（不随路由切换消失），由 app 把 [`DownloadWidget`] 登记为 shell 控件。
 //!
 //! 下载限速走云同步偏好写入；上传限速与代理模式走 `DownloadsCommand::PatchConfig`
 //!（`upload_limit_bytes` 为字节/秒，`proxy_mode` 为现有四模式之一）。
@@ -17,7 +19,7 @@ use fluxdown_ui_components::{
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    Anchor, App, AppContext as _, ClickEvent, Context, Div, Hsla, InteractiveElement as _,
+    Anchor, AnyElement, App, AppContext as _, Context, Div, Hsla, InteractiveElement as _,
     IntoElement, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, WeakEntity,
     Window, div, prelude::FluentBuilder as _,
 };
@@ -41,6 +43,133 @@ use crate::{
 const SPEED_PRESETS_MB: [i64; 4] = [1, 5, 10, 50];
 /// 完成后关机延迟预设（分钟）。
 const SHUTDOWN_PRESETS_MIN: [i64; 4] = [1, 5, 10, 30];
+
+/// 下载能力的可摆放控件；[`Self::id`] 是 chrome 布局里的稳定 id（与 Web 同名）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadWidget {
+    DownloadSpeed,
+    UploadSpeed,
+    PauseAll,
+    ResumeAll,
+    DownloadLimit,
+    UploadLimit,
+    Proxy,
+    Shutdown,
+    DiskFree,
+}
+
+impl DownloadWidget {
+    /// 默认顺序（状态栏自左向右）。
+    pub const ALL: [Self; 9] = [
+        Self::DownloadSpeed,
+        Self::UploadSpeed,
+        Self::PauseAll,
+        Self::ResumeAll,
+        Self::DownloadLimit,
+        Self::UploadLimit,
+        Self::Proxy,
+        Self::Shutdown,
+        Self::DiskFree,
+    ];
+
+    /// chrome 布局中的稳定 id。
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::DownloadSpeed => "downloadSpeed",
+            Self::UploadSpeed => "uploadSpeed",
+            Self::PauseAll => "pauseAll",
+            Self::ResumeAll => "resumeAll",
+            Self::DownloadLimit => "downloadLimit",
+            Self::UploadLimit => "uploadLimit",
+            Self::Proxy => "proxy",
+            Self::Shutdown => "shutdown",
+            Self::DiskFree => "diskFree",
+        }
+    }
+
+    /// 编辑布局时的占位 / 拖拽预览文案键。
+    #[must_use]
+    pub const fn label_key(self) -> &'static str {
+        match self {
+            Self::DownloadSpeed => "chromeWidgetDownloadSpeed",
+            Self::UploadSpeed => "chromeWidgetUploadSpeed",
+            Self::PauseAll => "pauseAll",
+            Self::ResumeAll => "resumeAll",
+            Self::DownloadLimit => "speedLimitTitle",
+            Self::UploadLimit => "uploadLimit",
+            Self::Proxy => "statusBarProxyLabel",
+            Self::Shutdown => "shutdownTitle",
+            Self::DiskFree => "chromeWidgetDiskFree",
+        }
+    }
+
+    /// 纯文字读数（速度、剩余空间）：没有图标形态，放不进窄活动栏。
+    #[must_use]
+    pub const fn is_text_readout(self) -> bool {
+        matches!(
+            self,
+            Self::DownloadSpeed | Self::UploadSpeed | Self::DiskFree
+        )
+    }
+}
+
+/// 控件摆放处的呈现要求：`compact` = 窄活动栏，只留图标、数值并入悬浮提示；
+/// `menu_anchor` = 下拉菜单相对触发器的锚点（底部区域向上弹、顶部区域向下弹）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WidgetPlacement {
+    pub compact: bool,
+    pub menu_anchor: Anchor,
+}
+
+/// 限速控件的静态参数。
+struct SpeedLimitControl {
+    element_id: &'static str,
+    icon: FluxIcon,
+    title_key: &'static str,
+    /// `speed_limit_bytes` 或 `upload_limit_bytes`（字节/秒）。
+    config_key: &'static str,
+}
+
+const DOWNLOAD_LIMIT: SpeedLimitControl = SpeedLimitControl {
+    element_id: "status-download-limit",
+    icon: FluxIcon::ArrowDown,
+    title_key: "speedLimitTitle",
+    config_key: "speed_limit_bytes",
+};
+
+const UPLOAD_LIMIT: SpeedLimitControl = SpeedLimitControl {
+    element_id: "status-upload-limit",
+    icon: FluxIcon::ArrowUp,
+    title_key: "uploadLimit",
+    config_key: "upload_limit_bytes",
+};
+
+/// 紧凑摆放的悬浮提示：标题 + 当前值。
+pub(super) fn compact_tooltip(title: &str, value: &str) -> SharedString {
+    SharedString::from(format!("{title} · {value}"))
+}
+
+/// 纯文字读数（图标 + 数值）：自带 caption 字号、等宽数字与二级文字色，放在任何承载条都一致。
+fn readout_cell(icon: FluxIcon, text: impl Into<SharedString>, cx: &App) -> AnyElement {
+    let theme = active_theme(cx);
+    let extended = theme.extended();
+    let spacing = theme.tokens().spacing;
+    let muted = theme.tokens().colors.muted_foreground;
+    h_flex()
+        .flex_none()
+        .items_center()
+        .gap(spacing.xxs)
+        .px(spacing.xs)
+        .whitespace_nowrap()
+        .text_size(extended.caption.size)
+        .line_height(extended.caption.line_height)
+        .font_features(tabular_numbers())
+        .text_color(muted)
+        .child(Icon::new(icon).size(extended.icon.sm).text_color(muted))
+        .child(text.into())
+        .into_any_element()
+}
 
 /// 状态栏带文字的小按钮外壳：ghost、`density.statusControl` 高、横向 `spacing.xs`。
 ///
@@ -240,15 +369,20 @@ impl DownloadView {
     }
 
     /// 下载 / 上传限速控件：图标 + 当前值的幽灵按钮，点开自动收起的菜单（预设 + 自定义）。
-    /// `config_key` 为 `speed_limit_bytes` 或 `upload_limit_bytes`（字节/秒）。
+    /// 紧凑摆放只留图标，当前值并入悬浮提示。
     fn render_speed_limit_control(
         &self,
-        element_id: &'static str,
-        icon: FluxIcon,
-        title_key: &'static str,
-        config_key: &'static str,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+        control: &SpeedLimitControl,
+        placement: WidgetPlacement,
+        view: WeakEntity<Self>,
+        cx: &App,
+    ) -> AnyElement {
+        let SpeedLimitControl {
+            element_id,
+            icon,
+            title_key,
+            config_key,
+        } = *control;
         let translator = self.translator.read(cx);
         let value = self
             .controller
@@ -276,7 +410,11 @@ impl DownloadView {
             cancel_label: SharedString::from(translator.text("cancel").to_owned()),
             confirm_label: SharedString::from(translator.text("confirm").to_owned()),
         };
-        let view = cx.weak_entity();
+        let tooltip = if placement.compact {
+            compact_tooltip(&title, &trigger_label)
+        } else {
+            title.clone()
+        };
 
         // 限速生效时触发器用强调色文字，一眼可见当前被限速；未限速保持中性。
         let limited_color = (value > 0).then(|| active_theme(cx).extended().colors.accent_text);
@@ -284,12 +422,12 @@ impl DownloadView {
         status_button(element_id, cx)
             .child(status_button_content(
                 Some(icon),
-                Some(trigger_label),
+                (!placement.compact).then_some(trigger_label),
                 limited_color,
                 cx,
             ))
-            .tooltip(title.clone())
-            .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
+            .tooltip(tooltip)
+            .dropdown_menu_with_anchor(placement.menu_anchor, move |menu, _, _| {
                 let mut menu = menu.item(
                     PopupMenuItem::new(off_label.clone())
                         .checked(value <= 0)
@@ -339,15 +477,15 @@ impl DownloadView {
                         }),
                 )
             })
+            .into_any_element()
     }
 
     /// 完成后关机控件：未启用时只显示电源图标（悬浮提示 + 预设菜单）；
-    /// 已启用 / 倒计时中显示 warning 色倒计时文字，点击取消。
-    fn render_shutdown_control(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// 已启用 / 倒计时中显示 warning 色倒计时文字，点击取消（紧凑摆放只留 warning 色图标）。
+    /// 宿主未注入关机端口时为 `None`。
+    fn render_shutdown_control(&self, placement: WidgetPlacement, cx: &App) -> Option<AnyElement> {
         let translator = self.translator.read(cx);
-        let Some(shutdown) = self.host.shutdown.clone() else {
-            return div().into_any_element();
-        };
+        let shutdown = self.host.shutdown.clone()?;
         let status = self
             .host
             .shutdown_status
@@ -376,16 +514,24 @@ impl DownloadView {
             })
         };
         if let Some(text) = armed_text {
-            return status_button("shutdown-cancel", cx)
-                .tooltip(cancel_label)
-                .child(status_button_content(
-                    Some(FluxIcon::Power),
-                    Some(SharedString::from(text)),
-                    Some(warning),
-                    cx,
-                ))
-                .on_click(move |_, _, cx| shutdown(ShutdownRequest::Disarm, cx))
-                .into_any_element();
+            let text = SharedString::from(text);
+            let (label, tooltip) = if placement.compact {
+                (None, compact_tooltip(&cancel_label, &text))
+            } else {
+                (Some(text), cancel_label)
+            };
+            return Some(
+                status_button("shutdown-cancel", cx)
+                    .tooltip(tooltip)
+                    .child(status_button_content(
+                        Some(FluxIcon::Power),
+                        label,
+                        Some(warning),
+                        cx,
+                    ))
+                    .on_click(move |_, _, cx| shutdown(ShutdownRequest::Disarm, cx))
+                    .into_any_element(),
+            );
         }
 
         let title = SharedString::from(translator.text("shutdownTitle").to_owned());
@@ -410,7 +556,7 @@ impl DownloadView {
             })
             .collect();
 
-        status_button("shutdown-trigger", cx)
+        let trigger = status_button("shutdown-trigger", cx)
             .min_w(active_theme(cx).density().status_control)
             .child(status_button_content(Some(FluxIcon::Power), None, None, cx))
             .tooltip(if can_arm {
@@ -418,7 +564,7 @@ impl DownloadView {
             } else {
                 need_active_hint
             })
-            .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
+            .dropdown_menu_with_anchor(placement.menu_anchor, move |menu, _, _| {
                 let mut menu = menu.item(
                     PopupMenuItem::new(immediate_label.clone())
                         .disabled(!can_arm)
@@ -461,21 +607,33 @@ impl DownloadView {
                             }
                         }),
                 )
-            })
-            .into_any_element()
+            });
+        Some(trigger.into_any_element())
     }
 
-    /// 状态栏里的小图标按钮（全部暂停 / 全部开始）；`blocker` 为不可用原因：有值时置灰
-    /// 禁用，tooltip 改为说明原因（tooltip 挂在外层，禁用时仍可悬停）。
+    /// 全部暂停 / 全部开始小图标按钮；不可用时置灰禁用，tooltip 改为说明原因
+    /// （tooltip 挂在外层，禁用时仍可悬停）。
     fn render_status_action(
         &self,
-        id: &'static str,
-        label: SharedString,
-        icon: FluxIcon,
         command: ToolbarCommand,
-        blocker: Option<SharedString>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+        view: WeakEntity<Self>,
+        cx: &App,
+    ) -> AnyElement {
+        let (id, label, icon, blocker) = if matches!(command, ToolbarCommand::PauseAll) {
+            (
+                "status-pause-all",
+                self.strings.pause_all.clone(),
+                FluxIcon::Pause,
+                self.pause_all_blocker(),
+            )
+        } else {
+            (
+                "status-resume-all",
+                self.strings.resume_all.clone(),
+                FluxIcon::Play,
+                self.resume_all_blocker(),
+            )
+        };
         let theme = active_theme(cx);
         let icon_size = theme.extended().icon.sm;
         let control_size = theme.density().status_control;
@@ -491,126 +649,63 @@ impl DownloadView {
             cx,
         )
         .size(control_size)
-        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.execute_toolbar(command, cx);
-        }));
+        .on_click(move |_, _, cx| {
+            let Ok(()) = view.update(cx, |this, cx| this.execute_toolbar(command, cx)) else {
+                // 视图已释放，结束这次回调而不再更新状态。
+                return;
+            };
+        });
         div()
             .id(SharedString::from(format!("{id}-tooltip")))
             .flex_none()
             .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
             .child(button)
+            .into_any_element()
     }
 
-    /// 状态栏：左 = 全局速度 + 全部暂停 / 全部开始；右 = 限速、代理、完成后关机、剩余空间。
-    pub(crate) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// 渲染一个可摆放控件（由 shell 在布局指定的位置调用）。`None` = 当前没有内容
+    /// （尚无剩余空间数据、宿主未注入关机端口），该位置不占空间。
+    pub fn render_widget(
+        &self,
+        widget: DownloadWidget,
+        placement: WidgetPlacement,
+        view: &WeakEntity<Self>,
+        cx: &App,
+    ) -> Option<AnyElement> {
         let stats = self.controller.runtime_stats();
-        let download_speed = format!("{}/s", format_bytes(stats.total_download_bps.max(0) as u64));
-        let upload_speed = format!("{}/s", format_bytes(stats.total_upload_bps.max(0) as u64));
-        let disk_free = stats.disk_free_bytes.map(|bytes| {
-            self.translator
-                .read(cx)
-                .text_with("diskSpaceFreeLabel", &[("size", &format_bytes(bytes))])
-        });
-
-        let theme = active_theme(cx);
-        let spacing = theme.tokens().spacing;
-        let muted = theme.tokens().colors.muted_foreground;
-        let extended = theme.extended();
-        let chrome = extended.colors.chrome;
-        let hairline = extended.colors.hairline;
-        let stroke = extended.stroke.thin;
-        let bar_height = theme.density().status_bar;
-        let caption_size = extended.caption.size;
-        let caption_line_height = extended.caption.line_height;
-        let icon_size = extended.icon.sm;
-
-        let pause_all = self.render_status_action(
-            "status-pause-all",
-            self.strings.pause_all.clone(),
-            FluxIcon::Pause,
-            ToolbarCommand::PauseAll,
-            self.pause_all_blocker(),
-            cx,
-        );
-        let resume_all = self.render_status_action(
-            "status-resume-all",
-            self.strings.resume_all.clone(),
-            FluxIcon::Play,
-            ToolbarCommand::ResumeAll,
-            self.resume_all_blocker(),
-            cx,
-        );
-        let download_limit = self.render_speed_limit_control(
-            "status-download-limit",
-            FluxIcon::ArrowDown,
-            "speedLimitTitle",
-            "speed_limit_bytes",
-            cx,
-        );
-        let upload_limit = self.render_speed_limit_control(
-            "status-upload-limit",
-            FluxIcon::ArrowUp,
-            "uploadLimit",
-            "upload_limit_bytes",
-            cx,
-        );
-        let proxy_control = self.render_proxy_control(cx);
-        let shutdown_control = self.render_shutdown_control(cx);
-        let icon_cell = move |icon: FluxIcon, text: String| {
-            h_flex()
-                .flex_none()
-                .items_center()
-                .gap(spacing.xxs)
-                .child(Icon::new(icon).size(icon_size).text_color(muted))
-                .child(text)
-        };
-
-        h_flex()
-            .w_full()
-            .h(bar_height)
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .gap(spacing.md)
-            .px(spacing.sm)
-            .bg(chrome)
-            .border_t(stroke)
-            .border_color(hairline)
-            .text_size(caption_size)
-            .line_height(caption_line_height)
-            .font_features(tabular_numbers())
-            .text_color(muted)
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap(spacing.md)
-                    .child(icon_cell(FluxIcon::ArrowDown, download_speed))
-                    .child(icon_cell(FluxIcon::ArrowUp, upload_speed))
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(spacing.xxs)
-                            .child(pause_all)
-                            .child(resume_all),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap(spacing.xs)
-                    .child(download_limit)
-                    .child(upload_limit)
-                    .child(proxy_control)
-                    .child(shutdown_control)
-                    .children(
-                        // 与左侧按钮内边距对齐，使右侧控件与磁盘信息的视觉间距一致。
-                        disk_free.map(|disk_free| {
-                            icon_cell(FluxIcon::HardDrive, disk_free).px(spacing.xs)
-                        }),
-                    ),
-            )
+        match widget {
+            DownloadWidget::DownloadSpeed => Some(readout_cell(
+                FluxIcon::ArrowDown,
+                format!("{}/s", format_bytes(stats.total_download_bps.max(0) as u64)),
+                cx,
+            )),
+            DownloadWidget::UploadSpeed => Some(readout_cell(
+                FluxIcon::ArrowUp,
+                format!("{}/s", format_bytes(stats.total_upload_bps.max(0) as u64)),
+                cx,
+            )),
+            DownloadWidget::PauseAll => {
+                Some(self.render_status_action(ToolbarCommand::PauseAll, view.clone(), cx))
+            }
+            DownloadWidget::ResumeAll => {
+                Some(self.render_status_action(ToolbarCommand::ResumeAll, view.clone(), cx))
+            }
+            DownloadWidget::DownloadLimit => {
+                Some(self.render_speed_limit_control(&DOWNLOAD_LIMIT, placement, view.clone(), cx))
+            }
+            DownloadWidget::UploadLimit => {
+                Some(self.render_speed_limit_control(&UPLOAD_LIMIT, placement, view.clone(), cx))
+            }
+            DownloadWidget::Proxy => Some(self.render_proxy_control(placement, view.clone(), cx)),
+            DownloadWidget::Shutdown => self.render_shutdown_control(placement, cx),
+            DownloadWidget::DiskFree => stats.disk_free_bytes.map(|bytes| {
+                let text = self
+                    .translator
+                    .read(cx)
+                    .text_with("diskSpaceFreeLabel", &[("size", &format_bytes(bytes))]);
+                readout_cell(FluxIcon::HardDrive, text, cx)
+            }),
+        }
     }
 }
 

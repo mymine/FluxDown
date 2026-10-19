@@ -21,9 +21,9 @@ describe('market logic', () => {
     expect(list.map((e) => `${e.pluginId}@${e.version}`)).toEqual(['a@1.1.0', 'b@1.0.0'])
   })
 
-  test('latestPerPlugin：全部撤回时取 sequence 最大者', () => {
-    const list = latestPerPlugin([entry('a', '1.0.0', 1, 'deprecated'), entry('a', '1.1.0', 2, 'vulnerable')])
-    expect(list[0]?.version).toBe('1.1.0')
+  test('latestPerPlugin：全部撤回（下架）的插件不出现', () => {
+    const list = latestPerPlugin([entry('a', '1.0.0', 1, 'deprecated'), entry('a', '1.1.0', 2, 'vulnerable'), entry('b', '1.0.0', 3)])
+    expect(list.map((e) => e.pluginId)).toEqual(['b'])
   })
 
   test('versionNewer：忽略前导 v 与预发布后缀，无法解析视为不更新', () => {

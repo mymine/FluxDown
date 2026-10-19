@@ -252,6 +252,10 @@ impl Projection {
             }
             DaemonEvent::TaskActivityAdded(_)
             | DaemonEvent::TaskNotice(_)
+            // 插件可移植视图事件：v1 移动端不渲染插件 UI，不改变投影。
+            | DaemonEvent::PluginViewFrame(_)
+            | DaemonEvent::PluginViewClosed { .. }
+            | DaemonEvent::PluginToast { .. }
             | DaemonEvent::PluginsChanged(_)
             | DaemonEvent::ComponentsChanged(_)
             | DaemonEvent::WebhooksChanged(_)

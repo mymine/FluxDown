@@ -1,14 +1,15 @@
 // 全局账号 / 互联守卫：入站局域网配对请求确认 + 会话被撤销的一次性提示。挂在 AppShell，任何页面都生效。
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useT } from '../i18n'
 import { rpc, useAgent, useServiceEvents } from '../lib/rpc'
-import type { EventFrame, LinkPairingRequestDto } from '../lib/rpc'
+import type { EventFrame, LinkDeviceInfo, LinkPairingRequestDto } from '../lib/rpc'
 import { accountErrorKey } from '../pages/settings/sections/account/errorText'
 import { sessionRevokedKey } from '../pages/settings/sections/account/sessionNotice'
 import { Button, Dialog, DialogFooter, FieldHint, toast } from '../ui'
 
 const NO_REQUESTS: readonly LinkPairingRequestDto[] = []
+const NO_LINKED: readonly LinkDeviceInfo[] = []
 
 function useSecondsLeft(expiresAtUnixMs: number): number {
   const [now, setNow] = useState(() => Date.now())
@@ -20,29 +21,42 @@ function useSecondsLeft(expiresAtUnixMs: number): number {
   return Math.max(0, Math.ceil((expiresAtUnixMs - now) / 1000))
 }
 
-function RequestDialog({ request }: { request: LinkPairingRequestDto }) {
+function RequestDialog({ request, onApproved }: { request: LinkPairingRequestDto; onApproved: (request: LinkPairingRequestDto) => void }) {
   const t = useT()
   const [busy, setBusy] = useState(false)
   const seconds = useSecondsLeft(request.expiresAtUnixMs)
+  const decided = useRef(false)
 
-  const decide = async (accept: boolean) => {
-    if (busy) return
-    setBusy(true)
-    try {
-      await rpc.agent.link.approve({ sessionId: request.sessionId, accept })
-      if (accept) toast.key('localPairingPaired', 'success', { device: request.peerName })
-    } catch (error) {
-      toast.key(accountErrorKey(error), 'error')
-    } finally {
-      setBusy(false)
-    }
-  }
+  const decide = useCallback(
+    async (accept: boolean) => {
+      if (decided.current) return
+      decided.current = true
+      setBusy(true)
+      try {
+        await rpc.agent.link.approve({ sessionId: request.sessionId, accept })
+        // 批准后不提前提示：由宿主等 linkedDevices 出现该指纹再报「已配对」。
+        if (accept) onApproved(request)
+      } catch (error) {
+        decided.current = false
+        toast.key(accountErrorKey(error), 'error')
+      } finally {
+        setBusy(false)
+      }
+    },
+    [request, onApproved],
+  )
+
+  // 到期自动拒绝。
+  useEffect(() => {
+    if (seconds === 0) void decide(false)
+  }, [seconds, decide])
 
   return (
     <Dialog
       open
-      onOpenChange={(open) => !open && void decide(false)}
-      modalLocked={busy}
+      // Esc / 遮罩不误拒：只有显式按钮才决定。
+      onOpenChange={() => undefined}
+      modalLocked
       title={t('localPairingIncomingTitle')}
       description={t('localPairingIncomingDesc', { device: request.peerName })}
       footer={
@@ -68,11 +82,41 @@ function RequestDialog({ request }: { request: LinkPairingRequestDto }) {
   )
 }
 
-/** 入站配对请求：一次只处理队首，处理后自动轮到下一条。 */
+/** 批准后等待 `linkedDevicesChanged` 出现该指纹的最长时间。 */
+const APPROVE_CONFIRM_WINDOW_MS = 30_000
+
+/** 入站配对请求：一次只处理队首，处理后自动轮到下一条；批准的请求等设备名册出现该指纹再提示已配对。 */
 function PairingRequestHost() {
   const requests = useAgent((snapshot) => snapshot.linkPairingRequests ?? NO_REQUESTS, NO_REQUESTS)
+  const linked = useAgent((snapshot) => snapshot.linkedDevices, NO_LINKED)
+  const awaiting = useRef(new Map<string, { name: string; deadline: number; basePairedAt: number | null }>())
+  const linkedRef = useRef(linked)
+  linkedRef.current = linked
   const first = requests[0]
-  return first ? <RequestDialog key={first.sessionId} request={first} /> : null
+
+  // 记录批准时该指纹的 pairedAt 基线：已存在（重新配对）时 pairedAt 变化也算成功，仅新出现不够。
+  const onApproved = useCallback((request: LinkPairingRequestDto) => {
+    const existing = linkedRef.current.find((device) => device.fingerprint === request.peerFingerprint && !device.revoked)
+    awaiting.current.set(request.peerFingerprint, {
+      name: request.peerName,
+      deadline: Date.now() + APPROVE_CONFIRM_WINDOW_MS,
+      basePairedAt: existing ? existing.pairedAt : null,
+    })
+  }, [])
+
+  useEffect(() => {
+    for (const [fingerprint, entry] of awaiting.current) {
+      const device = linked.find((item) => item.fingerprint === fingerprint && !item.revoked)
+      if (device && (entry.basePairedAt === null || device.pairedAt !== entry.basePairedAt)) {
+        awaiting.current.delete(fingerprint)
+        toast.key('localPairingPaired', 'success', { device: entry.name })
+      } else if (entry.deadline < Date.now()) {
+        awaiting.current.delete(fingerprint)
+      }
+    }
+  }, [linked])
+
+  return first ? <RequestDialog key={first.sessionId} request={first} onApproved={onApproved} /> : null
 }
 
 /** agent 推送的会话撤销通知（主动登出 / 删本设备不会发）：按 reason 一次性提示。 */

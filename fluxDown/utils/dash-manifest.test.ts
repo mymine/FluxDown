@@ -185,7 +185,8 @@ describe("parseDashXml — 标准 MPD XML 结构识别", () => {
       height: 360,
       downloadable: false,
     });
-    expect(result!.video[0].url).toContain("video/__fluxdown_segment__/");
+    // 清单已知的 $RepresentationID$ 展开，未知的 $Number$ 保留占位符
+    expect(result!.video[0].url).toContain("video/360/seg-__fluxdown_segment__.m4s");
   });
 
   test("非 MPD XML 返回 null", () => {

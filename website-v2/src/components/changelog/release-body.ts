@@ -146,6 +146,8 @@ function classify(name: string, t: T): { group: string; sub: string } {
     if (qnap) return { group: "NAS", sub: `QNAP ${qnap[1]}` };
     const syno = /-synology-(dsm6|dsm7)-(x64|arm64)\.spk$/.exec(n);
     if (syno) return { group: "NAS", sub: `Synology ${syno[1]!.toUpperCase()} ${syno[2]}` };
+    const fnos = /-fnos-(x64|arm64)\.fpk$/.exec(n);
+    if (fnos) return { group: "NAS", sub: `fnOS ${fnos[1]}` };
     return { group: "Server", sub: platLabel || name };
   }
   if (n.startsWith("luci-app-fluxdown_") && n.endsWith(".ipk")) return { group: "NAS", sub: "OpenWrt LuCI" };

@@ -20,12 +20,12 @@ use serde_json::Value;
 use super::install::{InstallTarget, ReleaseComponent};
 use crate::http_client::HttpClientError;
 
-/// 官方站点，按优先级：现行域名在前，迁移后的新域名在后；两者长期并存，任一失效时自动换用另一个。
-const DEFAULT_API_BASES: [&str; 2] = ["https://fluxdown.zerx.dev", "https://fluxdown.com"];
+/// 官方站点，按优先级：主域名在前，旧域名在后；两者长期并存，任一失效时自动换用另一个。
+const DEFAULT_API_BASES: [&str; 2] = ["https://fluxdown.com", "https://fluxdown.zerx.dev"];
 /// 未检查前（初始状态）展示的发布页。检查后改用胜出站点的 `/changelog`。
-pub(super) const RELEASE_PAGE_URL: &str = "https://fluxdown.zerx.dev/changelog";
+pub(super) const RELEASE_PAGE_URL: &str = "https://fluxdown.com/changelog";
 /// 首选站点在此时长内无结果，才并行请求下一个站点（避免每次都双发请求）。
-const FALLBACK_STAGGER: Duration = Duration::from_secs(3);
+pub(super) const FALLBACK_STAGGER: Duration = Duration::from_secs(3);
 const CHANGELOG_PER_PAGE: u32 = 50;
 
 /// 更新服务错误。
@@ -66,14 +66,10 @@ impl Endpoint {
         if let Ok(base) = std::env::var("FLUXDOWN_UPDATE_BASE_URL") {
             let base = base.trim().trim_end_matches('/');
             if !base.is_empty() {
-                return Self::with_base(base, true);
+                return Self::with_bases(&[base], true, FALLBACK_STAGGER);
             }
         }
         Self::with_bases(&DEFAULT_API_BASES, false, FALLBACK_STAGGER)
-    }
-
-    pub(super) fn with_base(base: &str, trust_any: bool) -> Self {
-        Self::with_bases(&[base], trust_any, FALLBACK_STAGGER)
     }
 
     pub(super) fn with_bases(bases: &[&str], trust_any: bool, stagger: Duration) -> Self {
@@ -468,7 +464,7 @@ mod tests {
 
     #[test]
     fn desktop_component_uses_top_level_assets_in_key_priority() {
-        let endpoint = Endpoint::with_base(DEFAULT_API_BASES[0], false);
+        let endpoint = Endpoint::with_bases(&[DEFAULT_API_BASES[0]], false, FALLBACK_STAGGER);
         let release = release_json()
             .component(
                 &target(
@@ -496,13 +492,13 @@ mod tests {
         assert_eq!(asset.name, "FluxDown-1.4.0-setup.exe");
         assert_eq!(
             asset.download_url,
-            "https://fluxdown.zerx.dev/api/download/FluxDown-1.4.0-setup.exe"
+            "https://fluxdown.com/api/download/FluxDown-1.4.0-setup.exe"
         );
     }
 
     #[test]
     fn server_component_reads_server_block() {
-        let endpoint = Endpoint::with_base(DEFAULT_API_BASES[0], false);
+        let endpoint = Endpoint::with_bases(&[DEFAULT_API_BASES[0]], false, FALLBACK_STAGGER);
         let release = release_json()
             .component(
                 &target(ReleaseComponent::Server, &["linux_arm64", "linux_x64"]),
@@ -519,7 +515,7 @@ mod tests {
 
     #[test]
     fn missing_asset_or_server_block() {
-        let endpoint = Endpoint::with_base(DEFAULT_API_BASES[0], false);
+        let endpoint = Endpoint::with_bases(&[DEFAULT_API_BASES[0]], false, FALLBACK_STAGGER);
         let none = release_json()
             .component(&target(ReleaseComponent::Desktop, &[]), &endpoint)
             .unwrap();
@@ -535,7 +531,7 @@ mod tests {
 
     #[test]
     fn debug_endpoint_override_trusts_any_host() {
-        let endpoint = Endpoint::with_base("http://127.0.0.1:9/", true);
+        let endpoint = Endpoint::with_bases(&["http://127.0.0.1:9/"], true, FALLBACK_STAGGER);
         let raw: RawRelease = serde_json::from_value(json!({
             "version": "1.0.0", "tag": "v1.0.0",
             "assets": { "setup": { "name": "a", "size": 1, "download_url": "/api/download/a" } }
@@ -552,12 +548,12 @@ mod tests {
 
     #[test]
     fn package_url_encodes_name_and_tag() {
-        let endpoint = Endpoint::with_base("https://fluxdown.zerx.dev/", false);
+        let endpoint = Endpoint::with_bases(&["https://fluxdown.com/"], false, FALLBACK_STAGGER);
         assert_eq!(
             endpoint
                 .package_url("FluxDown 1.4.0.zip", "v1.4.0-rc.1+b")
                 .unwrap(),
-            "https://fluxdown.zerx.dev/api/download/FluxDown%201.4.0.zip?tag=v1.4.0-rc.1%2Bb"
+            "https://fluxdown.com/api/download/FluxDown%201.4.0.zip?tag=v1.4.0-rc.1%2Bb"
         );
     }
 
@@ -579,7 +575,7 @@ mod tests {
 
     #[test]
     fn mobile_component_reads_mobile_block_and_falls_back_to_universal() {
-        let endpoint = Endpoint::with_base(DEFAULT_API_BASES[0], false);
+        let endpoint = Endpoint::with_bases(&[DEFAULT_API_BASES[0]], false, FALLBACK_STAGGER);
         let raw = || -> RawRelease {
             serde_json::from_value(json!({
                 "version": "1.4.0",
@@ -610,7 +606,7 @@ mod tests {
         assert_eq!(asset.name, "FluxDown-1.4.0-rc.2-android-universal.apk");
         assert_eq!(
             asset.download_url,
-            "https://fluxdown.zerx.dev/api/download/u.apk?tag=v1.4.0-rc.2"
+            "https://fluxdown.com/api/download/u.apk?tag=v1.4.0-rc.2"
         );
         let without_mobile: RawRelease =
             serde_json::from_value(json!({ "version": "1.4.0", "mobile": null })).unwrap();
@@ -630,22 +626,22 @@ mod tests {
         assert_eq!(endpoint.attempt_order(), [0, 1]);
         assert_eq!(
             endpoint.release_url_at(1, "stable").as_deref(),
-            Some("https://fluxdown.com/api/release?channel=stable")
+            Some("https://fluxdown.zerx.dev/api/release?channel=stable")
         );
         assert_eq!(endpoint.release_url_at(2, "stable"), None);
         endpoint.set_active(1);
         assert_eq!(endpoint.attempt_order(), [1, 0]);
         assert_eq!(
             endpoint.release_page_url(),
-            "https://fluxdown.com/changelog"
+            "https://fluxdown.zerx.dev/changelog"
         );
         assert_eq!(
             endpoint.package_url("a.apk", "v1.0.0").unwrap(),
-            "https://fluxdown.com/api/download/a.apk?tag=v1.0.0"
+            "https://fluxdown.zerx.dev/api/download/a.apk?tag=v1.0.0"
         );
         assert_eq!(
             endpoint.absolute("/api/download/a.apk"),
-            "https://fluxdown.com/api/download/a.apk"
+            "https://fluxdown.zerx.dev/api/download/a.apk"
         );
         // 越界下标不改变当前站点。
         endpoint.set_active(5);

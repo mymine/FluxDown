@@ -3,10 +3,17 @@ import type { CloudDevice, LinkDeviceInfo } from '../../../lib/rpc'
 import {
   buildRemoteTargets,
   checkRemoteSaveDir,
+  dispatchRoute,
   linkDispatchParams,
   remoteDispatchParams,
+  resolveTargetValue,
   summarizeDispatch,
 } from './target'
+import { mergeDevices, sidebarDevices } from '../model/devices'
+
+function link(over: Partial<LinkDeviceInfo>): LinkDeviceInfo {
+  return { fingerprint: 'fp', name: 'Phone', online: true, pairedAt: 0, lastSeenAt: 0, revoked: false, ...over }
+}
 
 function cloud(over: Partial<CloudDevice>): CloudDevice {
   return {
@@ -61,7 +68,7 @@ describe('下发参数', () => {
 describe('目标列表', () => {
   test('云设备去掉本机，路径风格未上报时按平台推断', () => {
     const linked: LinkDeviceInfo[] = [
-      { fingerprint: 'fp', name: 'Phone', online: true, pairedAt: 0, lastSeenAt: 0, platform: 'android', defaultSaveDir: '/sdcard' },
+      link({ platform: 'android', defaultSaveDir: '/sdcard' }),
     ]
     const targets = buildRemoteTargets(
       [
@@ -79,15 +86,71 @@ describe('目标列表', () => {
   })
 
   test('cloud disconnection hides stale presence without hiding dispatch targets or LAN presence', () => {
-    const linked: LinkDeviceInfo[] = [
-      { fingerprint: 'fp', name: 'Phone', online: true, pairedAt: 0, lastSeenAt: 0 },
-    ]
+    const linked: LinkDeviceInfo[] = [link({})]
     const cloudDevices = [cloud({ isOnline: true })]
     const targets = buildRemoteTargets(cloudDevices, linked, { cloud: false, local: true })
     expect(targets.map((target) => target.online)).toEqual([null, true])
     expect(targets.map((target) => target.value)).toEqual(['cloud:dev', 'link:fp'])
     expect(buildRemoteTargets(cloudDevices, linked, { cloud: false, local: false }).map((target) => target.online))
       .toEqual([null, null])
+  })
+
+  const presence = { cloud: true, local: true }
+
+  test('cloudDeviceId 命中云条目 → 挂接，不单独成条；显示云名，云优先目录', () => {
+    const cloudDevices = [cloud({ deviceId: 'pc', name: 'PC', isOnline: false })]
+    const linked = [link({ cloudDeviceId: 'pc', online: true, defaultSaveDir: '/x' })]
+    const entries = mergeDevices(cloudDevices, linked, presence)
+    expect(entries).toHaveLength(1)
+    expect(entries[0]).toMatchObject({ id: 'pc', kind: 'cloud', name: 'PC', online: true, linkFingerprint: 'fp', linkOnline: true, defaultSaveDir: '/x' })
+  })
+
+  test('挂接在线组合：任一在线 → 在线；否则任一未知 → 未知；否则离线', () => {
+    const cloudDevices = [cloud({ deviceId: 'pc', name: 'PC', isOnline: false })]
+    const linked = [link({ cloudDeviceId: 'pc', online: false })]
+    expect(mergeDevices(cloudDevices, linked, presence)[0]?.online).toBe(false)
+    expect(mergeDevices(cloudDevices, linked, { cloud: false, local: true })[0]?.online).toBeNull()
+    expect(mergeDevices([cloud({ deviceId: 'pc', name: 'PC', isOnline: true })], linked, { cloud: true, local: false })[0]?.online).toBe(true)
+  })
+
+  test('cloudDeviceId 无对应云条目 / 云条目已挂接 → 独立直连；revoked 排除', () => {
+    const cloudDevices = [cloud({ deviceId: 'pc', name: 'PC' })]
+    const linked = [
+      link({ fingerprint: 'a', name: 'A', cloudDeviceId: 'pc' }),
+      link({ fingerprint: 'b', name: 'B', cloudDeviceId: 'pc' }),
+      link({ fingerprint: 'c', name: 'C', cloudDeviceId: 'zzz' }),
+      link({ fingerprint: 'd', name: 'D', revoked: true }),
+    ]
+    const targets = buildRemoteTargets(cloudDevices, linked, presence)
+    expect(targets.map((target) => target.value)).toEqual(['cloud:pc', 'link:b', 'link:c'])
+    expect(targets[0]?.linkFingerprint).toBe('a')
+  })
+
+  test('合并后整表同名消歧：云 id / 指纹短码', () => {
+    const cloudDevices = [cloud({ deviceId: 'dev-AAAA1111', name: 'PC' })]
+    const linked = [link({ fingerprint: 'fp-bbbb2222', name: ' pc ' }), link({ fingerprint: 'fp-cc', name: '' })]
+    expect(mergeDevices(cloudDevices, linked, presence).map((entry) => entry.name)).toEqual(['PC · 1111', 'pc · 2222', 'fpcc'])
+  })
+
+  test('下发路由：独立直连 / 挂接且直连在线走 link，否则走云', () => {
+    const cloudDevices = [cloud({ deviceId: 'pc', name: 'PC' })]
+    const attachedOnline = buildRemoteTargets(cloudDevices, [link({ cloudDeviceId: 'pc', online: true })], presence)[0]
+    const attachedOffline = buildRemoteTargets(cloudDevices, [link({ cloudDeviceId: 'pc', online: false })], presence)[0]
+    const standalone = buildRemoteTargets([], [link({})], presence)[0]
+    expect(attachedOnline && dispatchRoute(attachedOnline)).toEqual({ via: 'link', fingerprint: 'fp' })
+    expect(attachedOffline && dispatchRoute(attachedOffline)).toEqual({ via: 'cloud' })
+    expect(standalone && dispatchRoute(standalone)).toEqual({ via: 'link', fingerprint: 'fp' })
+  })
+
+  test('持久化 link:<fp> 已挂接 → 解析为云条目', () => {
+    const targets = buildRemoteTargets([cloud({ deviceId: 'pc', name: 'PC' })], [link({ cloudDeviceId: 'pc' })], presence)
+    expect(resolveTargetValue('link:fp', targets)?.value).toBe('cloud:pc')
+    expect(resolveTargetValue('link:nope', targets)).toBeNull()
+  })
+
+  test('侧栏只列云条目（含挂接），独立直连不列', () => {
+    const entries = mergeDevices([cloud({ deviceId: 'pc', name: 'PC' })], [link({ cloudDeviceId: 'pc' }), link({ fingerprint: 'solo', name: 'Solo' })], presence)
+    expect(sidebarDevices(entries).map((entry) => entry.id)).toEqual(['pc'])
   })
 
   test('汇总成功 / 失败条数', () => {

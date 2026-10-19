@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 fluxdown_protocol = { version = "0.1.0", path = "../../native/protocol" }
 fluxdown_ui_components = { path = "../components" }
 fluxdown_ui_i18n = { version = "0.1.0", path = "../i18n" }

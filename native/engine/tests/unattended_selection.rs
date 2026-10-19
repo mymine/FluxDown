@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_config::BtConfig;
 use fluxdown_engine::download_manager::NewTaskSpec;
 use fluxdown_engine::proxy_config::ProxyConfig;
 use fluxdown_engine::{Engine, EngineConfig, NoopSelection, NoopSink};
@@ -46,8 +46,10 @@ async fn make_engine(work: &std::path::Path) -> Engine {
         .expect("engine")
 }
 
+#[cfg(feature = "bt")]
 const MAGNET: &str = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=demo";
 
+#[cfg(feature = "bt")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unattended_bt_task_preconfirms_all_files_and_persists_flag() {
     let work = std::env::temp_dir().join(format!("fluxdown-unattended-{}", uniq()));
@@ -128,6 +130,7 @@ async fn unattended_flag_persists_for_non_bt_tasks_too() {
     }
 }
 
+#[cfg(feature = "bt")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_creation_stays_attended() {
     let work = std::env::temp_dir().join(format!("fluxdown-unattended-{}", uniq()));

@@ -41,4 +41,33 @@ struct SelectionMappingTests {
         }
         #expect(SelectionOutcome.cancelled.dto.domain == .cancelled)
     }
+
+    @Test func pluginChoiceRequestAndOutcomeMapBothWays() {
+        let dto = SelectionRequestDto(
+            requestId: "r2",
+            taskId: "t2",
+            kind: .plugin(
+                site: "bilibili.com",
+                url: "https://www.bilibili.com/video/BV1",
+                candidates: [
+                    PluginCandidateDto(identity: "a.one", name: "One", version: "1.0.0", description: "d1"),
+                    PluginCandidateDto(identity: "b.two", name: "Two", version: "2.0.0", description: "d2"),
+                ]
+            ),
+            defaultChoice: .plugin(identity: "a.one", remember: false),
+            deadlineUnixMs: 7
+        )
+        let request = dto.domain
+        #expect(request.kind == .plugin(
+            site: "bilibili.com",
+            url: "https://www.bilibili.com/video/BV1",
+            candidates: [
+                PluginCandidate(identity: "a.one", name: "One", version: "1.0.0", description: "d1"),
+                PluginCandidate(identity: "b.two", name: "Two", version: "2.0.0", description: "d2"),
+            ]
+        ))
+        #expect(request.defaultChoice == .plugin(identity: "a.one", remember: false))
+        let outcome = SelectionOutcome.plugin(identity: "b.two", remember: true)
+        #expect(outcome.dto.domain == outcome)
+    }
 }

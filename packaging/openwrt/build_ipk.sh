@@ -62,7 +62,7 @@ build_server() {
 		Section: net
 		Architecture: $arch
 		Installed-Size: ${size}k
-		Maintainer: FluxDown <https://fluxdown.zerx.dev>
+		Maintainer: FluxDown <https://fluxdown.com>
 		License: AGPL-3.0
 		Description: Blazing fast multi-protocol download manager (headless server).
 		 HTTP/HTTPS/FTP/BitTorrent/HLS downloads with intelligent segmentation,
@@ -117,7 +117,7 @@ build_luci() {
 	Section: luci
 	Architecture: all
 	Installed-Size: ${size}k
-	Maintainer: FluxDown <https://fluxdown.zerx.dev>
+	Maintainer: FluxDown <https://fluxdown.com>
 	License: AGPL-3.0
 	Description: LuCI support for FluxDown download manager.
 	 Service configuration page and a shortcut to the FluxDown web interface.

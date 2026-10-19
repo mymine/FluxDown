@@ -10,6 +10,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -18,6 +19,7 @@ import androidx.core.content.ContextCompat
 import com.fluxdown.app.AppContainer
 import com.fluxdown.app.FluxApplication
 import com.fluxdown.app.R
+import com.fluxdown.app.diag.AppDiagnostics
 import com.fluxdown.app.i18n.str
 import com.fluxdown.core.format.Format
 import com.fluxdown.core.model.HostRef
@@ -29,6 +31,8 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 
 private const val TAG = "FluxDownService"
@@ -40,6 +44,12 @@ private const val THROTTLE_MS = 1_000L
 
 /** 空闲后保留前台的宽限（任务切换 / 队列接力时 active 会瞬间归零），随后自行停止。 */
 private const val IDLE_GRACE_MS = 3_000L
+
+/** 本机会话 Stale（进程内重连）时按断连前的活动量保留前台的上限；超时仍未恢复视为空闲，避免通知僵死。 */
+private const val STALE_KEEP_MS = 60_000L
+
+/** 下载期间持有的 CPU 唤醒锁超时；每次刷新通知续期，进程异常时也不会无限持有。 */
+private const val WAKE_LOCK_TIMEOUT_MS = 10L * 60L * 1000L
 
 /**
  * 本机下载前台服务（`dataSync`）：本机引擎有活跃 / 排队 / 待重试任务时存在，让进程在后台继续下载——
@@ -56,22 +66,29 @@ class DownloadService : Service() {
     private var watcher: Job? = null
     private var lastShownAtMs = 0L
 
+    /** 最近一次已交付的启动请求；停止只针对它，之后在途的启动请求会让 [stopSelfResult] 返回 false。 */
+    private var lastStartId = 0
+    private var wakeLock: PowerManager.WakeLock? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         ensureChannel(this)
+        AppDiagnostics.event("download service created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lastStartId = startId
         // startForegroundService 之后必须在数秒内 startForeground：先用当前量发出，再进入观察
         val container = (application as FluxApplication).container
         show(container.localActivity.value)
         // 完成 / 失败通知的观察在应用作用域内：下载期间即使 Activity 已被划掉也不中断
         DownloadNotifier.attach(container, applicationContext)
-        if (watcher?.isActive != true) {
-            watcher = scope.launch { watch(container) }
-        }
+        // 每次启动请求都重新开始观察（空闲宽限随之重新计时）：外部唤起会在新任务的状态到达之前请求启动，
+        // 旧的宽限计时不能紧接着把服务停掉。
+        watcher?.cancel()
+        watcher = scope.launch { watch(container) }
         return START_NOT_STICKY
     }
 
@@ -81,24 +98,45 @@ class DownloadService : Service() {
                 val wait = THROTTLE_MS - (SystemClock.elapsedRealtime() - lastShownAtMs)
                 if (wait > 0) delay(wait)
                 show(activity)
+                if (activity.stale) {
+                    delay(STALE_KEEP_MS)
+                    stopIfIdle("local session stale for ${STALE_KEEP_MS}ms")
+                }
             } else {
                 delay(IDLE_GRACE_MS)
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-                watcher?.cancel()
+                stopIfIdle("idle")
             }
         }
     }
 
-    /** Android 15+：dataSync 前台服务 6 小时上限；系统回调后必须立即停止，回到前台时由 [DownloadServiceEffect] 重新拉起。 */
-    override fun onTimeout(startId: Int, fgsType: Int) {
-        Log.w(TAG, "foreground service timed out (type=$fgsType); stopping until the app returns to foreground")
+    /**
+     * 只停止已交付的最后一次启动：若此后又有 `startForegroundService` 在途，系统返回 false 并保留服务——
+     * 无条件 `stopSelf()` 会在它调用 `startForeground` 之前拆掉服务，系统随即以
+     * ForegroundServiceDidNotStartInTimeException 结束整个进程。
+     */
+    private fun stopIfIdle(reason: String) {
+        if (!stopSelfResult(lastStartId)) {
+            AppDiagnostics.event("download service stop skipped ($reason): newer start pending")
+            return
+        }
+        AppDiagnostics.event("download service stopping: $reason")
+        releaseWakeLock()
+        stopForeground(STOP_FOREGROUND_REMOVE)
         watcher?.cancel()
+    }
+
+    /** Android 15+：dataSync 前台服务 24h 内累计 6 小时上限；系统回调后必须立即停止，回到前台时由 [DownloadServiceEffect] 重新拉起。 */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        AppDiagnostics.event("download service timed out (type=$fgsType); stopping until the app returns to foreground")
+        watcher?.cancel()
+        releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
     override fun onDestroy() {
+        AppDiagnostics.event("download service destroyed")
+        releaseWakeLock()
         scope.cancel()
         super.onDestroy()
     }
@@ -107,6 +145,22 @@ class DownloadService : Service() {
     private fun show(activity: LocalActivity) {
         lastShownAtMs = SystemClock.elapsedRealtime()
         ServiceCompat.startForeground(this, NOTIFICATION_ID, buildNotification(this, activity), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        if (activity.busy) holdWakeLock()
+    }
+
+    /** 下载期间保持 CPU 运行（前台服务本身不阻止息屏后 CPU 休眠）；非引用计数，带超时、每次刷新续期。 */
+    private fun holdWakeLock() {
+        val lock = wakeLock ?: getSystemService(PowerManager::class.java)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "FluxDown:download")
+            ?.also { it.setReferenceCounted(false) }
+            ?.also { wakeLock = it }
+            ?: return
+        lock.acquire(WAKE_LOCK_TIMEOUT_MS)
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.takeIf { it.isHeld }?.release()
+        wakeLock = null
     }
 }
 
@@ -236,12 +290,29 @@ object DownloadServiceController {
     private const val PREFS = "fluxdown_service"
     private const val KEY_NOTIF_ASKED = "notif_permission_asked"
 
-    /** 拉起（或刷新）前台服务。后台启动被系统拒绝时仅记录日志，服务若已在运行则不受影响。 */
-    fun start(context: Context) {
+    /** 拉起（或刷新）前台服务。后台启动被系统拒绝时记入诊断，服务若已在运行则不受影响。 */
+    fun start(context: Context, reason: String) {
         try {
             ContextCompat.startForegroundService(context, Intent(context, DownloadService::class.java))
         } catch (e: IllegalStateException) {
-            Log.w(TAG, "foreground service start refused: ${e.message}")
+            // 含 ForegroundServiceStartNotAllowedException（后台启动受限 / dataSync 时长耗尽）
+            AppDiagnostics.event("download service start refused ($reason): ${e.javaClass.simpleName}: ${e.message}")
+        } catch (e: SecurityException) {
+            AppDiagnostics.event("download service start denied ($reason): ${e.message}")
+        }
+    }
+
+    /**
+     * 进程级观察：本机由空闲变为有活动时就尝试拉起前台服务（界面不在前台时也尝试）。后台启动在 Android 12+
+     * 多数会被拒——电池优化白名单内的应用豁免；被拒时回到前台由 [DownloadServiceEffect] 补拉。
+     */
+    fun keepAliveWhileBusy(context: Context, container: AppContainer) {
+        val app = context.applicationContext
+        container.appScope.launch {
+            container.localActivity
+                .map { it.busy }
+                .distinctUntilChanged()
+                .collect { busy -> if (busy) start(app, "local activity") }
         }
     }
 

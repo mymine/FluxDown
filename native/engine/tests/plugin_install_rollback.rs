@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_config::BtConfig;
 use fluxdown_engine::plugin::PluginError;
 use fluxdown_engine::proxy_config::ProxyConfig;
 use fluxdown_engine::{Engine, EngineConfig, NoopSelection, NoopSink};

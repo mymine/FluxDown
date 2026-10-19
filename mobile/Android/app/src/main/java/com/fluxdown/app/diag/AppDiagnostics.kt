@@ -1,0 +1,184 @@
+package com.fluxdown.app.diag
+
+import android.app.ActivityManager
+import android.app.ApplicationExitInfo
+import android.app.usage.UsageStatsManager
+import android.content.Context
+import android.os.Build
+import android.os.PowerManager
+import android.os.Process
+import androidx.annotation.RequiresApi
+import android.util.Log
+import java.io.File
+import java.io.IOException
+import java.io.PrintWriter
+import java.io.StringWriter
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
+
+private const val TAG = "FluxDiag"
+
+/** 事件日志上限：超过即轮转为 `.1`（两份合计 ≤ 2 × 该值）。 */
+private const val EVENT_LOG_MAX_BYTES = 256L * 1024L
+
+/** 导出时附带的历史退出记录条数（系统每应用保留有限条数）。 */
+private const val EXIT_REASONS_MAX = 32
+
+/**
+ * Android 宿主侧诊断：Rust 引擎日志之外，记录进程层面的事实——前台服务启停 / 被拒 / 超时、
+ * Kotlin 未捕获异常，以及系统给出的历史进程退出原因（`ApplicationExitInfo`，Android 11+）。
+ * 用于区分「后台消失」是内存回收、冻结、崩溃、前台服务超时还是厂商系统清理。
+ *
+ * 只写应用私有目录 `noBackupFilesDir/diagnostics/`，随日志导出打包为 `android/` 目录，不上传。
+ */
+object AppDiagnostics {
+    private const val DIR = "diagnostics"
+    private const val EVENTS = "app-events.log"
+
+    @Volatile
+    private var dir: File? = null
+
+    /** 进程启动时调用一次：定位目录、记录启动、安装未捕获异常记录（之后交回原处理器，崩溃语义不变）。 */
+    fun install(context: Context) {
+        val root = File(context.noBackupFilesDir, DIR)
+        if (!root.isDirectory && !root.mkdirs()) {
+            Log.w(TAG, "cannot create ${root.path}")
+            return
+        }
+        dir = root
+        event("process start pid=${Process.myPid()} sdk=${Build.VERSION.SDK_INT}")
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            event("uncaught exception on ${thread.name}:\n${stackTrace(error)}")
+            previous?.uncaughtException(thread, error)
+        }
+    }
+
+    /** 追加一条带时间戳的事件（任意线程；写失败只记 logcat，诊断不能影响主流程）。 */
+    fun event(message: String) {
+        Log.i(TAG, message)
+        val root = dir ?: return
+        synchronized(this) {
+            val file = File(root, EVENTS)
+            try {
+                if (file.length() > EVENT_LOG_MAX_BYTES) {
+                    val rotated = File(root, "$EVENTS.1")
+                    if (rotated.exists() && !rotated.delete()) Log.w(TAG, "cannot delete ${rotated.path}")
+                    if (!file.renameTo(rotated)) Log.w(TAG, "cannot rotate ${file.path}")
+                }
+                file.appendText("${timestamp(System.currentTimeMillis())} $message\n")
+            } catch (e: IOException) {
+                Log.w(TAG, "event log write failed: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 把 Android 侧诊断追加进已有 zip（引擎导出的日志包）：`android/diagnostics.txt`（设备 / 后台策略 /
+     * 历史退出原因）与 `android/app-events.log*`。在 IO 线程调用。
+     */
+    fun appendTo(context: Context, zip: File) {
+        val merged = File(zip.parentFile, "${zip.name}.tmp")
+        ZipOutputStream(merged.outputStream().buffered()).use { out ->
+            ZipInputStream(zip.inputStream().buffered()).use { input ->
+                while (true) {
+                    val entry = input.nextEntry ?: break
+                    out.putNextEntry(ZipEntry(entry.name))
+                    input.copyTo(out)
+                    out.closeEntry()
+                }
+            }
+            out.putNextEntry(ZipEntry("android/diagnostics.txt"))
+            out.write(report(context).toByteArray())
+            out.closeEntry()
+            val root = dir
+            if (root != null) {
+                synchronized(this) {
+                    for (name in listOf("$EVENTS.1", EVENTS)) {
+                        val file = File(root, name)
+                        if (!file.isFile) continue
+                        out.putNextEntry(ZipEntry("android/$name"))
+                        file.inputStream().use { it.copyTo(out) }
+                        out.closeEntry()
+                    }
+                }
+            }
+        }
+        if (!merged.renameTo(zip)) {
+            merged.delete()
+            throw IOException("cannot replace ${zip.path}")
+        }
+    }
+
+    /** 纯文本报告：设备、后台限制状态、历史退出原因。 */
+    fun report(context: Context): String = buildString {
+        val pkg = context.packageName
+        val version = try {
+            context.packageManager.getPackageInfo(pkg, 0).versionName
+        } catch (e: android.content.pm.PackageManager.NameNotFoundException) {
+            "unknown (${e.message})"
+        }
+        appendLine("app: $pkg $version")
+        appendLine("device: ${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})")
+        appendLine("rom: ${Build.DISPLAY} / ${Build.FINGERPRINT}")
+        appendLine("android: ${Build.VERSION.RELEASE} (sdk ${Build.VERSION.SDK_INT})")
+        val am = context.getSystemService(ActivityManager::class.java)
+        val power = context.getSystemService(PowerManager::class.java)
+        appendLine("batteryOptimizationIgnored: ${power?.isIgnoringBatteryOptimizations(pkg)}")
+        appendLine("powerSaveMode: ${power?.isPowerSaveMode}")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            appendLine("backgroundRestricted: ${am?.isBackgroundRestricted}")
+            val bucket = context.getSystemService(UsageStatsManager::class.java)?.appStandbyBucket
+            appendLine("standbyBucket: $bucket")
+        }
+        appendLine("lowRamDevice: ${am?.isLowRamDevice} memoryClass: ${am?.memoryClass}MB")
+        appendLine()
+        appendLine("== process exit reasons (newest first) ==")
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || am == null) {
+            appendLine("unavailable below Android 11")
+            return@buildString
+        }
+        val exits = try {
+            am.getHistoricalProcessExitReasons(pkg, 0, EXIT_REASONS_MAX)
+        } catch (e: SecurityException) {
+            appendLine("unavailable: ${e.message}")
+            return@buildString
+        }
+        if (exits.isEmpty()) appendLine("(none recorded)")
+        for (exit in exits) appendLine(describe(exit))
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun describe(exit: ApplicationExitInfo): String {
+        val reason = when (exit.reason) {
+            ApplicationExitInfo.REASON_ANR -> "ANR"
+            ApplicationExitInfo.REASON_CRASH -> "CRASH"
+            ApplicationExitInfo.REASON_CRASH_NATIVE -> "CRASH_NATIVE"
+            ApplicationExitInfo.REASON_DEPENDENCY_DIED -> "DEPENDENCY_DIED"
+            ApplicationExitInfo.REASON_EXCESSIVE_RESOURCE_USAGE -> "EXCESSIVE_RESOURCE_USAGE"
+            ApplicationExitInfo.REASON_EXIT_SELF -> "EXIT_SELF"
+            ApplicationExitInfo.REASON_FREEZER -> "FREEZER"
+            ApplicationExitInfo.REASON_INITIALIZATION_FAILURE -> "INITIALIZATION_FAILURE"
+            ApplicationExitInfo.REASON_LOW_MEMORY -> "LOW_MEMORY"
+            ApplicationExitInfo.REASON_OTHER -> "OTHER"
+            ApplicationExitInfo.REASON_PACKAGE_STATE_CHANGE -> "PACKAGE_STATE_CHANGE"
+            ApplicationExitInfo.REASON_PACKAGE_UPDATED -> "PACKAGE_UPDATED"
+            ApplicationExitInfo.REASON_PERMISSION_CHANGE -> "PERMISSION_CHANGE"
+            ApplicationExitInfo.REASON_SIGNALED -> "SIGNALED"
+            ApplicationExitInfo.REASON_USER_REQUESTED -> "USER_REQUESTED"
+            ApplicationExitInfo.REASON_USER_STOPPED -> "USER_STOPPED"
+            else -> "UNKNOWN(${exit.reason})"
+        }
+        return "${timestamp(exit.timestamp)} pid=${exit.pid} $reason status=${exit.status} " +
+            "importance=${exit.importance} pss=${exit.pss}KB rss=${exit.rss}KB desc=${exit.description.orEmpty()}"
+    }
+
+    private fun timestamp(ms: Long): String =
+        SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS Z", Locale.ROOT).format(Date(ms))
+
+    private fun stackTrace(error: Throwable): String = StringWriter().also { error.printStackTrace(PrintWriter(it)) }.toString()
+}

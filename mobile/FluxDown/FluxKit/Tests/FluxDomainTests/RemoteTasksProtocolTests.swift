@@ -228,4 +228,41 @@ struct RemoteTasksProtocolTests {
         let notReady = DeviceRules.dispatchTargets(cloud: cloud, link: link, cloudPresenceKnown: true, localReady: false)
         #expect(notReady.map(\.online) == [nil, nil])
     }
+
+    @Test func linkAttachesToCloudEntryAndRoutes() {
+        let cloud = [
+            CloudDevice(deviceId: "pc", name: "PC", platform: "windows", isOnline: false, isCurrent: false, appVersion: nil),
+            CloudDevice(deviceId: "nas", name: "NAS", platform: "linux", isOnline: true, isCurrent: false, appVersion: nil),
+        ]
+        let link = [
+            // 挂接到 pc：云离线 + 直连在线 → 在线、走直连。
+            LinkDevice(fingerprint: "fp-pc", name: "pc-direct", platform: "windows", online: true, cloudDeviceId: "pc"),
+            // 同一云条目已被挂接：第二条 link 成为独立条目。
+            LinkDevice(fingerprint: "fp-pc2", name: "pc-second", platform: nil, online: false, cloudDeviceId: "pc"),
+            // revoked：不参与任何目标。
+            LinkDevice(fingerprint: "fp-rev", name: "gone", platform: nil, online: true, cloudDeviceId: "nas", revoked: true),
+            // cloudDeviceId 不在云名册：独立条目。
+            LinkDevice(fingerprint: "fp-x", name: "Phone", platform: "ios", online: true, cloudDeviceId: "unknown"),
+        ]
+        let targets = DeviceRules.dispatchTargets(cloud: cloud, link: link, cloudPresenceKnown: true, localReady: true)
+        #expect(targets.map(\.id) == ["cloud:pc", "cloud:nas", "link:fp-pc2", "link:fp-x"])
+        #expect(targets[0].name == "PC")
+        #expect(targets[0].online == true && targets[0].linkOnline == true)
+        #expect(targets[0].routesViaLink && targets[0].dispatchFingerprint == "fp-pc")
+        #expect(!targets[1].routesViaLink && targets[1].dispatchFingerprint == nil)
+        #expect(targets[2].routesViaLink && targets[2].dispatchFingerprint == "fp-pc2")
+        // 侧栏只列云条目（含挂接）。
+        #expect(DeviceRules.sidebarTargets(targets).map(\.id) == ["cloud:pc", "cloud:nas"])
+        // 持久化的 link:<fp> 解析为已挂接的云条目。
+        #expect(DeviceRules.resolveTarget(id: "link:fp-pc", in: targets)?.id == "cloud:pc")
+        #expect(DeviceRules.resolveTarget(id: "link:fp-rev", in: targets) == nil)
+
+        // 直连离线：回落走云。
+        let offline = [LinkDevice(fingerprint: "fp-pc", name: "x", platform: nil, online: false, cloudDeviceId: "pc")]
+        let fallback = DeviceRules.dispatchTargets(cloud: cloud, link: offline, cloudPresenceKnown: true, localReady: true)
+        #expect(fallback[0].online == false && !fallback[0].routesViaLink)
+        // 本地未就绪：直连在线未知 → 合并后云离线也只能是未知。
+        let notReady = DeviceRules.dispatchTargets(cloud: cloud, link: offline, cloudPresenceKnown: true, localReady: false)
+        #expect(notReady[0].online == nil && !notReady[0].routesViaLink)
+    }
 }

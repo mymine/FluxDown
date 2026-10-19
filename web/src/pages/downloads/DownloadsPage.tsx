@@ -1,5 +1,5 @@
 // 下载页（对齐 GPUI crates/downloads/src/pages/downloads.rs）：
-// 标题栏插槽（新建 / 搜索 / 视图）→ 侧栏 | 任务表 | 详情面板 → 状态栏；移动端侧栏与详情改为 Sheet，表格改为卡片行。
+// 标题栏插槽（新建 / 搜索 / 视图）→ 侧栏 | 任务表 | 详情面板 →（仅移动端）状态栏；移动端侧栏与详情改为 Sheet，表格改为卡片行。
 
 import { useEffect, useRef, useState } from 'react'
 import type { PointerEvent as ReactPointerEvent } from 'react'
@@ -237,7 +237,8 @@ function DownloadsBody() {
           </div>
         </div>
       </div>
-      <StatusBar />
+      {/* 桌面端状态栏属于外壳（所有路由可见、可自定义布局）；移动端仍是下载页自带的固定状态栏。 */}
+      {mobile ? <StatusBar /> : null}
       {dragging ? <div className="pointer-events-none absolute inset-0 z-30 bg-drop-target" /> : null}
 
       {mobile ? (

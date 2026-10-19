@@ -119,6 +119,25 @@ data class PluginDto(
     }
 }
 
+/** 站点默认插件（`PluginSiteDefaultDto`）；[automatic] = 无人值守下载自动选定、尚未被用户确认。 */
+data class PluginSiteDefault(
+    val site: String,
+    val identity: String,
+    val candidates: List<String> = emptyList(),
+    val automatic: Boolean = false,
+) {
+    companion object {
+        fun fromJson(v: JsonValue?): PluginSiteDefault? {
+            val site = v.strOrNull("site") ?: return null
+            val identity = v.strOrNull("identity") ?: return null
+            return PluginSiteDefault(site, identity, v.strings("candidates"), v.bool("automatic"))
+        }
+
+        /** `daemon.plugin.siteDefaults` 结果（`Vec<PluginSiteDefaultDto>`）。 */
+        fun listFromJson(v: JsonValue?): List<PluginSiteDefault> = v.arrayOrNull.orEmpty().mapNotNull { fromJson(it) }
+    }
+}
+
 /** `daemon.plugin.auth` 请求（`PluginAuthRequest`）；省略字段由主机按 `#[serde(default)]` 补空串，这里一律显式发送。 */
 data class PluginAuthRequest(
     val identity: String,
@@ -256,6 +275,10 @@ fun pluginMarketInstallParams(pluginId: String, version: String?): JsonValue =
 
 /** `daemon.plugin.ignoreRetry`（与 TaskIdParams 同形）。 */
 fun pluginIgnoreRetryParams(taskId: String): JsonValue = jsonObject("taskId" to taskId)
+
+/** `daemon.plugin.setSiteDefault`：[identity] = null 删除条目（下次下载重新询问）。 */
+fun pluginSetSiteDefaultParams(site: String, identity: String?): JsonValue =
+    jsonObject("site" to site, "identity" to identity)
 
 // ───────────────────────────── 设置校验 ─────────────────────────────
 
@@ -419,8 +442,8 @@ object PluginMarket {
     }
 
     /**
-     * 每个插件一条（`crates/extensions/src/market.rs::latest_per_plugin`）：优先最新可安装版本；
-     * 全部撤回时取 sequence 最大者（仅用于展示撤回标记）。顺序为各插件在索引中首次出现的位置。
+     * 每个插件一条（`crates/extensions/src/market.rs::latest_per_plugin`）：最新可安装版本；
+     * 全部撤回（下架）的插件不出现。顺序为各插件在索引中首次出现的位置。
      */
     fun latestPerPlugin(entries: List<MarketEntry>): List<MarketEntry> {
         val best = LinkedHashMap<String, MarketEntry>()
@@ -435,7 +458,7 @@ object PluginMarket {
             val better = if (a != b) a else entry.sequence > current.sequence
             if (better) best[entry.pluginId] = entry
         }
-        return best.values.toList()
+        return best.values.filter { it.installable }
     }
 
     /** `MAJOR.MINOR.PATCH`（可带前导 `v`，忽略预发布 / 构建后缀）；无法解析为 null。 */

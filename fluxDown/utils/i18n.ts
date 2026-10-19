@@ -145,7 +145,7 @@ export function t(key: MessageKey, params?: Record<string, string>): string {
 
   if (params) {
     for (const [k, v] of Object.entries(params)) {
-      message = message.replace(`{${k}}`, v);
+      message = message.replaceAll(`{${k}}`, v);
     }
   }
 

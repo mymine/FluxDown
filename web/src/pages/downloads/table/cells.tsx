@@ -8,9 +8,8 @@ import { reopenFileConflicts } from '../dialogs/fileConflict'
 import { percentLabel, sourceSite } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
 import type { ViewDensity } from '../model/viewPrefs'
-import { stateLabel } from '../state'
 import { SegmentProgress } from './SegmentProgress'
-import { kindLabel, relaxedMeta, relaxedStatusDetail, statusDetail, statusLabel, STATUS_TEXT } from './text'
+import { kindLabel, relaxedMeta, relaxedStatusDetail, statusDetail, statusLabel, STATUS_TEXT, taskStateLabel } from './text'
 import type { Translate } from './text'
 
 /** 文件图标边长：常规与 GPUI 选择列紧凑档同为 `icon.lg`，宽松密度放进 32px 底块（与三行主列等量）。 */
@@ -107,7 +106,7 @@ export function StatusCell({ t, view, density }: { t: Translate; view: DownloadT
   const tooltip = failedError ? view.errorMessage : twoLine ? undefined : (detail ?? undefined)
   return (
     <div className={cn('tabular flex min-w-0 flex-col justify-center', relaxed ? 'gap-[var(--fx-spacing-xs)] text-sm' : 'text-xs')} title={tooltip}>
-      <div className={cn('truncate', STATUS_TEXT[view.state])}>{relaxed ? stateLabel(t, view.state) : statusLabel(t, view)}</div>
+      <div className={cn('truncate', STATUS_TEXT[view.state])}>{relaxed ? taskStateLabel(t, view) : statusLabel(t, view)}</div>
       {twoLine && detail ? <div className="truncate text-xs text-text-tertiary">{detail}</div> : null}
     </div>
   )

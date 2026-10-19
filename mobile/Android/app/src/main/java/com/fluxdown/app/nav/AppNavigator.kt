@@ -45,6 +45,8 @@ sealed interface SheetRoute {
     data object HostSwitch : SheetRoute
     /** V2：添加远程（`--server`）主机。 */
     data object AddHost : SheetRoute
+    /** V4：添加设备（账户自动 / 直连配对）。 */
+    data object AddDevice : SheetRoute
     /** D9：全局活动面板。 */
     data object Activity : SheetRoute
     /** D5：移动到队列。 */

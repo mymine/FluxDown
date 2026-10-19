@@ -6,7 +6,7 @@
  * - 颜色:取自设计 token(`--accent` 等 OKLCH),经 1px 探针画布转成 sRGB;
  *   主题切换(motion.ts 派发 `theme-change`)时重新解析。
  * - 指针:监听宿主元素(canvas 自身 `pointer-events: none`,不遮挡上层内容);
- *   在交互控件上按下不触发 `press`,避免点按钮时炸出粒子。
+ *   在交互控件上按下不触发 `press`,避免点按钮时误触发场景的按下效果。
  */
 
 export type Rgb = readonly [number, number, number];

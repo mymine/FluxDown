@@ -1,7 +1,7 @@
 // 扩展设置的纯逻辑（无 React / 别名依赖，可被 bun test 直接加载）。
 // 语义与 crates/extensions（plugin_settings.rs / plugins.rs / plugin_auth.rs / managed_components.rs）逐条对齐。
 
-import type { MarketEntryDto, PluginAuthResponse, PluginDto, SettingFieldDto } from '../../../../lib/rpc/protocol'
+import type { MarketEntryDto, PluginAuthResponse, PluginDto, PluginRisk, SettingFieldDto } from '../../../../lib/rpc/protocol'
 
 // ── 插件设置校验 ────────────────────────────────────────────
 
@@ -75,8 +75,8 @@ function installable(entry: MarketEntryDto): boolean {
 }
 
 /**
- * 每个插件一条（镜像 crates/extensions/src/market.rs `latest_per_plugin`）：优先最新可安装版本；
- * 全部撤回时取 sequence 最大者（仅用于展示撤回标记）。顺序保持各插件在索引中首次出现的位置。
+ * 每个插件一条（镜像 crates/extensions/src/market.rs `latest_per_plugin`）：最新可安装版本；
+ * 全部撤回（下架）的插件不出现。顺序保持各插件在索引中首次出现的位置。
  */
 export function latestPerPlugin(entries: readonly MarketEntryDto[]): MarketEntryDto[] {
   const best = new Map<string, MarketEntryDto>()
@@ -91,7 +91,7 @@ export function latestPerPlugin(entries: readonly MarketEntryDto[]): MarketEntry
     const better = a !== b ? a : entry.sequence > current.sequence
     if (better) best.set(entry.pluginId, entry)
   }
-  return [...best.values()]
+  return [...best.values()].filter(installable)
 }
 
 /** `MAJOR.MINOR.PATCH`（可带前导 `v`，忽略预发布 / 构建后缀）；无法解析返回 null。 */
@@ -162,9 +162,86 @@ export function permissionKeys(permission: string): { name: string; desc: string
       return { name: 'pluginPermYtdlpName', desc: 'pluginPermYtdlpDesc' }
     case 'auth':
       return { name: 'pluginPermAuthName', desc: 'pluginPermAuthDesc' }
+    case 'tasks':
+      return { name: 'pluginPermTasksName', desc: 'pluginPermTasksDesc' }
+    case 'browserRules':
+      return { name: 'pluginPermBrowserRulesName', desc: 'pluginPermBrowserRulesDesc' }
+    case 'desktop':
+      return { name: 'pluginPermDesktopName', desc: 'pluginPermDesktopDesc' }
+    case 'background':
+      return { name: 'pluginPermBackgroundName', desc: 'pluginPermBackgroundDesc' }
+    case 'intercept':
+      return { name: 'pluginPermInterceptName', desc: 'pluginPermInterceptDesc' }
     default:
       return null
   }
+}
+
+// ── 授权与风险（镜像 crates/extensions market.rs；夹具 crates/extensions/tests/fixtures/consent_cases.json）──
+
+const ELEVATED_PERMISSIONS: readonly string[] = [
+  'ffmpeg',
+  'ytdlp',
+  'auth',
+  'tasks',
+  'browserRules',
+  'background',
+  'intercept',
+]
+
+/** 风险等级：含 `desktop` → full；含任一提权权限 → elevated；否则 standard。 */
+export function riskOf(permissions: readonly string[]): PluginRisk {
+  if (permissions.includes('desktop')) return 'full'
+  if (permissions.some((permission) => ELEVATED_PERMISSIONS.includes(permission))) return 'elevated'
+  return 'standard'
+}
+
+/** 风险等级 → 徽标 / 提示的 i18n 键。 */
+export function riskKeys(risk: string): { label: string; tooltip: string } {
+  switch (risk) {
+    case 'full':
+      return { label: 'pluginRiskFull', tooltip: 'pluginRiskTooltipFull' }
+    case 'elevated':
+      return { label: 'pluginRiskElevated', tooltip: 'pluginRiskTooltipElevated' }
+    default:
+      return { label: 'pluginRiskStandard', tooltip: 'pluginRiskTooltipStandard' }
+  }
+}
+
+export interface ConsentSet {
+  permissions: readonly string[]
+  networkHosts: readonly string[]
+}
+
+function normalizedSet(values: readonly string[]): string[] {
+  return [...new Set(values)].sort()
+}
+
+/** 用户已确认的集合与插件待授权集合排序去重后完全相等 → 免弹窗直接授权。 */
+export function consentMatches(confirmed: ConsentSet, pending: ConsentSet): boolean {
+  const same = (a: readonly string[], b: readonly string[]) => {
+    const left = normalizedSet(a)
+    const right = normalizedSet(b)
+    return left.length === right.length && left.every((value, index) => value === right[index])
+  }
+  return same(confirmed.permissions, pending.permissions) && same(confirmed.networkHosts, pending.networkHosts)
+}
+
+/** 市场条目中尚未授权的网络主机：新装取全部，更新排除已授权（已装 networkHosts 去掉 pending）。 */
+export function hostsToConfirm(entry: MarketEntryDto, installed: PluginDto | undefined): string[] {
+  const pending = installed?.consentPendingHosts ?? []
+  const granted = (installed?.networkHosts ?? []).filter((host) => !pending.includes(host))
+  return (entry.networkHosts ?? []).filter((host) => !granted.includes(host))
+}
+
+/** 安装 / 更新成功后的授权处理：无待授权 → none；市场预确认与 pending 吻合 → grant；其余 → dialog。 */
+export type PostInstallConsent = 'none' | 'grant' | 'dialog'
+
+export function postInstallConsent(plugin: PluginDto, confirmed: ConsentSet | null): PostInstallConsent {
+  const pending: ConsentSet = { permissions: plugin.consentPending, networkHosts: plugin.consentPendingHosts }
+  if (pending.permissions.length === 0 && pending.networkHosts.length === 0) return 'none'
+  if (confirmed !== null && consentMatches(confirmed, pending)) return 'grant'
+  return 'dialog'
 }
 
 // ── 插件登录挑战 ────────────────────────────────────────────

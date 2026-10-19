@@ -158,7 +158,7 @@ struct LinkProtocolTests {
     }
 
     @Test func syncReasonKeyLocalizesByReasonWithGenericFallback() {
-        #expect(SyncRules.reasonKey(SyncStatusDto(lastErrorReason: "syncDeviceLimit")) == "cloudSyncErrorDeviceLimit")
+        #expect(SyncRules.reasonKey(SyncStatusDto(lastErrorReason: "onlineDeviceLimit")) == "cloudSyncErrorOnlineLimit")
         #expect(SyncRules.reasonKey(SyncStatusDto(lastErrorReason: "deviceUntrusted")) == "cloudSyncErrorDeviceUntrusted")
         #expect(SyncRules.reasonKey(SyncStatusDto(lastErrorReason: "cloudUnreachable")) == "cloudSyncErrorNetwork")
         #expect(SyncRules.reasonKey(SyncStatusDto(lastErrorReason: "mystery")) == "cloudSyncErrorGeneric")

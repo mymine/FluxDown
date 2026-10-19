@@ -22,6 +22,8 @@ data class GatewayStatusDto(
     val portEditable: Boolean = true,
     /** 是否对局域网开放兼容 API；修改后下次 agent 启动生效。 */
     val lanEnabled: Boolean = false,
+    /** 本次运行网关是否实际监听非回环地址（`lanEnabled` 是持久化配置，下次启动才生效）。 */
+    val lanActive: Boolean = false,
 ) {
     companion object {
         /** 缺省端口（`default_gateway_port`）。 */
@@ -41,6 +43,7 @@ data class GatewayStatusDto(
             port = v.int("port", DEFAULT_PORT),
             portEditable = v.bool("portEditable", true),
             lanEnabled = v.bool("lanEnabled"),
+            lanActive = v.bool("lanActive"),
         )
     }
 }

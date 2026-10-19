@@ -31,11 +31,27 @@ import type {
   PluginAuthRequest,
   PluginAuthResponse,
   PluginDto,
+  PluginAuditClearParams,
+  PluginAuditListDto,
+  PluginAuditListParams,
+  PluginAuditRecordParams,
+  PluginConsentParams,
+  PluginSniffRulesDto,
+  PluginCommandParams,
+  PluginInvokeParams,
+  PluginViewEventParams,
+  PluginViewKeepaliveParams,
+  PluginViewOpenParams,
+  PluginViewOpenedDto,
+  PluginViewSessionParams,
+  PluginViewSnapshotDto,
   PluginIdentityParams,
   PluginInstallDevParams,
   PluginInstallParams,
   PluginMarketInstallParams,
   PluginSetEnabledParams,
+  PluginSetSiteDefaultParams,
+  PluginSiteDefaultDto,
   PluginUpdateSettingsParams,
   LinkProbeParams,
   LinkProbeResult,
@@ -61,6 +77,7 @@ import type {
   RssValidateResponse,
   SelectionResolutionDto,
   SetSeedLimitsParams,
+  TaskVerifyResult,
   SiteAuthCredentialDto,
   SiteAuthDeleteParams,
   SiteAuthEntryDto,
@@ -70,6 +87,8 @@ import type {
   SystemProxyDto,
   TaskActivityPage,
   TaskActivityQuery,
+  TaskSpeedHistoryDto,
+  TaskSpeedHistoryQuery,
   TaskDeleteManyParams,
   TaskDeleteParams,
   TaskChangeUrlParams,
@@ -88,11 +107,16 @@ import type {
 /** 服务端逐源串行拉取镜像（每源 20s），最坏远超默认 30s。 */
 const SLOW_MIRROR_TIMEOUT_MS = 120_000;
 
+/** BT 完整性校验需读盘比对全部分块，耗时随数据量增长。 */
+const VERIFY_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+
 const task = {
   list: () => call<TaskDto[]>(METHOD.DAEMON_TASK_LIST),
   get: (params: TaskIdParams) => call<TaskDto>(METHOD.DAEMON_TASK_GET, params),
   activity: (params: TaskActivityQuery) =>
     call<TaskActivityPage>(METHOD.DAEMON_TASK_ACTIVITY, params),
+  speedHistory: (params: TaskSpeedHistoryQuery) =>
+    call<TaskSpeedHistoryDto | null>(METHOD.DAEMON_TASK_SPEED_HISTORY, params),
   create: (params: DaemonCreateTaskParams) => call<CreatedTask>(METHOD.DAEMON_TASK_CREATE, params),
   /** 批量建任务：一块（≤512 条）共享同一份选项，整块一个事务，按 `batchId` 幂等。 */
   createMany: (params: DaemonCreateTasksParams) =>
@@ -112,6 +136,9 @@ const task = {
   rescan: () => call<OkResult>(METHOD.DAEMON_TASK_RESCAN),
   setSeedLimits: (params: SetSeedLimitsParams) =>
     call<OkResult>(METHOD.DAEMON_TASK_SET_SEED_LIMITS, params),
+  /** BT 完整性校验：耗时与数据量成正比，使用 6 小时超时。 */
+  verify: (params: TaskIdParams) =>
+    call<TaskVerifyResult>(METHOD.DAEMON_TASK_VERIFY, params, { timeoutMs: VERIFY_TIMEOUT_MS }),
   /** 批量操作：一次请求、整批只推一次任务快照（逐条调用会撞上 agent 的通道上限）。 */
   pauseMany: (taskIds: string[]) => {
     const params: TaskIdsParams = { taskIds };
@@ -217,6 +244,7 @@ const rss = {
 
 const plugin = {
   list: () => call<PluginDto[]>(METHOD.DAEMON_PLUGIN_LIST),
+  sniffRules: () => call<PluginSniffRulesDto>(METHOD.DAEMON_PLUGIN_SNIFF_RULES),
   auth: (params: PluginAuthRequest) =>
     call<PluginAuthResponse>(METHOD.DAEMON_PLUGIN_AUTH, params),
   setEnabled: (params: PluginSetEnabledParams) =>
@@ -239,6 +267,36 @@ const plugin = {
     call<InstalledPlugin>(METHOD.DAEMON_PLUGIN_MARKET_INSTALL, params, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
   /** 忽略插件解析失败并重试（清除任务 resolver 后恢复任务）。 */
   ignoreRetry: (params: TaskIdParams) => call<OkResult>(METHOD.DAEMON_PLUGIN_IGNORE_RETRY, params),
+  /** 站点默认插件列表（按 site 排序）。 */
+  siteDefaults: () => call<PluginSiteDefaultDto[]>(METHOD.DAEMON_PLUGIN_SITE_DEFAULTS),
+  /** 确认 / 变更站点默认插件；`identity: null` 移除条目。 */
+  setSiteDefault: (params: PluginSetSiteDefaultParams) => call<OkResult>(METHOD.DAEMON_PLUGIN_SET_SITE_DEFAULT, params),
+  /** 授权插件请求的全部能力；集合须与请求完全一致。 */
+  consent: (params: PluginConsentParams) => call<OkResult>(METHOD.DAEMON_PLUGIN_CONSENT, params),
+  auditList: (params: PluginAuditListParams = {}) =>
+    call<PluginAuditListDto>(METHOD.DAEMON_PLUGIN_AUDIT_LIST, params),
+  auditClear: (params: PluginAuditClearParams = {}) =>
+    call<OkResult>(METHOD.DAEMON_PLUGIN_AUDIT_CLEAR, params),
+  auditRecord: (params: PluginAuditRecordParams) =>
+    call<OkResult>(METHOD.DAEMON_PLUGIN_AUDIT_RECORD, params),
+  /** 打开可移植视图会话（可能激活常驻宿主，按慢方法超时）。 */
+  viewOpen: (params: PluginViewOpenParams) =>
+    call<PluginViewOpenedDto>(METHOD.DAEMON_PLUGIN_VIEW_OPEN, params, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
+  /** 投递视图事件；入队即返回，结果经 `pluginViewFrame` 事件送出。 */
+  viewEvent: (params: PluginViewEventParams) =>
+    call<OkResult>(METHOD.DAEMON_PLUGIN_VIEW_EVENT, params),
+  viewClose: (params: PluginViewSessionParams) =>
+    call<OkResult>(METHOD.DAEMON_PLUGIN_VIEW_CLOSE, params),
+  /** 取会话当前 `{seq, tree}`（序号断档 / 重连后重新同步）。 */
+  viewSnapshot: (params: PluginViewSessionParams) =>
+    call<PluginViewSnapshotDto>(METHOD.DAEMON_PLUGIN_VIEW_SNAPSHOT, params),
+  /** 会话续期；90 s 无续期的会话会被关闭。 */
+  viewKeepalive: (params: PluginViewKeepaliveParams) =>
+    call<OkResult>(METHOD.DAEMON_PLUGIN_VIEW_KEEPALIVE, params),
+  command: (params: PluginCommandParams) =>
+    call<OkResult>(METHOD.DAEMON_PLUGIN_COMMAND, params, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
+  invoke: (params: PluginInvokeParams) =>
+    call<unknown>(METHOD.DAEMON_PLUGIN_INVOKE, params, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
 };
 
 const component = {

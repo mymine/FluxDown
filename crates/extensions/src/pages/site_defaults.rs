@@ -1,0 +1,306 @@
+//! 站点默认插件：多个插件的 resolver 匹配同一站点时，用户记住的（或无人值守下载自动选用、
+//! 待确认的）插件。仅在列表非空时渲染；读 / 改均走 `daemon.plugin.siteDefaults` /
+//! `daemon.plugin.setSiteDefault`。
+
+use std::collections::HashSet;
+
+use fluxdown_protocol::{ApplicationErrorCode, PluginDto, PluginSiteDefaultDto, RpcErrorData};
+use fluxdown_ui_components::ControlExt as _;
+use gpui::{
+    Anchor, Context, IntoElement, ParentElement, SharedString, Styled, Window,
+    prelude::FluentBuilder as _, px,
+};
+use gpui_component::{
+    Disableable as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    menu::{DropdownMenu as _, PopupMenuItem},
+    v_flex,
+};
+
+use super::{
+    Frame,
+    plugins::{list_card, list_row},
+};
+use crate::{ExtensionsView, error_text, ui};
+
+/// 站点默认插件区的视图状态。
+#[derive(Default)]
+pub(crate) struct SiteDefaultsUi {
+    /// 本次进入插件页是否已发起读取。
+    pub requested: bool,
+    pub loading: bool,
+    pub entries: Vec<PluginSiteDefaultDto>,
+    /// 有写操作在途的站点（禁用该行控件）。
+    pub busy: HashSet<String>,
+    /// 上次读取因断连失败；重连后重新读取一次。
+    pub retry_on_reconnect: bool,
+}
+
+/// 候选插件展示名：优先插件列表中的名称，缺失（已卸载 / 未加载）时回退 identity。
+pub(crate) fn plugin_display_name<'a>(plugins: &'a [PluginDto], identity: &'a str) -> &'a str {
+    plugins
+        .iter()
+        .find(|plugin| plugin.identity == identity)
+        .map_or(identity, |plugin| plugin.name.as_str())
+}
+
+fn parse_site_defaults(
+    value: serde_json::Value,
+) -> Result<Vec<PluginSiteDefaultDto>, RpcErrorData> {
+    serde_json::from_value::<Vec<PluginSiteDefaultDto>>(value)
+        .map_err(|_| RpcErrorData::new(ApplicationErrorCode::ProtocolIncompatible, false))
+}
+
+impl ExtensionsView {
+    pub(crate) fn ensure_site_defaults_loaded(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let state = &self.plugins.site_defaults;
+        if self.controller.is_stale() || state.loading {
+            return;
+        }
+        if state.requested && !state.retry_on_reconnect {
+            return;
+        }
+        self.load_site_defaults(window, cx);
+    }
+
+    fn load_site_defaults(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let state = &mut self.plugins.site_defaults;
+        state.requested = true;
+        state.loading = true;
+        state.retry_on_reconnect = false;
+        let future = self.controller.site_defaults();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = future.await.and_then(parse_site_defaults);
+
+            let Ok(()) = this.update(cx, |this, cx| {
+                let stale = this.controller.is_stale();
+                let state = &mut this.plugins.site_defaults;
+                state.loading = false;
+                match result {
+                    Ok(entries) => state.entries = entries,
+                    // 不带插件的 daemon：没有该功能，区块保持隐藏。
+                    Err(error) if error.code == ApplicationErrorCode::Unsupported => {
+                        state.entries.clear();
+                    }
+                    // 其余失败保留已有列表；断连类失败在 daemon 恢复后自动重试一次。
+                    Err(error) => {
+                        state.retry_on_reconnect = stale
+                            && matches!(
+                                error.code,
+                                ApplicationErrorCode::Unavailable | ApplicationErrorCode::Timeout
+                            );
+                    }
+                }
+                cx.notify();
+            }) else {
+                // 扩展视图已释放，结束回调，不再更新状态。
+                return;
+            };
+        })
+        .detach();
+    }
+
+    /// `identity = None` 移除该站点记录；`Some` 确认 / 更改默认插件。无论成败都重新读取。
+    fn set_site_default(
+        &mut self,
+        site: String,
+        identity: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.plugins.site_defaults.busy.insert(site.clone()) {
+            return;
+        }
+        cx.notify();
+        let future = self.controller.set_site_default(site.clone(), identity);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = future.await;
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
+                this.plugins.site_defaults.busy.remove(&site);
+                if let Err(error) = result {
+                    let translator = this.translator.read(cx);
+                    let detail = error_text(translator, &error);
+                    let message =
+                        translator.text_with("pluginSiteDefaultSaveFailed", &[("error", &detail)]);
+                    this.toast_error(message, window, cx);
+                }
+                this.load_site_defaults(window, cx);
+                cx.notify();
+            }) else {
+                // 视图或窗口已释放，停止回写异步结果。
+                return;
+            };
+        })
+        .detach();
+    }
+
+    /// 列表为空时返回 `None`（整块不渲染）。
+    pub(crate) fn render_site_defaults(
+        &self,
+        frame: Frame<'_>,
+        cx: &Context<Self>,
+    ) -> Option<gpui::Div> {
+        let entries = &self.plugins.site_defaults.entries;
+        if entries.is_empty() {
+            return None;
+        }
+        let Frame {
+            translator,
+            tokens,
+            stale,
+            ..
+        } = frame;
+        let plugins = self.controller.plugins();
+        let view = cx.entity();
+        let rows = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let busy = stale || self.plugins.site_defaults.busy.contains(&entry.site);
+                let current_name =
+                    SharedString::from(plugin_display_name(plugins, &entry.identity).to_owned());
+                let options = entry
+                    .candidates
+                    .iter()
+                    .map(|identity| {
+                        (
+                            identity.clone(),
+                            SharedString::from(plugin_display_name(plugins, identity).to_owned()),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let site = entry.site.clone();
+                let current = entry.identity.clone();
+                let automatic = entry.automatic;
+                let picker = Button::new(("site-default-pick", index))
+                    .outline()
+                    .label(current_name)
+                    .dropdown_caret(true)
+                    .control(cx)
+                    .disabled(busy)
+                    .dropdown_menu_with_anchor(Anchor::TopRight, {
+                        let view = view.clone();
+                        let site = site.clone();
+                        move |menu, _, _| {
+                            options
+                                .iter()
+                                .fold(menu, |menu, (identity, name)| {
+                                    let view = view.clone();
+                                    let site = site.clone();
+                                    let target = identity.clone();
+                                    let selected = *identity == current;
+                                    menu.item(
+                                        PopupMenuItem::new(name.clone())
+                                            .checked(selected)
+                                            .on_click(move |_, window, cx| {
+                                                // 已确认的默认项再选一次是空操作；自动项选同一个等同于确认。
+                                                if selected && !automatic {
+                                                    return;
+                                                }
+                                                let site = site.clone();
+                                                let target = target.clone();
+                                                view.update(cx, |this, cx| {
+                                                    this.set_site_default(
+                                                        site,
+                                                        Some(target),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                    )
+                                })
+                                .scrollable(true)
+                                .max_h(px(320.))
+                        }
+                    });
+                list_row(frame)
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(tokens.spacing.xxs)
+                            .child(
+                                h_flex()
+                                    .gap(tokens.spacing.sm)
+                                    .items_center()
+                                    .flex_wrap()
+                                    .child(ui::title_text(entry.site.clone(), frame))
+                                    .when(automatic, |this| {
+                                        this.child(ui::tone_pill(
+                                            translator
+                                                .text("pluginSiteDefaultAutomatic")
+                                                .to_owned(),
+                                            frame.extended.colors.warning,
+                                            frame,
+                                        ))
+                                    }),
+                            )
+                            .when(automatic, |this| {
+                                this.child(ui::meta_text(
+                                    translator.text("pluginSiteDefaultAutomaticHint").to_owned(),
+                                    frame,
+                                ))
+                            }),
+                    )
+                    .child(picker)
+                    .when(automatic, |this| {
+                        let site = site.clone();
+                        let identity = entry.identity.clone();
+                        this.child(
+                            Button::new(("site-default-confirm", index))
+                                .primary()
+                                .control(cx)
+                                .label(translator.text("pluginSiteDefaultConfirm").to_owned())
+                                .disabled(busy)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.set_site_default(
+                                        site.clone(),
+                                        Some(identity.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    })
+                    .child({
+                        let site = site.clone();
+                        Button::new(("site-default-remove", index))
+                            .ghost()
+                            .control(cx)
+                            .label(translator.text("pluginSiteDefaultRemove").to_owned())
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.set_site_default(site.clone(), None, window, cx);
+                            }))
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        Some(
+            v_flex()
+                .w_full()
+                .gap(tokens.spacing.sm)
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap(tokens.spacing.xxs)
+                        .child(ui::title_text(
+                            translator.text("pluginSiteDefaultsTitle").to_owned(),
+                            frame,
+                        ))
+                        .child(ui::meta_text(
+                            translator.text("pluginSiteDefaultsDesc").to_owned(),
+                            frame,
+                        )),
+                )
+                .child(list_card(rows, frame, cx)),
+        )
+    }
+}

@@ -100,6 +100,7 @@ pub async fn probe_task_meta(
 
     // ed2k:// — 链接自带文件名与大小，无网络探测（HEAD 无意义）
     if lower_prefix.starts_with("ed2k://") {
+        #[cfg(feature = "ed2k")]
         return match crate::ed2k::link::parse_ed2k_link(url) {
             Ok(link) => ProbedMeta {
                 file_name: if file_name.is_empty() {
@@ -112,6 +113,9 @@ pub async fn probe_task_meta(
             },
             Err(_) => ProbedMeta::default(),
         };
+        // 无 eD2K 后端：不可探测，更不能当 HTTP 链接去请求。
+        #[cfg(not(feature = "ed2k"))]
+        return ProbedMeta::default();
     }
 
     // ftp:// — 使用现有 FTP 解析逻辑（FTP 无 HTTP 鉴权头语义，忽略 spec）

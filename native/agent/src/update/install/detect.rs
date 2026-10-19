@@ -1,7 +1,7 @@
 //! 安装形态检测：把「环境事实」（[`Facts`]）纯函数式地映射为 [`InstallTarget`]。
 //!
-//! 事实采集（[`gather`]）只读环境变量 / 路径 / 轻量命令（`dpkg -S`、`sysctl`），不写盘；
-//! 分类（[`classify`]）不碰系统，各平台的映射都能在任一宿主上单测。
+//! 事实采集（[`gather`]）只读环境变量 / 路径 / 轻量命令（`dpkg -S`、`pacman -Qqo`、`sysctl`），
+//! 不写盘；分类（[`classify`]）不碰系统，各平台的映射都能在任一宿主上单测。
 //!
 //! 架构取**硬件**而非构建：Windows x64 构建跑在 ARM64 仿真下、macOS x64 构建跑在 Rosetta 下，
 //! 都应拿 arm64 资产——否则更新后会永久停留在仿真层。
@@ -17,6 +17,10 @@ const INSTALL_SOURCE_ENV: &str = "FLUXDOWN_INSTALL_SOURCE";
 /// deb / Arch 包的安装根。
 #[cfg(target_os = "linux")]
 const PACKAGE_ROOT: &str = "/opt/fluxdown";
+/// 官方 deb / Arch 包的包名（`scripts/package_gpui_linux.sh`）。安装根归其它包所有时（AUR 的
+/// `zerx-lab-fluxdown-bin`、发行版仓库、第三方重打包）只能经包管理器更新：官方包与之冲突，
+/// 应用内 `pacman -U` / `apt-get install` 会失败，成功也会顶掉用户选择的包来源。
+const OFFICIAL_PACKAGE: &str = "fluxdown";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HostOs {
@@ -59,9 +63,24 @@ impl Arch {
 /// 拥有当前程序文件的系统包管理器。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(super) enum PackageOwner {
+pub(super) enum PackageManager {
     Dpkg,
     Pacman,
+}
+
+/// 拥有当前程序文件的系统包。
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) struct PackageOwner {
+    pub manager: PackageManager,
+    /// 包名；只有官方包（[`OFFICIAL_PACKAGE`]）可在应用内更新。
+    pub name: String,
+}
+
+impl PackageOwner {
+    fn is_official(&self) -> bool {
+        self.name == OFFICIAL_PACKAGE
+    }
 }
 
 /// 分类所需的全部环境事实。
@@ -82,7 +101,7 @@ pub(super) struct Facts {
     pub portable_marker: bool,
     /// Linux：以 AppImage 运行（`$APPIMAGE` 指向存在的文件）。
     pub appimage: bool,
-    /// Linux：`/opt/fluxdown` 下的程序归哪个包管理器所有。
+    /// Linux：`/opt/fluxdown` 下的程序归哪个系统包所有。
     pub package_owner: Option<PackageOwner>,
     /// macOS：从只读位置运行（App Translocation / 磁盘映像卷）。
     pub read_only_location: bool,
@@ -144,7 +163,9 @@ pub(super) fn classify(facts: &Facts) -> InstallTarget {
             | UpdateInstallKind::Synology
             | UpdateInstallKind::Qnap
             | UpdateInstallKind::Openwrt
-    ) {
+            | UpdateInstallKind::Fnos
+    ) || third_party_package(facts, kind)
+    {
         Some(UpdateManualReason::ManagedPackage)
     } else if kind == UpdateInstallKind::Unknown {
         Some(UpdateManualReason::Unsupported)
@@ -174,6 +195,7 @@ fn classify_server(facts: &Facts) -> (UpdateInstallKind, ReleaseComponent, Vec<&
         Some("synology") => Some(UpdateInstallKind::Synology),
         Some("qnap") => Some(UpdateInstallKind::Qnap),
         Some("openwrt") => Some(UpdateInstallKind::Openwrt),
+        Some("fnos") => Some(UpdateInstallKind::Fnos),
         _ => facts.in_docker.then_some(UpdateInstallKind::Docker),
     };
     if let Some(kind) = managed {
@@ -223,14 +245,14 @@ fn classify_desktop(facts: &Facts) -> (UpdateInstallKind, ReleaseComponent, Vec<
             let (kind, key) = if facts.appimage {
                 (UpdateInstallKind::LinuxAppImage, "linux_appimage")
             } else {
-                match facts.package_owner {
-                    Some(PackageOwner::Dpkg) => (UpdateInstallKind::LinuxDeb, "linux_deb"),
-                    Some(PackageOwner::Pacman) => (UpdateInstallKind::LinuxArch, "linux_arch"),
+                match facts.package_owner.as_ref().map(|owner| owner.manager) {
+                    Some(PackageManager::Dpkg) => (UpdateInstallKind::LinuxDeb, "linux_deb"),
+                    Some(PackageManager::Pacman) => (UpdateInstallKind::LinuxArch, "linux_arch"),
                     None => (UpdateInstallKind::LinuxPortable, "linux_tarball"),
                 }
             };
-            // Linux 桌面发行物只有 x64。
-            let keys = if facts.arch == Arch::X64 {
+            // Linux 桌面发行物只有 x64；非官方系统包不取官方资产（手动升级也不该指向会冲突的官方包）。
+            let keys = if facts.arch == Arch::X64 && !third_party_package(facts, kind) {
                 vec![key]
             } else {
                 Vec::new()
@@ -247,6 +269,17 @@ fn classify_desktop(facts: &Facts) -> (UpdateInstallKind, ReleaseComponent, Vec<
         }
         HostOs::Other => (UpdateInstallKind::Unknown, component, Vec::new()),
     }
+}
+
+/// 程序归非官方系统包所有（AUR、发行版仓库、第三方重打包）：只能经包管理器更新。
+fn third_party_package(facts: &Facts, kind: UpdateInstallKind) -> bool {
+    matches!(
+        kind,
+        UpdateInstallKind::LinuxDeb | UpdateInstallKind::LinuxArch
+    ) && facts
+        .package_owner
+        .as_ref()
+        .is_some_and(|owner| !owner.is_official())
 }
 
 /// 当前可执行文件路径。Linux 上程序被换掉后 `/proc/self/exe` 会带 ` (deleted)` 后缀，去掉它。
@@ -285,13 +318,16 @@ fn linux_package_owner(exe: &Path) -> Option<PackageOwner> {
     if !exe.starts_with(PACKAGE_ROOT) {
         return None;
     }
-    if package_owns(&["dpkg", "-S"], exe) {
-        return Some(PackageOwner::Dpkg);
+    // 认不出包名时按非官方包处理：宁可提示手动更新，也不对别人的包执行安装。
+    let owner = |manager, name: Option<&str>| PackageOwner {
+        manager,
+        name: name.unwrap_or_default().to_owned(),
+    };
+    if let Some(output) = query_owner(&["dpkg", "-S"], exe) {
+        return Some(owner(PackageManager::Dpkg, dpkg_owner_name(&output, exe)));
     }
-    if package_owns(&["pacman", "-Qo"], exe) {
-        return Some(PackageOwner::Pacman);
-    }
-    None
+    query_owner(&["pacman", "-Qqo"], exe)
+        .map(|output| owner(PackageManager::Pacman, pacman_owner_name(&output)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -299,15 +335,41 @@ fn linux_package_owner(_exe: &Path) -> Option<PackageOwner> {
     None
 }
 
+/// 包管理器的文件归属查询；文件归某个包所有（命令成功）时返回标准输出。
 #[cfg(target_os = "linux")]
-fn package_owns(command: &[&str], exe: &str) -> bool {
-    std::process::Command::new(command[0])
+fn query_owner(command: &[&str], exe: &str) -> Option<String> {
+    let output = std::process::Command::new(command[0])
         .args(&command[1..])
         .arg(exe)
-        .stdout(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `dpkg -S` 输出（`包名[:架构][, 包名…]: 路径`，可能夹着 diversion 行）中拥有 `exe` 的首个包名。
+#[cfg(any(target_os = "linux", test))]
+fn dpkg_owner_name<'a>(output: &'a str, exe: &str) -> Option<&'a str> {
+    output.lines().find_map(|line| {
+        let packages = line.trim_end().strip_suffix(exe)?.strip_suffix(": ")?;
+        let package = packages.split(", ").next()?.trim();
+        let name = package.split(':').next()?;
+        (!name.is_empty() && !name.contains(char::is_whitespace)).then_some(name)
+    })
+}
+
+/// `pacman -Qqo` 输出的包名（一行一个单词）。
+#[cfg(any(target_os = "linux", test))]
+fn pacman_owner_name(output: &str) -> Option<&str> {
+    let name = output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    (!name.contains(char::is_whitespace)).then_some(name)
 }
 
 #[cfg(windows)]
@@ -424,16 +486,25 @@ mod tests {
         assert_eq!(target.manual_reason, Some(UpdateManualReason::NoAsset));
     }
 
+    fn owner(manager: PackageManager, name: &str) -> Option<PackageOwner> {
+        Some(PackageOwner {
+            manager,
+            name: name.to_owned(),
+        })
+    }
+
     #[test]
     fn linux_prefers_appimage_then_package_then_tarball_and_is_x64_only() {
         let mut f = facts(HostOs::Linux, Arch::X64);
         assert_eq!(classify(&f).kind, UpdateInstallKind::LinuxPortable);
         assert_eq!(keys(&classify(&f)), vec!["linux_tarball"]);
-        f.package_owner = Some(PackageOwner::Dpkg);
+        f.package_owner = owner(PackageManager::Dpkg, OFFICIAL_PACKAGE);
         assert_eq!(keys(&classify(&f)), vec!["linux_deb"]);
-        f.package_owner = Some(PackageOwner::Pacman);
+        assert_eq!(classify(&f).manual_reason, None);
+        f.package_owner = owner(PackageManager::Pacman, OFFICIAL_PACKAGE);
         assert_eq!(classify(&f).kind, UpdateInstallKind::LinuxArch);
         assert_eq!(keys(&classify(&f)), vec!["linux_arch"]);
+        assert_eq!(classify(&f).manual_reason, None);
         f.appimage = true;
         assert_eq!(classify(&f).kind, UpdateInstallKind::LinuxAppImage);
         assert_eq!(keys(&classify(&f)), vec!["linux_appimage"]);
@@ -442,6 +513,74 @@ mod tests {
         assert_eq!(arm.kind, UpdateInstallKind::LinuxPortable);
         assert!(arm.asset_keys.is_empty());
         assert_eq!(arm.manual_reason, Some(UpdateManualReason::NoAsset));
+    }
+
+    #[test]
+    fn third_party_system_packages_are_left_to_the_package_manager() {
+        for (manager, kind, name) in [
+            (
+                PackageManager::Pacman,
+                UpdateInstallKind::LinuxArch,
+                "zerx-lab-fluxdown-bin",
+            ),
+            (
+                PackageManager::Dpkg,
+                UpdateInstallKind::LinuxDeb,
+                "fluxdown-bin",
+            ),
+            // 包名认不出时同样不在应用内安装。
+            (PackageManager::Pacman, UpdateInstallKind::LinuxArch, ""),
+        ] {
+            let mut f = facts(HostOs::Linux, Arch::X64);
+            f.package_owner = owner(manager, name);
+            let target = classify(&f);
+            assert_eq!(target.kind, kind, "{name}");
+            assert!(target.asset_keys.is_empty(), "{name}");
+            assert_eq!(
+                target.manual_reason,
+                Some(UpdateManualReason::ManagedPackage),
+                "{name}"
+            );
+            // 开发构建的原因优先于包来源。
+            f.official_build = false;
+            assert_eq!(
+                classify(&f).manual_reason,
+                Some(UpdateManualReason::UnofficialBuild)
+            );
+        }
+    }
+
+    #[test]
+    fn owner_queries_yield_the_package_name() {
+        let exe = "/opt/fluxdown/fluxdown-agent";
+        assert_eq!(
+            dpkg_owner_name("fluxdown: /opt/fluxdown/fluxdown-agent\n", exe),
+            Some("fluxdown")
+        );
+        assert_eq!(
+            dpkg_owner_name("fluxdown:amd64, other: /opt/fluxdown/fluxdown-agent\n", exe),
+            Some("fluxdown")
+        );
+        let diverted = "diversion by foo from: /opt/fluxdown/fluxdown-agent\n\
+                        diversion by foo to: /opt/fluxdown/fluxdown-agent.real\n\
+                        fluxdown-bin: /opt/fluxdown/fluxdown-agent\n";
+        assert_eq!(dpkg_owner_name(diverted, exe), Some("fluxdown-bin"));
+        assert_eq!(
+            dpkg_owner_name("fluxdown: /opt/fluxdown/fluxdownd\n", exe),
+            None
+        );
+        assert_eq!(dpkg_owner_name("", exe), None);
+
+        assert_eq!(
+            pacman_owner_name("zerx-lab-fluxdown-bin\n"),
+            Some("zerx-lab-fluxdown-bin")
+        );
+        assert_eq!(pacman_owner_name("\n  fluxdown \n"), Some("fluxdown"));
+        assert_eq!(
+            pacman_owner_name("/opt/fluxdown/fluxdown-agent is owned by fluxdown 0.5.7-1\n"),
+            None
+        );
+        assert_eq!(pacman_owner_name(""), None);
     }
 
     #[test]
@@ -467,6 +606,7 @@ mod tests {
             (" Synology ", UpdateInstallKind::Synology),
             ("QNAP", UpdateInstallKind::Qnap),
             ("openwrt", UpdateInstallKind::Openwrt),
+            ("fnOS", UpdateInstallKind::Fnos),
         ] {
             let mut f = facts(HostOs::Linux, Arch::X64);
             f.server_mode = true;

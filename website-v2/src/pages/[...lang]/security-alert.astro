@@ -5,13 +5,12 @@ import { BrandIcon } from "@/components/icons/brand";
 import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
 import { guides } from "@/i18n/messages/guides";
 import { GITHUB_URL } from "@/lib/site-nav";
+import { OFFICIAL_SITES } from "@/lib/announcements";
 
 export const getStaticPaths = langStaticPaths;
 const lang = resolveLang(Astro.params.lang);
 const t = guides[lang].security;
 
-/** 官方域名白名单;首项为主域名。 */
-const OFFICIAL_SITES = ["https://www.fluxdown.com", "https://fluxdown.com", "https://fluxdown.zerx.dev"] as const;
 const n = (i: number) => String(i + 1).padStart(2, "0");
 ---
 

@@ -259,6 +259,9 @@ jobs:
       - name: Build extension packages
         working-directory: fluxDown
         shell: bash
+        # 打包产物不展示内置嗅探规则原文（见 fluxDown RuleTable 的 BUILTIN_RULE_PREVIEW）
+        env:
+          WXT_HIDE_BUILTIN_RULES: '1'
         run: |
           VERSION=${{ needs.version.outputs.clean_version }}
           sed -i "s/\"version\": \".*\"/\"version\": \"${VERSION}\"/" package.json

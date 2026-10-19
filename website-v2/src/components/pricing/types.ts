@@ -7,6 +7,7 @@ export interface CloudCampaign {
   stageSold: number[];
   currentStageIndex: number;
   effectivePriceMinor: number;
+  effectivePriceUsdtMicros?: number | null;
 }
 
 export interface CloudPlan {
@@ -21,6 +22,7 @@ export interface CloudPlan {
   icon: string;
   color: string;
   priceMinor: number;
+  priceUsdtMicros?: number | null;
   currency: string;
   highlights: string[];
   /** Missing = purchasable (older catalog responses). Delisted-but-shown plans are false. */
@@ -35,4 +37,8 @@ export interface PlanBrief {
   /** Price currently shown on the card (campaign price, minor units); the order is authoritative. */
   priceMinor: number;
   currency: string;
+  /** Undiscounted list price (minor units); USDT is quoted proportionally to it. */
+  basePriceMinor: number;
+  /** USDT price at the list price (micros); null = USDT not offered. */
+  priceUsdtMicros: number | null;
 }

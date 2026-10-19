@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use fluxdown_protocol::shortcuts::GlobalShortcutsStatusDto;
 use fluxdown_protocol::{
     AgentEvent, AgentPreferencesDto, AgentSnapshot, DaemonEvent, ServiceEvent, ShellStatusDto,
     TrayUnavailableReason, method,
@@ -54,6 +55,8 @@ pub enum TrayAvailability {
 pub enum TrayAction {
     ShowWindow,
     ShowSettings,
+    /// 全局快捷键「新建下载」：拉起桌面程序并要求打开新建下载窗口。
+    NewDownload,
     PauseAll,
     ResumeAll,
     CancelShutdown,
@@ -94,6 +97,9 @@ pub struct ShellHost {
     pub actions: Option<mpsc::UnboundedReceiver<TrayAction>>,
     /// 由开机自启拉起（`--autostart`）。
     pub autostart: bool,
+    /// 宿主主线程上的全局热键后端承载（仅 macOS 事件循环提供；其它平台后端自带线程）。
+    #[cfg(feature = "desktop")]
+    pub(crate) hotkey_host: Option<Arc<dyn crate::hotkey::MainThreadHost>>,
 }
 
 impl ShellHost {
@@ -105,6 +111,8 @@ impl ShellHost {
             port: None,
             actions: None,
             autostart,
+            #[cfg(feature = "desktop")]
+            hotkey_host: None,
         }
     }
 }
@@ -121,11 +129,13 @@ pub fn shell_status(
             tray_available: true,
             tray_unavailable_reason: None,
             resident: close_to_tray,
+            global_shortcuts: GlobalShortcutsStatusDto::default(),
         },
         TrayAvailability::Unavailable(reason) => ShellStatusDto {
             tray_available: false,
             tray_unavailable_reason: Some(reason),
             resident: reason == TrayUnavailableReason::NotBuilt,
+            global_shortcuts: GlobalShortcutsStatusDto::default(),
         },
     }
 }
@@ -457,10 +467,10 @@ impl ShellState {
             self.launches().clear_tasks();
         }
         let (current, next) = self.events.inspect(|snapshot| {
-            (
-                snapshot.shell.clone(),
-                shell_status(self.availability, &snapshot.preferences),
-            )
+            let mut next = shell_status(self.availability, &snapshot.preferences);
+            // 全局快捷键状态由热键控制器发布，这里只推导托盘 / 驻留，不得覆盖它。
+            next.global_shortcuts = snapshot.shell.global_shortcuts.clone();
+            (snapshot.shell.clone(), next)
         });
         self.resident.store(next.resident, Ordering::Release);
         self.tray_visible
@@ -503,6 +513,13 @@ pub async fn run_controller(
     #[cfg(not(feature = "desktop"))]
     let _ = host.port.take();
     let mut actions = host.actions.take();
+    #[cfg(feature = "desktop")]
+    let mut hotkeys = crate::hotkey::HotkeyController::start(
+        has_desktop_session(host.availability),
+        host.hotkey_host.take(),
+    );
+    #[cfg(not(feature = "desktop"))]
+    let mut hotkeys = NoHotkeys;
     let (mut receiver, _) = events.subscribe_and_snapshot();
 
     state.refresh().await;
@@ -511,7 +528,10 @@ pub async fn run_controller(
         start_from_autostart(&state);
     }
     #[cfg(feature = "desktop")]
-    tray.update(&events);
+    {
+        tray.update(&events);
+        hotkeys.sync(&events);
+    }
 
     let mut idle_since: Option<Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -535,6 +555,11 @@ pub async fn run_controller(
                 None => actions = None,
             },
             _ = state.changed.notified() => {}
+            action = hotkey_action(&mut hotkeys) => {
+                if let Some(action) = action {
+                    handle_action(action, &state, &lifecycle, &power, &daemon, &gateway).await;
+                }
+            }
             _ = tick.tick() => {
                 if should_idle_exit(&state, &events, &mut idle_since, Instant::now()) {
                     tracing::info!("no UI and no pending work outside tray residency: quitting");
@@ -550,7 +575,10 @@ pub async fn run_controller(
             state.reconcile_update_prompt(Instant::now());
         }
         #[cfg(feature = "desktop")]
-        tray.update(&events);
+        {
+            tray.update(&events);
+            hotkeys.sync(&events);
+        }
     }
     state.launches().clear_tasks();
 }
@@ -562,6 +590,24 @@ async fn receive_action(
         Some(actions) => actions.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// 下一个全局快捷键触发的外壳动作；后端状态回报返回 `None`（由控制循环尾部发布）。
+#[cfg(feature = "desktop")]
+async fn hotkey_action(hotkeys: &mut crate::hotkey::HotkeyController) -> Option<TrayAction> {
+    match hotkeys.recv().await {
+        crate::hotkey::HotkeyEvent::Fire(action) => Some(action),
+        crate::hotkey::HotkeyEvent::Reported => None,
+    }
+}
+
+/// headless 构建没有全局快捷键。
+#[cfg(not(feature = "desktop"))]
+struct NoHotkeys;
+
+#[cfg(not(feature = "desktop"))]
+async fn hotkey_action(_: &mut NoHotkeys) -> Option<TrayAction> {
+    std::future::pending().await
 }
 
 async fn handle_frame(state: &ShellState, event: &ServiceEvent) {
@@ -598,6 +644,11 @@ async fn handle_action(
         TrayAction::ShowSettings => {
             if let Err(error) = crate::platform::launch_desktop(&["--settings"]) {
                 tracing::warn!(error = %error, "could not launch desktop settings");
+            }
+        }
+        TrayAction::NewDownload => {
+            if let Err(error) = crate::platform::launch_desktop(&["--new-download"]) {
+                tracing::warn!(error = %error, "could not launch desktop new-download window");
             }
         }
         TrayAction::PauseAll => call_daemon(daemon, method::DAEMON_TASK_PAUSE_ALL).await,

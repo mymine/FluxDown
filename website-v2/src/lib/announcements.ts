@@ -30,8 +30,8 @@ export interface Announcement {
 
 export const DISMISSED_KEY = "fluxdown-dismissed-announcements";
 
-/** 官方域名;首项为主域名。 */
-export const OFFICIAL_SITES = ["https://www.fluxdown.com", "https://fluxdown.com", "https://fluxdown.zerx.dev"] as const;
+/** 官方域名;首项为主域名(www 由反代 301 到主域名,fluxdown.zerx.dev 为旧域名,长期保留)。 */
+export const OFFICIAL_SITES = ["https://fluxdown.com", "https://www.fluxdown.com", "https://fluxdown.zerx.dev"] as const;
 
 export const ANNOUNCEMENTS: Announcement[] = [
   {

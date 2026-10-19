@@ -145,6 +145,36 @@ struct TasksProtocolTests {
         #expect(String(decoding: data, as: UTF8.self) == #"{"beforeId":5,"limit":0,"taskId":"t"}"#)
     }
 
+    @Test func speedHistoryDecodesWireShape_nullMeansNoRecord_andDerivesAverage() throws {
+        let json = #"{"taskId":"t","bucketSecs":2,"samples":[0,100,300],"activeSecs":6,"transferredBytes":1200,"peakBps":400}"#
+        let history = try ProtocolJSON.decode(TaskSpeedHistory.self, from: Data(json.utf8), what: "h")
+        #expect(history.bucketSecs == 2 && history.samples == [0, 100, 300])
+        #expect(history.averageBps == 200 && history.hasCurve)
+        let none = try ProtocolJSON.decode(TaskSpeedHistory?.self, from: Data("null".utf8), what: "h")
+        #expect(none == nil)
+        #expect(TaskSpeedHistory(taskId: "t").averageBps == 0)
+        #expect(!TaskSpeedHistory(taskId: "t", samples: [0, 0], peakBps: 0).hasCurve)
+        #expect(!TaskSpeedHistory(taskId: "t", samples: [5], peakBps: 5).hasCurve)
+    }
+
+    @Test func speedHistoryElapsedSeconds_bucketedClampedAndStrictlyIncreasing() {
+        let full = TaskSpeedHistory(taskId: "t", bucketSecs: 2, samples: [1, 2, 3], activeSecs: 6)
+        #expect(full.elapsedSeconds == [2, 4, 6])
+        // 末尾不完整桶被 activeSecs 截断。
+        let partial = TaskSpeedHistory(taskId: "t", bucketSecs: 5, samples: [1, 2, 3], activeSecs: 11)
+        #expect(partial.elapsedSeconds == [5, 10, 11])
+        // 截断后重复的点强制严格递增。
+        let tiny = TaskSpeedHistory(taskId: "t", bucketSecs: 5, samples: [1, 2, 3], activeSecs: 3)
+        #expect(tiny.elapsedSeconds == [3, 4, 5])
+        #expect(TaskSpeedHistory(taskId: "t", bucketSecs: 0, samples: [1, 2], activeSecs: 9).elapsedSeconds == [1, 2])
+    }
+
+    @Test func clockDurationText_minutesAndHours() {
+        #expect(clockDurationText(0) == "0:00" && clockDurationText(65) == "1:05")
+        #expect(clockDurationText(3599) == "59:59" && clockDurationText(3661) == "1:01:01")
+        #expect(clockDurationText(-4) == "0:00")
+    }
+
     @Test func feed_latestThenLoadOlderThenLiveEvents() throws {
         var feed = TaskActivityFeed(taskId: "t")
         let firstTicket = feed.begin()

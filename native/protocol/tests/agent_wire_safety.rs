@@ -71,7 +71,7 @@ fn verification_metadata_uses_camel_case_without_tokens() -> Result<(), serde_js
 #[test]
 fn entitlement_unknown_fields_roundtrip_losslessly() -> Result<(), serde_json::Error> {
     let input = json!({
-        "maxSyncDevices": 5,
+        "maxOnlineDevices": 2,
         "futureCapability": {"nested": [1, true, "x"]}
     });
     let entitlements = serde_json::from_value::<Entitlements>(input.clone())?;

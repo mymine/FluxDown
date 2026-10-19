@@ -5,6 +5,10 @@ export default defineConfig({
   // 曾因同名导出触发 "Duplicated imports" 警告；全项目已改为显式导入
   // （browser 来自 wxt/browser，define* 来自 wxt/utils/*），不再需要魔法全局。
   imports: false,
+  // UI 使用 Preact：esbuild 的 automatic JSX 运行时指向 preact/jsx-runtime。
+  vite: () => ({
+    esbuild: { jsx: "automatic", jsxImportSource: "preact" },
+  }),
   zip: {
     excludeSources: ["*.zip", "*.html", "stats.html"],
   },
@@ -54,6 +58,9 @@ export default defineConfig({
       // Firefox MV3 仍支持 blocking webRequest：用 onHeadersReceived {cancel:true}
       // 从源头拦截下载，避免残留"已取消"记录（issue #21）。Chrome MV3 已弃用，故仅 Firefox 加。
       ...(browser === "firefox" ? ["webRequestBlocking"] : []),
+      // 扩展安装 / 更新后给已打开的页面补注入 sensor 与 MAIN 钩子（background/probe.ts）。
+      // Firefox MV2 用 tabs.executeScript，不需要该权限。
+      ...(browser === "firefox" ? [] : ["scripting"]),
       "storage",
       "alarms",
       "notifications",
@@ -63,12 +70,18 @@ export default defineConfig({
       "contextMenus",
     ],
     host_permissions: ["<all_urls>"],
-    web_accessible_resources: [
-      {
-        resources: ["/fetch-interceptor.js"],
-        matches: ["<all_urls>"],
-      },
-    ],
+    // 仅 Firefox：sensor 以 injectScript 注入 /page-hooks-main.js（MV2 无 world: MAIN）。
+    // Chrome 由 page-hooks.content.ts 直接以 MAIN world 注入，无需暴露任何资源。
+    ...(browser === "firefox"
+      ? {
+          web_accessible_resources: [
+            {
+              resources: ["/page-hooks-main.js"],
+              matches: ["<all_urls>"],
+            },
+          ],
+        }
+      : {}),
     action: {
       default_icon: {
         16: "/icon/16.png",
@@ -92,15 +105,27 @@ export default defineConfig({
         },
       },
     },
+    // 描述经 _locales 跟随浏览器语言；浏览器快捷键页已按扩展分组，无需再加扩展名前缀。
+    // 打开侧边栏：Firefox 用内置 `_execute_sidebar_action`（浏览器直接切换 sidebar_action）；
+    // Chromium 无内置命令，以自定义命令在 background 中调用 sidePanel.open。
     commands: {
       "toggle-intercept": {
         suggested_key: {
           default: "Alt+Shift+D",
         },
-        description:
-          browser === "chrome"
-            ? "__MSG_extensionName__: Toggle download interception"
-            : "Toggle download interception",
+        description: "__MSG_commandToggleIntercept__",
+      },
+      "download-playing-media": {
+        suggested_key: {
+          default: "Alt+Shift+V",
+        },
+        description: "__MSG_commandDownloadPlayingMedia__",
+      },
+      [browser === "firefox" ? "_execute_sidebar_action" : "open-side-panel"]: {
+        suggested_key: {
+          default: "Alt+Shift+S",
+        },
+        description: "__MSG_commandOpenSidePanel__",
       },
     },
   }),

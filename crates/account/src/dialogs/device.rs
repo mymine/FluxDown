@@ -2,7 +2,7 @@
 //!
 //! 全部以 `Entity<AccountHost>` 为入口，可从设置窗口的账户页或任何窗口打开。
 
-use fluxdown_protocol::{CloudDevice, LinkDeviceInfo, LinkDeviceParams};
+use fluxdown_protocol::{CloudDevice, LinkDeviceInfo, LinkDeviceParams, LinkRenameParams};
 use fluxdown_ui_components::{
     BusyExt as _, ControlExt as _, DialogIntent, dialog_footer, dialog_scroll_body, dialog_title,
     field_error, field_hint, form, form_field,
@@ -33,10 +33,18 @@ fn translated(host: &Entity<AccountHost>, key: &str, cx: &App) -> SharedString {
 
 // ───────────────────────── 重命名 ─────────────────────────
 
+/// 重命名的对象：云设备（`agent.device.rename`，1–64 字符必填）或直连设备
+/// （`agent.link.rename`，仅本机显示；留空 = 清除备注名、恢复对方自报名）。
+enum RenameTarget {
+    Cloud { device_id: String },
+    Link { fingerprint: String },
+}
+
 struct RenameDialog {
     host: Entity<AccountHost>,
-    device_id: String,
+    target: RenameTarget,
     input: Entity<InputState>,
+    hint: Option<SharedString>,
     busy: bool,
     error: Option<SharedString>,
 }
@@ -47,9 +55,51 @@ pub(crate) fn open_rename(
     window: &mut Window,
     cx: &mut App,
 ) {
+    open_rename_dialog(
+        host,
+        RenameTarget::Cloud {
+            device_id: device.id.clone(),
+        },
+        device.name.clone(),
+        None,
+        window,
+        cx,
+    );
+}
+
+/// 重命名已配对的直连设备：输入框预填当前生效名，留空恢复对方自报名。
+pub(crate) fn open_link_rename(
+    host: &Entity<AccountHost>,
+    device: &LinkDeviceInfo,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let hint = translated(host, "linkedDeviceRenameHint", cx);
+    open_rename_dialog(
+        host,
+        RenameTarget::Link {
+            fingerprint: device.fingerprint.clone(),
+        },
+        device
+            .custom_name
+            .clone()
+            .unwrap_or_else(|| device.name.clone()),
+        Some(hint),
+        window,
+        cx,
+    );
+}
+
+fn open_rename_dialog(
+    host: &Entity<AccountHost>,
+    target: RenameTarget,
+    initial: String,
+    hint: Option<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let title = translated(host, "accountDeviceRenameTitle", cx);
-    let name = SharedString::from(device.name.clone());
-    let device_id = device.id.clone();
+    let name = SharedString::from(initial);
     let host = host.clone();
     let view = cx.new(|cx| {
         let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
@@ -65,8 +115,9 @@ pub(crate) fn open_rename(
         .detach();
         RenameDialog {
             host,
-            device_id,
+            target,
             input,
+            hint,
             busy: false,
             error: None,
         }
@@ -90,18 +141,46 @@ impl RenameDialog {
             return;
         }
         let raw = self.input.read(cx).value().to_string();
-        let Some(name) = normalize_device_name(&raw) else {
-            self.error = Some(translated(&self.host, "accountDeviceRenameInvalid", cx));
-            cx.notify();
-            return;
+        let (method, params) = match &self.target {
+            RenameTarget::Cloud { device_id } => {
+                let Some(name) = normalize_device_name(&raw) else {
+                    self.error = Some(translated(&self.host, "accountDeviceRenameInvalid", cx));
+                    cx.notify();
+                    return;
+                };
+                (
+                    fluxdown_protocol::method::AGENT_DEVICE_RENAME,
+                    serde_json::json!({ "id": device_id, "name": name }),
+                )
+            }
+            RenameTarget::Link { fingerprint } => {
+                // 留空 = 清除备注名；非空走与云设备相同的 1–64 字符校验。
+                let name = if raw.trim().is_empty() {
+                    None
+                } else {
+                    let Some(name) = normalize_device_name(&raw) else {
+                        self.error = Some(translated(&self.host, "accountDeviceRenameInvalid", cx));
+                        cx.notify();
+                        return;
+                    };
+                    Some(name)
+                };
+                let params = serde_json::to_value(LinkRenameParams {
+                    fingerprint: fingerprint.clone(),
+                    name,
+                })
+                .unwrap_or_default();
+                (fluxdown_protocol::method::AGENT_LINK_RENAME, params)
+            }
         };
         self.busy = true;
         self.error = None;
         cx.notify();
-        let future = self.host.read(cx).port().execute(AccountCommand::Device {
-            method: fluxdown_protocol::method::AGENT_DEVICE_RENAME,
-            params: serde_json::json!({ "id": self.device_id, "name": name }),
-        });
+        let command = match &self.target {
+            RenameTarget::Cloud { .. } => AccountCommand::Device { method, params },
+            RenameTarget::Link { .. } => AccountCommand::Link { method, params },
+        };
+        let future = self.host.read(cx).port().execute(command);
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
             let Ok(()) = this.update_in(cx, |this, window, cx| {
@@ -135,7 +214,7 @@ impl Render for RenameDialog {
             .child(form(cx).child(form_field(
                 translated(&self.host, "accountFieldDeviceName", cx),
                 Input::new(&self.input).control(cx).w_full(),
-                None,
+                self.hint.clone(),
                 cx,
             )))
             .when_some(self.error.clone(), |column, error| {
@@ -227,6 +306,34 @@ pub(crate) fn confirm_delete(
     });
 }
 
+/// 让另一台在线设备下线（无确认：只是释放在线名额，设备仍受信任，可自行重连）；失败弹出错误通知。
+pub(crate) fn disconnect_device(
+    host: &Entity<AccountHost>,
+    device: &CloudDevice,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let future = host.update(cx, |host, _| host.disconnect_device(&device.id));
+    let host = host.clone();
+    window
+        .spawn(cx, async move |cx| {
+            let result = future.await;
+            let Ok(()) = cx.update(|window, cx| {
+                if let Err(error) = result {
+                    let message = error_text(
+                        host.read(cx).translator().read(cx),
+                        &error,
+                        ErrorContext::General,
+                    );
+                    window.push_notification(Notification::error(message), cx);
+                }
+            }) else {
+                return;
+            };
+        })
+        .detach();
+}
+
 /// 解除局域网配对确认。
 pub(crate) fn confirm_unpair(
     host: &Entity<AccountHost>,
@@ -274,7 +381,7 @@ pub(crate) fn confirm_unpair(
                                 let message = error_text(
                                     host.read(cx).translator().read(cx),
                                     &error,
-                                    ErrorContext::Pairing,
+                                    ErrorContext::General,
                                 );
                                 window.push_notification(Notification::error(message), cx);
                             }) else {

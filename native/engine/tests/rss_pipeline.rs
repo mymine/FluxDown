@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_config::BtConfig;
 use fluxdown_engine::proxy_config::ProxyConfig;
 use fluxdown_engine::rss::RssRefreshOutcome;
 use fluxdown_engine::rss::model::{RssItemStatus, RssSourceInfo};
@@ -82,6 +82,7 @@ const FEED_ROUND2: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// Mikan 形态的 feed：enclosure 是 `.torrent` 直链，且 `length` 声明的是
 /// **番剧内容**的大小（342 MB）而非种子文件本身的几 KB——这正是真实站点的
 /// 行为，也是曾经把 `hint_file_size` 毒死的那个坑。
+#[cfg(feature = "bt")]
 const FEED_TORRENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0"><channel>
   <title>Mikan Project - 欺诈游戏</title>
@@ -478,6 +479,7 @@ async fn rss_fetch_failure_is_recorded_and_backs_off_without_disabling() {
 /// 2. 把 `<enclosure length>`（番剧 342 MB）当 `hint_file_size` → 引擎按
 ///    342 MB 规划 16 段并发并跳过 probe，首段 truncated、后续段全 416，还把
 ///    站点误学成「只支持 2 连接」污染 24h 的域名策略缓存。
+#[cfg(feature = "bt")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn torrent_enclosures_become_real_bt_tasks_without_a_bogus_size_hint() {
     let work = std::env::temp_dir().join(format!("fluxdown-rss-bt-{}", uniq()));

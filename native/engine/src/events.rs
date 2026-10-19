@@ -85,6 +85,12 @@ pub enum EngineEvent {
         previous_downloaded_bytes: Option<i64>,
     },
 
+    /// 自上一帧以来从网络读到的 body 字节（下载器上报了
+    /// `ProgressUpdate::transfer_bytes` 时才有），紧排在对应进度帧之前。
+    /// 宿主据此统计流量，并忽略该任务进度帧的落盘增量，直到任务离开活动态。
+    /// Host-local accounting only: this is not a wire event.
+    TaskTransferred { task_id: String, bytes: i64 },
+
     /// 分段级进度，用于下载可视化（IDM 风格）。
     SegmentProgress {
         task_id: String,
@@ -180,6 +186,24 @@ pub enum EngineEvent {
         task_id: String,
         plugin_id: String,
         running: bool,
+    },
+
+    /// 常驻插件宿主渲染出一棵新的可移植视图树（未规范化的原始 JSON，由 daemon
+    /// `normalize_view` + `diff_view` 后推给 UI）。仅 `plugins` feature 下由
+    /// `PluginManager` 发出。
+    PluginViewRendered {
+        session: String,
+        tree: serde_json::Value,
+    },
+    /// 可移植视图渲染 / 事件处理失败（会话仍保持打开，下一次渲染可恢复）。
+    PluginViewFailed { session: String, message: String },
+    /// 可移植视图会话已结束（`reason`：`closed` / `expired` / `pluginUnloaded`）。
+    PluginViewClosed { session: String, reason: String },
+    /// 插件经 `flux.ui.toast` 请求的提示（`level`：info/success/warning/error）。
+    PluginToast {
+        identity: String,
+        level: String,
+        text: String,
     },
 
     /// 全部任务组快照——组建/删除/改名/回收（GC）后发送。兼容 WebSocket

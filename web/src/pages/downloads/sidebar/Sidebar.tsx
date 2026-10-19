@@ -27,7 +27,7 @@ import { ContextMenuArea, Icon, confirmDialog } from '../../../ui'
 import { toastRpcError } from '../../../lib/rpcToast'
 import type { MenuEntry } from '../../../ui'
 import { openQueueManager } from '../dialogs'
-import { otherDevices } from '../model/devices'
+import { mergeDevices, sidebarDevices } from '../model/devices'
 import { LOCAL_DEVICE, SIDEBAR_SECTION_PREFS, STATUS_FILTERS, filterMatches, sameSelection } from '../model/filters'
 import type { DownloadFilter, DownloadStatusFilter, SidebarSelection } from '../model/filters'
 import type { DownloadTaskView } from '../model/task'
@@ -199,8 +199,12 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const loggedIn = useAgent((snapshot) => snapshot.session !== null && snapshot.session !== undefined, false)
   const devicesPref = usePref<unknown>(SIDEBAR_SECTION_PREFS.devices)
   // 设备区三态：显式设置按值；未设置时有任何设备才显示。
+  const sidebarEntries = useMemo(
+    () => sidebarDevices(mergeDevices(cloudDevices, linkedDevices, { cloud: cloudReady, local: localReady })),
+    [cloudDevices, linkedDevices, cloudReady, localReady],
+  )
   const showDevices =
-    typeof devicesPref === 'boolean' ? devicesPref : loggedIn || linkedDevices.length > 0
+    typeof devicesPref === 'boolean' ? devicesPref : loggedIn || sidebarEntries.length > 0
 
   const categoryEntries = useMemo<CustomCategoryDto[]>(
     () => categories.visible().map((rule) => rule.dto).filter((dto) => dto.builtinType !== 'all'),
@@ -293,15 +297,10 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
 
   const devices: { id: string; label: string; online: boolean | null }[] = [
     { id: LOCAL_DEVICE, label: t('thisDevice'), online: true },
-    ...otherDevices(cloudDevices).map((device) => ({
-      id: device.deviceId,
-      label: device.name || device.deviceId,
-      online: cloudReady ? device.isOnline : null,
-    })),
-    ...linkedDevices.map((device) => ({
-      id: device.fingerprint,
-      label: device.name || device.fingerprint,
-      online: localReady ? device.online : null,
+    ...sidebarEntries.map((device) => ({
+      id: device.id,
+      label: device.name,
+      online: device.online,
     })),
   ]
   const openAddDevice = () => {

@@ -20,7 +20,7 @@ pub use kit::{
 };
 pub use motion::{SlidingHighlight, StateLayer, color_transition};
 pub use qr::{MAX_QR_TEXT_LENGTH, QrPalette, qr_image};
-pub use sidebar::{SidebarChange, SidebarPanel, SidebarState};
+pub use sidebar::{SidebarChange, SidebarPanel, SidebarState, sidebar_toggle_button};
 
 use fluxdown_ui_theme::active_theme;
 use gpui::prelude::FluentBuilder as _;

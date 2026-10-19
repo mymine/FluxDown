@@ -17,11 +17,6 @@ export const docs = defineMessages({
       contribute: "Contribute on GitHub",
       sectionsLabel: "Sections",
       pages: (n: number) => (n === 1 ? "1 page" : `${n} pages`),
-      communityTitle: "Spotted a mistake, missing a topic, or want FluxDown in your language?",
-      communityBody:
-        "The docs live in a public repository and every page links to its source. App and website translations are contributed through GitHub pull requests.",
-      translate: "Translate FluxDown",
-      guide: "Contribution guide",
     },
     sections: {
       "getting-started": "Install FluxDown and run your first download in minutes.",
@@ -30,7 +25,7 @@ export const docs = defineMessages({
       "headless-server": "Run FluxDown headless with a Web UI, WebSocket and REST control.",
       api: "Local HTTP API with aria2-compatible JSON-RPC.",
       plugins: "Extend FluxDown with JavaScript plugins — URL resolvers and task hooks.",
-      contributing: "These docs are community-driven — every page is editable.",
+      contributing: "Plugins, themes, sniffing rules, translations and docs — where each contribution goes.",
     },
     search: {
       label: "Search docs",
@@ -107,11 +102,6 @@ export const docs = defineMessages({
       contribute: "在 GitHub 上贡献",
       sectionsLabel: "分区",
       pages: (n: number) => `${n} 篇`,
-      communityTitle: "发现错误、想补充内容,或想看到你的语言?",
-      communityBody:
-        "文档托管在公开仓库,每一页都链接到源文件;应用与官网翻译请通过 GitHub Pull Request 贡献。",
-      translate: "参与翻译",
-      guide: "贡献指南",
     },
     sections: {
       "getting-started": "几分钟内完成安装,开始第一个下载任务。",
@@ -120,7 +110,7 @@ export const docs = defineMessages({
       "headless-server": "以 Headless 模式运行,自带 Web UI 与 WebSocket / REST 控制。",
       api: "本机 HTTP API,兼容 aria2 JSON-RPC。",
       plugins: "用 JavaScript 插件扩展 FluxDown —— 链接解析与任务钩子。",
-      contributing: "文档由社区共建 —— 每一页都可以编辑。",
+      contributing: "插件、主题、嗅探规则、翻译与文档 —— 每类贡献该去哪里。",
     },
     search: {
       label: "搜索文档",

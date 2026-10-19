@@ -7,6 +7,7 @@ import { TASK_STATUS, downloadTaskFile, rpc, useDaemon, useTasks } from '../../.
 import type { GroupDto, TaskDto } from '../../../lib/rpc'
 import { ActionMenu, Badge, Button, Dialog, EmptyState, Icon, ProgressBar, SectionHeader, Tooltip, confirmDialog, toast } from '../../../ui'
 import { toastRpcError } from '../../../lib/rpcToast'
+import { copyText } from '../../../lib/copy'
 import type { MenuEntry } from '../../../ui'
 import { closeGroupDetail } from './store'
 import { formatBytes } from './utils'
@@ -98,13 +99,9 @@ function Overview({ group, summary }: { group: GroupDto; summary: GroupSummary }
     { type: 'item', key: 'delete-files', label: t('groupDeleteWithFiles'), icon: Trash2, destructive: true, onSelect: () => void deleteGroup(true) },
   ]
 
-  const copySource = async () => {
-    try {
-      await navigator.clipboard.writeText(group.sourceUrl)
-      toast.key('urlCopied', 'success')
-    } catch (error) {
-      toast.error(error, t('copyFileFailed'))
-    }
+  const copySource = () => {
+    copyText(group.sourceUrl)
+    toast.key('urlCopied', 'success')
   }
 
   const created = Number(group.createdAt)
@@ -116,7 +113,7 @@ function Overview({ group, summary }: { group: GroupDto; summary: GroupSummary }
           <span className="min-w-0 flex-1 break-all">{group.sourceUrl || '—'}</span>
           {group.sourceUrl ? (
             <Tooltip content={t('groupCopySourceLink')}>
-              <Button variant="ghost" iconOnly aria-label={t('groupCopySourceLink')} onClick={() => void copySource()}>
+              <Button variant="ghost" iconOnly aria-label={t('groupCopySourceLink')} onClick={copySource}>
                 <Icon icon={Copy} />
               </Button>
             </Tooltip>

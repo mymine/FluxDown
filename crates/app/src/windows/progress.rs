@@ -9,14 +9,17 @@
 //!   （macOS 为不激活应用的浮动面板，Windows 为 `WS_EX_TOPMOST`）；Linux X11 的 PopUp 是
 //!   不受窗口管理器管理的 override-redirect（不能拖动），这里保持普通窗口并请求注意。
 
-use std::{sync::Arc, time::Duration};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 
 use fluxdown_ui_downloads::{
     COMPLETION_WINDOW_PREF, PROGRESS_WINDOW_INITIAL_HEIGHT, PROGRESS_WINDOW_WIDTH,
     ProgressWindowEvent, ProgressWindowPrefs, ProgressWindowView,
 };
 use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_window_options};
-use gpui::{App, AppContext as _, Context, Entity, SharedString, Window, WindowKind, px, size};
+use gpui::{
+    App, AppContext as _, Context, Entity, SharedString, Subscription, Task, Window, WindowKind,
+    px, size,
+};
 use gpui_component::Root;
 
 use crate::{
@@ -26,7 +29,7 @@ use crate::{
     windows::{RememberedWindow, WindowKey, WindowRegistry},
 };
 
-/// 打开文件 / 文件夹后等待对方接管前台的上限。
+/// 打开文件 / 文件夹后等待对方接管前台的上限，从点击起算。
 const HANDOFF_CLOSE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// 打开（或置前）任务的进度窗口。`activate = false` 时不抢焦点（后台完成弹窗）。
@@ -131,6 +134,7 @@ fn open_window(
 
         let root = cx.new(|cx| {
             let root = Root::new(window_view.clone(), window, cx);
+            let hand_off = Rc::new(RefCell::new(HandOff::default()));
             cx.observe_in(&view, window, move |_, view, window, cx| {
                 let Some(title) = view.read(cx).title() else {
                     return;
@@ -141,17 +145,8 @@ fn open_window(
                 });
             })
             .detach();
-            cx.subscribe_in(&view, window, move |_, _, event, window, cx| match event {
-                ProgressWindowEvent::Close => window.remove_window(),
-                ProgressWindowEvent::HandedOff => {
-                    if completion {
-                        crate::completion_windows::window_closing(cx);
-                    }
-                    close_after_handoff(window, cx);
-                }
-                ProgressWindowEvent::ShowCompletionChanged(value) => {
-                    Desktop::set_pref(cx, COMPLETION_WINDOW_PREF, (*value).into());
-                }
+            cx.subscribe_in(&view, window, move |_, view, event, window, cx| {
+                on_view_event(view, event, completion, &hand_off, window, cx);
             })
             .detach();
             root
@@ -178,25 +173,138 @@ fn open_window(
     opened_view
 }
 
-/// 打开的文件 / 文件夹接管前台后再关窗。本应用仍在前台时直接关闭当前窗口，系统会把本应用
-/// 的下一个窗口（通常是主窗口）提到前面、压住刚打开的程序；等窗口失活（对方已成为前台）再关，
-/// 超时兜底（对方未抢前台时也不让窗口滞留）。
-fn close_after_handoff(window: &mut Window, cx: &mut Context<Root>) {
-    if !window.is_window_active() {
-        window.remove_window();
-        return;
+/// 进度视图的事件：关窗、打开文件 / 文件夹的前台交接，以及完成窗口偏好。
+fn on_view_event(
+    view: &Entity<ProgressWindowView>,
+    event: &ProgressWindowEvent,
+    completion: bool,
+    hand_off: &Rc<RefCell<HandOff>>,
+    window: &mut Window,
+    cx: &mut Context<Root>,
+) {
+    match event {
+        ProgressWindowEvent::Close => window.remove_window(),
+        ProgressWindowEvent::HandOffStarted => {
+            if completion {
+                crate::completion_windows::window_closing(cx);
+            }
+            // 窗口可能先于打开命令结束关闭：命令登记为关窗后仍须完成的请求，
+            // 关掉最后一个窗口时界面等它结束再退出。
+            if let Some(task) = view.update(cx, |view, _| view.take_hand_off_task()) {
+                crate::lifecycle::keep_alive(cx, task).detach();
+            }
+            begin_hand_off(hand_off, window, cx);
+        }
+        ProgressWindowEvent::HandOffAborted => {
+            if completion {
+                crate::completion_windows::window_kept(cx);
+            }
+            // 丢弃失活订阅与兜底计时：窗口保留。
+            drop(hand_off.take());
+        }
+        ProgressWindowEvent::HandedOff => {
+            if completion {
+                crate::completion_windows::window_closing(cx);
+            }
+            finish_hand_off(hand_off, window, cx);
+        }
+        ProgressWindowEvent::ShowCompletionChanged(value) => {
+            Desktop::set_pref(cx, COMPLETION_WINDOW_PREF, (*value).into());
+        }
+        ProgressWindowEvent::OpenMainWindow => {
+            if completion {
+                crate::completion_windows::window_closing(cx);
+            }
+            // 先显示主窗口再关本窗口：避免关掉最后一个窗口时界面退出。
+            crate::windows::main::reveal(cx);
+            window.remove_window();
+        }
     }
-    cx.observe_window_activation(window, |_, window, _| {
+}
+
+/// 打开文件 / 文件夹的前台交接（每个窗口至多一个）。本应用仍在前台时直接关闭当前窗口，系统会
+/// 把本应用的下一个窗口（通常是主窗口）提到前面、压住刚打开的程序；所以等窗口失活（对方已成为
+/// 前台）再关。点击即开始等待；兜底时限也从点击起算，但打开命令成功前不因时限关窗。
+#[derive(Default)]
+struct HandOff {
+    /// 兜底时限已到。
+    expired: bool,
+    /// 打开命令已成功。
+    succeeded: bool,
+    /// 窗口失活即关窗；`None` = 没有进行中的交接。丢弃即取消。
+    activation: Option<Subscription>,
+    /// 兜底计时，只为持有；丢弃即取消。
+    _timer: Option<Task<()>>,
+}
+
+impl HandOff {
+    /// 兜底时限到：命令已成功则关窗，否则等结果。
+    fn expire(&mut self) -> bool {
+        self.expired = true;
+        self.succeeded
+    }
+
+    /// 命令成功：窗口已失活或时限已到则立即关窗，否则继续等对方接管前台。
+    fn succeed(&mut self, window_active: bool) -> bool {
+        self.succeeded = true;
+        self.expired || !window_active
+    }
+}
+
+fn begin_hand_off(state: &Rc<RefCell<HandOff>>, window: &mut Window, cx: &mut Context<Root>) {
+    let activation = cx.observe_window_activation(window, |_, window, _| {
         if !window.is_window_active() {
             window.remove_window();
         }
-    })
-    .detach();
-    cx.spawn_in(window, async move |_, cx| {
+    });
+    // 计时持弱引用：状态与计时互不延长对方的生命周期。
+    let weak = Rc::downgrade(state);
+    let timer = cx.spawn_in(window, async move |_, cx| {
         cx.background_executor().timer(HANDOFF_CLOSE_TIMEOUT).await;
-        if let Err(error) = cx.update(|window, _| window.remove_window()) {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        let close = state.borrow_mut().expire();
+        if close && let Err(error) = cx.update(|window, _| window.remove_window()) {
             log::debug!("view or window released before lifecycle update: {error:#}");
         }
-    })
-    .detach();
+    });
+    // 旧交接（若有）随替换丢弃，其订阅与计时一并取消。
+    drop(state.replace(HandOff {
+        activation: Some(activation),
+        _timer: Some(timer),
+        ..HandOff::default()
+    }));
+}
+
+fn finish_hand_off(state: &Rc<RefCell<HandOff>>, window: &mut Window, cx: &mut Context<Root>) {
+    if state.borrow().activation.is_none() {
+        // 点击时预计窗口保留（完成集合里还有其它项），结果却要关窗：从现在开始等待。
+        begin_hand_off(state, window, cx);
+    }
+    let close = state.borrow_mut().succeed(window.is_window_active());
+    if close {
+        window.remove_window();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HandOff;
+
+    #[test]
+    fn handoff_closes_only_after_success_and_then_on_deactivation_or_expiry() {
+        // 时限先到：命令未成功前不关（失败要显示在窗口里），成功即关。
+        let mut slow = HandOff::default();
+        assert!(!slow.expire());
+        assert!(slow.succeed(true));
+
+        // 成功时窗口仍在前台：等对方接管前台或时限到。
+        let mut fast = HandOff::default();
+        assert!(!fast.succeed(true));
+        assert!(fast.expire());
+
+        // 成功时对方已接管前台：立即关。
+        assert!(HandOff::default().succeed(false));
+    }
 }

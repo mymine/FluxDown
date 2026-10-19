@@ -133,6 +133,8 @@ pub async fn run_with(
     let service_data_dir = data_dir.clone();
     #[cfg(feature = "plugins")]
     let service_plugin_manager = engine.manager.plugin_manager();
+    #[cfg(feature = "plugins")]
+    let host_plugin_manager = service_plugin_manager.clone();
     let receivers = take_engine_receivers(&mut engine)?;
     let (actor, mut actor_task) = crate::actor::spawn_actor(
         engine,
@@ -206,6 +208,17 @@ pub async fn run_with(
         .initialize_dynamic_projection()
         .await
         .map_err(|error| std::io::Error::other(error.message))?;
+    // 常驻插件宿主：先装好 `flux.tasks` 出口，再启动 background 宿主。宿主启动不阻塞
+    // 控制面就绪（单个插件的 main 初始化最长 30 s）。
+    #[cfg(feature = "plugins")]
+    if let Some(plugin_manager) = host_plugin_manager {
+        plugin_manager.set_task_port(Arc::new(crate::plugin_port::DaemonPluginPort::new(
+            Arc::downgrade(&service),
+        )));
+        tokio::spawn(async move {
+            plugin_manager.start_background_hosts().await;
+        });
+    }
     let listener = TcpListener::bind(process_config.bind_addr).await?;
     let bound_addr = listener.local_addr()?;
     tracing::info!(address = %bound_addr, "fluxdownd control plane listening");

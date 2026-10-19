@@ -3,8 +3,11 @@
 use fluxdown_protocol::{ReleaseNoteDto, method};
 use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button};
 use fluxdown_ui_theme::active_theme;
-use gpui::{App, IntoElement as _, ParentElement, SharedString, Styled, div, rems};
-use gpui_component::text::{TextView, TextViewStyle};
+use gpui::{
+    App, FontWeight, IntoElement as _, ParentElement, SharedString, Styled, div,
+    prelude::FluentBuilder as _, relative,
+};
+use gpui_component::text::TextView;
 use gpui_component::{h_flex, v_flex};
 use serde_json::json;
 
@@ -13,11 +16,13 @@ use crate::ui::{Control, SettingsPage, SettingsRow, SettingsSection, body_text, 
 use crate::update_view;
 
 pub(crate) const APP_VERSION: &str = fluxdown_protocol::APP_VERSION;
-const WEBSITE: &str = "https://fluxdown.zerx.dev";
+const WEBSITE: &str = "https://fluxdown.com";
 const CHROME_STORE: &str = "https://chromewebstore.google.com/search/FluxDown";
 const FIREFOX_STORE: &str = "https://addons.mozilla.org/firefox/addon/fluxdown/";
 const EDGE_STORE: &str = "https://microsoftedge.microsoft.com/addons/search/FluxDown";
-const DONATE: &str = "https://fluxdown.zerx.dev/sponsor";
+const DONATE: &str = "https://fluxdown.com/sponsor";
+/// 更新说明正文的行高（字号倍数）：多行列表项与中文长句比控件文字需要更宽松的行距。
+const RELEASE_NOTES_LINE_HEIGHT: f32 = 1.6;
 
 pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingsPage {
     SettingsPage::new(
@@ -185,36 +190,100 @@ fn release_notes_item(ctx: &SectionContext) -> SettingsRow {
 }
 
 /// 更新说明列表（最多 10 个版本，按界面语言取对应段落）；关于页与新版本提醒窗口共用。
+/// 每个版本的标题统一为「v版本 + 发布日期」，正文开头与之重复的版本标题会被去掉。
 pub(crate) fn release_notes(notes: Vec<ReleaseNoteDto>, locale: &str, cx: &App) -> gpui::Div {
-    let tokens = active_theme(cx).tokens().clone();
+    let theme = active_theme(cx);
+    let tokens = theme.tokens().clone();
+    let extended = theme.extended().clone();
     v_flex()
         .w_full()
-        .gap(tokens.spacing.md)
-        .children(notes.into_iter().take(10).map(|note| {
-            let body = localized_release_body(&note.body, locale).to_owned();
-            let markdown = TextView::markdown(
-                SharedString::from(format!("release-notes-{}", note.version)),
-                body,
-            )
-            .style(TextViewStyle::default().paragraph_gap(rems(0.5)))
-            .selectable(true)
-            .w_full();
+        .gap(tokens.spacing.lg)
+        .children(notes.into_iter().take(10).enumerate().map(|(index, note)| {
+            let body =
+                strip_version_heading(localized_release_body(&note.body, locale), &note.version)
+                    .to_owned();
+            let date =
+                release_date(&note.published_at).map(|date| SharedString::from(date.to_owned()));
+            let markdown = (!body.is_empty()).then(|| {
+                div()
+                    .w_full()
+                    .text_size(tokens.typography.sm.size)
+                    .line_height(relative(RELEASE_NOTES_LINE_HEIGHT))
+                    .text_color(tokens.colors.foreground)
+                    .child(
+                        TextView::markdown(
+                            SharedString::from(format!("release-notes-{}", note.version)),
+                            body,
+                        )
+                        .selectable(true)
+                        .w_full(),
+                    )
+            });
             v_flex()
                 .w_full()
-                .gap(tokens.spacing.xs)
-                .child(body_text(cx).child(SharedString::from(format!(
-                    "v{} {}",
-                    note.version, note.published_at
-                ))))
+                .gap(tokens.spacing.sm)
+                .when(index > 0, |this| {
+                    this.pt(tokens.spacing.lg)
+                        .border_t(extended.stroke.thin)
+                        .border_color(extended.colors.hairline)
+                })
                 .child(
-                    div()
-                        .w_full()
-                        .text_size(tokens.typography.sm.size)
-                        .line_height(tokens.typography.sm.line_height)
-                        .text_color(tokens.colors.foreground)
-                        .child(markdown),
+                    h_flex()
+                        .gap(tokens.spacing.sm)
+                        .items_center()
+                        .child(
+                            body_text(cx)
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(SharedString::from(format!("v{}", note.version))),
+                        )
+                        .children(date.map(|date| meta_text(cx).child(date))),
                 )
+                .children(markdown)
         }))
+}
+
+/// 发布时间（ISO 8601）的日期部分 `YYYY-MM-DD`；不是该格式时为 `None`，标题只显示版本。
+fn release_date(published_at: &str) -> Option<&str> {
+    let published_at = published_at.trim();
+    let date = published_at.get(..10)?;
+    let rest = published_at.get(10..)?;
+    let digits = date.bytes().enumerate().all(|(index, byte)| match index {
+        4 | 7 => byte == b'-',
+        _ => byte.is_ascii_digit(),
+    });
+    (digits && (rest.is_empty() || rest.starts_with(['T', 't', ' ']))).then_some(date)
+}
+
+/// 去掉正文开头与标题重复的版本标题（`## 0.5.7 - 2026-10-15`、`## [0.5.6] - …`、
+/// `## v0.4.8 - …`）。只认首个非空行、且标题文字以该版本号开头（其后不是版本号字符）；
+/// 其它开头（如 `## 问题修复`、别的版本）原样保留。
+fn strip_version_heading<'a>(body: &'a str, version: &str) -> &'a str {
+    let body = body.trim_start();
+    let version = version.trim().trim_start_matches(['v', 'V']);
+    let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
+    let Some(title) = atx_heading_text(first.trim_end()) else {
+        return body;
+    };
+    let title = title.trim_start_matches('[').trim_start_matches(['v', 'V']);
+    match title.strip_prefix(version) {
+        Some(after)
+            if !version.is_empty()
+                && after.chars().next().is_none_or(|next| {
+                    !(next.is_alphanumeric() || matches!(next, '.' | '-' | '+' | '_'))
+                }) =>
+        {
+            rest.trim_start()
+        }
+        _ => body,
+    }
+}
+
+/// ATX 标题（1–6 个 `#` 后接空白或行尾）的标题文字。
+fn atx_heading_text(line: &str) -> Option<&str> {
+    let text = line.trim_start_matches('#');
+    let level = line.len() - text.len();
+    ((1..=6).contains(&level) && (text.is_empty() || text.starts_with([' ', '\t'])))
+        .then(|| text.trim())
 }
 
 fn localized_release_body<'a>(body: &'a str, locale: &str) -> &'a str {
@@ -413,7 +482,7 @@ fn link_item(
 
 #[cfg(test)]
 mod tests {
-    use super::localized_release_body;
+    use super::{localized_release_body, release_date, strip_version_heading};
 
     #[test]
     fn release_notes_follow_ui_language() {
@@ -450,5 +519,68 @@ mod tests {
         assert_eq!(localized_release_body(chinese, "en"), "中文");
         let english = "<!-- fluxdown:lang:en -->\nEnglish";
         assert_eq!(localized_release_body(english, "zh"), "English");
+    }
+
+    #[test]
+    fn release_notes_drop_the_heading_that_repeats_the_version() {
+        let body = "## 0.5.7 - 2026-10-15\n\n### 🚀 新功能\n- 批量导入";
+        assert_eq!(
+            strip_version_heading(body, "0.5.7"),
+            "### 🚀 新功能\n- 批量导入"
+        );
+        // 已发布说明里出现过的标题写法都按同一版本识别。
+        for heading in [
+            "## [0.5.6] - 2026-10-12",
+            "## v0.5.6 - 2026-10-12",
+            "# 0.5.6",
+        ] {
+            let body = format!("{heading}\r\n\r\n- fix\r\n");
+            assert_eq!(
+                strip_version_heading(&body, "0.5.6"),
+                "- fix\r\n",
+                "{heading}"
+            );
+            assert_eq!(
+                strip_version_heading(&body, "v0.5.6"),
+                "- fix\r\n",
+                "{heading}"
+            );
+        }
+        assert_eq!(strip_version_heading("\n  ## 0.5.7\n", "0.5.7"), "");
+    }
+
+    #[test]
+    fn release_notes_keep_headings_of_other_versions_and_sections() {
+        for (body, version) in [
+            ("## 0.5.10 - 2026-11-01\n- a", "0.5.1"),
+            ("## 0.5.7-rc.1 - 2026-10-14\n- a", "0.5.7"),
+            ("## 问题修复\n- a", "0.5.7"),
+            ("##0.5.7\n- a", "0.5.7"),
+            ("####### 0.5.7\n- a", "0.5.7"),
+            ("- 0.5.7 修复\n## 0.5.7", "0.5.7"),
+            ("## 0.5.7\n- a", ""),
+        ] {
+            assert_eq!(
+                strip_version_heading(body, version),
+                body,
+                "{body:?} / {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_dates_take_the_calendar_day_of_iso_timestamps() {
+        assert_eq!(release_date("2026-10-15T06:14:16Z"), Some("2026-10-15"));
+        assert_eq!(release_date(" 2026-10-15 "), Some("2026-10-15"));
+        assert_eq!(release_date("2026-10-15 06:14:16"), Some("2026-10-15"));
+        for invalid in [
+            "",
+            "2026-10",
+            "2026/10/15T00:00:00Z",
+            "2026-10-150",
+            "十月十五日之后",
+        ] {
+            assert_eq!(release_date(invalid), None, "{invalid}");
+        }
     }
 }

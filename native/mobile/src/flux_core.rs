@@ -124,13 +124,21 @@ impl FluxCore {
         .await
     }
 
-    /// App 自更新器（进程内唯一；首次调用的 `config` 生效）。与主机会话无关。
+    /// App 自更新器（进程内唯一；首次调用的 `config` 生效）。与主机会话无关；本机主机运行时
+    /// 更新下载走它的统一出口（全局代理），否则按系统默认网络。
     pub fn app_updater(&self, config: AppUpdateConfig) -> Result<Arc<AppUpdater>, FluxError> {
         let handle = self.handle()?.clone();
-        Ok(Arc::clone(
-            self.updater
-                .get_or_init(|| Arc::new(AppUpdater::new(handle, config))),
-        ))
+        let local = Arc::clone(&self.local);
+        Ok(Arc::clone(self.updater.get_or_init(|| {
+            // 主机启动 / 停止期间锁被占用：此刻视为没有本机出口。
+            let egress = fluxdown_agent::egress::Egress::dynamic(move || {
+                local
+                    .try_lock()
+                    .ok()
+                    .and_then(|host| host.as_ref().map(LocalHost::egress_source))
+            });
+            Arc::new(AppUpdater::new(handle, config, egress))
+        })))
     }
 
     /// 停止本机主机（若在运行）：先放开所有本机会话，再停 agent 与 daemon。

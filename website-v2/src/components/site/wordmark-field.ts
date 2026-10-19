@@ -3,9 +3,9 @@
  *
  * - 首次进入视口:粒子从下方散落处汇流成字。
  * - 轮廓粒子较亮(延续原描边字标的观感),字腔内部是淡淡的强调色填充;自下而上渐隐,同原遮罩。
- * - 指针:附近粒子被推开并绕指针旋转(弹簧回位),划过时被「点燃」成强调色 / cyan 后慢慢冷却;
- *   快速划过会带起一阵风。
- * - 在空白处按下:冲击波炸散附近粒子,随后重新聚合。
+ * - 指针:像一枚放大镜/聚光灯——光标附近的粒子被点亮成强调色 / cyan,并向外轻微鼓起几像素
+ *   (按归位坐标计算,字形始终可读,不会被搅散);移开后余辉慢慢冷却,留下一道淡淡的光痕。
+ * - 按下:从按下点扩散出一圈涟漪,波前经过处粒子短暂发亮并沿径向轻轻起伏,随距离与时间衰减。
  * - 空闲时随机零星闪烁。
  */
 import { StrokeBatch, smoothstep, type Palette, type Pointer, type Scene } from "../../scripts/particle-stage";
@@ -24,12 +24,27 @@ interface Grain {
   fade: number;
 }
 
-const REPEL_R = 110;
-const BLAST_R = 300;
+interface Ripple {
+  x: number;
+  y: number;
+  /** 已扩散时长(秒) */
+  age: number;
+}
+
 const SPRING = 60;
+/** 透镜半径与最大鼓起位移(px) */
+const LENS_R = 140;
+const LENS_PUSH = 7;
+/** 涟漪波前速度(px/s)、波带半宽(px)、最大径向起伏(px)、寿命(s) */
+const RIPPLE_SPEED = 560;
+const RIPPLE_BAND = 46;
+const RIPPLE_PUSH = 5;
+const RIPPLE_LIFE = 1.8;
+const MAX_RIPPLES = 4;
 
 export class WordmarkField implements Scene {
   private grains: Grain[] = [];
+  private ripples: Ripple[] = [];
   private width = 0;
   private height = 0;
   private introPending = true;
@@ -105,16 +120,8 @@ export class WordmarkField implements Scene {
   }
 
   press(x: number, y: number) {
-    for (const g of this.grains) {
-      const dx = g.x - x;
-      const dy = g.y - y;
-      const d = Math.hypot(dx, dy) || 1;
-      if (d > BLAST_R) continue;
-      const k = 1 - d / BLAST_R;
-      g.vx += (dx / d) * 1500 * k;
-      g.vy += (dy / d) * 1500 * k;
-      g.heat = Math.max(g.heat, k);
-    }
+    if (this.ripples.length >= MAX_RIPPLES) this.ripples.shift();
+    this.ripples.push({ x, y, age: 0 });
   }
 
   frame(ctx: CanvasRenderingContext2D, dt: number, p: Pointer, pal: Palette) {
@@ -137,23 +144,43 @@ export class WordmarkField implements Scene {
         const g = this.grains[Math.floor(Math.random() * this.grains.length)];
         if (g) g.heat = Math.max(g.heat, 0.55);
       }
+      let alive = 0;
+      for (const r of this.ripples) {
+        r.age += dt;
+        if (r.age < RIPPLE_LIFE) this.ripples[alive++] = r;
+      }
+      this.ripples.length = alive;
+
       for (const g of this.grains) {
-        let ax = (g.hx - g.x) * SPRING;
-        let ay = (g.hy - g.y) * SPRING;
+        // 目标位置 = 归位点 + 透镜鼓起 + 涟漪起伏;位移只按归位坐标算,避免与当前位置互相反馈抖动
+        let tx = g.hx;
+        let ty = g.hy;
         if (p.presence > 0.01) {
-          const dx = g.x - p.x;
-          const dy = g.y - p.y;
+          const dx = g.hx - p.x;
+          const dy = g.hy - p.y;
           const d2 = dx * dx + dy * dy;
-          if (d2 < REPEL_R * REPEL_R) {
+          if (d2 < LENS_R * LENS_R) {
             const d = Math.sqrt(d2) || 1;
-            const f = (1 - d / REPEL_R) ** 2 * p.presence;
-            ax += (dx / d) * 5200 * f - (dy / d) * 1900 * f + p.vx * f * 4;
-            ay += (dy / d) * 5200 * f + (dx / d) * 1900 * f + p.vy * f * 4;
-            g.heat = Math.max(g.heat, Math.min(1, f * 2.2));
+            const t = d / LENS_R;
+            const push = LENS_PUSH * Math.sin(Math.PI * t) * p.presence;
+            tx += (dx / d) * push;
+            ty += (dy / d) * push;
+            g.heat = Math.max(g.heat, smoothstep(1, 0, t) * 0.9 * p.presence);
           }
         }
-        g.vx = (g.vx + ax * dt) * damp;
-        g.vy = (g.vy + ay * dt) * damp;
+        for (const r of this.ripples) {
+          const dx = g.hx - r.x;
+          const dy = g.hy - r.y;
+          const d = Math.hypot(dx, dy) || 1;
+          const band = 1 - Math.abs(d - r.age * RIPPLE_SPEED) / RIPPLE_BAND;
+          if (band <= 0) continue;
+          const k = band * band * (1 - r.age / RIPPLE_LIFE) ** 2;
+          tx += (dx / d) * RIPPLE_PUSH * k;
+          ty += (dy / d) * RIPPLE_PUSH * k;
+          g.heat = Math.max(g.heat, k);
+        }
+        g.vx = (g.vx + (tx - g.x) * SPRING * dt) * damp;
+        g.vy = (g.vy + (ty - g.y) * SPRING * dt) * damp;
         g.x += g.vx * dt;
         g.y += g.vy * dt;
         g.heat *= cool;
@@ -166,7 +193,7 @@ export class WordmarkField implements Scene {
       const x0 = moving ? g.x - g.vx * 0.016 : g.x;
       const y0 = moving ? g.y - g.vy * 0.016 : g.y;
       const x1 = moving ? g.x : g.x + 0.01;
-      // 飞散中的粒子不受渐隐影响太多,保证入场与炸散可见
+      // 运动中的粒子(入场汇流)不受渐隐影响太多,保证入场可见
       const fade = Math.max(g.fade, moving ? 0.5 : 0);
       if (g.heat > 0.35) {
         this.hotBatch.line(pal, g.cyan ? "cyan" : "accent", (0.45 + 0.55 * g.heat) * fade * tone, x0, y0, x1, g.y);

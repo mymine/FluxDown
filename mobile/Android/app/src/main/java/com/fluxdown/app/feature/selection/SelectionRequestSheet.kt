@@ -44,6 +44,7 @@ import com.fluxdown.core.store.HostStore
 import com.fluxdown.fluxui.controls.ButtonVariant
 import com.fluxdown.fluxui.controls.FluxButton
 import com.fluxdown.fluxui.controls.FluxRadioRow
+import com.fluxdown.fluxui.controls.FluxSwitchRow
 import com.fluxdown.fluxui.controls.FluxTag
 import com.fluxdown.fluxui.controls.GlassSection
 import com.fluxdown.fluxui.data.CountdownRing
@@ -124,6 +125,7 @@ fun SelectionRequestSheet(request: SelectionRequest?) {
             is SelectionKind.Bt -> BtSelectionSheet(ui, kind)
             is SelectionKind.Hls -> HlsSelectionSheet(ui, kind)
             is SelectionKind.Variant -> VariantSelectionSheet(ui, kind)
+            is SelectionKind.Plugin -> PluginSelectionSheet(ui, kind)
             // fileExists 不走单请求 Sheet：由 FileConflictSheet 聚合呈现（shell 只把其它请求传进来）
             is SelectionKind.FileExists -> Unit
         }
@@ -490,6 +492,91 @@ private fun VariantSelectionSheet(ui: SelectionUi, kind: SelectionKind.Variant) 
                         value = if (o.totalBytes > 0) Format.bytes(o.totalBytes).toString() else null,
                     )
                 }
+            }
+        }
+    }
+}
+
+// ── 插件选择 ─────────────────────────────────────────────────────────────
+
+/** 多个插件解析器匹配同一 URL：默认项预选，可勾选「始终使用」记住站点默认；可划走（= 取消，下次启动重新询问）。 */
+@Composable
+private fun PluginSelectionSheet(ui: SelectionUi, kind: SelectionKind.Plugin) {
+    val request = ui.request
+    val c = FluxTheme.colors
+    val type = FluxTheme.type
+    val defaultIdentity = (request.defaultChoice as? SelectionOutcome.Plugin)?.identity
+    var selected by remember {
+        mutableStateOf(kind.candidates.firstOrNull { it.identity == defaultIdentity }?.identity ?: kind.candidates.firstOrNull()?.identity)
+    }
+    var rememberChoice by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val title = str(R.string.pluginChoiceTitle)
+
+    FluxSheet(
+        visible = ui.visible,
+        onDismissRequest = { ui.resolver.cancel(request) },
+        detent = FluxSheetDetent.Wrap,
+        title = title,
+        header = {
+            FluxSheetHeader(
+                title = title,
+                subtitle = str(R.string.pluginChoiceDesc, "count" to kind.candidates.size, "site" to kind.site),
+                onClose = { ui.resolver.cancel(request) },
+            )
+        },
+        footer = {
+            SelectionFooter(ui.countdown) {
+                FluxButton(str(R.string.cancel), { ui.resolver.cancel(request) }, modifier = Modifier.weight(1f))
+                FluxButton(
+                    str(R.string.pluginChoiceConfirm),
+                    {
+                        val pick = kind.candidates.firstOrNull { it.identity == selected } ?: return@FluxButton
+                        ui.resolver.resolve(
+                            request,
+                            SelectionOutcome.Plugin(pick.identity, rememberChoice),
+                            context.str(R.string.mobileSelectionPicked, "label" to pick.name.ifEmpty { pick.identity }),
+                            userInitiated = true,
+                        )
+                    },
+                    variant = ButtonVariant.Primary,
+                    modifier = Modifier.weight(1f),
+                    enabled = selected != null,
+                )
+            }
+        },
+    ) {
+        SelectionTaskRow(ui.taskOf())
+        FluxText(
+            kind.url,
+            Modifier.fillMaxWidth().padding(horizontal = 6.dp, vertical = 4.dp),
+            style = type.mono,
+            color = c.inkMuted,
+            maxLines = 1,
+        )
+        GlassSection(Modifier.padding(top = 8.dp)) {
+            kind.candidates.forEach { p ->
+                row {
+                    val meta = listOf(p.version, p.identity).filter { it.isNotEmpty() }.joinToString(" · ")
+                    val sub = listOf(meta, p.description).filter { it.isNotEmpty() }.joinToString("\n").ifEmpty { null }
+                    FluxRadioRow(
+                        title = p.name.ifEmpty { p.identity },
+                        selected = p.identity == selected,
+                        onSelect = { selected = p.identity },
+                        subtitle = sub,
+                        value = if (p.identity == defaultIdentity) str(R.string.pluginChoiceDefaultBadge) else null,
+                    )
+                }
+            }
+        }
+        GlassSection(Modifier.padding(top = 8.dp)) {
+            row {
+                FluxSwitchRow(
+                    title = str(R.string.pluginChoiceRemember, "site" to kind.site),
+                    checked = rememberChoice,
+                    onCheckedChange = { rememberChoice = it },
+                    subtitle = str(R.string.pluginChoiceRememberHint),
+                )
             }
         }
     }

@@ -8,14 +8,18 @@
 //! - **响应方**（被添加设备）：生成配对码、处理 `hello`/`confirm`、mDNS 广播。
 //! - **发起方**（正在添加设备）：mDNS 浏览、`begin_pairing`（发 hello、算 SAS）、
 //!   `confirm_pairing`（发 confirm、落库）。
-//! - **数据面**：`dispatch`（把下载下发给已配对设备，先 AEAD 加密再走传输栈）、
-//!   `authorize`（校验入站链路请求的 HMAC 鉴权并解密）、`exchange_peer_info`
-//!   （经已认证链路交换默认目录 / 路径风格）。
+//! - **数据面（v2）**：`dispatch`（把下载下发给已配对设备）、`exchange_peer_info`（双向交换
+//!   设备信息）、`remove_device`（解除配对并尽力通知对端）、`authorize`（校验入站请求并解密）、
+//!   `answer_peer_info` / `answer_unpair`（响应端处理）。请求体先 AEAD 加密再对密文做 MAC，
+//!   **响应体同样被封装**，发起方只在响应成功解封后才相信对端；线格式见 [`crate::crypto`]。
+//! - **连通性维护**：名册非空且本机可被局域网访问时常驻 mDNS 存在性广播；宿主发现设备长时间
+//!   离线时可调用 [`LinkManager::browse_for`] 短时浏览，线索用于下一轮拨号。
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -23,8 +27,8 @@ use tokio::sync::mpsc;
 
 use super::address::PeerAddress;
 use super::crypto::{
-    LINK_AUTH_SKEW_SECS, derive_link_aead_key, link_auth_tag, open_link_body, seal_link_body,
-    verify_link_auth_tag,
+    LINK_AUTH_SKEW_SECS, LINK_ENC_V2, LINK_PROTOCOL_VERSION, LinkExchange, derive_link_aead_key,
+    link_auth_tag, open_link_body, request_aad, response_aad, seal_link_body, verify_link_auth_tag,
 };
 use super::discovery::{self, MdnsAdvertiser, MdnsBrowser};
 use super::error::{LinkError, LinkResult};
@@ -34,14 +38,32 @@ use super::pairing::{
     RevealRequest, RevealResponse, SelfInfo,
 };
 use super::storage::LinkStorage;
-use super::transport::TransportStack;
-use super::types::{DiscoveredPeer, PeerCandidate, PeerInfo, PeerRecord, TransportKind};
+use super::text::{
+    MAX_NAME_CHARS, MAX_PLATFORM_CHARS, MAX_VERSION_CHARS, is_valid_cloud_device_id,
+    sanitize_optional, sanitize_text,
+};
+use super::transport::{PeerConn, TransportStack};
+use super::types::{
+    DiscoveredPeer, MAX_DIRECT_CANDIDATES, PeerCandidate, PeerInfo, PeerRecord, TransportKind,
+};
 use super::wire::{self, classify_failure, read_json_object, send_failure};
 
 /// 数据面：经已认证链路交换设备信息的路径（与 `fluxdown_api::routes::API_LINK_INFO` 一致）。
 pub const LINK_INFO_PATH: &str = "/api/v1/link/info";
 /// 数据面：下发下载任务的路径（与 `fluxdown_api::routes::API_LINK_TASKS` 一致）。
 pub const LINK_TASKS_PATH: &str = "/api/v1/link/tasks";
+/// 数据面：通知对端解除配对的路径（与 `fluxdown_api::routes::API_LINK_UNPAIR` 一致）。
+pub const LINK_UNPAIR_PATH: &str = "/api/v1/link/unpair";
+
+/// 解除配对时通知在线对端的总时限（含拨号）。对端不可达 / 太慢不阻断本地删除。
+const UNPAIR_NOTIFY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 请求头：发送方指纹 / 时间戳 / nonce / MAC / 方案版本。
+const HEADER_DEVICE: &str = "X-FluxLink-Device";
+const HEADER_TS: &str = "X-FluxLink-Ts";
+const HEADER_NONCE: &str = "X-FluxLink-Nonce";
+const HEADER_TAG: &str = "X-FluxLink-Tag";
+const HEADER_ENC: &str = "X-FluxLink-Enc";
 
 /// 设备互联事件，由宿主消费并转换为协议通知。
 #[derive(Debug, Clone)]
@@ -52,6 +74,8 @@ pub enum LinkEngineEvent {
     Paired(PeerRecord),
     /// 一台设备被解除配对（fingerprint）。
     Unpaired(String),
+    /// 对端经已认证链路通知本机：它已解除与本机的配对。记录已标记 `revoked` 并持久化。
+    Revoked(String),
     /// 有设备正在向本机发起配对，等待本机用户核对 SAS 后批准/拒绝。
     IncomingPairing {
         session_id: String,
@@ -128,26 +152,20 @@ fn upsert_discovered(snapshot: &mut Vec<DiscoveredPeer>, peer: DiscoveredPeer) {
 
 /// 发起方待确认会话（[`PendingInit`]）存活上限。**必须**与响应方
 /// `pairing.rs` 的 `SESSION_TTL`（180s）保持一致——双端各自独立维护一套
-/// 过期判定，此前这个 180 是硬编码在 [`LinkManager::begin_pairing`] 剪枝
-/// 调用里的魔法数，[`LinkManager::confirm_pairing`] 需要同一个值做本地
-/// 过期检查（此前它完全不做本地过期检查，只依赖对端 `SESSION_TTL` 兜
-/// 底），因此提升为具名常量集中定义，未来两端 TTL 一起改，不会各自漂移。
-const PENDING_INIT_TTL: std::time::Duration = std::time::Duration::from_secs(180);
+/// 过期判定，[`LinkManager::begin_pairing`] 的剪枝与
+/// [`LinkManager::confirm_pairing`] 的本地过期检查共用这一个具名常量，
+/// 未来两端 TTL 一起改，不会各自漂移。
+const PENDING_INIT_TTL: Duration = Duration::from_secs(180);
 
 /// 手动探测（`/ping`）得到的设备指纹的保留时长：配对时用来校验对端出示的身份，
 /// 过久的探测结果不再可信（设备可能已换身份）。
-const PROBED_FINGERPRINT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const PROBED_FINGERPRINT_TTL: Duration = Duration::from_secs(600);
 
 /// 探测指纹表的条数上限，超出时淘汰最旧的一条，保证内存占用有界。
 const MAX_PROBED_FINGERPRINTS: usize = 64;
 
-/// 已配对设备 Direct 候选端点集合的总数上限。mDNS 重新发现命中已配对
-/// 指纹时会把新地址去重后插到候选表首位、旧候选整体保留作回退（见
-/// `LinkManager::start_discovery` 的转发任务），若不设上限，设备长期
-/// 在多个网络间漂移会让候选表无界增长。取一个小值：日常场景「当前
-/// 网段 + 一两个历史网段」远用不到 4 个，仍能覆盖「NAS 同时插着物理
-/// 网卡和虚拟机 host-only 网卡」这类多网卡场景的合理候选数。
-const MAX_DIRECT_CANDIDATES: usize = 4;
+/// 数据面 nonce 的长度上限与字符集：发起方用 UUID（32 hex），这里放宽到 `[A-Za-z0-9_-]{1,64}`。
+const MAX_NONCE_LEN: usize = 64;
 
 /// 发起方待确认会话（begin_pairing 与 confirm_pairing 之间的状态）。
 struct PendingInit {
@@ -158,7 +176,7 @@ struct PendingInit {
 }
 
 /// [`LinkManager`] 的宿主相关选项。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LinkOptions {
     /// 本机 fluxdown API 端口（mDNS 广播 + 自报候选用）。
     pub api_port: u16,
@@ -169,6 +187,10 @@ pub struct LinkOptions {
     /// 是否允许 mDNS 广播（`FLUXDOWN_MDNS=off` 的开关）。`false` 时仍可用配对码 +
     /// 手动地址配对，只是不在局域网内广播本机。
     pub advertise: bool,
+    /// 覆盖本机自报的回连地址（配对 `initiatorAddrs` 与 `/info` 的 `addrs`）；空 = 自动探测。
+    /// 容器 / NAS / 多网卡下自动探测到的往往是对端连不通的内部地址。每条是 `host:port` 或完整
+    /// URL，至多 [`MAX_DIRECT_CANDIDATES`] 条；运行期可经 [`LinkManager::set_advertise_addrs`] 改。
+    pub advertise_addrs: Vec<String>,
 }
 
 impl LinkOptions {
@@ -179,6 +201,7 @@ impl LinkOptions {
             api_port,
             reachable: true,
             advertise: true,
+            advertise_addrs: Vec::new(),
         }
     }
 }
@@ -186,19 +209,31 @@ impl LinkOptions {
 /// 设备互联门面。宿主持 `Arc<LinkManager>`。
 pub struct LinkManager {
     identity: LinkIdentity,
-    self_info: SelfInfo,
     store: Arc<dyn LinkStorage>,
+    /// 响应方持有本机自报信息（设备名 / 云设备 ID，运行期可变）。
     responder: PairingResponder,
     transport: TransportStack,
     client: reqwest::Client,
     api_port: AtomicU16,
     reachable: bool,
     advertise: bool,
+    /// 覆盖自报的回连地址（候选形态，已规范化）。
+    advertise_addrs: RwLock<Vec<String>>,
     events: mpsc::Sender<LinkEngineEvent>,
     advertiser: Mutex<Option<MdnsAdvertiser>>,
+    /// 配对窗口（配对码有效期内）：广播让发起方能发现本机。
+    pairing_open: AtomicBool,
+    /// 名册里有未被解除的设备：常驻存在性广播，让对端在本机换 IP / 端口后能重新找到。
+    roster_present: AtomicBool,
+    /// 宿主显式要求长期广播（[`LinkManager::start_advertising`]）。
+    forced_advertising: AtomicBool,
     browser: Mutex<Option<MdnsBrowser>>,
+    /// 用户界面是否开着发现：开着才把未配对设备汇入发现快照 / 事件；自愈浏览只收集回连线索。
+    ui_discovery: Arc<AtomicBool>,
     pending: Mutex<HashMap<String, PendingInit>>,
-    /// 数据面防重放：时窗内已见过的 `(device:nonce, ts)`，authorize 剪枝保持有界。
+    /// 数据面防重放：已见过的 `device:nonce` → 过期时刻（Unix 秒）。过期时刻取
+    /// `max(请求 ts, 当前时间) + LINK_AUTH_SKEW_SECS`：发送方时钟超前时，同一份请求在整个
+    /// 「ts ± 容忍窗」内都能通过时间窗，nonce 必须保留到窗口真正关闭为止。
     ///
     /// **纯内存态，无持久化**：进程重启即清空全部历史。残余风险——若攻击者
     /// 截获过一份合法的 `(ts, nonce, tag)`，理论上可在响应方重启后、原始
@@ -206,14 +241,14 @@ pub struct LinkManager {
     /// 窗口极窄（需精确命中「重启后 120s 内」这个时机，且重启本身不频繁），
     /// 判定为可接受风险：加持久化的工程成本（落盘 + 跨重启一致性）远大于
     /// 收窄这个窗口带来的收益。这是权衡后的结论，不是遗漏。
-    seen_nonces: Mutex<Vec<(String, i64)>>,
-    /// 发现快照（发起方侧）：`start_discovery` 转发任务里按 [`upsert_discovered`]
+    seen_nonces: Mutex<HashMap<String, i64>>,
+    /// 发现快照（发起方侧）：浏览转发任务里按 [`upsert_discovered`]
     /// 去重更新；`start_discovery` 调用时清空；`probe` 的结果不入此快照。
     /// `Arc` 包裹以便转发任务（`tokio::spawn` 的 `'static` 闭包）持有写句柄。
     discovered: Arc<Mutex<Vec<DiscoveredPeer>>>,
     /// mDNS 广播给出、尚未经认证链路验证的回连候选（指纹 → 候选）。仅存内存，
-    /// 只在拨号时排在已验证候选之后；认证请求经它成功后才由
-    /// [`Self::promote_hinted`] 写入名册。每个已配对指纹至多一条，天然有界。
+    /// 拨号时**排在已验证候选之前**（换 IP 后新地址最可能有效），但只有认证请求经它拿到可验证的
+    /// 封装响应后才由 [`Self::promote_hinted`] 写入名册。每个已配对指纹至多一条，天然有界。
     hinted: Arc<Mutex<HashMap<String, PeerCandidate>>>,
     /// 手动探测（`/ping`）得到的设备指纹（`PeerAddress::base_url` → 指纹 + 记录时刻）。
     /// 与 [`Self::discovered`] 一起，是发起方配对时比对对端身份的“发现指纹”来源，见
@@ -221,8 +256,43 @@ pub struct LinkManager {
     probed: Mutex<HashMap<String, (String, std::time::Instant)>>,
 }
 
+/// 清洗宿主给出的本机自报信息：设备名剔除控制 / 双向控制字符并限长（空则用 `FluxDown`），
+/// 云设备 ID 只接受 UUID 形态。
+fn clean_self_info(mut info: SelfInfo) -> SelfInfo {
+    info.name = sanitize_text(&info.name, MAX_NAME_CHARS);
+    if info.name.is_empty() {
+        info.name = "FluxDown".to_owned();
+    }
+    info.platform = sanitize_optional(info.platform.as_deref(), MAX_PLATFORM_CHARS);
+    info.app_version = sanitize_optional(info.app_version.as_deref(), MAX_VERSION_CHARS);
+    info.cloud_device_id = info
+        .cloud_device_id
+        .filter(|id| is_valid_cloud_device_id(id));
+    info
+}
+
+/// 把一组宿主给出的地址规范化为候选形态（非法的丢弃、去重、截断）。
+fn normalize_advertised(addrs: &[String]) -> Vec<String> {
+    let mut normalized: Vec<String> = Vec::new();
+    for addr in addrs {
+        let Ok(parsed) = PeerAddress::parse(addr) else {
+            tracing::warn!(address = %addr, "ignoring an unusable advertised link address");
+            continue;
+        };
+        let candidate = parsed.to_candidate();
+        if !normalized.contains(&candidate) {
+            normalized.push(candidate);
+        }
+    }
+    normalized.truncate(MAX_DIRECT_CANDIDATES);
+    normalized
+}
+
 impl LinkManager {
     /// 从存储加载（或首次生成并持久化）本机身份，构造门面。
+    ///
+    /// 身份种子「存在但无法解析」时存储后端返回错误，本函数随之失败——绝不静默生成新身份
+    /// 覆盖它：指纹一变，所有已配对设备立即失效。
     pub async fn load(
         storage: Arc<dyn LinkStorage>,
         self_info: SelfInfo,
@@ -231,11 +301,10 @@ impl LinkManager {
     ) -> LinkResult<Arc<Self>> {
         let identity = Self::load_or_create_identity(storage.as_ref()).await?;
         let client = wire::http_client();
-        let responder = PairingResponder::new(identity.clone(), self_info.clone());
+        let responder = PairingResponder::new(identity.clone(), clean_self_info(self_info));
         let transport = TransportStack::direct_only(client.clone());
         let mgr = Arc::new(Self {
             identity,
-            self_info,
             store: storage,
             responder,
             transport,
@@ -243,24 +312,29 @@ impl LinkManager {
             api_port: AtomicU16::new(options.api_port),
             reachable: options.reachable,
             advertise: options.advertise,
+            advertise_addrs: RwLock::new(normalize_advertised(&options.advertise_addrs)),
             events,
             advertiser: Mutex::new(None),
+            pairing_open: AtomicBool::new(false),
+            roster_present: AtomicBool::new(false),
+            forced_advertising: AtomicBool::new(false),
             browser: Mutex::new(None),
+            ui_discovery: Arc::new(AtomicBool::new(false)),
             pending: Mutex::new(HashMap::new()),
-            seen_nonces: Mutex::new(Vec::new()),
+            seen_nonces: Mutex::new(HashMap::new()),
             discovered: Arc::new(Mutex::new(Vec::new())),
             hinted: Arc::new(Mutex::new(HashMap::new())),
             probed: Mutex::new(HashMap::new()),
         });
         Self::spawn_gc(&mgr);
+        mgr.refresh_presence().await;
         Ok(mgr)
     }
 
     /// 启动后台周期清理任务：每 60s 剪枝 `pending`/`seen_nonces`，并转发给
     /// 响应方剪枝其 `codes`/`sessions`（见
-    /// [`super::pairing::PairingResponder::prune_expired`]）。此前这几张
-    /// 状态表都只在「恰好又发生一次同类调用」时顺带清理，半途放弃的配对/
-    /// 过期 nonce 记录会一直驻留到进程重启才被回收。
+    /// [`super::pairing::PairingResponder::prune_expired`]）。状态表若只在「恰好又发生
+    /// 一次同类调用」时顺带清理，半途放弃的配对/过期 nonce 记录会一直驻留到进程重启才被回收。
     ///
     /// 持 `Weak` 而非 `Arc`：循环体自身绝不能成为 `LinkManager` 存活的
     /// 理由——宿主释放最后一个 `Arc` 后，下一次 `upgrade()` 必然失败，循环
@@ -270,7 +344,7 @@ impl LinkManager {
     fn spawn_gc(mgr: &Arc<Self>) {
         let weak = Arc::downgrade(mgr);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
                 let Some(mgr) = weak.upgrade() else {
@@ -290,16 +364,81 @@ impl LinkManager {
         Ok(identity)
     }
 
+    async fn emit(&self, event: LinkEngineEvent) {
+        if self.events.send(event).await.is_err() {
+            tracing::debug!("link event receiver closed");
+        }
+    }
+
     /// 本机设备指纹（设备 ID）。
     #[must_use]
     pub fn fingerprint(&self) -> &str {
         self.identity.fingerprint()
     }
 
+    /// 本机当前自报信息（快照）。
+    #[must_use]
+    pub fn self_info(&self) -> SelfInfo {
+        self.responder.self_info()
+    }
+
     /// 本机展示名（供 `/ping` 透出）。
     #[must_use]
-    pub fn self_name(&self) -> &str {
-        &self.self_info.name
+    pub fn self_name(&self) -> String {
+        self.responder.self_info().name
+    }
+
+    /// 本机平台（供 `/ping` 透出）。
+    #[must_use]
+    pub fn self_platform(&self) -> Option<String> {
+        self.responder.self_info().platform
+    }
+
+    /// 更新本机自报的设备名与云设备 ID（改名、云账号登录 / 登出后调用）；返回是否有变化。
+    /// 设备名变化会同步到已开启的 mDNS 广播、`/ping`、之后的配对 hello 与信息交换；云设备 ID
+    /// 只经已认证的信息交换告知已配对对端。
+    pub fn update_self(&self, name: &str, cloud_device_id: Option<&str>) -> LinkResult<bool> {
+        let current = self.responder.self_info();
+        let next = clean_self_info(SelfInfo {
+            name: name.to_owned(),
+            platform: current.platform.clone(),
+            app_version: current.app_version.clone(),
+            cloud_device_id: cloud_device_id.map(str::to_owned),
+        });
+        let name_changed = next.name != current.name;
+        if !name_changed && next.cloud_device_id == current.cloud_device_id {
+            return Ok(false);
+        }
+        self.responder.set_self_info(next.clone());
+        if name_changed {
+            let advertiser = self.advertiser.lock().map_err(|_| LinkError::Unavailable)?;
+            if let Some(advertiser) = advertiser.as_ref()
+                && let Err(error) = advertiser.update(
+                    self.api_port.load(Ordering::Relaxed),
+                    self.identity.fingerprint(),
+                    &next.name,
+                    next.platform.as_deref(),
+                    next.app_version.as_deref(),
+                )
+            {
+                tracing::warn!(error = %error, "could not refresh the mDNS advertisement after a rename");
+            }
+        }
+        Ok(true)
+    }
+
+    /// 更新覆盖自报的回连地址（见 [`LinkOptions::advertise_addrs`]）；返回是否有变化。
+    pub fn set_advertise_addrs(&self, addrs: &[String]) -> bool {
+        let next = normalize_advertised(addrs);
+        let mut current = match self.advertise_addrs.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *current == next {
+            return false;
+        }
+        *current = next;
+        true
     }
 
     /// 更新实际 API 端口及已开启的 mDNS 广播；不改变可达范围、身份、配对或浏览状态。
@@ -309,13 +448,14 @@ impl LinkManager {
         let advertiser = self.advertiser.lock().map_err(|_| LinkError::Unavailable)?;
         let old_port = self.api_port.load(Ordering::Relaxed);
         if let Some(advertiser) = advertiser.as_ref() {
+            let me = self.responder.self_info();
             let update = |port| {
-                advertiser.update_port(
+                advertiser.update(
                     port,
                     self.identity.fingerprint(),
-                    &self.self_info.name,
-                    self.self_info.platform.as_deref(),
-                    self.self_info.app_version.as_deref(),
+                    &me.name,
+                    me.platform.as_deref(),
+                    me.app_version.as_deref(),
                 )
             };
             if let Err(error) = update(api_port) {
@@ -332,16 +472,11 @@ impl LinkManager {
         Ok(())
     }
 
-    /// 本机平台（供 `/ping` 透出）。
-    #[must_use]
-    pub fn self_platform(&self) -> Option<&str> {
-        self.self_info.platform.as_deref()
-    }
-
     // ── 响应方（被添加设备侧）─────────────────────────────────────────────
 
     /// 生成一次性配对码（在被添加设备 UI 展示），并确保 mDNS 广播已开启。
     pub fn generate_code(&self) -> String {
+        self.pairing_open.store(true, Ordering::Relaxed);
         self.ensure_advertising();
         self.responder.generate_code()
     }
@@ -411,7 +546,7 @@ impl LinkManager {
     /// 处理入站 `confirm`：本机用户批准则把发起方入册并广播 `Paired` 事件。
     ///
     /// 返回 [`PairConfirmOutcome`] 而非 `bool`：本机用户**拒绝**与**核验超时**都是
-    /// 协议的正常终局（不是服务端错误），必须能被发起方区分。此前它们经 `Err` 冒泡成
+    /// 协议的正常终局（不是服务端错误），必须能被发起方区分——它们若经 `Err` 冒泡成
     /// HTTP 400，发起方的 [`Self::confirm_pairing`] 见非 2xx 一律映射成
     /// `SessionExpired`，用户看到的是「会话过期」而不是「对方拒绝了配对」。
     pub async fn pair_confirm(
@@ -421,30 +556,19 @@ impl LinkManager {
     ) -> LinkResult<PairConfirmOutcome> {
         match self.responder.handle_confirm(session_id, confirm).await {
             Ok(Some(record)) => {
+                // 重新配对同一指纹：新记录覆盖旧记录，`revoked` 随之清除。
                 self.store.upsert(&record).await?;
-                if self
-                    .events
-                    .send(LinkEngineEvent::Paired(record))
-                    .await
-                    .is_err()
-                {
-                    tracing::debug!("link event receiver closed after pairing");
-                }
+                self.emit(LinkEngineEvent::Paired(record)).await;
+                self.refresh_presence().await;
                 Ok(PairConfirmOutcome::Paired)
             }
             // 发起方自己传了 confirm=false —— 它当然知道自己拒绝了，无需额外语义。
             Ok(None) => {
                 // 发起方放弃/拒绝：响应方会话已被删除，通知宿主关闭待确认弹窗。
-                if self
-                    .events
-                    .send(LinkEngineEvent::IncomingCancelled {
-                        session_id: session_id.to_string(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::debug!("link event receiver closed after pairing cancellation");
-                }
+                self.emit(LinkEngineEvent::IncomingCancelled {
+                    session_id: session_id.to_string(),
+                })
+                .await;
                 Ok(PairConfirmOutcome::Declined)
             }
             Err(LinkError::RejectedByPeer) => Ok(PairConfirmOutcome::Rejected),
@@ -487,8 +611,16 @@ impl LinkManager {
         });
     }
 
+    /// 是否应当保持 mDNS 广播：配对窗口开着、名册里有未解除的设备，或宿主显式要求。
+    fn advertising_needed(&self) -> bool {
+        self.pairing_open.load(Ordering::Relaxed)
+            || self.roster_present.load(Ordering::Relaxed)
+            || self.forced_advertising.load(Ordering::Relaxed)
+    }
+
     /// 确保 mDNS 广播运行（幂等）。本机 API 局域网不可达（[`LinkOptions::reachable`]
     /// 为 `false`）时不广播。失败仅记 Error 事件，不阻断配对（手动地址可兜底）。
+    /// 广播只含指纹 / 名称 / 平台 / 版本 / 端口，**不含**任何配对标志或云账号信息。
     fn ensure_advertising(&self) {
         if !self.reachable || !self.advertise {
             return;
@@ -500,12 +632,13 @@ impl LinkManager {
         if guard.is_some() {
             return;
         }
+        let me = self.responder.self_info();
         match MdnsAdvertiser::start(
             self.api_port.load(Ordering::Relaxed),
             self.identity.fingerprint(),
-            &self.self_info.name,
-            self.self_info.platform.as_deref(),
-            self.self_info.app_version.as_deref(),
+            &me.name,
+            me.platform.as_deref(),
+            me.app_version.as_deref(),
         ) {
             Ok(a) => *guard = Some(a),
             Err(e) => {
@@ -522,38 +655,67 @@ impl LinkManager {
         }
     }
 
-    /// 主动开启 mDNS 广播（宿主在启用本地互联时调用）。
+    /// 主动开启并长期保持 mDNS 广播（宿主常驻服务，如 headless server）。
     pub fn start_advertising(&self) {
+        self.forced_advertising.store(true, Ordering::Relaxed);
         self.ensure_advertising();
     }
 
-    /// 停止 mDNS 广播（配对码过期 / 用户关闭配对界面时调用）。与
-    /// [`Self::stop_discovery`] 对称：持锁置 `None`，[`MdnsAdvertiser`] 的
-    /// `Drop` 负责实际 shutdown；此前只有 `ensure_advertising`/
-    /// `start_advertising`，广播一旦开启就持续到进程退出，本机指纹/设备名
-    /// 一直暴露在局域网上，即使用户已经关掉了配对界面。
+    /// 结束配对窗口并撤回广播（配对码过期 / 用户关闭配对界面时调用）。名册里还有未解除的设备、
+    /// 或宿主要求长期广播时，存在性广播继续保持（对端据此在本机换地址后重新找到本机）。
     pub fn stop_advertising(&self) {
+        self.pairing_open.store(false, Ordering::Relaxed);
+        if self.advertising_needed() {
+            return;
+        }
         if let Ok(mut guard) = self.advertiser.lock() {
             *guard = None; // Drop → daemon.shutdown()
         }
     }
 
-    /// 停止配对：立即作废当前配对码并停止 mDNS 广播。
+    /// 停止配对：立即作废当前配对码并撤回配对窗口的广播。
     pub fn stop_pairing(&self) {
         self.responder.revoke_codes();
         self.stop_advertising();
     }
+
+    /// 按名册当前内容刷新「常驻存在性广播」：有未解除的设备则开启（本机可被局域网访问且允许
+    /// 广播时），否则撤回。名册变化（配对、解除、对端解除）后调用。
+    pub async fn refresh_presence(&self) {
+        let present = match self.store.list().await {
+            Ok(records) => records.iter().any(|record| !record.revoked),
+            Err(error) => {
+                tracing::warn!(error = %error, "cannot read the linked roster to refresh presence");
+                return;
+            }
+        };
+        self.roster_present.store(present, Ordering::Relaxed);
+        if present {
+            self.ensure_advertising();
+        } else if !self.advertising_needed()
+            && let Ok(mut guard) = self.advertiser.lock()
+        {
+            *guard = None;
+        }
+    }
+
     // ── 发现（发起方侧）───────────────────────────────────────────────────
 
     /// 开始 mDNS 浏览：发现的设备经事件通道以 `Discovered` 汇出，并同步去重
     /// 更新发现快照。幂等——重复调用不重启浏览，但仍清空发现快照，与管理面
     /// `POST /link/discovery {"action":"start"}` 的语义对齐。
-    /// 命中已配对指纹的广播不入快照/不发事件，而是刷新该设备的 Direct 候选
-    /// 地址（见下）。
+    /// 命中已配对指纹的广播不入快照/不发事件，而是作为该设备的回连线索（见
+    /// [`Self::browse_for`]）。
     pub fn start_discovery(&self) -> LinkResult<()> {
         if let Ok(mut snapshot) = self.discovered.lock() {
             snapshot.clear();
         }
+        self.ui_discovery.store(true, Ordering::Relaxed);
+        self.ensure_browser()
+    }
+
+    /// 浏览器已在运行则什么都不做；否则启动，并起转发任务处理发现结果。
+    fn ensure_browser(&self) -> LinkResult<()> {
         let mut guard = self.browser.lock().map_err(|_| LinkError::Unavailable)?;
         if guard.is_some() {
             return Ok(());
@@ -563,6 +725,7 @@ impl LinkManager {
         let hinted = Arc::clone(&self.hinted);
         let self_fp = self.identity.fingerprint().to_string();
         let discovered = Arc::clone(&self.discovered);
+        let ui_discovery = Arc::clone(&self.ui_discovery);
         let store = self.store.clone();
         tokio::spawn(async move {
             while let Some(peer) = rx.recv().await {
@@ -570,11 +733,13 @@ impl LinkManager {
                 if peer.fingerprint.as_deref() == Some(self_fp.as_str()) {
                     continue;
                 }
-                // 命中已配对名册：多半是设备 DHCP 换了 IP 后重新广播——刷新
-                // 其 Direct 候选地址，不当作「可添加的新设备」推进 discovered
-                // 快照/事件通道（否则已配对设备会污染「发现列表」UI）。
+                // 命中已配对名册（且对端没有解除配对）：多半是设备 DHCP 换了 IP 后重新广播——
+                // 记为回连线索，不当作「可添加的新设备」推进 discovered 快照/事件通道
+                // （否则已配对设备会污染「发现列表」UI）。已被对端解除的设备按未配对处理，
+                // 以便用户重新配对。
                 if let Some(fp) = peer.fingerprint.as_deref()
                     && let Ok(Some(record)) = store.get(fp).await
+                    && !record.revoked
                 {
                     let Ok(address) = PeerAddress::from_host_port(&peer.host, peer.port) else {
                         continue;
@@ -584,14 +749,18 @@ impl LinkManager {
                         address: address.to_candidate(),
                     };
                     // mDNS 通告的指纹是公开值，地址未经任何认证：不写库、不挤占
-                    // 已验证候选，只作为内存中的待验证线索；认证请求经它成功后
-                    // 才持久化。已知地址/重复线索直接跳过。
+                    // 已验证候选，只作为内存中的待验证线索；认证请求经它拿到可验证的
+                    // 封装响应后才持久化。已知地址/重复线索直接跳过。
                     if record.candidates.contains(&fresh) {
                         continue;
                     }
                     if let Ok(mut map) = hinted.lock() {
                         map.insert(fp.to_string(), fresh);
                     }
+                    continue;
+                }
+                // 用户没开发现（自愈浏览）时，未配对设备既不进快照也不发事件。
+                if !ui_discovery.load(Ordering::Relaxed) {
                     continue;
                 }
                 if let Ok(mut snapshot) = discovered.lock() {
@@ -608,9 +777,28 @@ impl LinkManager {
 
     /// 停止 mDNS 浏览。
     pub fn stop_discovery(&self) {
+        self.ui_discovery.store(false, Ordering::Relaxed);
         if let Ok(mut guard) = self.browser.lock() {
             *guard = None; // Drop → daemon.shutdown()
         }
+    }
+
+    /// 短时 mDNS 浏览 `duration`，只为收集已配对设备的回连线索（设备换 IP / 端口后重新
+    /// 广播的新地址），线索用于之后的拨号。用户界面已开着发现时复用同一个浏览器、直接返回；
+    /// mDNS 被禁用（[`LinkOptions::advertise`] 为 `false`）时什么都不做。期间用户打开发现，
+    /// 浏览器归用户界面所有，到期不会被关掉。
+    pub async fn browse_for(&self, duration: Duration) -> LinkResult<()> {
+        if !self.advertise || self.ui_discovery.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.ensure_browser()?;
+        tokio::time::sleep(duration).await;
+        if !self.ui_discovery.load(Ordering::Relaxed)
+            && let Ok(mut guard) = self.browser.lock()
+        {
+            *guard = None;
+        }
+        Ok(())
     }
 
     /// 当前发现快照（发起方侧 UI 轮询用）；`start_discovery` 时清空，浏览期间
@@ -694,7 +882,7 @@ impl LinkManager {
     ) -> LinkResult<BeginPairingResult> {
         let mut initiator = PairingInitiator::new(self.identity.clone());
         let addrs = self.self_addrs_towards(address).await;
-        let hello = initiator.build_hello(code, &self.self_info, addrs);
+        let hello = initiator.build_hello(code, &self.responder.self_info(), addrs);
 
         let body = serde_json::json!({
             "protocolVersion": hello.protocol_version,
@@ -729,7 +917,15 @@ impl LinkManager {
         let sas = initiator.on_reveal_response(&reveal_resp)?;
 
         let token = uuid::Uuid::new_v4().simple().to_string();
-        let peer_name = hello_resp.name.clone();
+        let peer_fingerprint = super::crypto::fingerprint(&hello_resp.responder_id_pub);
+        let peer_name = {
+            let cleaned = sanitize_text(&hello_resp.name, MAX_NAME_CHARS);
+            if cleaned.is_empty() {
+                peer_fingerprint.chars().take(12).collect()
+            } else {
+                cleaned
+            }
+        };
         if let Ok(mut pending) = self.pending.lock() {
             // 剪枝：丢弃用户已放弃、超过会话时窗的待确认项，避免无界增长 + 及时释放临时密钥。
             pending.retain(|_, p| p.created.elapsed() < PENDING_INIT_TTL);
@@ -752,7 +948,7 @@ impl LinkManager {
             token,
             sas,
             peer_name,
-            peer_fingerprint: super::crypto::fingerprint(&hello_resp.responder_id_pub),
+            peer_fingerprint,
         })
     }
 
@@ -768,7 +964,7 @@ impl LinkManager {
             .client
             .post(address.url(path))
             .json(body)
-            .timeout(std::time::Duration::from_secs(8))
+            .timeout(Duration::from_secs(8))
             .send()
             .await
             .map_err(|e| send_failure(&e))?;
@@ -781,9 +977,27 @@ impl LinkManager {
     /// 本机朝向 `peer` 的可回连地址（`initiatorAddrs`，供对端存为回连候选）。本机 API
     /// 局域网不可达、或对端是 https 站点（多半是公网反代，回连无意义）时为空。
     async fn self_addrs_towards(&self, peer: &PeerAddress) -> Vec<String> {
-        if !self.reachable || peer.is_https() {
+        self.advertised_addrs(Some(peer)).await
+    }
+
+    /// 本机自报的可回连地址：覆盖地址（[`LinkOptions::advertise_addrs`]）优先；否则朝向
+    /// `towards`（对端地址）做出站网卡探测，没有对端地址可参照时按各常见网段的默认出站网卡。
+    /// 本机 API 局域网不可达、或对端是 https 站点时为空。
+    async fn advertised_addrs(&self, towards: Option<&PeerAddress>) -> Vec<String> {
+        if !self.reachable || towards.is_some_and(|peer| peer.is_https()) {
             return Vec::new();
         }
+        let configured = match self.advertise_addrs.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if !configured.is_empty() {
+            return configured;
+        }
+        let port = self.api_port.load(Ordering::Relaxed);
+        let Some(peer) = towards else {
+            return discovery::default_route_addrs(port);
+        };
         let host = peer.host();
         let ip_text = if host.parse::<IpAddr>().is_ok() {
             host.to_string()
@@ -797,7 +1011,7 @@ impl LinkManager {
                 Err(_) => String::new(),
             }
         };
-        discovery::local_direct_addrs(&ip_text, self.api_port.load(Ordering::Relaxed))
+        discovery::local_direct_addrs(&ip_text, port)
     }
 
     /// SAS 核对后确认/拒绝配对。`accept=true` 且对端确认成功 → 落库 + 广播 Paired。
@@ -813,9 +1027,8 @@ impl LinkManager {
         let Some(pending) = pending else {
             return Err(LinkError::SessionExpired);
         };
-        // 本地也校验过期：此前只靠对端 SESSION_TTL 兜底，双端各自维护一套
-        // 过期逻辑，未来任一端常量独立调整就会行为不一致。本机用户迟迟不
-        // 核验 SAS 时在这里直接短路，不必再发起一次注定失败、还要等待
+        // 本地也校验过期：双端各自维护一套过期逻辑，未来任一端常量独立调整就会行为不一致。
+        // 本机用户迟迟不核验 SAS 时在这里直接短路，不必再发起一次注定失败、还要等待
         // 下方最多 70s 超时的网络往返。
         if pending.created.elapsed() > PENDING_INIT_TTL {
             return Err(LinkError::SessionExpired);
@@ -825,11 +1038,11 @@ impl LinkManager {
             .client
             .post(pending.peer.url("/api/v1/link/pair/confirm"))
             .json(&body)
-            // 对端响应方现在要等本机用户在 confirm 阶段核验 SAS 并点击批准/
-            // 拒绝（PairingResponder::handle_confirm 等待用户决策，上限
-            // 60s），因此这里的超时必须盖过那 60s 决策窗口再留出网络往返
-            // 余量，否则发起方会在对端用户点确认前就先行超时掉线。
-            .timeout(std::time::Duration::from_secs(70))
+            // 对端响应方要等本机用户在 confirm 阶段核验 SAS 并点击批准/拒绝
+            // （PairingResponder::handle_confirm 等待用户决策，上限 60s），因此这里的超时
+            // 必须盖过那 60s 决策窗口再留出网络往返余量，否则发起方会在对端用户点确认前就
+            // 先行超时掉线。
+            .timeout(Duration::from_secs(70))
             .send()
             .await
             .map_err(|e| send_failure(&e))?;
@@ -856,15 +1069,10 @@ impl LinkManager {
             });
         }
         let record = pending.initiator.finalize()?;
+        // 重新配对同一指纹：新记录覆盖旧记录，`revoked` 随之清除。
         self.store.upsert(&record).await?;
-        if self
-            .events
-            .send(LinkEngineEvent::Paired(record.clone()))
-            .await
-            .is_err()
-        {
-            tracing::debug!("link event receiver closed after pairing");
-        }
+        self.emit(LinkEngineEvent::Paired(record.clone())).await;
+        self.refresh_presence().await;
         Ok(Some(record))
     }
 
@@ -880,35 +1088,106 @@ impl LinkManager {
         self.store.get(fingerprint).await
     }
 
-    /// 解除配对（删除设备），广播 Unpaired。
+    /// 解除配对：对**在线**对端经已认证链路尽力通知（总时限 [`UNPAIR_NOTIFY_TIMEOUT`]，失败 /
+    /// 超时不阻断），再本地删除并广播 `Unpaired`。已被对端解除（`revoked`）的记录不再通知。
     pub async fn remove_device(&self, fingerprint: &str) -> LinkResult<bool> {
-        let removed = self.store.remove(fingerprint).await?;
-        if removed
-            && self
-                .events
-                .send(LinkEngineEvent::Unpaired(fingerprint.to_string()))
-                .await
-                .is_err()
+        if let Some(record) = self.store.get(fingerprint).await?
+            && !record.revoked
         {
-            tracing::debug!("link event receiver closed after unpairing");
+            self.notify_unpair(record).await;
+        }
+        let removed = self.store.remove(fingerprint).await?;
+        if removed {
+            self.emit(LinkEngineEvent::Unpaired(fingerprint.to_string()))
+                .await;
+            self.refresh_presence().await;
         }
         Ok(removed)
     }
 
-    /// 把 mDNS 待验证候选追加到名册候选之后（仅用于本次拨号，不持久化、不越过
-    /// 已验证候选）。
+    /// 尽力通知对端「本机已解除配对」。整段（拨号 + 请求）受 [`UNPAIR_NOTIFY_TIMEOUT`] 约束，
+    /// 任何失败只记日志。
+    async fn notify_unpair(&self, record: PeerRecord) {
+        let fingerprint = record.fingerprint.clone();
+        let notify = async {
+            let record = self.with_hinted(record);
+            let conn = self.transport.connect(&record).await?;
+            self.post_sealed(
+                &record,
+                &conn,
+                LINK_UNPAIR_PATH,
+                br#"{"v":2}"#,
+                UNPAIR_NOTIFY_TIMEOUT,
+            )
+            .await
+            .map(|_| ())
+        };
+        match tokio::time::timeout(UNPAIR_NOTIFY_TIMEOUT, notify).await {
+            Ok(Ok(())) => tracing::debug!(fingerprint, "peer notified about the unpairing"),
+            Ok(Err(error)) => {
+                tracing::debug!(fingerprint, error = %error, "could not notify the peer about the unpairing");
+            }
+            Err(_) => tracing::debug!(
+                fingerprint,
+                "notifying the peer about the unpairing timed out"
+            ),
+        }
+    }
+
+    /// 设置 / 清除已配对设备的本机备注名（仅本机可见）。`name` 为 `None` 或全空白 = 清除；
+    /// 否则去首尾空白后须为 1–64 个字符且不含控制字符，否则 [`LinkError::BadPayload`]。
+    /// 返回更新后的记录；设备不存在 → [`LinkError::NotPaired`]。
+    pub async fn rename_device(
+        &self,
+        fingerprint: &str,
+        name: Option<&str>,
+    ) -> LinkResult<PeerRecord> {
+        let custom = match name.map(str::trim).filter(|name| !name.is_empty()) {
+            None => None,
+            Some(name) => {
+                if name.chars().count() > MAX_NAME_CHARS || name.chars().any(char::is_control) {
+                    return Err(LinkError::BadPayload("invalid device name".to_owned()));
+                }
+                Some(name.to_owned())
+            }
+        };
+        let updated = self
+            .store
+            .update_record(
+                fingerprint,
+                Box::new(move |record| {
+                    if record.custom_name == custom {
+                        false
+                    } else {
+                        record.custom_name = custom;
+                        true
+                    }
+                }),
+            )
+            .await?;
+        if updated.is_none() {
+            return Err(LinkError::NotPaired);
+        }
+        self.store
+            .get(fingerprint)
+            .await?
+            .ok_or(LinkError::NotPaired)
+    }
+
+    /// 把 mDNS 待验证候选放到**本次拨号**候选的最前面（不持久化）：设备换 IP 后新地址最可能
+    /// 有效，旧地址留作回退。
     fn with_hinted(&self, mut record: PeerRecord) -> PeerRecord {
         if let Ok(map) = self.hinted.lock()
             && let Some(hint) = map.get(&record.fingerprint)
-            && !record.candidates.contains(hint)
         {
-            record.candidates.push(hint.clone());
+            record.candidates.retain(|candidate| candidate != hint);
+            record.candidates.insert(0, hint.clone());
         }
         record
     }
 
-    /// 认证请求（链路密钥 HMAC/AEAD 往返成功）经 `base_url` 完成后，若该地址正是
-    /// 待验证候选，则将其置首并持久化；否则不动名册。
+    /// 认证请求（链路密钥 MAC / AEAD 往返成功，且响应经封装校验）经 `base_url` 完成后，若该地址
+    /// 正是待验证候选，则将其置首并持久化；否则不动名册。
     async fn promote_hinted(&self, fingerprint: &str, base_url: &str) {
         let hint = match self.hinted.lock() {
             Ok(map) => map.get(fingerprint).cloned(),
@@ -945,11 +1224,15 @@ impl LinkManager {
         }
     }
 
-    /// 探测一台已配对设备是否在线（走传输栈拨号），成功则刷新 last_seen。
+    /// 探测一台已配对设备是否在线（走传输栈拨号），成功则刷新 last_seen。已被对端解除配对
+    /// 的设备不再探测（恒为离线）。
     pub async fn is_online(&self, fingerprint: &str) -> bool {
         let Ok(Some(record)) = self.store.get(fingerprint).await else {
             return false;
         };
+        if record.revoked {
+            return false;
+        }
         let record = self.with_hinted(record);
         match self.transport.connect(&record).await {
             Ok(_) => {
@@ -967,12 +1250,26 @@ impl LinkManager {
         }
     }
 
-    // ── 数据面 ────────────────────────────────────────────────────────────
+    // ── 数据面（发起方）────────────────────────────────────────────────────
 
-    /// 把一个下载任务下发给已配对设备（发起方数据面）。走传输栈解析可达
-    /// base_url，请求体先加密（[`derive_link_aead_key`] + [`seal_link_body`]）
-    /// 再用每对独立链路密钥对**密文**做 HMAC 鉴权（encrypt-then-MAC），POST
-    /// 对端 `/api/v1/link/tasks`。返回新任务 ID。
+    /// 读取一台可下发 / 可交换信息的已配对设备：不存在或已被对端解除 → [`LinkError::NotPaired`]。
+    async fn active_record(&self, fingerprint: &str) -> LinkResult<PeerRecord> {
+        let record = self
+            .store
+            .get(fingerprint)
+            .await?
+            .ok_or(LinkError::NotPaired)?;
+        if record.revoked {
+            return Err(LinkError::NotPaired);
+        }
+        Ok(self.with_hinted(record))
+    }
+
+    /// 把一个下载任务下发给已配对设备（一次性投递）。走传输栈解析可达 base_url，请求体先 AEAD
+    /// 加密再对**密文**做 MAC（encrypt-then-MAC），POST 对端 `/api/v1/link/tasks`；响应必须经
+    /// 链路密钥解封成功才算成功。返回新任务 ID。对端数据面协议过旧 →
+    /// [`LinkError::PeerOutdated`]（不发请求）；对端已解除配对 / 本机记录已被对端撤销 →
+    /// [`LinkError::NotPaired`] / [`LinkError::Unauthorized`]。
     pub async fn dispatch(
         &self,
         fingerprint: &str,
@@ -980,14 +1277,9 @@ impl LinkManager {
         save_dir: Option<&str>,
         file_name: Option<&str>,
     ) -> LinkResult<String> {
-        let record = self
-            .store
-            .get(fingerprint)
-            .await?
-            .ok_or(LinkError::NotPaired)?;
-        let record = self.with_hinted(record);
+        let record = self.active_record(fingerprint).await?;
         let conn = self.transport.connect(&record).await?;
-        // 明文序列化**一次**，加密**一次**——同一份密文字节既用于 HMAC 也
+        // 明文序列化**一次**，加密**一次**——同一份密文字节既用于 MAC 也
         // 用于发送，保证签名覆盖的字节与对端收到并校验的字节完全一致
         // （Option 空值序列化为 ""，非 null，否则响应方 `LinkTaskRequest`
         // (非 Option String) 反序列化会 400）。
@@ -997,25 +1289,24 @@ impl LinkManager {
             "fileName": file_name.unwrap_or_default(),
         });
         let plaintext = serde_json::to_vec(&body_json).unwrap_or_default();
-        let resp = self
+        let reply = self
             .post_sealed(
                 &record,
-                &conn.base_url,
+                &conn,
                 LINK_TASKS_PATH,
                 &plaintext,
-                std::time::Duration::from_secs(15),
+                Duration::from_secs(15),
             )
             .await?;
-        if !resp.status().is_success() {
-            return Err(classify_failure(resp).await);
-        }
-        let json = read_json_object(resp).await?;
+        let json: serde_json::Value = serde_json::from_slice(&reply)
+            .map_err(|_| LinkError::Io("malformed dispatch reply".into()))?;
         let task_id = json
             .get("taskId")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .ok_or_else(|| LinkError::Io("missing taskId in dispatch response".into()))?
             .to_string();
+        // 到这里响应已经过链路密钥解封校验：对端确实持有配对密钥，才有资格把该地址写进名册。
         self.promote_hinted(fingerprint, &conn.base_url).await;
         if let Err(error) = self.store.touch(fingerprint, now_unix()).await {
             tracing::warn!(fingerprint, %error, "cannot persist linked peer last_seen");
@@ -1023,114 +1314,194 @@ impl LinkManager {
         Ok(task_id)
     }
 
-    /// 数据面出站请求：对明文 AEAD 加密（[`derive_link_aead_key`] + [`seal_link_body`]），
-    /// 再用每对独立链路密钥对**密文**做 HMAC 鉴权（encrypt-then-MAC），POST 到
-    /// `{base_url}{path}`。对端必须按同一顺序校验（先验 HMAC 再解密），否则攻击者能在
-    /// 密文没被认证前就篡改，让对端白白解密一次。
+    /// 数据面出站请求（v2）：对明文 AEAD 加密，再用每对独立链路密钥对**密文**做 MAC
+    /// （encrypt-then-MAC，MAC 与 AAD 都绑定收发双方指纹），POST 到 `{base_url}{path}`；
+    /// 成功响应必须带 `X-FluxLink-Enc: v2` 且能用同一密钥按响应 AAD 解封，否则按鉴权失败处理。
+    /// 返回解封后的响应明文。
     async fn post_sealed(
         &self,
         record: &PeerRecord,
-        base_url: &str,
+        conn: &PeerConn,
         path: &str,
         plaintext: &[u8],
-        timeout: std::time::Duration,
-    ) -> LinkResult<reqwest::Response> {
+        timeout: Duration,
+    ) -> LinkResult<Vec<u8>> {
+        if conn.link_protocol < LINK_PROTOCOL_VERSION {
+            return Err(LinkError::PeerOutdated);
+        }
         let ts = now_unix();
         let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let me = self.identity.fingerprint();
+        let exchange = LinkExchange {
+            method: "POST",
+            path,
+            nonce: &nonce,
+            sender_fp: me,
+            receiver_fp: &record.fingerprint,
+        };
         let aead_key = derive_link_aead_key(&record.link_secret);
-        let sealed = seal_link_body(&aead_key, plaintext);
-        let tag = link_auth_tag(&record.link_secret, "POST", path, ts, &nonce, &sealed);
-        self.client
-            .post(format!("{base_url}{path}"))
-            .header("X-FluxLink-Device", self.identity.fingerprint())
-            .header("X-FluxLink-Ts", ts.to_string())
-            .header("X-FluxLink-Nonce", nonce)
-            .header("X-FluxLink-Auth", tag)
-            .header("X-FluxLink-Enc", "v1")
+        let sealed = seal_link_body(&aead_key, &request_aad(&exchange), plaintext);
+        let tag = link_auth_tag(&record.link_secret, &exchange, ts, &sealed);
+        let resp = self
+            .client
+            .post(format!("{}{path}", conn.base_url))
+            .header(HEADER_DEVICE, me)
+            .header(HEADER_TS, ts.to_string())
+            .header(HEADER_NONCE, nonce.as_str())
+            .header(HEADER_TAG, tag)
+            .header(HEADER_ENC, LINK_ENC_V2)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(sealed)
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| send_failure(&e))
+            .map_err(|e| send_failure(&e))?;
+        if !resp.status().is_success() {
+            return Err(classify_failure(resp).await);
+        }
+        let enc_ok = resp
+            .headers()
+            .get(HEADER_ENC)
+            .and_then(|value| value.to_str().ok())
+            == Some(LINK_ENC_V2);
+        let body = resp.bytes().await.map_err(|e| send_failure(&e))?;
+        if !enc_ok {
+            return Err(LinkError::Unauthorized);
+        }
+        open_link_body(&aead_key, &response_aad(&exchange), &body).ok_or(LinkError::Unauthorized)
     }
 
-    /// 经已认证链路与对端**交换设备信息**（默认下载目录 / 路径风格）：本机信息 `mine`
-    /// 随请求发给对端（对端据此更新它名册里的本机信息），对端信息随响应回来并写入本机名册。
+    /// 组装本机经信息交换自报的 [`PeerInfo`]：名称 / 平台 / 版本 / 云设备 ID 取自本机自报信息，
+    /// 目录与路径风格取自宿主传入的 `local`，回连地址按 [`Self::advertised_addrs`]。
+    async fn compose_local_info(
+        &self,
+        local: &PeerInfo,
+        towards: Option<&PeerAddress>,
+    ) -> PeerInfo {
+        let me = self.responder.self_info();
+        PeerInfo {
+            name: Some(me.name),
+            platform: me.platform,
+            app_version: me.app_version,
+            addrs: self.advertised_addrs(towards).await,
+            cloud_device_id: me.cloud_device_id,
+            default_save_dir: local.default_save_dir.clone(),
+            path_style: local.path_style.clone(),
+        }
+    }
+
+    /// 把对端自报的信息并入名册记录；返回记录是否真的变化（只有变化才写盘）。
+    async fn apply_peer_info(&self, fingerprint: &str, info: PeerInfo) -> LinkResult<bool> {
+        self.store
+            .update_record(
+                fingerprint,
+                Box::new(move |record| record.apply_peer_info(&info)),
+            )
+            .await?
+            .ok_or(LinkError::NotPaired)
+    }
+
+    /// 经已认证链路与对端**双向交换设备信息**：本机信息随请求发给对端（对端据此更新它名册里的
+    /// 本机记录），对端信息随响应回来并并入本机名册（备注名之外的名称 / 平台 / 版本 / 云设备 ID /
+    /// 目录 / 路径风格，自报回连地址放候选首位）。`local` 只需携带宿主才知道的默认目录与路径风格，
+    /// 其余自报字段由本方法填充。
     ///
-    /// 请求与响应体都是 AEAD 密文：对端信息无法被局域网嗅探，也无法被中间人伪造。
-    /// 对端不认识该端点（旧版 Flutter hub / 旧 server）→ `Ok(None)`，调用方按「未知」处理。
+    /// 返回名册记录是否**变化**：只有变化才落盘（空闲时周期性交换零写入），宿主据此决定是否通知界面。
+    /// 对端数据面协议过旧 → [`LinkError::PeerOutdated`]。
     pub async fn exchange_peer_info(
         &self,
         fingerprint: &str,
-        mine: &PeerInfo,
-    ) -> LinkResult<Option<PeerInfo>> {
-        let record = self
-            .store
-            .get(fingerprint)
-            .await?
-            .ok_or(LinkError::NotPaired)?;
-        let record = self.with_hinted(record);
+        local: &PeerInfo,
+    ) -> LinkResult<bool> {
+        let record = self.active_record(fingerprint).await?;
         let conn = self.transport.connect(&record).await?;
-        let resp = self
+        let mine = self
+            .compose_local_info(local, PeerAddress::parse(&conn.base_url).ok().as_ref())
+            .await;
+        let reply = self
             .post_sealed(
                 &record,
-                &conn.base_url,
+                &conn,
                 LINK_INFO_PATH,
-                &encode_peer_info(mine),
-                std::time::Duration::from_secs(8),
+                &encode_peer_info(&mine),
+                Duration::from_secs(8),
             )
             .await?;
-        let status = resp.status();
-        if matches!(status.as_u16(), 404 | 405 | 501) {
-            return Ok(None);
-        }
-        if !status.is_success() {
-            return Err(classify_failure(resp).await);
-        }
-        let sealed = resp.bytes().await.map_err(|e| send_failure(&e))?;
-        let aead_key = derive_link_aead_key(&record.link_secret);
-        let Some(info) =
-            open_link_body(&aead_key, &sealed).and_then(|plaintext| decode_peer_info(&plaintext))
-        else {
-            // 不是本链路密钥加密的合法信息包（对端是别的服务 / 旧版本兜底页）。
-            tracing::debug!(fingerprint, "peer info response could not be opened");
-            return Ok(None);
-        };
+        let info = decode_peer_info(&reply)
+            .ok_or_else(|| LinkError::BadPayload("malformed peer info reply".to_owned()))?;
         self.promote_hinted(fingerprint, &conn.base_url).await;
-        self.store.set_peer_info(fingerprint, &info).await?;
+        let changed = self.apply_peer_info(fingerprint, info).await?;
         if let Err(error) = self.store.touch(fingerprint, now_unix()).await {
             tracing::warn!(fingerprint, %error, "cannot persist linked peer last_seen");
         }
-        Ok(Some(info))
+        Ok(changed)
     }
 
-    /// 响应端处理已通过 [`Self::authorize`] 的 `POST /api/v1/link/info`：记下请求方自报信息，
-    /// 返回用链路密钥加密的本机信息 `mine`（响应体，`application/octet-stream`）。
+    // ── 数据面（响应端）────────────────────────────────────────────────────
+
+    /// 响应端处理已通过 [`Self::authorize`] 的 `POST /api/v1/link/info`：并入请求方自报的信息，
+    /// 返回封装好的本机信息 `mine`（响应体）以及名册记录是否变化。
     pub async fn answer_peer_info(
         &self,
         request: &LinkRequest,
-        mine: &PeerInfo,
-    ) -> LinkResult<Vec<u8>> {
+        local: &PeerInfo,
+    ) -> LinkResult<PeerInfoAnswer> {
+        let theirs = decode_peer_info(&request.body)
+            .ok_or_else(|| LinkError::BadPayload("malformed peer info request".to_owned()))?;
         let record = self
             .store
             .get(&request.device)
             .await?
             .ok_or(LinkError::Unauthorized)?;
-        if let Some(theirs) = decode_peer_info(&request.body) {
-            self.store.set_peer_info(&request.device, &theirs).await?;
-        }
-        let aead_key = derive_link_aead_key(&record.link_secret);
-        Ok(seal_link_body(&aead_key, &encode_peer_info(mine)))
+        let towards = record
+            .direct_address()
+            .and_then(|address| PeerAddress::parse(address).ok());
+        let changed = self.apply_peer_info(&request.device, theirs).await?;
+        let mine = self.compose_local_info(local, towards.as_ref()).await;
+        Ok(PeerInfoAnswer {
+            sealed: request.seal_response(&encode_peer_info(&mine)),
+            changed,
+        })
     }
 
-    /// 校验入站链路数据面请求：时间戳时窗 → 取设备记录 → 验 HMAC（覆盖
-    /// 密文摘要，encrypt-then-MAC）→ nonce 防重放 → 解密。成功返回发起方
-    /// 指纹 + **已解密**的明文 body（见 [`LinkRequest`]）。
+    /// 响应端处理已通过 [`Self::authorize`] 的 `POST /api/v1/link/unpair`：把请求方记录标记为
+    /// `revoked` 并持久化（不删除，让用户看到「对方已解除」并自行删除或重新配对），广播
+    /// [`LinkEngineEvent::Revoked`]。重复通知幂等。返回封装好的确认响应。
+    pub async fn answer_unpair(&self, request: &LinkRequest) -> LinkResult<Vec<u8>> {
+        let updated = self
+            .store
+            .update_record(
+                &request.device,
+                Box::new(|record| {
+                    if record.revoked {
+                        false
+                    } else {
+                        record.revoked = true;
+                        true
+                    }
+                }),
+            )
+            .await?;
+        match updated {
+            None => return Err(LinkError::NotPaired),
+            Some(true) => {
+                self.emit(LinkEngineEvent::Revoked(request.device.clone()))
+                    .await;
+                self.refresh_presence().await;
+            }
+            Some(false) => {}
+        }
+        Ok(request.seal_response(br#"{"ok":true}"#))
+    }
+
+    /// 校验入站链路数据面请求（v2）：方案头 / 头部格式 / 时间窗（廉价检查，先于名册查询）→
+    /// 取设备记录（已被对端解除的记录视同未配对）→ 验 MAC（覆盖密文摘要与收发双方指纹，
+    /// encrypt-then-MAC）→ nonce 防重放 → 按请求 AAD 解密。成功返回发起方指纹 + **已解密**的
+    /// 明文 body（见 [`LinkRequest`]），并携带封装响应所需的上下文。
     ///
-    /// `enc` 是 `X-FluxLink-Enc` 请求头的原始值：数据面 body 恒为密文，
-    /// 双端同版本发布、不兼容明文旧客户端——缺这个头或头值不是 `"v1"` 一律
-    /// 当鉴权失败拒绝，不留明文回退路径（回退路径等于给降级攻击开门）。
+    /// `enc` 是 `X-FluxLink-Enc` 请求头的原始值：缺失或不是 `"v2"`（含旧的 `"v1"`）一律当
+    /// 鉴权失败拒绝，不留降级回退路径。错误只作诊断：[`LinkError::ClockSkew`]（时间窗）、
+    /// [`LinkError::NotPaired`]（未配对 / 已解除）、[`LinkError::Unauthorized`]（其余）。
     #[allow(clippy::too_many_arguments)]
     pub async fn authorize(
         &self,
@@ -1143,62 +1514,77 @@ impl LinkManager {
         tag: &str,
         enc: &str,
     ) -> LinkResult<LinkRequest> {
-        if enc != "v1" {
+        if enc != LINK_ENC_V2 {
+            return Err(LinkError::Unauthorized);
+        }
+        if !is_fingerprint_shaped(device_fp) || !is_nonce_shaped(nonce) || !is_tag_shaped(tag) {
             return Err(LinkError::Unauthorized);
         }
         let now = now_unix();
         // i128 比较，防攻击者构造的极端 ts 触发 i64 溢出（debug 下 panic）。
         if (now as i128 - ts as i128).abs() > LINK_AUTH_SKEW_SECS as i128 {
-            return Err(LinkError::Unauthorized);
+            return Err(LinkError::ClockSkew);
         }
         let record = self
             .store
             .get(device_fp)
             .await?
-            .ok_or(LinkError::Unauthorized)?;
-        // encrypt-then-MAC：`body` 此刻仍是密文，先验 HMAC（覆盖密文摘要）
-        // ——与发起方 [`Self::dispatch`] 对同一份密文字节算 tag 的顺序一致，
-        // 签名覆盖的字节与此处校验的字节完全相同。
-        if !verify_link_auth_tag(&record.link_secret, method, path, ts, nonce, body, tag) {
+            .filter(|record| !record.revoked)
+            .ok_or(LinkError::NotPaired)?;
+        let me = self.identity.fingerprint();
+        let exchange = LinkExchange {
+            method,
+            path,
+            nonce,
+            sender_fp: device_fp,
+            receiver_fp: me,
+        };
+        // encrypt-then-MAC：`body` 此刻仍是密文，先验 MAC（覆盖密文摘要与收发双方指纹）
+        // ——与发起方 [`Self::post_sealed`] 对同一份密文字节算 tag 的顺序一致。
+        if !verify_link_auth_tag(&record.link_secret, &exchange, ts, body, tag) {
             return Err(LinkError::Unauthorized);
         }
-        // 防重放：同 (device, nonce) 在时窗内仅接受一次；顺带按时窗剪枝保持有界。
+        // 防重放：同 (device, nonce) 在时窗内仅接受一次。保留到 `max(ts, now) + SKEW`：
+        // 发送方时钟超前时请求在整个 ts ± SKEW 内都有效，只按「收到时刻」计时会让 nonce 过早过期。
         {
             let mut seen = self
                 .seen_nonces
                 .lock()
                 .map_err(|_| LinkError::Unavailable)?;
-            seen.retain(|(_, seen_ts)| now - *seen_ts <= LINK_AUTH_SKEW_SECS);
+            seen.retain(|_, expires| *expires > now);
             let key = format!("{device_fp}:{nonce}");
-            if seen.iter().any(|(k, _)| *k == key) {
+            if seen.contains_key(&key) {
                 return Err(LinkError::Unauthorized);
             }
-            seen.push((key, now));
+            seen.insert(key, ts.max(now).saturating_add(LINK_AUTH_SKEW_SECS));
         }
-        // HMAC 通过后才解密：密文完整性此刻已由 HMAC 保证，解密在正常流程
-        // 下不会失败（同一 `record.link_secret` 派生的 AEAD 密钥）；仍显式
-        // 处理——解密失败统一按鉴权失败处理，不额外泄露「HMAC 过但解密
-        // 失败」这种细分信息。
+        // MAC 通过后才解密：密文完整性此刻已由 MAC 保证；解密失败统一按鉴权失败处理，不额外泄露
+        // 「MAC 过但解密失败」这种细分信息。
         let aead_key = derive_link_aead_key(&record.link_secret);
-        let plaintext = open_link_body(&aead_key, body).ok_or(LinkError::Unauthorized)?;
+        let plaintext = open_link_body(&aead_key, &request_aad(&exchange), body)
+            .ok_or(LinkError::Unauthorized)?;
         Ok(LinkRequest {
             device: device_fp.to_string(),
             body: plaintext,
+            receiver: me.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            nonce: nonce.to_string(),
+            aead_key,
         })
     }
 
     /// 剪枝全部「只靠恰好又发生一次同类调用才顺带清理」的过期状态：
     /// `pending`（本机发起、SAS 核对/confirm 未完成的待确认会话）、
     /// `seen_nonces`（数据面防重放时窗）、`probed`（手动探测指纹），并转发给响应方
-    /// 剪枝其 `codes`/`sessions`。由 [`Self::spawn_gc`] 每 60s 调用一次；半途
-    /// 放弃的配对与过期 nonce 记录此前会一直驻留到进程重启才被回收。
+    /// 剪枝其 `codes`/`sessions`。由 [`Self::spawn_gc`] 每 60s 调用一次。
     pub fn prune_expired(&self) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.retain(|_, p| p.created.elapsed() < PENDING_INIT_TTL);
         }
         if let Ok(mut seen) = self.seen_nonces.lock() {
             let now = now_unix();
-            seen.retain(|(_, seen_ts)| now - *seen_ts <= LINK_AUTH_SKEW_SECS);
+            seen.retain(|_, expires| *expires > now);
         }
         if let Ok(mut probed) = self.probed.lock() {
             probed.retain(|_, (_, at)| at.elapsed() < PROBED_FINGERPRINT_TTL);
@@ -1216,18 +1602,80 @@ pub struct BeginPairingResult {
     pub peer_fingerprint: String,
 }
 
-/// [`LinkManager::authorize`] 成功后的产出：通过链路鉴权的一次入站数据面
-/// 请求——发起方指纹 + **已解密**的明文 body。此前 `authorize` 只返回发起
-/// 方指纹（`LinkResult<String>`），宿主拿到指纹后仍用自己手里的原始请求
-/// 体字节反序列化；数据面加密后那份原始字节是密文，宿主必须改用这里
-/// 返回的解密结果——把「鉴权通过」与「拿到明文」在返回值里绑在一起，
-/// 杜绝调用方漏改、继续拿密文当明文解析的错误用法。
+/// [`LinkManager::answer_peer_info`] 的结果。
 #[derive(Debug, Clone)]
+pub struct PeerInfoAnswer {
+    /// 封装好的响应体（`application/octet-stream`，响应头 `X-FluxLink-Enc: v2`）。
+    pub sealed: Vec<u8>,
+    /// 请求方的自报信息让本机名册记录发生了变化。
+    pub changed: bool,
+}
+
+/// [`LinkManager::authorize`] 成功后的产出：通过链路鉴权的一次入站数据面请求——发起方指纹 +
+/// **已解密**的明文 body，以及封装响应所需的上下文（方法 / 路径 / 请求 nonce / 链路 AEAD 密钥）。
+///
+/// 把「鉴权通过」与「拿到明文」在返回值里绑在一起，杜绝调用方漏改、继续拿密文当明文解析的错误
+/// 用法；响应必须经 [`LinkRequest::seal_response`] 封装后再回给发起方。
+#[derive(Clone)]
 pub struct LinkRequest {
     /// 发起方设备指纹。
     pub device: String,
     /// 已解密的明文请求体。
     pub body: Vec<u8>,
+    receiver: String,
+    method: String,
+    path: String,
+    nonce: String,
+    aead_key: [u8; 32],
+}
+
+impl std::fmt::Debug for LinkRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkRequest")
+            .field("device", &self.device)
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("body_len", &self.body.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl LinkRequest {
+    /// 封装响应体：用链路 AEAD 密钥 + 响应 AAD（绑定方向、方法、路径、双方指纹与**本次请求的
+    /// nonce**）加密。HTTP 层必须同时回 `X-FluxLink-Enc: v2`。
+    #[must_use]
+    pub fn seal_response(&self, plaintext: &[u8]) -> Vec<u8> {
+        let exchange = LinkExchange {
+            method: &self.method,
+            path: &self.path,
+            nonce: &self.nonce,
+            sender_fp: &self.device,
+            receiver_fp: &self.receiver,
+        };
+        seal_link_body(&self.aead_key, &response_aad(&exchange), plaintext)
+    }
+}
+
+/// 指纹形态：64 位小写 hex。
+fn is_fingerprint_shaped(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// nonce 形态：`[A-Za-z0-9_-]{1,64}`。
+fn is_nonce_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_NONCE_LEN
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// MAC 标签形态：64 位 hex（HMAC-SHA256）。
+fn is_tag_shaped(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn b64_to_array<const N: usize>(json: &serde_json::Value, key: &str) -> LinkResult<[u8; N]> {
@@ -1345,42 +1793,74 @@ fn decode_b64_array<const N: usize>(s: &str) -> LinkResult<[u8; N]> {
     <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| LinkError::BadPayload("bad length".into()))
 }
 
-/// 一个字符串字段的长度上限（对端自报值一律不信任，超限即丢弃）。
+/// 默认下载目录字段的长度上限（对端自报值一律不信任，超限即丢弃）。
 const PEER_INFO_MAX_DIR_LEN: usize = 1024;
+/// 自报回连地址单条长度上限。
+const PEER_INFO_MAX_ADDR_LEN: usize = 256;
 
-/// 对端信息的线上形式（加密前的明文 JSON）：`{"v":1,"defaultSaveDir":…,"pathStyle":…}`。
+/// 设备信息的线上形式（加密前的明文 JSON）：
+/// `{"v":2,"name":…,"platform":…,"appVersion":…,"addrs":[…],"cloudDeviceId":…,"defaultSaveDir":…,"pathStyle":…}`。
 fn encode_peer_info(info: &PeerInfo) -> Vec<u8> {
-    let mut json = serde_json::json!({ "v": 1 });
-    if let Some(dir) = &info.default_save_dir {
-        json["defaultSaveDir"] = serde_json::Value::String(dir.clone());
-    }
-    if let Some(style) = &info.path_style {
-        json["pathStyle"] = serde_json::Value::String(style.clone());
-    }
+    let mut json = serde_json::json!({ "v": 2, "addrs": info.addrs });
+    let mut put = |key: &str, value: &Option<String>| {
+        if let Some(value) = value {
+            json[key] = serde_json::Value::String(value.clone());
+        }
+    };
+    put("name", &info.name);
+    put("platform", &info.platform);
+    put("appVersion", &info.app_version);
+    put("cloudDeviceId", &info.cloud_device_id);
+    put("defaultSaveDir", &info.default_save_dir);
+    put("pathStyle", &info.path_style);
     serde_json::to_vec(&json).unwrap_or_default()
 }
 
-/// 解析对端信息；不是 v1 信息包（含请求方反射回来的其它数据面明文）→ `None`。
-/// 字段一律做长度 / 取值收敛：目录 ≤ 1024 字节且无 NUL，风格只认 `windows` / `posix`。
+/// 解析对端信息；不是 v2 信息包 → `None`。字段一律做长度 / 取值收敛：名称 / 平台 / 版本清洗并
+/// 限长，回连地址至多 [`MAX_DIRECT_CANDIDATES`] 条且必须能被 [`PeerAddress::parse`] 解析（规范化后
+/// 去重，非法条目丢弃），云设备 ID 只接受 UUID 形态，目录 ≤ 1024 字节且无 NUL，风格只认
+/// `windows` / `posix`。
 fn decode_peer_info(plaintext: &[u8]) -> Option<PeerInfo> {
     let json: serde_json::Value = serde_json::from_slice(plaintext).ok()?;
-    if json.get("v").and_then(serde_json::Value::as_i64) != Some(1) {
+    if json.get("v").and_then(serde_json::Value::as_i64) != Some(2) {
         return None;
     }
-    let default_save_dir = json
-        .get("defaultSaveDir")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|dir| !dir.is_empty() && dir.len() <= PEER_INFO_MAX_DIR_LEN && !dir.contains('\0'))
-        .map(str::to_owned);
-    let path_style = json
-        .get("pathStyle")
-        .and_then(serde_json::Value::as_str)
-        .filter(|style| matches!(*style, "windows" | "posix"))
-        .map(str::to_owned);
+    let text = |key: &str| json.get(key).and_then(serde_json::Value::as_str);
+    let mut addrs: Vec<String> = Vec::new();
+    if let Some(reported) = json.get("addrs").and_then(serde_json::Value::as_array) {
+        for address in reported.iter().filter_map(serde_json::Value::as_str) {
+            if addrs.len() >= MAX_DIRECT_CANDIDATES {
+                break;
+            }
+            if address.len() > PEER_INFO_MAX_ADDR_LEN {
+                continue;
+            }
+            let Ok(parsed) = PeerAddress::parse(address) else {
+                continue;
+            };
+            let candidate = parsed.to_candidate();
+            if !addrs.contains(&candidate) {
+                addrs.push(candidate);
+            }
+        }
+    }
     Some(PeerInfo {
-        default_save_dir,
-        path_style,
+        name: sanitize_optional(text("name"), MAX_NAME_CHARS),
+        platform: sanitize_optional(text("platform"), MAX_PLATFORM_CHARS),
+        app_version: sanitize_optional(text("appVersion"), MAX_VERSION_CHARS),
+        addrs,
+        cloud_device_id: text("cloudDeviceId")
+            .filter(|id| is_valid_cloud_device_id(id))
+            .map(str::to_owned),
+        default_save_dir: text("defaultSaveDir")
+            .map(str::trim)
+            .filter(|dir| {
+                !dir.is_empty() && dir.len() <= PEER_INFO_MAX_DIR_LEN && !dir.contains('\0')
+            })
+            .map(str::to_owned),
+        path_style: text("pathStyle")
+            .filter(|style| matches!(*style, "windows" | "posix"))
+            .map(str::to_owned),
     })
 }
 
@@ -1394,626 +1874,5 @@ fn promoted_candidates(old: &[PeerCandidate], verified: PeerCandidate) -> Vec<Pe
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-    use crate::crypto::{derive_link_aead_key, link_auth_tag, seal_link_body};
-    use crate::storage::memory::MemoryLinkStorage;
-    use crate::types::DiscoveryKind;
-
-    async fn mgr_with_device(secret: Vec<u8>) -> (Arc<LinkManager>, String) {
-        mgr_with_storage(secret, Arc::new(MemoryLinkStorage::default())).await
-    }
-
-    async fn mgr_with_storage(
-        secret: Vec<u8>,
-        storage: Arc<MemoryLinkStorage>,
-    ) -> (Arc<LinkManager>, String) {
-        let (tx, _rx) = mpsc::channel(8);
-        let mgr = LinkManager::load(
-            storage,
-            SelfInfo {
-                name: "me".into(),
-                platform: None,
-                app_version: None,
-            },
-            LinkOptions::reachable(17800),
-            tx,
-        )
-        .await
-        .unwrap();
-        let fp = "peerfp".to_string();
-        mgr.store
-            .upsert(&PeerRecord {
-                fingerprint: fp.clone(),
-                identity_pub: vec![1u8; 32],
-                name: "peer".into(),
-                platform: None,
-                link_secret: secret,
-                candidates: vec![],
-                paired_at: 0,
-                last_seen_at: 0,
-                info: PeerInfo::default(),
-            })
-            .await
-            .unwrap();
-        (mgr, fp)
-    }
-
-    /// 按发起方 [`LinkManager::dispatch`] 同款 encrypt-then-MAC 流程构造
-    /// 密文 body + tag：先加密、再对**密文**算 HMAC——测试里的「合法请求」
-    /// 必须复刻这个顺序，否则测出来的是另一套协议。
-    fn seal_and_tag(
-        secret: &[u8],
-        path: &str,
-        ts: i64,
-        nonce: &str,
-        plaintext: &[u8],
-    ) -> (Vec<u8>, String) {
-        let sealed = seal_link_body(&derive_link_aead_key(secret), plaintext);
-        let tag = link_auth_tag(secret, "POST", path, ts, nonce, &sealed);
-        (sealed, tag)
-    }
-
-    #[tokio::test]
-    async fn api_port_update_refreshes_pairing_candidates_without_resetting_identity_or_auth() {
-        let secret = vec![7u8; 32];
-        let (mgr, fp) = mgr_with_device(secret.clone()).await;
-        let identity = mgr.fingerprint().to_owned();
-        let peer = PeerAddress::parse("127.0.0.1:17800").unwrap();
-        let path = LINK_TASKS_PATH;
-        let ts = now_unix();
-        let plaintext = br#"{"url":"http://example.test/file"}"#;
-        let (sealed, tag) = seal_and_tag(&secret, path, ts, "before-port-update", plaintext);
-        mgr.authorize(
-            "POST",
-            path,
-            &fp,
-            ts,
-            "before-port-update",
-            &sealed,
-            &tag,
-            "v1",
-        )
-        .await
-        .unwrap();
-        assert_eq!(mgr.self_addrs_towards(&peer).await, vec!["127.0.0.1:17800"]);
-
-        mgr.update_api_port(17801).unwrap();
-        assert_eq!(mgr.self_addrs_towards(&peer).await, vec!["127.0.0.1:17801"]);
-        assert_eq!(mgr.fingerprint(), identity);
-        assert!(
-            mgr.advertiser
-                .lock()
-                .is_ok_and(|advertiser| advertiser.is_none()),
-            "updating a port must not start advertising"
-        );
-        // 端口切换不能清除防重放状态，也不能使已有 link_secret 失效。
-        assert!(matches!(
-            mgr.authorize(
-                "POST",
-                path,
-                &fp,
-                ts,
-                "before-port-update",
-                &sealed,
-                &tag,
-                "v1"
-            )
-            .await,
-            Err(LinkError::Unauthorized)
-        ));
-        let (sealed, tag) = seal_and_tag(&secret, path, ts, "after-port-update", plaintext);
-        let authorized = mgr
-            .authorize(
-                "POST",
-                path,
-                &fp,
-                ts,
-                "after-port-update",
-                &sealed,
-                &tag,
-                "v1",
-            )
-            .await
-            .unwrap();
-        assert_eq!(authorized.device, fp);
-        assert_eq!(authorized.body, plaintext);
-
-        mgr.update_api_port(17800).unwrap();
-        assert_eq!(mgr.self_addrs_towards(&peer).await, vec!["127.0.0.1:17800"]);
-    }
-
-    #[tokio::test]
-    async fn api_port_update_does_not_expand_reachability_or_revoke_pairing_codes() {
-        let (mgr, _events) = responder_mgr().await;
-        let code = mgr.generate_code();
-        mgr.update_api_port(17801).unwrap();
-        let peer = PeerAddress::parse("127.0.0.1:17800").unwrap();
-        assert!(mgr.self_addrs_towards(&peer).await.is_empty());
-        assert!(
-            mgr.advertiser
-                .lock()
-                .is_ok_and(|advertiser| advertiser.is_none())
-        );
-        let mut initiator = PairingInitiator::new(LinkIdentity::generate());
-        let hello = initiator.build_hello(&code, &mgr.self_info, Vec::new());
-        let response = mgr.responder.handle_hello(&hello, None).unwrap();
-        assert_eq!(
-            crate::crypto::fingerprint(&response.responder_id_pub),
-            mgr.fingerprint()
-        );
-    }
-
-    #[tokio::test]
-    async fn authorize_accepts_valid_then_rejects_replay_tamper_and_skew() {
-        let secret = vec![7u8; 32];
-        let (mgr, fp) = mgr_with_device(secret.clone()).await;
-        let path = "/api/v1/link/tasks";
-        let ts = now_unix();
-        let plaintext = br#"{"url":"http://x/f"}"#;
-        let (sealed, tag) = seal_and_tag(&secret, path, ts, "n1", plaintext);
-
-        // 合法请求通过，且解密还原出原始明文。
-        let authorized = mgr
-            .authorize("POST", path, &fp, ts, "n1", &sealed, &tag, "v1")
-            .await
-            .unwrap();
-        assert_eq!(authorized.device, fp);
-        assert_eq!(authorized.body, plaintext);
-        // 同 nonce 重放被拒（防重放）。
-        assert!(matches!(
-            mgr.authorize("POST", path, &fp, ts, "n1", &sealed, &tag, "v1")
-                .await,
-            Err(LinkError::Unauthorized)
-        ));
-        // 篡改密文（哪怕只翻一个字节）→ HMAC 覆盖密文摘要，篡改后 tag 不再
-        // 匹配 → 拒（encrypt-then-MAC 的完整性保护在生效）。
-        let mut tampered = sealed.clone();
-        let last = tampered.len() - 1;
-        tampered[last] ^= 0xFF;
-        assert!(matches!(
-            mgr.authorize("POST", path, &fp, ts, "n2", &tampered, &tag, "v1")
-                .await,
-            Err(LinkError::Unauthorized)
-        ));
-        // 过期时间戳 → 拒。
-        let old_ts = ts - LINK_AUTH_SKEW_SECS - 5;
-        let (old_sealed, old_tag) = seal_and_tag(&secret, path, old_ts, "n3", plaintext);
-        assert!(matches!(
-            mgr.authorize("POST", path, &fp, old_ts, "n3", &old_sealed, &old_tag, "v1")
-                .await,
-            Err(LinkError::Unauthorized)
-        ));
-        // 未配对设备 → 拒。
-        let (sealed4, tag4) = seal_and_tag(&secret, path, ts, "n4", plaintext);
-        assert!(matches!(
-            mgr.authorize("POST", path, "unknown", ts, "n4", &sealed4, &tag4, "v1")
-                .await,
-            Err(LinkError::Unauthorized)
-        ));
-    }
-
-    #[tokio::test]
-    async fn authorize_rejects_missing_or_invalid_enc_header() {
-        // 数据面不留明文回退路径：缺 `X-FluxLink-Enc` 头或头值不是 "v1"，
-        // 哪怕 HMAC/nonce/时间戳全部合法也一律拒绝——回归防止未来有人为
-        // 兼容旧客户端悄悄加回明文分支（降级攻击）。
-        let secret = vec![7u8; 32];
-        let (mgr, fp) = mgr_with_device(secret.clone()).await;
-        let path = "/api/v1/link/tasks";
-        let ts = now_unix();
-        let (sealed, tag) = seal_and_tag(&secret, path, ts, "n1", br#"{"url":"http://x/f"}"#);
-
-        assert!(matches!(
-            mgr.authorize("POST", path, &fp, ts, "n1", &sealed, &tag, "")
-                .await,
-            Err(LinkError::Unauthorized)
-        ));
-        assert!(matches!(
-            mgr.authorize("POST", path, &fp, ts, "n1", &sealed, &tag, "v0")
-                .await,
-            Err(LinkError::Unauthorized)
-        ));
-    }
-
-    #[tokio::test]
-    async fn prune_expired_evicts_stale_seen_nonces() {
-        // pending 的过期判定已由 confirm_pairing 的本地 PENDING_INIT_TTL
-        // 检查覆盖；这里覆盖 prune_expired 对 seen_nonces 的时窗剪枝——
-        // 超过 LINK_AUTH_SKEW_SECS 的防重放记录必须被清掉，否则该表在
-        // 进程存活期内随数据面请求量无界增长。
-        let secret = vec![7u8; 32];
-        let (mgr, fp) = mgr_with_device(secret).await;
-        let old_ts = now_unix() - LINK_AUTH_SKEW_SECS - 5;
-        if let Ok(mut seen) = mgr.seen_nonces.lock() {
-            seen.push((format!("{fp}:stale"), old_ts));
-        }
-        mgr.prune_expired();
-        assert!(mgr.seen_nonces.lock().unwrap().is_empty());
-    }
-
-    fn direct(addr: &str) -> PeerCandidate {
-        PeerCandidate {
-            kind: TransportKind::Direct,
-            address: addr.to_string(),
-        }
-    }
-
-    #[tokio::test]
-    async fn metadata_persistence_failure_keeps_verified_hint_until_retry_succeeds()
-    -> LinkResult<()> {
-        let storage = Arc::new(MemoryLinkStorage::default());
-        let (manager, fingerprint) = mgr_with_storage(vec![7; 32], storage.clone()).await;
-        let candidate = direct("10.0.0.9:17800");
-        manager
-            .hinted
-            .lock()
-            .map_err(|error| LinkError::Store(error.to_string()))?
-            .insert(fingerprint.clone(), candidate.clone());
-        let address = PeerAddress::parse(&candidate.address)?.base_url();
-        storage
-            .fail_metadata_writes
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        manager.promote_hinted(&fingerprint, &address).await;
-        assert_eq!(
-            manager
-                .hinted
-                .lock()
-                .map_err(|error| LinkError::Store(error.to_string()))?
-                .get(&fingerprint),
-            Some(&candidate)
-        );
-        assert!(
-            manager
-                .store
-                .get(&fingerprint)
-                .await?
-                .ok_or(LinkError::NotPaired)?
-                .candidates
-                .is_empty()
-        );
-        storage
-            .fail_metadata_writes
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        manager.promote_hinted(&fingerprint, &address).await;
-        assert!(
-            !manager
-                .hinted
-                .lock()
-                .map_err(|error| LinkError::Store(error.to_string()))?
-                .contains_key(&fingerprint)
-        );
-        assert_eq!(
-            manager
-                .store
-                .get(&fingerprint)
-                .await?
-                .ok_or(LinkError::NotPaired)?
-                .candidates,
-            vec![candidate]
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn peer_info_response_does_not_report_success_before_metadata_is_persisted()
-    -> LinkResult<()> {
-        let storage = Arc::new(MemoryLinkStorage::default());
-        let (manager, fingerprint) = mgr_with_storage(vec![7; 32], storage.clone()).await;
-        storage
-            .fail_metadata_writes
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let request = LinkRequest {
-            device: fingerprint.clone(),
-            body: encode_peer_info(&PeerInfo {
-                default_save_dir: Some("/downloads".into()),
-                path_style: Some("posix".into()),
-            }),
-        };
-        let result = manager
-            .answer_peer_info(&request, &PeerInfo::default())
-            .await;
-        assert!(matches!(result, Err(LinkError::Store(_))));
-        assert_eq!(
-            manager
-                .store
-                .get(&fingerprint)
-                .await?
-                .ok_or(LinkError::NotPaired)?
-                .info
-                .default_save_dir,
-            None
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn unverified_hint_never_displaces_stored_candidates() {
-        let (mgr, fp) = mgr_with_device(vec![7u8; 32]).await;
-        mgr.store
-            .update_candidates(&fp, &[direct("10.0.0.2:17800")])
-            .await
-            .unwrap();
-        mgr.hinted
-            .lock()
-            .unwrap()
-            .insert(fp.clone(), direct("10.0.0.9:17800"));
-        let record = mgr.store.get(&fp).await.unwrap().unwrap();
-        let dial = mgr.with_hinted(record);
-        assert_eq!(
-            dial.candidates,
-            vec![direct("10.0.0.2:17800"), direct("10.0.0.9:17800")]
-        );
-        let stored = mgr.store.get(&fp).await.unwrap().unwrap();
-        assert_eq!(stored.candidates, vec![direct("10.0.0.2:17800")]);
-    }
-
-    #[tokio::test]
-    async fn hint_is_persisted_only_after_authenticated_success_on_its_address() {
-        let (mgr, fp) = mgr_with_device(vec![7u8; 32]).await;
-        mgr.store
-            .update_candidates(&fp, &[direct("10.0.0.2:17800")])
-            .await
-            .unwrap();
-        mgr.hinted
-            .lock()
-            .unwrap()
-            .insert(fp.clone(), direct("10.0.0.9:17800"));
-        let other = PeerAddress::parse("10.0.0.2:17800").unwrap().base_url();
-        mgr.promote_hinted(&fp, &other).await;
-        let stored = mgr.store.get(&fp).await.unwrap().unwrap();
-        assert_eq!(stored.candidates, vec![direct("10.0.0.2:17800")]);
-
-        let hinted = PeerAddress::parse("10.0.0.9:17800").unwrap().base_url();
-        mgr.promote_hinted(&fp, &hinted).await;
-        let stored = mgr.store.get(&fp).await.unwrap().unwrap();
-        assert_eq!(
-            stored.candidates,
-            vec![direct("10.0.0.9:17800"), direct("10.0.0.2:17800")]
-        );
-    }
-
-    fn wire_hello(hello: &HelloRequest) -> WireHello {
-        WireHello {
-            protocol_version: hello.protocol_version,
-            code: hello.code.clone(),
-            initiator_id_pub: B64.encode(hello.initiator_id_pub),
-            initiator_commit: B64.encode(hello.initiator_commit),
-            initiator_sig: B64.encode(hello.initiator_sig),
-            name: hello.name.clone(),
-            platform: hello.platform.clone(),
-            app_version: hello.app_version.clone(),
-            initiator_addrs: hello.initiator_addrs.clone(),
-        }
-    }
-
-    async fn responder_mgr() -> (Arc<LinkManager>, mpsc::Receiver<LinkEngineEvent>) {
-        let (tx, rx) = mpsc::channel(8);
-        let mgr = LinkManager::load(
-            Arc::new(MemoryLinkStorage::default()),
-            SelfInfo {
-                name: "nas".into(),
-                platform: Some("linux".into()),
-                app_version: None,
-            },
-            LinkOptions {
-                api_port: 17800,
-                reachable: false,
-                advertise: false,
-            },
-            tx,
-        )
-        .await
-        .unwrap();
-        (mgr, rx)
-    }
-
-    #[tokio::test]
-    async fn incoming_pairing_is_announced_only_after_reveal_with_the_shared_sas() {
-        // 响应方在 hello 阶段还看不到发起方的临时公钥，没有 SAS 可展示：入站配对请求
-        // 只在 reveal 被受理之后才广播，且广播的 SAS 与发起方算出的一致。
-        let (mgr, mut events) = responder_mgr().await;
-        let code = mgr.generate_code();
-        let initiator_id = LinkIdentity::generate();
-        let mut initiator = PairingInitiator::new(initiator_id.clone());
-        let hello = initiator.build_hello(
-            &code,
-            &SelfInfo {
-                name: "laptop".into(),
-                platform: Some("macos".into()),
-                app_version: None,
-            },
-            vec![],
-        );
-
-        let resp = mgr.pair_hello_wire(wire_hello(&hello), None).unwrap();
-        tokio::task::yield_now().await;
-        assert!(events.try_recv().is_err(), "hello alone must not announce");
-
-        // 发起方按对端 JSON 的形状解析 hello 回复（与 begin_pairing 同一条解析路径）。
-        let json = serde_json::json!({
-            "protocolVersion": resp.protocol_version,
-            "sessionId": resp.session_id,
-            "responderEphPub": resp.responder_eph_pub,
-            "responderNonce": resp.responder_nonce,
-            "responderIdPub": resp.responder_id_pub,
-            "name": resp.name,
-            "platform": resp.platform,
-            "appVersion": resp.app_version,
-        });
-        let hello_resp = parse_hello_response(&json).unwrap();
-        let reveal = initiator
-            .on_hello_response(&hello_resp, "10.0.0.1:17800", &[])
-            .unwrap();
-        let revealed = mgr
-            .pair_reveal_wire(WireReveal {
-                session_id: reveal.session_id.clone(),
-                initiator_eph_pub: B64.encode(reveal.initiator_eph_pub),
-                initiator_nonce: B64.encode(reveal.initiator_nonce),
-            })
-            .unwrap();
-        let reveal_resp =
-            parse_reveal_response(&serde_json::json!({ "responderSig": revealed.responder_sig }))
-                .unwrap();
-        let initiator_sas = initiator.on_reveal_response(&reveal_resp).unwrap();
-
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        match event {
-            LinkEngineEvent::IncomingPairing {
-                session_id,
-                sas,
-                peer_name,
-                peer_fingerprint,
-                ..
-            } => {
-                assert_eq!(session_id, hello_resp.session_id);
-                assert_eq!(sas, initiator_sas);
-                assert_eq!(peer_name, "laptop");
-                assert_eq!(peer_fingerprint, initiator_id.fingerprint());
-            }
-            other => panic!("expected IncomingPairing, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn hello_from_other_protocol_version_is_rejected_before_field_decoding() {
-        // 旧版发起方的 hello 没有新字段（解码后是空串）：要得到明确的版本不兼容，
-        // 而不是含糊的载荷非法。
-        let (mgr, _events) = responder_mgr().await;
-        let code = mgr.generate_code();
-        let stale = WireHello {
-            protocol_version: 0,
-            code: code.clone(),
-            initiator_id_pub: String::new(),
-            initiator_commit: String::new(),
-            initiator_sig: String::new(),
-            name: "old".into(),
-            platform: None,
-            app_version: None,
-            initiator_addrs: vec![],
-        };
-        assert!(matches!(
-            mgr.pair_hello_wire(stale, None),
-            Err(LinkError::UnsupportedVersion)
-        ));
-    }
-
-    #[test]
-    fn legacy_peer_replies_are_reported_as_unsupported_version() {
-        // 旧版响应方的 hello 回复：有 sessionId、明文 SAS 与自己的签名，没有 protocolVersion。
-        let legacy = serde_json::json!({
-            "sessionId": "abc",
-            "responderEphPub": B64.encode([1u8; 32]),
-            "responderIdPub": B64.encode([2u8; 32]),
-            "responderSig": B64.encode([3u8; 64]),
-            "name": "old-nas",
-            "sas": "123456",
-        });
-        assert!(matches!(
-            parse_hello_response(&legacy),
-            Err(LinkError::UnsupportedVersion)
-        ));
-        // 根本不是 FluxDown 的 JSON 仍是 NotFluxDown，不被误判成版本问题。
-        assert!(matches!(
-            parse_hello_response(&serde_json::json!({ "ok": true })),
-            Err(LinkError::NotFluxDown(_))
-        ));
-
-        // 旧版响应方会把新 hello 当作无法解析的载荷拒绝。
-        let rejected = LinkError::BadPayload(
-            "invalid link hello payload: missing field `initiatorEphPub` at line 1 column 80"
-                .into(),
-        );
-        assert!(matches!(
-            hello_rejection(rejected),
-            LinkError::UnsupportedVersion
-        ));
-        assert!(matches!(
-            hello_rejection(LinkError::InvalidCode),
-            LinkError::InvalidCode
-        ));
-        assert!(matches!(
-            hello_rejection(LinkError::BadPayload("unrelated".into())),
-            LinkError::BadPayload(_)
-        ));
-    }
-
-    #[test]
-    fn new_pairing_errors_round_trip_through_the_wire_message_contract() {
-        // 发起方只看得到对端的 HTTP message：新错误必须能被还原，而不是一律变成含糊的载荷错误。
-        for error in [LinkError::UnsupportedVersion, LinkError::CommitmentMismatch] {
-            let restored = LinkError::from_wire_message(&error.to_string());
-            assert_eq!(
-                restored.map(|e| std::mem::discriminant(&e)),
-                Some(std::mem::discriminant(&error))
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn known_fingerprints_cover_probe_and_discovery_for_that_address_only() {
-        let (mgr, _events) = responder_mgr().await;
-        let addr = PeerAddress::parse("10.0.0.2:17800").unwrap();
-        let elsewhere = PeerAddress::parse("10.0.0.3:17800").unwrap();
-        assert!(mgr.known_fingerprints(&addr).is_empty());
-
-        mgr.remember_probe(&addr, "fp-probed");
-        let peer = |fingerprint: Option<&str>, host: &str| DiscoveredPeer {
-            fingerprint: fingerprint.map(str::to_string),
-            name: "peer".into(),
-            platform: None,
-            host: host.into(),
-            port: 17800,
-            app_version: None,
-            kind: DiscoveryKind::Mdns,
-        };
-        {
-            let mut snapshot = mgr.discovered.lock().unwrap();
-            snapshot.push(peer(Some("fp-mdns"), "10.0.0.2"));
-            // 没有指纹的条目与其它地址的条目都不提供这个地址的指纹。
-            snapshot.push(peer(None, "10.0.0.2"));
-            snapshot.push(peer(Some("fp-other"), "10.0.0.3"));
-        }
-
-        let mut known = mgr.known_fingerprints(&addr);
-        known.sort();
-        assert_eq!(known, vec!["fp-mdns".to_string(), "fp-probed".to_string()]);
-        let mut elsewhere_known = mgr.known_fingerprints(&elsewhere);
-        elsewhere_known.sort();
-        assert_eq!(elsewhere_known, vec!["fp-other".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn probed_fingerprints_are_bounded_and_expire() {
-        let (mgr, _events) = responder_mgr().await;
-        for i in 0..(MAX_PROBED_FINGERPRINTS + 8) {
-            let addr = PeerAddress::parse(&format!("10.1.0.{}:17800", i + 1)).unwrap();
-            mgr.remember_probe(&addr, &format!("fp-{i}"));
-        }
-        assert_eq!(mgr.probed.lock().unwrap().len(), MAX_PROBED_FINGERPRINTS);
-        // 满员淘汰的是最旧的，最新的仍在。
-        let newest =
-            PeerAddress::parse(&format!("10.1.0.{}:17800", MAX_PROBED_FINGERPRINTS + 8)).unwrap();
-        assert_eq!(
-            mgr.known_fingerprints(&newest),
-            vec![format!("fp-{}", MAX_PROBED_FINGERPRINTS + 7)]
-        );
-
-        // 过期的探测结果不再参与比对，并被后台剪枝回收。
-        let Some(expired_at) = std::time::Instant::now()
-            .checked_sub(PROBED_FINGERPRINT_TTL + std::time::Duration::from_secs(1))
-        else {
-            return;
-        };
-        for (_, at) in mgr.probed.lock().unwrap().values_mut() {
-            *at = expired_at;
-        }
-        assert!(mgr.known_fingerprints(&newest).is_empty());
-        mgr.prune_expired();
-        assert!(mgr.probed.lock().unwrap().is_empty());
-    }
-}
+#[path = "manager_tests.rs"]
+mod tests;

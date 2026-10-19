@@ -4,7 +4,7 @@
 //! install/uninstall/toggle 写（整表原子替换），resolve/hook match 读。**不用 arc-swap**
 //! （workspace 无此依赖且约束禁新增）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -31,6 +31,13 @@ use super::runtime::{
     PluginEntryKind, PluginError, PluginEvent, PluginScript, ResolveManifest, ResolveRequest,
     ResolveResult, ScriptRuntime, SubscriptionRequest,
 };
+
+#[path = "host_manager.rs"]
+mod host_manager;
+#[path = "interceptors.rs"]
+mod interceptors;
+#[path = "routing.rs"]
+pub mod routing;
 
 /// 连续超时/超内存达到该次数 → 自动熔断禁用。
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
@@ -63,6 +70,8 @@ pub enum DisabledReason {
     None,
     Manual,
     CircuitBreaker,
+    Revoked,
+    ConsentRequired,
 }
 
 impl DisabledReason {
@@ -71,12 +80,16 @@ impl DisabledReason {
             DisabledReason::None => "None",
             DisabledReason::Manual => "Manual",
             DisabledReason::CircuitBreaker => "CircuitBreaker",
+            DisabledReason::Revoked => "Revoked",
+            DisabledReason::ConsentRequired => "ConsentRequired",
         }
     }
     pub fn parse(s: &str) -> Self {
         match s {
             "Manual" => DisabledReason::Manual,
             "CircuitBreaker" => DisabledReason::CircuitBreaker,
+            "Revoked" => DisabledReason::Revoked,
+            "ConsentRequired" => DisabledReason::ConsentRequired,
             _ => DisabledReason::None,
         }
     }
@@ -114,6 +127,8 @@ pub struct LoadedPlugin {
     resolver_entry: Option<PathBuf>,
     /// hooks 入口绝对路径（若声明）。
     hooks_entry: Option<PathBuf>,
+    /// interceptors 入口绝对路径（若声明）。
+    intercept_entry: Option<PathBuf>,
     /// auth 入口绝对路径（若声明）。
     auth_entry: Option<PathBuf>,
     /// subscription provider 入口绝对路径（若声明）。
@@ -121,8 +136,13 @@ pub struct LoadedPlugin {
     /// 非 dev 模式的缓存源码（加载时读入）。
     resolver_cache: Option<String>,
     hooks_cache: Option<String>,
+    intercept_cache: Option<String>,
     auth_cache: Option<String>,
     subscription_cache: Option<String>,
+    /// `main` 入口绝对路径（若声明）。
+    main_entry: Option<PathBuf>,
+    /// 非 dev 模式的 `main` 源码缓存。
+    main_cache: Option<String>,
     /// 熔断计数（连续 Timeout/MemoryLimit）。
     timeout_streak: Arc<AtomicU32>,
 }
@@ -142,11 +162,26 @@ impl LoadedPlugin {
             (None, _) => None,
         }
     }
+    async fn intercept_source(&self) -> Option<String> {
+        match (&self.intercept_entry, self.dev) {
+            (Some(p), true) => tokio::fs::read_to_string(p).await.ok(),
+            (Some(_), false) => self.intercept_cache.clone(),
+            (None, _) => None,
+        }
+    }
 
     async fn auth_source(&self) -> Option<String> {
         match (&self.auth_entry, self.dev) {
             (Some(p), true) => tokio::fs::read_to_string(p).await.ok(),
             (Some(_), false) => self.auth_cache.clone(),
+            (None, _) => None,
+        }
+    }
+
+    async fn main_source(&self) -> Option<String> {
+        match (&self.main_entry, self.dev) {
+            (Some(p), true) => tokio::fs::read_to_string(p).await.ok(),
+            (Some(_), false) => self.main_cache.clone(),
             (None, _) => None,
         }
     }
@@ -203,11 +238,27 @@ pub struct PluginInfo {
     pub auth_supported: bool,
     /// manifest 声明的订阅 provider ID；仅启用插件会被前端作为可选订阅来源展示。
     pub subscription_provider_ids: Vec<String>,
+    /// manifest resolvers[0].match.urls（glob，语义见 url_glob_match）。
+    pub resolver_urls: Vec<String>,
     /// 加载状态：`Loaded` 表示已通过启动时的 manifest/源码加载，`Failed` 表示
     /// 目录仍存在但加载失败。与 `enabled` 分离：手动禁用的插件仍可能已加载。
     pub load_status: String,
     /// 加载失败的可读原因；加载成功时为空。
     pub load_error: String,
+    /// manifest 声明的贡献点（视图 / 命令 / 嗅探规则）；加载失败的插件为空。
+    pub contributions: super::manifest::ContributesDecl,
+    /// manifest 是否声明了 `main`（可移植视图由 main 提供）。
+    pub has_main: bool,
+    /// 由权限推导的风险等级。
+    pub risk: super::manifest::PluginRisk,
+    /// 所有 desktop 视图声明的网络主机（排序去重）。
+    pub network_hosts: Vec<String>,
+    /// 尚未授权的权限（manifest 请求 − `plugin.<id>.consent` 已授权）。
+    pub consent_pending: Vec<String>,
+    /// 尚未授权的网络主机。
+    pub consent_pending_hosts: Vec<String>,
+    /// 插件包绝对目录；仅已加载插件为 Some。
+    pub package_dir: Option<String>,
 }
 
 /// 目录或 dev 配置仍存在、但没有进入运行时快照的插件。
@@ -239,10 +290,15 @@ pub struct PluginManager {
     /// 串行化 `load_all`：扫描 + 整表替换非原子，交错的两次重载会用旧快照
     /// 覆盖新的启停/熔断状态。
     load_lock: tokio::sync::Mutex<()>,
+    audit: super::audit::AuditLog,
+    /// 常驻宿主（`main`）的运行态：宿主表、视图会话、定时器、任务端口。
+    host: host_manager::HostState,
+    /// 多插件选择框按站点串行化（见 [`routing`]）。
+    site_prompts: routing::SitePromptLocks,
 }
 
 impl PluginManager {
-    /// 构造（不加载）；随后调用 [`Self::load_all`]。
+    /// 构造（不加载）；随后调用 [`Self::load_all`]。审计写入器由 manager 自建。
     pub fn new(
         runtime: Arc<dyn ScriptRuntime>,
         bridge: Arc<dyn PluginBridge>,
@@ -250,6 +306,21 @@ impl PluginManager {
         root: PathBuf,
         app_version: String,
         sink: Arc<dyn EventSink>,
+    ) -> Self {
+        let audit = super::audit::AuditLog::new(db.clone(), &runtime.spawn_handle());
+        Self::with_audit(runtime, bridge, db, root, app_version, sink, audit)
+    }
+
+    /// 与 [`Self::new`] 相同，但使用外部创建的审计写入器（引擎装配时同一个
+    /// [`super::audit::AuditLog`] 同时喂给 `AuditingBridge`）。
+    pub fn with_audit(
+        runtime: Arc<dyn ScriptRuntime>,
+        bridge: Arc<dyn PluginBridge>,
+        db: Db,
+        root: PathBuf,
+        app_version: String,
+        sink: Arc<dyn EventSink>,
+        audit: super::audit::AuditLog,
     ) -> Self {
         Self {
             runtime,
@@ -263,7 +334,15 @@ impl PluginManager {
             hook_budget: DEFAULT_HOOK_BUDGET,
             sink,
             load_lock: tokio::sync::Mutex::new(()),
+            audit,
+            host: host_manager::HostState::new(),
+            site_prompts: routing::SitePromptLocks::default(),
         }
+    }
+
+    /// 审计写入器（生命周期记录与宿主调用共用）。
+    pub fn audit(&self) -> &super::audit::AuditLog {
+        &self.audit
     }
 
     /// 专用运行时 handle，供 off-actor worker spawn（禁止裸 tokio::spawn）。
@@ -279,6 +358,7 @@ impl PluginManager {
     /// 扫描根目录 + `plugin.dev.*` 键，解析并加载全部插件。
     pub async fn load_all(&self) {
         let _serial = self.load_lock.lock().await;
+        self.migrate_consent().await;
         let mut loaded: Vec<LoadedPlugin> = Vec::new();
         let mut failed: Vec<FailedPlugin> = Vec::new();
 
@@ -316,6 +396,8 @@ impl PluginManager {
 
         *self.plugins.write().await = Arc::new(deduped);
         *self.failed_plugins.write().await = Arc::new(failed);
+        // 宿主对账：被禁用 / 卸载 / manifest 或 main 源码变化的插件，其宿主立即释放。
+        self.reconcile_hosts().await;
     }
 
     /// 加载单个插件目录。失败记 warn 并保留诊断信息（不阻塞其他插件）。
@@ -389,8 +471,46 @@ impl PluginManager {
 
         let resolver_entry = manifest.resolvers.first().map(|r| dir.join(&r.entry));
         let hooks_entry = manifest.hooks.as_ref().map(|h| dir.join(&h.entry));
+        let intercept_entry = manifest.interceptors.as_ref().map(|i| dir.join(&i.entry));
         let auth_entry = manifest.auth.as_ref().map(|a| dir.join(&a.entry));
         let subscription_entry = manifest.subscriptions.first().map(|s| dir.join(&s.entry));
+
+        // main / desktop 入口 / sniffRules 只做存在性检查：main 由宿主按需编译，desktop 入口是
+        // GPUI Shell 执行的 ESM，引擎从不编译或求值它。
+        let mut present: HashSet<String> = HashSet::new();
+        for file in manifest.package_files() {
+            let is_file = tokio::fs::metadata(dir.join(&file))
+                .await
+                .map(|m| m.is_file())
+                .unwrap_or(false);
+            if is_file {
+                present.insert(file);
+            }
+        }
+        let mut file_check = manifest.check_package_files(|p| present.contains(p));
+        if file_check.is_ok()
+            && let Some(rules) = manifest
+                .contributes
+                .as_ref()
+                .and_then(|c| c.sniff_rules.as_ref())
+        {
+            file_check = match tokio::fs::read(dir.join(rules)).await {
+                Ok(bytes) => super::manifest::validate_sniff_pack(&bytes),
+                Err(e) => Err(PluginError::ManifestInvalid(format!(
+                    "sniffRules '{rules}' 读取失败: {e}"
+                ))),
+            };
+        }
+        if let Err(e) = file_check {
+            log_info!("[plugin] 跳过 {}: {e}", manifest.identity);
+            return Err(FailedPlugin {
+                identity: manifest.identity.clone(),
+                dir: dir.to_path_buf().into_boxed_path(),
+                manifest: Some(Box::new(manifest.clone())),
+                dev_mode: dev,
+                error: e.to_string(),
+            });
+        }
 
         // 死订阅检查：同时声明 resolver 与订阅 onMetaProbed → warn（带 resolver 的
         // 任务跳过 probe，onMetaProbed 不会触发）。
@@ -404,81 +524,53 @@ impl PluginManager {
             );
         }
 
-        // 非 dev：加载时读入源码缓存。
-        let (resolver_cache, hooks_cache, auth_cache, subscription_cache) = if dev {
-            (None, None, None, None)
+        // 入口脚本：dev 与非 dev 都在加载期读一遍——缺失或不可读直接判定加载失败并点名
+        // 文件，而不是等到调用时才报「未提供 resolver」。非 dev 另存缓存；dev 每次调用重读。
+        let fail = |error: String| {
+            log_info!("[plugin] 跳过 {}: {error}", manifest.identity);
+            FailedPlugin {
+                identity: manifest.identity.clone(),
+                dir: dir.to_path_buf().into_boxed_path(),
+                manifest: Some(Box::new(manifest.clone())),
+                dev_mode: dev,
+                error,
+            }
+        };
+        let resolver_source = read_entry(dir, manifest.resolvers.first().map(|r| r.entry.as_str()))
+            .await
+            .map_err(fail)?;
+        let hooks_source = read_entry(dir, manifest.hooks.as_ref().map(|h| h.entry.as_str()))
+            .await
+            .map_err(fail)?;
+        let auth_source = read_entry(dir, manifest.auth.as_ref().map(|a| a.entry.as_str()))
+            .await
+            .map_err(fail)?;
+        let subscription_source = read_entry(
+            dir,
+            manifest.subscriptions.first().map(|s| s.entry.as_str()),
+        )
+        .await
+        .map_err(fail)?;
+        let main_source = read_entry(dir, manifest.main.as_ref().map(|m| m.entry.as_str()))
+            .await
+            .map_err(fail)?;
+        let intercept_source = read_entry(
+            dir,
+            manifest.interceptors.as_ref().map(|i| i.entry.as_str()),
+        )
+        .await
+        .map_err(fail)?;
+        let (resolver_cache, hooks_cache, auth_cache, subscription_cache, intercept_cache) = if dev
+        {
+            (None, None, None, None, None)
         } else {
-            let rc = match &resolver_entry {
-                Some(p) => match tokio::fs::read_to_string(p).await {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        log_info!(
-                            "[plugin] 跳过 {}: 读取 resolver 失败: {e}",
-                            manifest.identity
-                        );
-                        return Err(FailedPlugin {
-                            identity: manifest.identity.clone(),
-                            dir: dir.to_path_buf().into_boxed_path(),
-                            manifest: Some(Box::new(manifest.clone())),
-                            dev_mode: dev,
-                            error: format!("读取 resolver 失败: {e}"),
-                        });
-                    }
-                },
-                None => None,
-            };
-            let hc = match &hooks_entry {
-                Some(p) => match tokio::fs::read_to_string(p).await {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        log_info!("[plugin] 跳过 {}: 读取 hooks 失败: {e}", manifest.identity);
-                        return Err(FailedPlugin {
-                            identity: manifest.identity.clone(),
-                            dir: dir.to_path_buf().into_boxed_path(),
-                            manifest: Some(Box::new(manifest.clone())),
-                            dev_mode: dev,
-                            error: format!("读取 hooks 失败: {e}"),
-                        });
-                    }
-                },
-                None => None,
-            };
-            let ac = match &auth_entry {
-                Some(p) => match tokio::fs::read_to_string(p).await {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        log_info!("[plugin] 跳过 {}: 读取 auth 失败: {e}", manifest.identity);
-                        return Err(FailedPlugin {
-                            identity: manifest.identity.clone(),
-                            dir: dir.to_path_buf().into_boxed_path(),
-                            manifest: Some(Box::new(manifest.clone())),
-                            dev_mode: dev,
-                            error: format!("读取 auth 失败: {e}"),
-                        });
-                    }
-                },
-                None => None,
-            };
-            let sc = match &subscription_entry {
-                Some(p) => match tokio::fs::read_to_string(p).await {
-                    Ok(s) => Some(s),
-                    Err(e) => {
-                        log_info!(
-                            "[plugin] 跳过 {}: 读取 subscription 失败: {e}",
-                            manifest.identity
-                        );
-                        return Err(FailedPlugin {
-                            identity: manifest.identity.clone(),
-                            dir: dir.to_path_buf().into_boxed_path(),
-                            manifest: Some(Box::new(manifest.clone())),
-                            dev_mode: dev,
-                            error: format!("读取 subscription 失败: {e}"),
-                        });
-                    }
-                },
-                None => None,
-            };
-            (rc, hc, ac, sc)
+            (
+                resolver_source,
+                hooks_source,
+                auth_source,
+                subscription_source,
+                intercept_source,
+            )
         };
 
         let identity = manifest.identity.clone();
@@ -499,7 +591,18 @@ impl PluginManager {
             .map(DisabledReason::parse)
             .unwrap_or(DisabledReason::None);
         // 无 enabled 键 = 新装默认启用。
-        let enabled = enabled_str.as_deref().map(|v| v == "true").unwrap_or(true);
+        let mut enabled = enabled_str.as_deref().map(|v| v == "true").unwrap_or(true);
+        let mut disabled_reason = disabled_reason;
+        // 授权判定：任一待授权项非空 → 视为禁用（不写 enabled 键，授权后直接生效）。
+        let consent = self.read_consent(&identity).await;
+        let (pending_perms, pending_hosts) = super::consent::pending(&manifest, consent.as_ref());
+        if !pending_perms.is_empty() || !pending_hosts.is_empty() {
+            enabled = false;
+            disabled_reason = DisabledReason::ConsentRequired;
+        }
+
+        let main_entry = manifest.main.as_ref().map(|m| dir.join(&m.entry));
+        let main_cache = if dev { None } else { main_source };
 
         Ok(LoadedPlugin {
             manifest,
@@ -509,62 +612,18 @@ impl PluginManager {
             disabled_reason,
             resolver_entry,
             hooks_entry,
+            intercept_entry,
             auth_entry,
             subscription_entry,
             resolver_cache,
             hooks_cache,
+            intercept_cache,
             auth_cache,
             subscription_cache,
+            main_entry,
+            main_cache,
             timeout_streak: Arc::new(AtomicU32::new(0)),
         })
-    }
-
-    /// 纯 Rust glob 首匹配（按 identity 字典序稳定排序）。返回命中插件 identity。
-    pub async fn match_resolver(&self, url: &str) -> Option<String> {
-        let snapshot = self.plugins.read().await.clone();
-        let mut candidates: Vec<&LoadedPlugin> = snapshot
-            .iter()
-            .filter(|p| p.enabled && !p.manifest.resolvers.is_empty())
-            .collect();
-        candidates.sort_by(|a, b| a.manifest.identity.cmp(&b.manifest.identity));
-        for p in candidates {
-            for pat in p.manifest.resolver_urls() {
-                if super::manifest::url_glob_match(pat, url) {
-                    return Some(p.manifest.identity.clone());
-                }
-            }
-        }
-        None
-    }
-
-    /// 同 [`Self::match_resolver`]，但仅当命中插件的 resolver 声明了
-    /// `"multi": true` 时才返回——供前置预解析（[`ResolveManifest`]）判定是否
-    /// 触发，避免解析昂贵的单文件插件在创建下载时白跑一次（A2 契约）。
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # async fn run(pm: std::sync::Arc<fluxdown_engine::plugin::PluginManager>) {
-    /// // 未声明 multi 的插件恒不命中，即使 URL glob 匹配。
-    /// let hit = pm.match_multi_resolver("https://pan.example.com/s/abc").await;
-    /// assert!(hit.is_none() || hit.is_some());
-    /// # }
-    /// ```
-    pub async fn match_multi_resolver(&self, url: &str) -> Option<String> {
-        let snapshot = self.plugins.read().await.clone();
-        let mut candidates: Vec<&LoadedPlugin> = snapshot
-            .iter()
-            .filter(|p| p.enabled && p.manifest.resolvers.first().is_some_and(|r| r.multi))
-            .collect();
-        candidates.sort_by(|a, b| a.manifest.identity.cmp(&b.manifest.identity));
-        for p in candidates {
-            for pat in p.manifest.resolver_urls() {
-                if super::manifest::url_glob_match(pat, url) {
-                    return Some(p.manifest.identity.clone());
-                }
-            }
-        }
-        None
     }
 
     /// 惰性解析。off-actor worker 调用（在插件专用 runtime 上）。
@@ -589,6 +648,7 @@ impl PluginManager {
             if !p.enabled {
                 let reason = match p.disabled_reason {
                     DisabledReason::CircuitBreaker => "已被熔断自动禁用",
+                    DisabledReason::Revoked => "已被插件市场撤回",
                     _ => "已被禁用",
                 };
                 return Err(PluginError::Runtime(format!(
@@ -908,7 +968,7 @@ impl PluginManager {
 
     /// 通知平面：遍历声明该事件且 match 命中的启用插件，逐个在插件 runtime 上 spawn
     /// invoke_hook。**全部 fire-and-forget，本函数立即返回**。
-    pub async fn notify(&self, event: PluginEvent) {
+    pub async fn notify(self: &Arc<Self>, event: PluginEvent) {
         let snapshot = self.plugins.read().await.clone();
         let ev_name = event.declared_name();
         let url = event.url().to_string();
@@ -916,6 +976,14 @@ impl PluginManager {
             let p = &snapshot[idx];
             if !p.enabled {
                 continue;
+            }
+            // 常驻宿主：事件声明在 `main.events` 的插件，由宿主处理（必要时激活）。
+            if p.manifest
+                .main
+                .as_ref()
+                .is_some_and(|m| m.events.iter().any(|e| e == ev_name))
+            {
+                self.deliver_host_event(&p.manifest.identity, event.clone());
             }
             let Some(hooks) = &p.manifest.hooks else {
                 continue;
@@ -1070,7 +1138,19 @@ impl PluginManager {
 
     /// 从 zip 字节安装。
     pub async fn install_from_zip(&self, bytes: Vec<u8>) -> Result<String, PluginError> {
-        let outcome = super::install::install_from_zip_with_backup(&self.root, &bytes)?;
+        let outcome = super::install::install_from_zip_with_backup(&self.root, &bytes, |_| Ok(()))?;
+        self.finish_install_outcome(outcome).await
+    }
+
+    /// 与 [`Self::install_from_zip`] 相同，但在 manifest 校验通过后、替换旧版本前
+    /// 先运行 `check_manifest`（市场安装用它核对包内 manifest 与索引条目一致）。
+    pub(crate) async fn install_from_zip_checked(
+        &self,
+        bytes: Vec<u8>,
+        check_manifest: impl FnOnce(&super::manifest::PluginManifest) -> Result<(), PluginError>,
+    ) -> Result<String, PluginError> {
+        let outcome =
+            super::install::install_from_zip_with_backup(&self.root, &bytes, check_manifest)?;
         self.finish_install_outcome(outcome).await
     }
 
@@ -1113,6 +1193,7 @@ impl PluginManager {
             self.load_all().await;
             return Err(error);
         }
+        self.audit_event(&identity, "install", manifest.version.clone(), "dev");
         Ok(identity)
     }
 
@@ -1167,6 +1248,7 @@ impl PluginManager {
         outcome: super::install::InstallOutcome,
     ) -> Result<String, PluginError> {
         let identity = outcome.identity().to_string();
+        let previous_version = self.installed_version(&identity).await;
         if let Err(error) = self.finish_install(&identity).await {
             // 升级失败恢复旧目录；新装失败只删本次新建的目录。设置/KV 与同 identity
             // 的 dev 登记不是这次安装写的，绝不能清。
@@ -1182,6 +1264,16 @@ impl PluginManager {
             }
             self.load_all().await;
             return Err(error);
+        }
+        let new_version = self.installed_version(&identity).await.unwrap_or_default();
+        match previous_version {
+            Some(previous) if previous != new_version => self.audit_event(
+                &identity,
+                "update",
+                new_version.clone(),
+                format!("{previous} -> {new_version}"),
+            ),
+            _ => self.audit_event(&identity, "install", new_version, ""),
         }
         Ok(identity)
     }
@@ -1212,10 +1304,23 @@ impl PluginManager {
 
         // enabled 写入规则：
         // - 新装（无 enabled 键）或熔断 → enabled=1, reason=None（升级即解熔断）
+        // - 撤回且新版本不同于被撤回版本 → 同上并清除 revoked_version
         // - Manual → 维持 disabled 不动（不覆盖用户主动关闭）
-        if !has_enabled_key || reason == DisabledReason::CircuitBreaker {
+        let revoked_stale = reason == DisabledReason::Revoked && {
+            let revoked_version = self
+                .db
+                .get_config(&format!("plugin.{identity}.revoked_version"))
+                .await
+                .map_err(|e| PluginError::Runtime(e.to_string()))?;
+            revoked_version != self.installed_version(identity).await
+        };
+        if !has_enabled_key || reason == DisabledReason::CircuitBreaker || revoked_stale {
             self.write_enabled(identity, true, DisabledReason::None)
                 .await?;
+            self.db
+                .delete_config(&format!("plugin.{identity}.revoked_version"))
+                .await
+                .map_err(|e| PluginError::Runtime(e.to_string()))?;
         }
         // 最终重载让内存态与 config 一致。
         self.load_all().await;
@@ -1235,6 +1340,7 @@ impl PluginManager {
             p.hooks_source().await,
             p.auth_source().await,
             p.subscription_source().await,
+            p.intercept_source().await,
         ]
         .into_iter()
         .flatten()
@@ -1262,11 +1368,16 @@ impl PluginManager {
     /// 安装失败的回滚不走 purge（只回退本次写入的目录/dev 登记），避免误删同
     /// identity 已有插件的目录、设置与凭据。
     pub async fn uninstall(&self, identity: &str) -> Result<(), PluginError> {
+        let uninstalled_version = self.installed_version(identity).await.unwrap_or_default();
         self.db
             .clear_tasks_resolver(identity)
             .await
             .map_err(|e| PluginError::Runtime(e.to_string()))?;
         self.purge(identity).await?;
+        if let Err(error) = self.forget_site_defaults_of(identity).await {
+            // 与凭据清理同理：插件本体已卸载完成；残留记录选中它时会在下次匹配时失效重问。
+            log_info!("[plugin] 整理插件 {identity} 的站点默认插件记录失败（已忽略）: {error:#}");
+        }
         self.bridge.remove_plugin_workspace(identity).await;
         if let Err(e) = crate::auth::remove_plugin(&self.db, identity).await {
             // 只记日志不 `?`：目录/配置键已经清干净，卸载本身已经完成；凭据
@@ -1274,6 +1385,7 @@ impl PluginManager {
             // 这里只剩真正的 db I/O 错误）不该让用户看到卸载报错回滚假象。
             log_info!("[plugin] 清理插件 {identity} 认证凭据失败（已忽略）: {e:#}");
         }
+        self.audit_event(identity, "uninstall", uninstalled_version, "");
         Ok(())
     }
 
@@ -1374,6 +1486,30 @@ impl PluginManager {
 
     /// 手动开关（写 enabled + disabled_reason）。
     pub async fn set_enabled(&self, identity: &str, enabled: bool) -> Result<(), PluginError> {
+        if enabled {
+            let pending = {
+                let snapshot = self.plugins.read().await.clone();
+                match snapshot.iter().find(|p| p.manifest.identity == identity) {
+                    Some(p) => self.pending_for(&p.manifest).await,
+                    None => (Vec::new(), Vec::new()),
+                }
+            };
+            if !pending.0.is_empty() || !pending.1.is_empty() {
+                return Err(PluginError::ManifestInvalid("consent required".to_string()));
+            }
+            let revoked = self
+                .db
+                .get_config(&format!("plugin.{identity}.revoked_version"))
+                .await
+                .map_err(|e| PluginError::Runtime(e.to_string()))?;
+            if let Some(revoked) = revoked
+                && self.installed_version(identity).await.as_deref() == Some(revoked.as_str())
+            {
+                return Err(PluginError::Runtime(
+                    "该插件版本已被插件市场撤回，请升级后再启用".into(),
+                ));
+            }
+        }
         let reason = if enabled {
             DisabledReason::None
         } else {
@@ -1381,7 +1517,98 @@ impl PluginManager {
         };
         self.write_enabled(identity, enabled, reason).await?;
         self.load_all().await;
+        self.audit_event(
+            identity,
+            if enabled { "enable" } else { "disable" },
+            "",
+            "manual",
+        );
         Ok(())
+    }
+
+    /// 当前已装版本：已加载插件优先，其次是带 manifest 的失败插件。
+    async fn installed_version(&self, identity: &str) -> Option<String> {
+        let loaded = self.plugins.read().await.clone();
+        if let Some(p) = loaded.iter().find(|p| p.manifest.identity == identity) {
+            return Some(p.manifest.version.clone());
+        }
+        let failed = self.failed_plugins.read().await.clone();
+        failed
+            .iter()
+            .find(|p| p.identity == identity)
+            .and_then(|p| p.manifest.as_ref().map(|m| m.version.clone()))
+    }
+
+    /// 按市场索引撤回已装插件：(identity, version) 命中即禁用（Revoked）并记录 revoked_version；
+    /// 已记录但不再命中的只清除 revoked_version（保持禁用，由用户手动启用）。返回是否有变化。
+    pub async fn apply_market_revocations(
+        &self,
+        revoked: &std::collections::HashSet<(String, String)>,
+    ) -> Result<bool, PluginError> {
+        let loaded = self.plugins.read().await.clone();
+        let failed = self.failed_plugins.read().await.clone();
+        let mut targets: Vec<(String, String)> = Vec::new();
+        for p in loaded.iter().filter(|p| !p.dev) {
+            targets.push((p.manifest.identity.clone(), p.manifest.version.clone()));
+        }
+        for p in failed.iter().filter(|p| !p.dev_mode) {
+            if let Some(manifest) = &p.manifest {
+                targets.push((p.identity.clone(), manifest.version.clone()));
+            }
+        }
+
+        let mut newly_revoked: Vec<(String, String)> = Vec::new();
+        let mut changed = false;
+        for (identity, version) in targets {
+            let key = format!("plugin.{identity}.revoked_version");
+            let recorded = self
+                .db
+                .get_config(&key)
+                .await
+                .map_err(|e| PluginError::Runtime(e.to_string()))?;
+            if revoked.contains(&(identity.clone(), version.clone())) {
+                let (enabled, reason) = self.plugin_state(&identity).await;
+                if !enabled
+                    && reason == DisabledReason::Revoked
+                    && recorded.as_deref() == Some(version.as_str())
+                {
+                    continue;
+                }
+                let values = std::collections::BTreeMap::from([
+                    (format!("plugin.{identity}.enabled"), "false".to_string()),
+                    (
+                        format!("plugin.{identity}.disabled_reason"),
+                        DisabledReason::Revoked.as_str().to_string(),
+                    ),
+                    (key, version.clone()),
+                ]);
+                self.db
+                    .set_config_batch_atomic(&values)
+                    .await
+                    .map_err(|e| PluginError::Runtime(e.to_string()))?;
+                newly_revoked.push((identity, version));
+                changed = true;
+            } else if recorded.is_some() {
+                self.db
+                    .delete_config(&key)
+                    .await
+                    .map_err(|e| PluginError::Runtime(e.to_string()))?;
+                changed = true;
+            }
+        }
+
+        if changed {
+            self.load_all().await;
+        }
+        for (identity, version) in newly_revoked {
+            self.audit_event(&identity, "revoked", version, "market revocation");
+            self.sink.emit(EngineEvent::PluginAutoDisabled {
+                identity: identity.clone(),
+                reason: DisabledReason::Revoked.as_str().to_string(),
+            });
+            log_info!("[plugin] {identity} 已被插件市场撤回，已自动禁用");
+        }
+        Ok(changed)
     }
 
     async fn write_enabled(
@@ -1418,6 +1645,7 @@ impl PluginManager {
             reason: DisabledReason::CircuitBreaker.as_str().to_string(),
         });
         log_info!("[plugin] {identity} 连续超时，已自动熔断禁用");
+        self.audit_event(identity, "breaker", "", "consecutive timeouts");
     }
 
     /// 批量设置，all-or-nothing。
@@ -1455,6 +1683,7 @@ impl PluginManager {
             .set_config_batch_atomic(&values)
             .await
             .map_err(|e| PluginError::Runtime(e.to_string()))?;
+        self.push_host_settings(identity).await;
         Ok(())
     }
 
@@ -1517,6 +1746,7 @@ impl PluginManager {
         let mut out = Vec::with_capacity(snapshot.len() + failed_snapshot.len());
         for p in snapshot.iter() {
             let values = self.load_setting_values(&p.manifest.identity).await;
+            let loaded_pending = self.pending_for(&p.manifest).await;
             out.push(PluginInfo {
                 identity: p.manifest.identity.clone(),
                 name: p.manifest.name.clone(),
@@ -1536,8 +1766,21 @@ impl PluginManager {
                     .iter()
                     .map(|subscription| subscription.provider_id.clone())
                     .collect(),
+                resolver_urls: p
+                    .manifest
+                    .resolvers
+                    .first()
+                    .map(|r| r.match_decl.urls.clone())
+                    .unwrap_or_default(),
                 load_status: PluginLoadStatus::Loaded.as_str().to_string(),
                 load_error: String::new(),
+                contributions: p.manifest.contributes.clone().unwrap_or_default(),
+                has_main: p.manifest.main.is_some(),
+                risk: p.manifest.risk(),
+                network_hosts: p.manifest.network_hosts(),
+                consent_pending: loaded_pending.0,
+                consent_pending_hosts: loaded_pending.1,
+                package_dir: Some(p.dir.to_string_lossy().into_owned()),
             });
         }
         for p in failed_snapshot.iter() {
@@ -1583,6 +1826,10 @@ impl PluginManager {
                 ),
             };
             let values = self.load_setting_values(&p.identity).await;
+            let failed_pending = match &p.manifest {
+                Some(manifest) => self.pending_for(manifest).await,
+                None => (Vec::new(), Vec::new()),
+            };
             out.push(PluginInfo {
                 identity: p.identity.clone(),
                 name,
@@ -1597,8 +1844,29 @@ impl PluginManager {
                 permissions,
                 auth_supported,
                 subscription_provider_ids,
+                resolver_urls: p
+                    .manifest
+                    .as_ref()
+                    .and_then(|m| m.resolvers.first())
+                    .map(|r| r.match_decl.urls.clone())
+                    .unwrap_or_default(),
                 load_status: PluginLoadStatus::Failed.as_str().to_string(),
                 load_error: truncate_load_error(&p.error),
+                contributions: super::manifest::ContributesDecl::default(),
+                has_main: false,
+                risk: p
+                    .manifest
+                    .as_ref()
+                    .map(|m| m.risk())
+                    .unwrap_or(super::manifest::PluginRisk::Standard),
+                network_hosts: p
+                    .manifest
+                    .as_ref()
+                    .map(|m| m.network_hosts())
+                    .unwrap_or_default(),
+                consent_pending: failed_pending.0,
+                consent_pending_hosts: failed_pending.1,
+                package_dir: None,
             });
         }
         out.sort_by(|a, b| a.identity.cmp(&b.identity));
@@ -1708,6 +1976,21 @@ fn dedup_plugins_by_identity(
 
 fn identity_from_dev_key(key: &str) -> &str {
     key.strip_prefix("plugin.dev.").unwrap_or(key)
+}
+
+/// 读取 manifest 声明的入口脚本（相对插件目录）。未声明返回 `None`；缺失与不可读都
+/// 以点名该文件的消息报告，供加载期判定失败。
+async fn read_entry(dir: &Path, rel: Option<&str>) -> Result<Option<String>, String> {
+    let Some(rel) = rel else {
+        return Ok(None);
+    };
+    match tokio::fs::read_to_string(dir.join(rel)).await {
+        Ok(source) => Ok(Some(source)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("包内缺少文件 '{rel}'"))
+        }
+        Err(error) => Err(format!("读取入口文件 '{rel}' 失败: {error}")),
+    }
 }
 
 fn failure_identity(dir: &Path, identity_hint: Option<&str>) -> String {
@@ -2053,6 +2336,268 @@ fn validate_manifest_item(item: &ManifestItem) -> Result<(), PluginError> {
     Ok(())
 }
 
+impl PluginManager {
+    /// 生命周期审计（origin 恒为 `daemon`，outcome 恒为 `ok`）。
+    fn audit_event(
+        &self,
+        identity: &str,
+        action: &str,
+        target: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        self.audit.record(super::audit::PluginAuditRow::new(
+            identity, "daemon", action, target, "ok", detail,
+        ));
+    }
+
+    /// 读取授权记录；缺失或损坏均为 `None`（损坏不得放行）。
+    async fn read_consent(&self, identity: &str) -> Option<super::consent::ConsentRecord> {
+        match self
+            .db
+            .get_config(&super::consent::consent_key(identity))
+            .await
+        {
+            Ok(Some(raw)) => super::consent::ConsentRecord::parse(&raw),
+            Ok(None) => None,
+            Err(error) => {
+                crate::logger::report_error("plugin", "read_consent", &error);
+                None
+            }
+        }
+    }
+
+    /// 某 manifest 当前待授权的 `(权限, 网络主机)`。
+    async fn pending_for(&self, manifest: &PluginManifest) -> (Vec<String>, Vec<String>) {
+        let consent = self.read_consent(&manifest.identity).await;
+        super::consent::pending(manifest, consent.as_ref())
+    }
+
+    /// 一次性迁移：升级前已安装的插件视为已授权其当前请求的全部能力（`source:"migration"`）。
+    /// 之后安装的插件不会自动获得授权。
+    async fn migrate_consent(&self) {
+        use super::consent::{CONSENT_MIGRATED_KEY, ConsentRecord, consent_key};
+        match self.db.get_config(CONSENT_MIGRATED_KEY).await {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(error) => {
+                crate::logger::report_error("plugin", "consent_migration_flag", &error);
+                return;
+            }
+        }
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Ok(mut rd) = tokio::fs::read_dir(&self.root).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let path = entry.path();
+                let internal = path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with('.'));
+                if path.is_dir() && !internal {
+                    dirs.push(path);
+                }
+            }
+        }
+        if let Ok(entries) = self.db.list_config_with_prefix("plugin.dev.").await {
+            dirs.extend(entries.into_iter().map(|(_, p)| PathBuf::from(p)));
+        }
+        let mut values = std::collections::BTreeMap::new();
+        let mut migrated: Vec<(String, ConsentRecord)> = Vec::new();
+        for dir in dirs {
+            let Ok(bytes) = tokio::fs::read(dir.join("manifest.json")).await else {
+                continue;
+            };
+            let Ok(manifest) = PluginManifest::parse(&bytes) else {
+                continue;
+            };
+            if manifest.validate().is_err() {
+                continue;
+            }
+            let identity = manifest.identity.clone();
+            let key = consent_key(&identity);
+            if values.contains_key(&key) {
+                continue;
+            }
+            match self.db.get_config(&key).await {
+                Ok(None) => {}
+                Ok(Some(_)) => continue,
+                Err(error) => {
+                    crate::logger::report_error("plugin", "consent_migration_read", &error);
+                    return;
+                }
+            }
+            let record = ConsentRecord::for_manifest(&manifest, "migration");
+            match record.to_json() {
+                Ok(json) => {
+                    values.insert(key, json);
+                    migrated.push((identity, record));
+                }
+                Err(error) => {
+                    crate::logger::report_error("plugin", "consent_migration_encode", &error);
+                    return;
+                }
+            }
+        }
+        values.insert(CONSENT_MIGRATED_KEY.to_string(), "1".to_string());
+        if let Err(error) = self.db.set_config_batch_atomic(&values).await {
+            // 不写完成标记，下次加载重试。
+            crate::logger::report_error("plugin", "consent_migration_write", &error);
+            return;
+        }
+        for (identity, record) in migrated {
+            self.audit_event(
+                &identity,
+                "consent.migrated",
+                record.version.clone(),
+                format!(
+                    "permissions={} networkHosts={}",
+                    record.permissions.join(","),
+                    record.network_hosts.join(",")
+                ),
+            );
+        }
+    }
+
+    /// 用户授权：`permissions` / `network_hosts` 必须与 manifest 当前请求的集合完全相等。
+    pub async fn grant_consent(
+        &self,
+        identity: &str,
+        permissions: &[String],
+        network_hosts: &[String],
+    ) -> Result<(), PluginError> {
+        let manifest = {
+            let snapshot = self.plugins.read().await.clone();
+            snapshot
+                .iter()
+                .find(|p| p.manifest.identity == identity)
+                .map(|p| p.manifest.clone())
+        };
+        let Some(manifest) = manifest else {
+            return Err(PluginError::Runtime(format!("插件 {identity} 未找到")));
+        };
+        if !super::consent::same_set(
+            permissions,
+            &super::consent::requested_permissions(&manifest),
+        ) || !super::consent::same_set(network_hosts, &manifest.network_hosts())
+        {
+            return Err(PluginError::ManifestInvalid(
+                "consent does not match requested capabilities".to_string(),
+            ));
+        }
+        let record = super::consent::ConsentRecord::for_manifest(&manifest, "user");
+        let json = record
+            .to_json()
+            .map_err(|e| PluginError::Runtime(e.to_string()))?;
+        self.db
+            .set_config(&super::consent::consent_key(identity), &json)
+            .await
+            .map_err(|e| PluginError::Runtime(e.to_string()))?;
+        self.audit_event(
+            identity,
+            "consent.granted",
+            record.version.clone(),
+            format!(
+                "permissions={} networkHosts={}",
+                record.permissions.join(","),
+                record.network_hosts.join(",")
+            ),
+        );
+        self.load_all().await;
+        Ok(())
+    }
+}
+
+/// `daemon.plugin.audit.record` 单次上限。
+const AUDIT_RECORD_MAX_ENTRIES: usize = 100;
+
+/// 客户端上报的一条桌面审计记录（未校验）。
+pub struct DesktopAuditEntry {
+    pub identity: String,
+    pub action: String,
+    pub target: String,
+    pub outcome: String,
+    pub detail: String,
+}
+
+impl PluginManager {
+    /// 分页读取审计（id 降序）；返回的游标非空表示还有更早的记录。
+    pub async fn audit_list(
+        &self,
+        identity: Option<&str>,
+        before_id: Option<i64>,
+        limit: u32,
+    ) -> Result<(Vec<super::audit::PluginAuditRow>, Option<i64>), PluginError> {
+        let limit = limit.clamp(1, 1000);
+        // 先落盘缓冲中的记录，保证读到最新。
+        self.audit.flush().await;
+        let mut rows = self
+            .db
+            .list_plugin_audit(identity, before_id, limit + 1)
+            .await
+            .map_err(|e| PluginError::Runtime(e.to_string()))?;
+        let next = if rows.len() > limit as usize {
+            rows.truncate(limit as usize);
+            rows.last().map(|row| row.id)
+        } else {
+            None
+        };
+        Ok((rows, next))
+    }
+
+    /// 清空审计（`identity` 为空 = 全部），并记一条 `audit.clear`（全部时记在 `*`）。
+    pub async fn audit_clear(&self, identity: Option<&str>) -> Result<(), PluginError> {
+        self.audit.flush().await;
+        self.db
+            .clear_plugin_audit(identity)
+            .await
+            .map_err(|e| PluginError::Runtime(e.to_string()))?;
+        self.audit_event(identity.unwrap_or("*"), "audit.clear", "", "");
+        Ok(())
+    }
+
+    /// 接收客户端上报的桌面脚本审计：整批校验通过才入队；`origin` 强制为 `desktop`。
+    pub async fn audit_record(&self, entries: Vec<DesktopAuditEntry>) -> Result<(), PluginError> {
+        if entries.len() > AUDIT_RECORD_MAX_ENTRIES {
+            return Err(PluginError::Runtime(format!(
+                "entries exceeds {AUDIT_RECORD_MAX_ENTRIES}"
+            )));
+        }
+        let mut known: HashSet<String> = HashSet::new();
+        for entry in &entries {
+            if !entry.action.starts_with("desktop.") {
+                return Err(PluginError::Runtime(format!(
+                    "action '{}' must start with 'desktop.'",
+                    entry.action
+                )));
+            }
+            if !matches!(entry.outcome.as_str(), "ok" | "denied" | "error") {
+                return Err(PluginError::Runtime(format!(
+                    "outcome '{}' must be ok|denied|error",
+                    entry.outcome
+                )));
+            }
+            if !known.contains(&entry.identity) {
+                if self.installed_version(&entry.identity).await.is_none() {
+                    return Err(PluginError::Runtime(format!(
+                        "plugin '{}' is not installed",
+                        entry.identity
+                    )));
+                }
+                known.insert(entry.identity.clone());
+            }
+        }
+        for entry in entries {
+            self.audit.record(super::audit::PluginAuditRow::new(
+                &entry.identity,
+                "desktop",
+                &entry.action,
+                entry.target,
+                &entry.outcome,
+                entry.detail,
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -2080,7 +2625,10 @@ mod tests {
             resolvers: Vec::new(),
             subscriptions: Vec::new(),
             hooks: None,
+            interceptors: None,
             auth: None,
+            main: None,
+            contributes: None,
             settings: Vec::new(),
             permissions: Vec::new(),
         }
@@ -2095,12 +2643,16 @@ mod tests {
             disabled_reason: super::DisabledReason::None,
             resolver_entry: None,
             hooks_entry: None,
+            intercept_entry: None,
             auth_entry: None,
             subscription_entry: None,
             resolver_cache: None,
             hooks_cache: None,
+            intercept_cache: None,
             auth_cache: None,
             subscription_cache: None,
+            main_entry: None,
+            main_cache: None,
             timeout_streak: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -2401,5 +2953,196 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_resolve_output(&res, false).is_err());
+    }
+
+    // ---- 市场撤回（Revoked）----
+
+    use super::PluginManager;
+    use crate::events::{EngineEvent, EventSink};
+    use crate::plugin::quickjs::QuickJsScriptRuntime;
+    use crate::plugin::runtime::{
+        BridgeHttpRequest, BridgeHttpResponse, PluginBridge, PluginLogLevel,
+    };
+    use std::collections::HashSet;
+
+    struct NullBridge;
+
+    #[async_trait::async_trait]
+    impl PluginBridge for NullBridge {
+        async fn http_request(
+            &self,
+            _plugin_id: &str,
+            _req: BridgeHttpRequest,
+        ) -> Result<BridgeHttpResponse, PluginError> {
+            Err(PluginError::Runtime("no network in test".to_string()))
+        }
+        async fn storage_get(&self, _plugin_id: &str, _key: &str) -> Option<String> {
+            None
+        }
+        async fn storage_set(
+            &self,
+            _plugin_id: &str,
+            _key: &str,
+            _value: String,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn log(&self, _plugin_id: &str, _level: PluginLogLevel, _message: &str) {}
+        fn request_retry(&self, _plugin_id: &str, _task_id: &str, _delay_ms: u64) {}
+    }
+
+    #[derive(Default)]
+    struct CaptureSink(std::sync::Mutex<Vec<EngineEvent>>);
+
+    impl EventSink for CaptureSink {
+        fn emit(&self, event: EngineEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    const REVOKE_ID: &str = "acme@demo";
+
+    fn write_plugin(root: &std::path::Path, dir: &str, identity: &str, version: &str) {
+        let dir = root.join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            format!(r#"{{"identity":"{identity}","name":"N","version":"{version}"}}"#),
+        )
+        .unwrap();
+    }
+
+    async fn revoke_fixture() -> (PluginManager, Arc<CaptureSink>, PathBuf) {
+        let root = std::env::temp_dir().join(format!("fluxdown-revoke-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        write_plugin(&root, REVOKE_ID, REVOKE_ID, "1.0.0");
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        let sink = Arc::new(CaptureSink::default());
+        let manager = PluginManager::new(
+            Arc::new(QuickJsScriptRuntime::new(1).unwrap()),
+            Arc::new(NullBridge),
+            db,
+            root.clone(),
+            "1.0.0".to_string(),
+            sink.clone(),
+        );
+        manager.load_all().await;
+        (manager, sink, root)
+    }
+
+    fn revoked_set(identity: &str, version: &str) -> HashSet<(String, String)> {
+        HashSet::from([(identity.to_string(), version.to_string())])
+    }
+
+    async fn state_of(manager: &PluginManager) -> (bool, String) {
+        let info = manager
+            .list()
+            .await
+            .into_iter()
+            .find(|p| p.identity == REVOKE_ID)
+            .unwrap();
+        (info.enabled, info.disabled_reason)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn market_revocation_disables_plugin_and_emits_event() {
+        let (manager, sink, _root) = revoke_fixture().await;
+        assert_eq!(state_of(&manager).await, (true, "None".to_string()));
+
+        let changed = manager
+            .apply_market_revocations(&revoked_set(REVOKE_ID, "1.0.0"))
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(state_of(&manager).await, (false, "Revoked".to_string()));
+        assert!(sink.0.lock().unwrap().iter().any(|event| matches!(
+            event,
+            EngineEvent::PluginAutoDisabled { identity, reason }
+                if identity == REVOKE_ID && reason == "Revoked"
+        )));
+
+        // 幂等：重复应用不再变化、不再发事件。
+        let again = manager
+            .apply_market_revocations(&revoked_set(REVOKE_ID, "1.0.0"))
+            .await
+            .unwrap();
+        assert!(!again);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoked_version_cannot_be_enabled() {
+        let (manager, _sink, _root) = revoke_fixture().await;
+        manager
+            .apply_market_revocations(&revoked_set(REVOKE_ID, "1.0.0"))
+            .await
+            .unwrap();
+        let error = manager.set_enabled(REVOKE_ID, true).await.unwrap_err();
+        assert!(error.to_string().contains("已被插件市场撤回"));
+        assert_eq!(state_of(&manager).await, (false, "Revoked".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn installing_newer_version_reenables_and_clears_marker() {
+        let (manager, _sink, root) = revoke_fixture().await;
+        manager
+            .apply_market_revocations(&revoked_set(REVOKE_ID, "1.0.0"))
+            .await
+            .unwrap();
+
+        write_plugin(&root, REVOKE_ID, REVOKE_ID, "1.1.0");
+        manager.finish_install(REVOKE_ID).await.unwrap();
+
+        assert_eq!(state_of(&manager).await, (true, "None".to_string()));
+        let marker = manager
+            .db
+            .get_config(&format!("plugin.{REVOKE_ID}.revoked_version"))
+            .await
+            .unwrap();
+        assert!(marker.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifted_revocation_clears_marker_but_stays_disabled() {
+        let (manager, _sink, _root) = revoke_fixture().await;
+        manager
+            .apply_market_revocations(&revoked_set(REVOKE_ID, "1.0.0"))
+            .await
+            .unwrap();
+
+        let changed = manager
+            .apply_market_revocations(&HashSet::new())
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(state_of(&manager).await, (false, "Revoked".to_string()));
+        manager.set_enabled(REVOKE_ID, true).await.unwrap();
+        assert_eq!(state_of(&manager).await, (true, "None".to_string()));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dev_plugins_are_not_revoked() {
+        let (manager, sink, root) = revoke_fixture().await;
+        // 把已装目录换成 dev 登记：dev 覆盖同名安装目录。
+        let dev_dir = root.join(".dev-src");
+        write_plugin(&root, ".dev-src", REVOKE_ID, "1.0.0");
+        manager
+            .db
+            .set_config(
+                &format!("plugin.dev.{REVOKE_ID}"),
+                &dev_dir.to_string_lossy(),
+            )
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(root.join(REVOKE_ID)).unwrap();
+        manager.load_all().await;
+
+        let changed = manager
+            .apply_market_revocations(&revoked_set(REVOKE_ID, "1.0.0"))
+            .await
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(state_of(&manager).await, (true, "None".to_string()));
+        assert!(sink.0.lock().unwrap().is_empty());
     }
 }

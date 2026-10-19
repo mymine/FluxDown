@@ -58,6 +58,11 @@ pub fn manual_reason_key(reason: UpdateManualReason, kind: UpdateInstallKind) ->
             UpdateInstallKind::Synology => "updateManualSynology",
             UpdateInstallKind::Qnap => "updateManualQnap",
             UpdateInstallKind::Openwrt => "updateManualOpenwrt",
+            UpdateInstallKind::Fnos => "updateManualFnos",
+            // 归 AUR / 发行版仓库等非官方系统包所有：官方 deb / Arch 包永远可应用内更新。
+            UpdateInstallKind::LinuxDeb | UpdateInstallKind::LinuxArch => {
+                "updateManualSystemPackage"
+            }
             _ => "updateManualUnsupported",
         },
         UpdateManualReason::NotWritable => "updateManualNotWritable",
@@ -240,6 +245,20 @@ mod tests {
         assert_eq!(
             manual_reason_key(UpdateManualReason::ManagedPackage, UpdateInstallKind::Qnap),
             "updateManualQnap"
+        );
+        assert_eq!(
+            manual_reason_key(
+                UpdateManualReason::ManagedPackage,
+                UpdateInstallKind::LinuxArch
+            ),
+            "updateManualSystemPackage"
+        );
+        assert_eq!(
+            manual_reason_key(
+                UpdateManualReason::ManagedPackage,
+                UpdateInstallKind::LinuxDeb
+            ),
+            "updateManualSystemPackage"
         );
         assert_eq!(
             manual_reason_key(UpdateManualReason::Unknown, UpdateInstallKind::Docker),

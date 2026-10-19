@@ -52,6 +52,7 @@ private struct DevicesContent: View {
     @State private var renaming: CloudDeviceRecord?
     @State private var deleting: CloudDeviceRecord?
     @State private var pendingUnpair: LinkDevice?
+    @State private var renamingLink: LinkRenameTarget?
 
     /// 已信任设备分组最多直接显示的行数，其余进入「管理全部」。
     private static let cloudPreviewLimit = 5
@@ -147,6 +148,7 @@ private struct DevicesContent: View {
             .sensoryFeedback(.selection, trigger: current.id)
         }
         .cloudDeviceRenameAlert(renaming: $renaming)
+        .linkDeviceRenameAlert(renaming: $renamingLink)
         .environment(model)
         .sheet(item: $sheet, onDismiss: sheetDismissed) { item in
             switch item {
@@ -417,7 +419,13 @@ private struct DevicesContent: View {
             }
             ForEach(devices) { device in
                 NavigationLink(value: DevicesRoute.linkDevice(fingerprint: device.fingerprint)) {
-                    LinkDeviceRow(name: device.name, platform: device.platform, online: device.online)
+                    LinkDeviceRow(
+                        name: device.name,
+                        platform: device.platform,
+                        online: device.online,
+                        revoked: device.revoked,
+                        sameAccount: DevicePresentation.isSameAccount(device, cloud: state.cloudDevices)
+                    )
                 }
                 // 解除只弹确认框：不用 `role: .destructive`（会让 List 先行移除该行而数据未变，导致行数不一致崩溃）。
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
@@ -426,10 +434,21 @@ private struct DevicesContent: View {
                             pendingUnpair = device
                         }
                         .tint(Color.fdStatusFailed)
+                        if !device.revoked {
+                            Button(L("linkedDeviceRename"), systemImage: FluxSymbol.edit) {
+                                renamingLink = LinkRenameTarget(fingerprint: device.fingerprint, customName: device.customName ?? "")
+                            }
+                            .tint(.accentColor)
+                        }
                     }
                 }
                 .contextMenu {
                     if !readOnly {
+                        if !device.revoked {
+                            Button(L("linkedDeviceRename"), systemImage: FluxSymbol.edit) {
+                                renamingLink = LinkRenameTarget(fingerprint: device.fingerprint, customName: device.customName ?? "")
+                            }
+                        }
                         Button(L("linkedDeviceRemove"), systemImage: "minus.circle", role: .destructive) {
                             pendingUnpair = device
                         }
@@ -458,7 +477,7 @@ private struct DevicesContent: View {
                 Text(L("linkedDevicesTitle"))
                 Spacer(minLength: 8)
                 if model.linkPhase == .loading {
-                    ProgressView().accessibilityLabel(L("localPairingRetryScan"))
+                    ProgressView().accessibilityLabel(L("linkedDeviceRefresh"))
                 } else {
                     Button {
                         Task {
@@ -473,7 +492,7 @@ private struct DevicesContent: View {
                     }
                     .buttonStyle(.borderless)
                     .disabled(readOnly)
-                    .accessibilityLabel(L("localPairingRetryScan"))
+                    .accessibilityLabel(L("linkedDeviceRefresh"))
                 }
                 Button {
                     presentAddDevice()

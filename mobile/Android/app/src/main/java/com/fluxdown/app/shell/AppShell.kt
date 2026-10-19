@@ -55,6 +55,8 @@ import com.fluxdown.app.actions.LocalTaskActions
 import com.fluxdown.app.actions.TaskActions
 import com.fluxdown.app.feature.devices.DevicesScreen
 import com.fluxdown.app.feature.devices.AddHostSheet
+import com.fluxdown.app.feature.devices.AddDeviceSheet
+import com.fluxdown.app.feature.devices.InboundPairingPrompt
 import com.fluxdown.app.feature.downloads.ActivitySheet
 import com.fluxdown.app.feature.downloads.DownloadsRailContext
 import com.fluxdown.app.feature.downloads.DownloadsRailFooter
@@ -212,6 +214,7 @@ fun AppShell() {
                 Sheets()
                 FluxPortalHost(portal)
                 SelectionRequestSheet(request = selection)
+                InboundPairingPrompt()
                 FileConflictHost(requests = fileConflicts, blocked = selection != null)
                 CommandSearch(visible = nav.searchOpen, onDismiss = nav::closeSearch)
                 FluxOverlayHost(overlays)
@@ -403,6 +406,7 @@ private fun Sheets() {
     ViewOptionsSheet(visible = sheet == SheetRoute.ViewOptions, onDismiss = nav::closeSheet)
     HostSwitchSheet(visible = sheet == SheetRoute.HostSwitch, onDismiss = nav::closeSheet)
     AddHostSheet(visible = sheet == SheetRoute.AddHost, onDismiss = nav::closeSheet)
+    AddDeviceSheet(visible = sheet == SheetRoute.AddDevice, onDismiss = nav::closeSheet)
     ActivitySheet(visible = sheet == SheetRoute.Activity, onDismiss = nav::closeSheet)
     val rss = sheet as? SheetRoute.RssEditor
     RssEditorSheet(

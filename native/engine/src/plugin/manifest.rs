@@ -9,6 +9,10 @@
 //! `RegExp.test(value)` 匹配，见 [`super::manager`]）——对写 JS 的插件作者更自然。
 //! 本文件（纯模块）只做结构校验：`pattern` 仅 string 有效、非空即存储；实际编译/
 //! 匹配在持有 runtime 的 manager 侧完成。
+//!
+//! 官方插件索引（`zerx-lab/fluxdown-plugin-index`）的 `scripts/package-lib.mjs` 镜像本文件
+//! 与 `install.rs` 的准入规则，市场收录的包必须能在客户端安装：改字段、权限、事件、
+//! 设置矩阵或安装限制时同步该脚本。
 
 use std::collections::HashSet;
 
@@ -170,6 +174,31 @@ pub struct HooksDecl {
     pub match_decl: Option<MatchDecl>,
 }
 
+/// 拦截器失败策略。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InterceptFailure {
+    /// 记录后继续下载。
+    #[default]
+    Continue,
+    /// 使任务失败。
+    Fail,
+}
+
+/// 拦截平面声明。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InterceptorsDecl {
+    pub entry: String,
+    pub stages: Vec<String>,
+    #[serde(rename = "match")]
+    pub match_decl: MatchDecl,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub on_failure: InterceptFailure,
+}
+
 /// 平台登录入口。脚本实现 `globalThis.authenticate(ctx)`，由 daemon 以
 /// `begin`/`poll`/`cancel`/`logout`/`status` action 驱动，登录成功后脚本调用
 /// `flux.auth.save`。
@@ -183,6 +212,138 @@ pub struct AuthDecl {
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
+
+/// `main`：可移植视图 / 命令 / 后台逻辑的常驻脚本（classic script，由 daemon 内的
+/// QuickJS 宿主执行）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MainDecl {
+    pub entry: String,
+    /// 投递给宿主的事件（⊆ [`VALID_EVENTS`]）。
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// 是否随 daemon 启动常驻（需 `background` 权限）。
+    #[serde(default)]
+    pub background: bool,
+}
+
+/// 视图放置位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ViewLocation {
+    Activity,
+    Settings,
+    TaskDetail,
+    Window,
+}
+
+impl ViewLocation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ViewLocation::Activity => "activity",
+            ViewLocation::Settings => "settings",
+            ViewLocation::TaskDetail => "taskDetail",
+            ViewLocation::Window => "window",
+        }
+    }
+}
+
+/// 视图的桌面增强实现。`entry` 是由 GPUI Shell 在桌面进程内执行的 ESM 脚本
+/// （`import` 自 "gpui-kit"/"gpui-base"/"gpui-component"），引擎只校验路径与存在性，
+/// 从不编译或执行它；daemon 亦不执行。需要 `desktop` 权限。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DesktopEntryDecl {
+    pub entry: String,
+    /// 脚本允许访问的网络主机（小写 DNS 主机名或 IP 字面量）。
+    #[serde(default)]
+    pub network_hosts: Vec<String>,
+    /// 初始窗口宽度（仅 `location == window`）。
+    #[serde(default)]
+    pub width: Option<f32>,
+    /// 初始窗口高度（仅 `location == window`）。
+    #[serde(default)]
+    pub height: Option<f32>,
+}
+
+/// 视图贡献。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ViewDecl {
+    pub id: String,
+    pub title: String,
+    pub location: ViewLocation,
+    #[serde(default)]
+    pub desktop: Option<DesktopEntryDecl>,
+    /// 声明了 `desktop` 的 view 是否同时由 `main` 提供可移植实现（Web / 移动端可用）。
+    /// 仅允许与 `desktop` 同时出现；未声明 `desktop` 的 view 恒为可移植。
+    #[serde(default)]
+    pub portable: bool,
+}
+
+impl ViewDecl {
+    /// 是否有可移植实现（daemon 经 `main` 渲染）：无 `desktop`，或显式 `portable: true`。
+    pub fn is_portable(&self) -> bool {
+        self.desktop.is_none() || self.portable
+    }
+}
+
+/// 命令贡献。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandDecl {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub palette: bool,
+    #[serde(default)]
+    pub task_menu: bool,
+}
+
+/// 贡献点。空数组等同未声明。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContributesDecl {
+    #[serde(default)]
+    pub views: Vec<ViewDecl>,
+    #[serde(default)]
+    pub commands: Vec<CommandDecl>,
+    /// 浏览器扩展嗅探规则包（相对路径，`.json`），需 `browserRules` 权限。
+    #[serde(default)]
+    pub sniff_rules: Option<String>,
+}
+
+/// 插件风险等级（由权限推导）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginRisk {
+    Standard,
+    Elevated,
+    Full,
+}
+
+impl PluginRisk {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PluginRisk::Standard => "standard",
+            PluginRisk::Elevated => "elevated",
+            PluginRisk::Full => "full",
+        }
+    }
+}
+
+/// 窗口尺寸下限/上限（逻辑像素）。
+pub const WINDOW_SIZE_MIN: f32 = 240.0;
+pub const WINDOW_SIZE_MAX: f32 = 4096.0;
+/// `desktop.networkHosts` 条目数上限。
+pub const NETWORK_HOSTS_MAX: usize = 64;
+/// `contributes.views` / `contributes.commands` 条目数上限。
+pub const VIEWS_MAX: usize = 16;
+pub const COMMANDS_MAX: usize = 32;
+/// view / command 标题的最大字符数。
+const TITLE_MAX_CHARS: usize = 40;
+/// sniff 规则包文件大小与规则数上限。
+pub const SNIFF_PACK_MAX_BYTES: usize = 256 * 1024;
+pub const SNIFF_PACK_MAX_RULES: usize = 500;
 
 /// 插件 manifest。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,9 +368,18 @@ pub struct PluginManifest {
     pub subscriptions: Vec<SubscriptionDecl>,
     #[serde(default)]
     pub hooks: Option<HooksDecl>,
+    /// 可选的拦截平面声明（v1 至多一个）。
+    #[serde(default)]
+    pub interceptors: Option<InterceptorsDecl>,
     /// 可选的平台特有登录入口。
     #[serde(default)]
     pub auth: Option<AuthDecl>,
+    /// 可选的常驻脚本声明（可移植视图 / 命令 / 后台逻辑）。
+    #[serde(default)]
+    pub main: Option<MainDecl>,
+    /// 可选的贡献点（视图 / 命令 / 嗅探规则）。
+    #[serde(default)]
+    pub contributes: Option<ContributesDecl>,
     #[serde(default)]
     pub settings: Vec<SettingField>,
     /// 声明式能力权限（如 `"auth"`、`"ffmpeg"`）。空 = 无额外能力。授予的能力经宿主
@@ -227,8 +397,27 @@ pub const PERMISSION_FFMPEG: &str = "ffmpeg";
 pub const PERMISSION_YTDLP: &str = "ytdlp";
 /// 通用认证能力权限名（manifest `permissions`）。
 pub const PERMISSION_AUTH: &str = "auth";
+/// 任务操作能力权限名（`flux.tasks.*`）。
+pub const PERMISSION_TASKS: &str = "tasks";
+/// 浏览器扩展嗅探规则贡献权限名。
+pub const PERMISSION_BROWSER_RULES: &str = "browserRules";
+/// 桌面原生脚本权限名（完全信任）。
+pub const PERMISSION_DESKTOP: &str = "desktop";
+/// 后台常驻权限名。
+pub const PERMISSION_BACKGROUND: &str = "background";
+/// 下载拦截平面权限名。
+pub const PERMISSION_INTERCEPT: &str = "intercept";
 /// 合法能力权限（manifest `permissions`）。
-pub const VALID_PERMISSIONS: [&str; 3] = [PERMISSION_FFMPEG, PERMISSION_YTDLP, PERMISSION_AUTH];
+pub const VALID_PERMISSIONS: [&str; 8] = [
+    PERMISSION_FFMPEG,
+    PERMISSION_YTDLP,
+    PERMISSION_AUTH,
+    PERMISSION_TASKS,
+    PERMISSION_BROWSER_RULES,
+    PERMISSION_DESKTOP,
+    PERMISSION_BACKGROUND,
+    PERMISSION_INTERCEPT,
+];
 
 impl PluginManifest {
     /// 从 JSON 字节解析（不校验语义，仅结构）。
@@ -382,6 +571,53 @@ impl PluginManifest {
             }
         }
 
+        // interceptors：拦截平面入口。
+        if let Some(i) = &self.interceptors {
+            if !is_safe_relative_path(&i.entry) {
+                return Err(PluginError::ManifestInvalid(format!(
+                    "interceptors entry 路径 '{}' 非法",
+                    i.entry
+                )));
+            }
+            if i.stages.is_empty() {
+                return Err(PluginError::ManifestInvalid(
+                    "interceptors.stages 不可为空".to_string(),
+                ));
+            }
+            let mut seen_stages: HashSet<&str> = HashSet::new();
+            for s in &i.stages {
+                if !crate::intercept::STAGE_NAMES.contains(&s.as_str()) {
+                    return Err(PluginError::ManifestInvalid(format!(
+                        "未知拦截阶段 '{s}'，合法：{:?}",
+                        crate::intercept::STAGE_NAMES
+                    )));
+                }
+                if !seen_stages.insert(s.as_str()) {
+                    return Err(PluginError::ManifestInvalid(format!(
+                        "interceptors.stages 重复：'{s}'"
+                    )));
+                }
+            }
+            if i.match_decl.urls.is_empty() {
+                return Err(PluginError::ManifestInvalid(
+                    "interceptors match.urls 不可为空".to_string(),
+                ));
+            }
+            if i.timeout_ms == Some(0) {
+                return Err(PluginError::ManifestInvalid(
+                    "interceptors timeoutMs 不可为 0".to_string(),
+                ));
+            }
+            if !self.has_permission(PERMISSION_INTERCEPT) {
+                return Err(PluginError::ManifestInvalid(
+                    "声明 interceptors 时 permissions 必须包含 intercept".to_string(),
+                ));
+            }
+        }
+
+        validate_main(self)?;
+        validate_contributes(self)?;
+
         // settings：键唯一 + widget×type 矩阵 + 值域约束。
         let mut seen: HashSet<&str> = HashSet::new();
         for f in &self.settings {
@@ -422,6 +658,298 @@ impl PluginManifest {
     pub fn has_permission(&self, perm: &str) -> bool {
         self.permissions.iter().any(|p| p == perm)
     }
+
+    /// 风险等级：`desktop` → Full；其余任一提权能力 → Elevated；否则 Standard。
+    pub fn risk(&self) -> PluginRisk {
+        if self.has_permission(PERMISSION_DESKTOP) {
+            PluginRisk::Full
+        } else if self.permissions.iter().any(|p| {
+            matches!(
+                p.as_str(),
+                PERMISSION_FFMPEG
+                    | PERMISSION_YTDLP
+                    | PERMISSION_AUTH
+                    | PERMISSION_TASKS
+                    | PERMISSION_BROWSER_RULES
+                    | PERMISSION_BACKGROUND
+                    | PERMISSION_INTERCEPT
+            )
+        }) {
+            PluginRisk::Elevated
+        } else {
+            PluginRisk::Standard
+        }
+    }
+
+    /// 所有 view `desktop.networkHosts` 的排序去重并集。
+    pub fn network_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self
+            .contributes
+            .iter()
+            .flat_map(|c| c.views.iter())
+            .filter_map(|v| v.desktop.as_ref())
+            .flat_map(|d| d.network_hosts.iter().cloned())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    }
+
+    /// 包内必须存在的文件：`main.entry`、各 `desktop.entry`、`sniffRules`。
+    pub fn package_files(&self) -> Vec<String> {
+        let mut files = Vec::new();
+        if let Some(main) = &self.main {
+            files.push(main.entry.clone());
+        }
+        if let Some(c) = &self.contributes {
+            files.extend(
+                c.views
+                    .iter()
+                    .filter_map(|v| v.desktop.as_ref())
+                    .map(|d| d.entry.clone()),
+            );
+            files.extend(c.sniff_rules.iter().cloned());
+        }
+        files
+    }
+
+    /// 逐个检查 [`Self::package_files`] 是否存在（`exists` 由调用方提供）。
+    pub fn check_package_files(&self, exists: impl Fn(&str) -> bool) -> Result<(), PluginError> {
+        for file in self.package_files() {
+            if !exists(&file) {
+                return manifest_err(format!("包内缺少文件 '{file}'"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn manifest_err<T>(msg: String) -> Result<T, PluginError> {
+    Err(PluginError::ManifestInvalid(msg))
+}
+
+/// 视图 / 命令 id：`^[a-z][a-z0-9-]{0,31}$`。
+fn is_valid_contribution_id(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_ascii_lowercase()
+        && s.len() <= 32
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn has_extension(path: &str, exts: &[&str]) -> bool {
+    let lower = path.to_ascii_lowercase();
+    exts.iter().any(|e| lower.ends_with(e))
+}
+
+/// 校验 `main` 声明。
+fn validate_main(m: &PluginManifest) -> Result<(), PluginError> {
+    let Some(main) = &m.main else {
+        return Ok(());
+    };
+    if !is_safe_relative_path(&main.entry) {
+        return manifest_err(format!("main entry 路径 '{}' 非法", main.entry));
+    }
+    if !has_extension(&main.entry, &[".js"]) {
+        return manifest_err(format!("main entry '{}' 扩展名须为 .js", main.entry));
+    }
+    for ev in &main.events {
+        if !VALID_EVENTS.contains(&ev.as_str()) {
+            return manifest_err(format!(
+                "main.events 未知事件 '{ev}'，合法：{VALID_EVENTS:?}"
+            ));
+        }
+    }
+    if main.background && !m.has_permission(PERMISSION_BACKGROUND) {
+        return manifest_err("main.background 为 true 时 permissions 必须包含 background".into());
+    }
+    Ok(())
+}
+
+/// 校验 `contributes` 声明。
+fn validate_contributes(m: &PluginManifest) -> Result<(), PluginError> {
+    let Some(c) = &m.contributes else {
+        return Ok(());
+    };
+    if c.views.len() > VIEWS_MAX {
+        return manifest_err(format!("contributes.views 至多 {VIEWS_MAX} 项"));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut settings_views = 0usize;
+    for v in &c.views {
+        if !is_valid_contribution_id(&v.id) {
+            return manifest_err(format!(
+                "view id '{}' 非法：须匹配 ^[a-z][a-z0-9-]{{0,31}}$",
+                v.id
+            ));
+        }
+        if !seen.insert(v.id.as_str()) {
+            return manifest_err(format!("view id '{}' 重复", v.id));
+        }
+        let title_len = v.title.chars().count();
+        if !(1..=TITLE_MAX_CHARS).contains(&title_len) {
+            return manifest_err(format!(
+                "view '{}' title 须为 1–{TITLE_MAX_CHARS} 个字符",
+                v.id
+            ));
+        }
+        if v.location == ViewLocation::Settings {
+            settings_views += 1;
+            if settings_views > 1 {
+                return manifest_err("location 为 settings 的 view 至多 1 个".into());
+            }
+        }
+        match &v.desktop {
+            None => {
+                if v.portable {
+                    return manifest_err(format!(
+                        "view '{}' 的 portable 仅允许与 desktop 同时声明",
+                        v.id
+                    ));
+                }
+            }
+            Some(d) => validate_desktop_entry(m, v, d)?,
+        }
+        if v.is_portable() && m.main.is_none() {
+            return manifest_err(format!("view '{}' 有可移植实现，必须声明 main", v.id));
+        }
+    }
+    if c.commands.len() > COMMANDS_MAX {
+        return manifest_err(format!("contributes.commands 至多 {COMMANDS_MAX} 项"));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for cmd in &c.commands {
+        if !is_valid_contribution_id(&cmd.id) {
+            return manifest_err(format!(
+                "command id '{}' 非法：须匹配 ^[a-z][a-z0-9-]{{0,31}}$",
+                cmd.id
+            ));
+        }
+        if !seen.insert(cmd.id.as_str()) {
+            return manifest_err(format!("command id '{}' 重复", cmd.id));
+        }
+        let title_len = cmd.title.chars().count();
+        if !(1..=TITLE_MAX_CHARS).contains(&title_len) {
+            return manifest_err(format!(
+                "command '{}' title 须为 1–{TITLE_MAX_CHARS} 个字符",
+                cmd.id
+            ));
+        }
+    }
+    if !c.commands.is_empty() && m.main.is_none() {
+        return manifest_err("声明 commands 时必须声明 main".into());
+    }
+    if let Some(rules) = &c.sniff_rules {
+        if !is_safe_relative_path(rules) {
+            return manifest_err(format!("sniffRules 路径 '{rules}' 非法"));
+        }
+        if !has_extension(rules, &[".json"]) {
+            return manifest_err(format!("sniffRules '{rules}' 扩展名须为 .json"));
+        }
+        if !m.has_permission(PERMISSION_BROWSER_RULES) {
+            return manifest_err("声明 sniffRules 时 permissions 必须包含 browserRules".into());
+        }
+    }
+    Ok(())
+}
+
+/// 校验 view 的 `desktop` 条目：它是由 GPUI Shell 在桌面进程内执行的 ESM 脚本，
+/// 引擎只校验路径与存在性，从不编译或执行它。
+fn validate_desktop_entry(
+    m: &PluginManifest,
+    v: &ViewDecl,
+    d: &DesktopEntryDecl,
+) -> Result<(), PluginError> {
+    if !is_safe_relative_path(&d.entry) {
+        return manifest_err(format!(
+            "view '{}' desktop entry 路径 '{}' 非法",
+            v.id, d.entry
+        ));
+    }
+    if !has_extension(&d.entry, &[".js", ".mjs"]) {
+        return manifest_err(format!(
+            "view '{}' desktop entry '{}' 扩展名须为 .js 或 .mjs",
+            v.id, d.entry
+        ));
+    }
+    if !m.has_permission(PERMISSION_DESKTOP) {
+        return manifest_err(format!(
+            "view '{}' 声明 desktop 时 permissions 必须包含 desktop",
+            v.id
+        ));
+    }
+    for (name, size) in [("width", d.width), ("height", d.height)] {
+        let Some(size) = size else { continue };
+        if v.location != ViewLocation::Window {
+            return manifest_err(format!(
+                "view '{}' 的 {name} 仅允许用于 location 为 window 的 view",
+                v.id
+            ));
+        }
+        if !size.is_finite() || !(WINDOW_SIZE_MIN..=WINDOW_SIZE_MAX).contains(&size) {
+            return manifest_err(format!(
+                "view '{}' {name} 须为 [{WINDOW_SIZE_MIN}, {WINDOW_SIZE_MAX}] 内的有限数",
+                v.id
+            ));
+        }
+    }
+    if d.network_hosts.len() > NETWORK_HOSTS_MAX {
+        return manifest_err(format!(
+            "view '{}' networkHosts 至多 {NETWORK_HOSTS_MAX} 项",
+            v.id
+        ));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for host in &d.network_hosts {
+        if !is_valid_network_host(host) {
+            return manifest_err(format!("view '{}' networkHosts '{host}' 非法", v.id));
+        }
+        if !seen.insert(host.as_str()) {
+            return manifest_err(format!("view '{}' networkHosts '{host}' 重复", v.id));
+        }
+    }
+    Ok(())
+}
+
+/// 校验 sniff 规则包文件内容：≤256 KiB、合法 JSON、`format` 正确、`rules` 数组 ≤500 条。
+pub fn validate_sniff_pack(bytes: &[u8]) -> Result<(), PluginError> {
+    if bytes.len() > SNIFF_PACK_MAX_BYTES {
+        return manifest_err(format!("sniffRules 文件超过 {SNIFF_PACK_MAX_BYTES} 字节"));
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| PluginError::ManifestInvalid(format!("sniffRules JSON 解析失败: {e}")))?;
+    if value.get("format").and_then(|f| f.as_str()) != Some("fluxdown-sniff-pack") {
+        return manifest_err("sniffRules format 须为 fluxdown-sniff-pack".into());
+    }
+    let Some(rules) = value.get("rules").and_then(|r| r.as_array()) else {
+        return manifest_err("sniffRules rules 须为数组".into());
+    };
+    if rules.len() > SNIFF_PACK_MAX_RULES {
+        return manifest_err(format!("sniffRules 至多 {SNIFF_PACK_MAX_RULES} 条规则"));
+    }
+    Ok(())
+}
+
+/// 小写 DNS 主机名（RFC 1123 标签，总长 ≤253）或 IP 字面量；禁 scheme/端口/路径/通配符。
+fn is_valid_network_host(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        // IPv6 字面量必须已是规范小写形式。
+        return host == host.to_ascii_lowercase();
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    })
 }
 
 /// 逐字段校验 widget×type 矩阵与值域约束。
@@ -768,6 +1296,135 @@ mod tests {
                 "settings":[{"key":"q","title":"Q","type":"string","widget":"textarea","helperScript":"copy(document.cookie)","helperLabel":"复制"}]}"#,
         );
         assert!(ok.validate().is_ok());
+    }
+
+    fn contributes_json(contributes: &str) -> String {
+        format!(
+            r#"{{"identity":"a@b","name":"N","version":"1.0.0","permissions":["desktop"],
+                "main":{{"entry":"main.js"}},"contributes":{contributes}}}"#
+        )
+    }
+
+    #[test]
+    fn accepts_valid_contributes() {
+        let m = parse_ok(&contributes_json(
+            r#"{"views":[{"id":"win","title":"W","location":"window",
+                 "desktop":{"entry":"ui/window.mjs","width":960,"height":640,
+                            "networkHosts":["b.example.com","a.example.com","127.0.0.1","::1"]}}],
+                "commands":[{"id":"go","title":"Go"}]}"#,
+        ));
+        assert!(m.validate().is_ok());
+        assert_eq!(
+            m.network_hosts(),
+            vec!["127.0.0.1", "::1", "a.example.com", "b.example.com"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_desktop_entry() {
+        for desktop in [
+            r#"{"entry":"/abs/window.js"}"#,
+            r#"{"entry":"../window.js"}"#,
+            r#"{"entry":"window.ts"}"#,
+            r#"{"entry":"window.js","width":100}"#,
+            r#"{"entry":"window.js","height":5000}"#,
+            r#"{"entry":"window.js","networkHosts":["https://a.com"]}"#,
+            r#"{"entry":"window.js","networkHosts":["a.com:80"]}"#,
+            r#"{"entry":"window.js","networkHosts":["*.a.com"]}"#,
+            r#"{"entry":"window.js","networkHosts":["A.com"]}"#,
+            r#"{"entry":"window.js","networkHosts":["a.com","a.com"]}"#,
+        ] {
+            let m = parse_ok(&contributes_json(&format!(
+                r#"{{"views":[{{"id":"w","title":"W","location":"window","desktop":{desktop}}}]}}"#
+            )));
+            assert!(m.validate().is_err(), "应拒绝: {desktop}");
+        }
+    }
+
+    #[test]
+    fn rejects_too_many_desktop_hosts() {
+        let hosts: Vec<String> = (0..65).map(|i| format!("\"h{i}.example.com\"")).collect();
+        let m = parse_ok(&contributes_json(&format!(
+            r#"{{"views":[{{"id":"w","title":"W","location":"window",
+                 "desktop":{{"entry":"window.js","networkHosts":[{}]}}}}]}}"#,
+            hosts.join(",")
+        )));
+        assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_contributes_field() {
+        let r = PluginManifest::parse(
+            contributes_json(r#"{"views":[{"id":"w","title":"W","location":"window","extra":1}]}"#)
+                .as_bytes(),
+        );
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn empty_contributes_arrays_are_undeclared() {
+        let m = parse_ok(&contributes_json(r#"{"views":[],"commands":[]}"#));
+        assert!(m.validate().is_ok());
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct FixtureCase {
+        name: String,
+        manifest: serde_json::Value,
+        files: Vec<String>,
+        ok: bool,
+        #[serde(default)]
+        risk: Option<String>,
+        #[serde(default)]
+        network_hosts: Option<Vec<String>>,
+    }
+
+    /// 跨实现夹具：SDK 校验器与索引仓校验器复用同一文件。
+    #[test]
+    fn manifest_fixture_cases() {
+        let cases: Vec<FixtureCase> =
+            serde_json::from_str(include_str!("fixtures/manifest_cases.json")).expect("fixtures");
+        assert!(cases.len() >= 30, "夹具不足 30 条");
+        for case in cases {
+            let bytes = serde_json::to_vec(&case.manifest).expect("serialize");
+            let result = PluginManifest::parse(&bytes).and_then(|m| {
+                m.validate()?;
+                m.check_package_files(|p| case.files.iter().any(|f| f == p))?;
+                Ok(m)
+            });
+            assert_eq!(
+                result.is_ok(),
+                case.ok,
+                "{}: {:?}",
+                case.name,
+                result.as_ref().err()
+            );
+            if let Ok(m) = result {
+                if let Some(risk) = &case.risk {
+                    assert_eq!(m.risk().as_str(), risk, "{}", case.name);
+                }
+                if let Some(hosts) = &case.network_hosts {
+                    assert_eq!(&m.network_hosts(), hosts, "{}", case.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sniff_pack_validation() {
+        use super::validate_sniff_pack;
+        assert!(validate_sniff_pack(br#"{"format":"fluxdown-sniff-pack","rules":[]}"#).is_ok());
+        assert!(validate_sniff_pack(br#"{"format":"other","rules":[]}"#).is_err());
+        assert!(validate_sniff_pack(br#"{"format":"fluxdown-sniff-pack"}"#).is_err());
+        assert!(validate_sniff_pack(b"not json").is_err());
+        let many = format!(
+            r#"{{"format":"fluxdown-sniff-pack","rules":[{}]}}"#,
+            vec!["{}"; 501].join(",")
+        );
+        assert!(validate_sniff_pack(many.as_bytes()).is_err());
+        let big = vec![b' '; super::SNIFF_PACK_MAX_BYTES + 1];
+        assert!(validate_sniff_pack(&big).is_err());
     }
 
     #[test]

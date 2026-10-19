@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { canChangeSegments, canChangeUrl, isBtUrl, isReplaceableUrl, parseTaskSegments } from './taskEdit'
+import { canChangeSegments, canChangeUrl, canVerifyIntegrity, isBtUrl, isReplaceableUrl, parseTaskSegments } from './taskEdit'
 import type { TaskState, TaskSource } from './task'
 
 function facts(state: TaskState, over: { source?: TaskSource; url?: string } = {}) {
@@ -37,6 +37,21 @@ describe('修改线程数可用性', () => {
     expect(canChangeSegments(facts('paused', { source: 'remote' }))).toBe(false)
     expect(canChangeSegments(facts('paused', { url: 'magnet:?xt=urn:btih:abc' }))).toBe(false)
     expect(canChangeSegments(facts('paused', { url: 'torrent-file://local' }))).toBe(false)
+  })
+})
+
+describe('完整性校验可用性', () => {
+  const bt = 'magnet:?xt=urn:btih:abc'
+  const ok = { ...facts('completed', { url: bt }), fileMissing: false }
+  test('已完成 BT 可用（torrent-file 与大小写同样）', () => {
+    expect(canVerifyIntegrity(ok)).toBe(true)
+    expect(canVerifyIntegrity({ ...ok, url: 'TORRENT-FILE://x' })).toBe(true)
+  })
+  test('未完成 / 非 BT / 远程 / 文件缺失不可', () => {
+    expect(canVerifyIntegrity({ ...ok, state: 'paused' })).toBe(false)
+    expect(canVerifyIntegrity({ ...ok, url: 'https://a/b' })).toBe(false)
+    expect(canVerifyIntegrity({ ...ok, source: 'remote' })).toBe(false)
+    expect(canVerifyIntegrity({ ...ok, fileMissing: true })).toBe(false)
   })
 })
 

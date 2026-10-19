@@ -2,6 +2,8 @@ import { File, PanelBottom, PanelRight, X } from 'lucide-react'
 import { useState } from 'react'
 import { useT } from '../../../i18n'
 import { Button, Icon, SegmentedTabs, Tooltip } from '../../../ui'
+import { usePluginDetailTabs } from '../../plugins/usePluginContributions'
+import { PluginViewHost } from '../../plugins/view/PluginViewHost'
 import { useDownloads } from '../state'
 import { AdvancedTab } from './AdvancedTab'
 import { GeneralTab } from './GeneralTab'
@@ -11,20 +13,25 @@ import { SpeedTab } from './SpeedTab'
 import { useSpeedHistory } from './useSpeedHistory'
 import type { DownloadTaskView } from '../model/task'
 
-type DetailTab = 'general' | 'speed' | 'seeding' | 'log' | 'advanced'
+/** 内置 tab 或插件 tab（`plugin:<identity>:<viewId>`）。 */
+type DetailTab = string
 
 function TaskDetail({ view }: { view: DownloadTaskView }) {
   const t = useT()
   const [tab, setTab] = useState<DetailTab>('general')
   const isBt = view.protocol === 'bt'
-  const active: DetailTab = tab === 'seeding' && !isBt ? 'general' : tab
-  const speedHistory = useSpeedHistory(view, active === 'speed')
+  const pluginTabs = usePluginDetailTabs()
+  const pluginTab = pluginTabs.find((item) => item.value === tab)
+  // 插件 tab 随插件卸载 / 禁用消失时回到常规；seeding 仅 BT 任务有。
+  const active: DetailTab = (tab === 'seeding' && !isBt) || (tab.startsWith('plugin:') && !pluginTab) ? 'general' : tab
+  const speedHistory = useSpeedHistory(view.taskId, view.state === 'downloading', active === 'speed')
   const items = [
     { value: 'general' as const, label: t('detailTabGeneral') },
     { value: 'speed' as const, label: t('detailTabSpeed') },
     ...(isBt ? [{ value: 'seeding' as const, label: t('tabSeeding') }] : []),
     { value: 'log' as const, label: t('detailTabLog') },
     { value: 'advanced' as const, label: t('detailTabAdvanced') },
+    ...pluginTabs.map((item) => ({ value: item.value, label: item.view.title })),
   ]
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -37,6 +44,9 @@ function TaskDetail({ view }: { view: DownloadTaskView }) {
         {active === 'seeding' ? <SeedingTab view={view} /> : null}
         {active === 'log' ? <LogTab taskId={view.taskId} /> : null}
         {active === 'advanced' ? <AdvancedTab view={view} /> : null}
+        {pluginTab && active === pluginTab.value ? (
+          <PluginViewHost key={`${pluginTab.value}/${view.taskId}`} identity={pluginTab.identity} view={pluginTab.view.id} taskId={view.taskId} />
+        ) : null}
       </div>
     </div>
   )

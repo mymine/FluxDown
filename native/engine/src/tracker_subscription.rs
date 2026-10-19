@@ -127,9 +127,15 @@ impl FetchOutcome {
 /// Fetch every subscription URL (newline-separated list, `#` comments
 /// allowed) and return the merged + deduped tracker list.
 ///
+/// Requests go through the host egress ([`crate::egress::client_builder`]) so the
+/// global proxy applies exactly as for download tasks.
+///
 /// Individual source failures are tolerated: the outcome is a success as
 /// long as at least one source responds.  All network errors are logged.
-pub async fn fetch_subscriptions(urls: &str) -> FetchOutcome {
+pub async fn fetch_subscriptions(
+    urls: &str,
+    proxy: &crate::proxy_config::ProxyConfig,
+) -> FetchOutcome {
     let sources: Vec<&str> = urls
         .lines()
         .map(str::trim)
@@ -146,7 +152,14 @@ pub async fn fetch_subscriptions(urls: &str) -> FetchOutcome {
         };
     }
 
-    let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
+    let client = match crate::egress::client_builder(proxy, "")
+        .map_err(|e| e.to_string())
+        .and_then(|builder| {
+            builder
+                .timeout(FETCH_TIMEOUT)
+                .build()
+                .map_err(|e| e.to_string())
+        }) {
         Ok(c) => c,
         Err(e) => {
             return FetchOutcome {

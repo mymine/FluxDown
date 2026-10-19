@@ -35,9 +35,35 @@ export function formatEta(t: Translate, seconds: number): string {
   return t('etaHours', { n: (seconds / 3600).toFixed(1) })
 }
 
+/**
+ * 任务的状态名：引擎 status 5（探测 / 插件解析）为「准备中」而非「等待中」，对齐 GPUI
+ * `task_state_label` 的准备中分支。按任务展示状态名的地方都走这里，不直接用 `stateLabel`。
+ */
+export function taskStateLabel(t: Translate, view: Pick<DownloadTaskView, 'state' | 'preparing'>): string {
+  return view.state === 'pending' && view.preparing ? t('statusPreparing') : stateLabel(t, view.state)
+}
+
+/** 活动日志里只有引擎原始 status 的状态名：5 为「准备中」（GPUI `status_code_label`）。 */
+export function statusCodeLabel(t: Translate, status: number): string {
+  switch (status) {
+    case 0:
+      return stateLabel(t, 'pending')
+    case 1:
+      return stateLabel(t, 'downloading')
+    case 2:
+      return stateLabel(t, 'paused')
+    case 3:
+      return stateLabel(t, 'completed')
+    case 5:
+      return t('statusPreparing')
+    default:
+      return stateLabel(t, 'failed')
+  }
+}
+
 /** 状态列主文案：下载中显示「速度 · 剩余时间」（只显示已知部分），其余为状态名。 */
 export function statusLabel(t: Translate, view: DownloadTaskView): string {
-  if (view.state !== 'downloading') return stateLabel(t, view.state)
+  if (view.state !== 'downloading') return taskStateLabel(t, view)
   const speed = view.speed !== null && view.speed > 0 ? `${formatBytes(view.speed)}/s` : null
   const eta = view.etaSeconds !== null && view.etaSeconds <= MAX_ETA_SECS ? formatEta(t, view.etaSeconds) : null
   if (speed && eta) return `${speed} · ${eta}`

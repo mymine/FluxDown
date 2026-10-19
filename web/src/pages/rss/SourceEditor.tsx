@@ -1,12 +1,13 @@
 // 订阅编辑器（GPUI `crates/rss/src/editor.rs`）：基本 / 过滤 / 高级三个 Tab，
-// 新建须先验证 feed（验证结果绑定其请求参数，输入变化即失效），编辑保留只读运行态字段。
+// 新建须先验证订阅地址（验证结果绑定其请求参数，输入变化即失效），编辑保留只读运行态字段。
+// 来源类型（内置 RSS / 插件 provider）与 provider 配置的规则见 `./provider.ts`。
 // 桌面居中 Dialog，移动端全屏。
 
 import { CheckCircle2, FolderOpen } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useT } from '../../i18n'
 import { MAIN_QUEUE_ID, RpcError, errorMessage, rpc } from '../../lib/rpc'
-import type { QueueDto, RssItemDto, RssSourceDto, RssSourceInput, RssValidateRequest } from '../../lib/rpc'
+import type { PluginDto, QueueDto, RssItemDto, RssSourceDto, RssSourceInput, RssValidateRequest } from '../../lib/rpc'
 import {
   Button,
   Card,
@@ -31,12 +32,16 @@ import { formatSize, parseSize } from './filter'
 import type { RssFilterRule } from './filter'
 import { DEFAULT_INTERVAL_MINUTES, DEFAULT_MAX_PER_FETCH, effectiveInterval, intervalLabel, queueLabel } from './format'
 import { FilterPreview } from './FilterPreview'
+import { BUILTIN_PROVIDER_ID, normalizeProviderId, providerChoices, validateProviderConfig } from './provider'
+import type { ProviderChoice } from './provider'
 
 const INTERVALS = [10, 30, 60, 120, 360, 720, 1440]
 
 type Tab = 'basic' | 'filter' | 'advanced'
 
 interface EditorForm {
+  providerId: string
+  providerConfig: string
   name: string
   url: string
   saveDir: string
@@ -67,6 +72,8 @@ interface ValidatedFeed {
 
 function initialForm(source: RssSourceDto | null): EditorForm {
   return {
+    providerId: normalizeProviderId(source?.providerId ?? ''),
+    providerConfig: source?.providerConfig ?? '',
     name: source?.name ?? '',
     url: source?.url ?? '',
     saveDir: source?.saveDir ?? '',
@@ -91,11 +98,25 @@ function initialForm(source: RssSourceDto | null): EditorForm {
 }
 
 function requestOf(form: EditorForm): RssValidateRequest {
-  return { url: form.url.trim(), cookies: form.cookies.trim(), userAgent: form.userAgent.trim(), proxyUrl: form.proxyUrl.trim() }
+  return {
+    providerId: form.providerId,
+    providerConfig: form.providerId === BUILTIN_PROVIDER_ID ? '' : form.providerConfig.trim(),
+    url: form.url.trim(),
+    cookies: form.cookies.trim(),
+    userAgent: form.userAgent.trim(),
+    proxyUrl: form.proxyUrl.trim(),
+  }
 }
 
 function sameRequest(a: RssValidateRequest, b: RssValidateRequest): boolean {
-  return a.url === b.url && a.cookies === b.cookies && a.userAgent === b.userAgent && a.proxyUrl === b.proxyUrl
+  return (
+    a.providerId === b.providerId &&
+    a.providerConfig === b.providerConfig &&
+    a.url === b.url &&
+    a.cookies === b.cookies &&
+    a.userAgent === b.userAgent &&
+    a.proxyUrl === b.proxyUrl
+  )
 }
 
 /** 空体积 = 不限（0）；非法返回 null。 */
@@ -120,16 +141,20 @@ export function SourceEditor({
   open,
   source,
   queues,
+  plugins,
   onOpenChange,
 }: {
   open: boolean
   /** null = 新建。 */
   source: RssSourceDto | null
   queues: readonly QueueDto[]
+  /** 已安装插件：打开时取一次快照生成来源选项（与 GPUI 一致，编辑期间不随插件变化重排）。 */
+  plugins: readonly PluginDto[]
   onOpenChange: (open: boolean) => void
 }) {
   const t = useT()
   const [form, setForm] = useState<EditorForm>(() => initialForm(source))
+  const [choices] = useState<ProviderChoice[]>(() => providerChoices(plugins, source?.providerId ?? ''))
   const [tab, setTab] = useState<Tab>('basic')
   const [validated, setValidated] = useState<ValidatedFeed | null>(null)
   const [validating, setValidating] = useState(false)
@@ -193,6 +218,11 @@ export function SourceEditor({
       setError(t('rssFeedRequired'))
       return
     }
+    if (sent.providerId !== BUILTIN_PROVIDER_ID && validateProviderConfig(sent.providerConfig ?? '') === null) {
+      setTab('basic')
+      setError(t('rssProviderConfigInvalid'))
+      return
+    }
     setValidating(true)
     setValidated(null)
     setError(null)
@@ -221,6 +251,9 @@ export function SourceEditor({
   const save = async () => {
     if (saving || validating) return
     if (request.url === '') return fail('basic', 'rssFeedRequired')
+    if (request.providerId !== BUILTIN_PROVIDER_ID && validateProviderConfig(request.providerConfig ?? '') === null) {
+      return fail('basic', 'rssProviderConfigInvalid')
+    }
     if (!existing && !validOk) return fail('basic', 'rssValidateBeforeSave')
     const min = sizeField(form.sizeMin)
     const max = sizeField(form.sizeMax)
@@ -231,6 +264,8 @@ export function SourceEditor({
     const name = form.name.trim() !== '' ? form.name.trim() : existing ? '' : (validated?.title ?? '')
     const input: RssSourceInput = {
       ...(source ?? {}),
+      providerId: request.providerId ?? BUILTIN_PROVIDER_ID,
+      providerConfig: request.providerConfig ?? '',
       url: request.url,
       name,
       enabled: form.enabled,
@@ -277,10 +312,34 @@ export function SourceEditor({
     <OptionRow title={title} description={description} control={<Switch checked={checked} onCheckedChange={onChange} aria-label={title} />} />
   )
 
+  const builtin = form.providerId === BUILTIN_PROVIDER_ID
+  const currentChoice = choices.find((choice) => choice.id === form.providerId)
+  const providerLabel = (choice: ProviderChoice) => (choice.kind === 'builtin' ? t('rssProviderBuiltin') : choice.kind === 'plugin' ? choice.name : choice.id)
+  const providerHint =
+    currentChoice?.kind === 'plugin'
+      ? t('rssProviderPluginHint')
+      : currentChoice?.kind === 'missing'
+        ? t('rssProviderUnavailable', { id: form.providerId })
+        : undefined
+
   const basicForm = (
     <>
+      {choices.length > 1 ? (
+        <FormField label={t('rssProviderLabel')} hint={providerHint}>
+          <Select
+            value={form.providerId}
+            options={choices.map((choice) => ({ value: choice.id, label: providerLabel(choice) }))}
+            onValueChange={(value) => {
+              if (value !== form.providerId) {
+                setValidated(null)
+                patchRequest({ providerId: value })
+              }
+            }}
+          />
+        </FormField>
+      ) : null}
       <FormField
-        label={t('rssUrlLabel')}
+        label={t(builtin ? 'rssUrlLabel' : 'rssProviderUrlLabel')}
         hint={existing ? undefined : t(validating ? 'rssWizardValidating' : 'rssEditorAuthHint')}
       >
         <InputWithAction
@@ -303,6 +362,18 @@ export function SourceEditor({
           }
         />
       </FormField>
+      {builtin ? null : (
+        <FormField label={t('rssProviderConfigLabel')} hint={t('rssProviderConfigHint')}>
+          <Input
+            value={form.providerConfig}
+            placeholder={t('rssProviderConfigPlaceholder')}
+            autoCapitalize="off"
+            autoCorrect="off"
+            spellCheck={false}
+            onChange={(event) => patchRequest({ providerConfig: event.target.value })}
+          />
+        </FormField>
+      )}
       {validOk && !existing ? (
         <Card className="flex items-center gap-2 px-3 py-2">
           <Icon icon={CheckCircle2} className="text-success" />

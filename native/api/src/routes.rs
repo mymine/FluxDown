@@ -106,11 +106,15 @@ pub const API_LINK_PAIR_HELLO: &str = "/api/v1/link/pair/hello";
 pub const API_LINK_PAIR_REVEAL: &str = "/api/v1/link/pair/reveal";
 /// P2P 设备互联：确认/拒绝配对（POST，无 token 鉴权，由会话 + SAS 守卫）。
 pub const API_LINK_PAIR_CONFIRM: &str = "/api/v1/link/pair/confirm";
-/// P2P 设备互联：已配对设备下发下载任务（POST，链路 HMAC 鉴权，非 token）。
+/// P2P 设备互联：已配对设备下发下载任务（POST，链路 HMAC 鉴权，非 token；请求与响应体均为
+/// AEAD 密文，`X-FluxLink-Enc: v2`）。
 pub const API_LINK_TASKS: &str = "/api/v1/link/tasks";
-/// P2P 设备互联：已配对设备经已认证链路交换设备信息（默认下载目录 / 路径风格）
-/// （POST，链路 HMAC 鉴权，请求与响应体均为 AEAD 密文；旧版对端没有该路由 → 404）。
+/// P2P 设备互联：已配对设备经已认证链路双向交换设备信息（名称 / 平台 / 版本 / 回连地址 /
+/// 云设备 ID / 默认下载目录 / 路径风格）（POST，链路 HMAC 鉴权，请求与响应体均为 AEAD 密文）。
 pub const API_LINK_INFO: &str = "/api/v1/link/info";
+/// P2P 设备互联：已配对设备通知本机「我已解除与你的配对」（POST，链路 HMAC 鉴权，请求与响应体
+/// 均为 AEAD 密文）。收到后本机把对应记录标记为已撤销（拒绝其入站请求、不再向它下发）。
+pub const API_LINK_UNPAIR: &str = "/api/v1/link/unpair";
 /// P2P 设备互联：生成一次性配对码（POST，**需 management token**，供 web/CLI 让
 /// headless 设备出示配对码）。
 pub const API_LINK_CODE: &str = "/api/v1/link/code";

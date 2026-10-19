@@ -36,6 +36,31 @@ final class PairingPromptGate {
     @ObservationIgnored private var entries: [Entry] = []
     @ObservationIgnored private var nextSeq = 0
     @ObservationIgnored private var announced: Set<String> = []
+    /// 已批准、等待 `LinkedDevicesChanged` 出现该指纹才提示「已配对」：指纹 → (对端名, 批准时刻)。
+    @ObservationIgnored private var awaitingPaired: [String: (name: String, at: Date, pairedAt: Int64?)] = [:]
+    private static let awaitingWindow: TimeInterval = 120
+
+    /// `pairedAt` = 批准时该指纹已有记录的配对时间（重新配对时以其变化为成功信号）；新指纹为 nil。
+    func awaitPaired(fingerprint: String, name: String, pairedAt: Int64?) {
+        awaitingPaired[fingerprint] = (name, Date(), pairedAt)
+    }
+
+    func cancelAwaitPaired(fingerprint: String) {
+        awaitingPaired[fingerprint] = nil
+    }
+
+    /// 取走已出现在已配对列表里的待确认项（各嵌套实例共用，只会被第一个消费者取到）。
+    func takePaired(in devices: [LinkDevice]) -> [String] {
+        let now = Date()
+        awaitingPaired = awaitingPaired.filter { now.timeIntervalSince($0.value.at) < Self.awaitingWindow }
+        let current = Dictionary(devices.map { ($0.fingerprint, $0.pairedAt) }, uniquingKeysWith: { a, _ in a })
+        let hit = awaitingPaired.filter { key, value in
+            guard let now = current[key] else { return false }
+            return value.pairedAt.map { $0 != now } ?? true
+        }
+        for key in hit.keys { awaitingPaired[key] = nil }
+        return hit.values.map(\.name)
+    }
 
     /// 登记一个实例（幂等）。
     func register(_ instance: UUID, depth: Int) {
@@ -161,6 +186,13 @@ private struct PairingPromptModifier: ViewModifier {
                 )
             }
             .onChange(of: pendingIds) { _, live in gate.prune(keeping: live) }
+            // 批准后不提前报成功：以已配对列表里出现该指纹为准再提示。
+            .onChange(of: state.linkDevices.map { "\($0.fingerprint)#\($0.pairedAt)" }) { _, _ in
+                for name in gate.takePaired(in: container.store.state.linkDevices) {
+                    FluxHaptic.success.play()
+                    container.toasts.show(text: L("localPairingPaired", ["device": name]), tone: .success)
+                }
+            }
             .onChange(of: shown?.sessionId) { old, new in
                 guard isPresenter else { return }
                 if let old, old != new, !gate.handled.contains(old), !pendingIds.contains(old) {
@@ -174,10 +206,15 @@ private struct PairingPromptModifier: ViewModifier {
     /// 到期自动拒绝失败不再重试（请求本身已过期，由 agent 清理）。
     private func respond(to request: LinkPairingRequestDto, accept: Bool, automatic: Bool, gate: PairingPromptGate) {
         guard gate.markHandled(request.sessionId) else { return }
+        if accept {
+            let existing = container.store.state.linkDevices.first { $0.fingerprint == request.peerFingerprint }
+            gate.awaitPaired(fingerprint: request.peerFingerprint, name: request.peerName, pairedAt: existing?.pairedAt)
+        }
         Task {
             do throws(HostError) {
                 try await container.agent.linkApprove(sessionId: request.sessionId, accept: accept)
             } catch {
+                gate.cancelAwaitPaired(fingerprint: request.peerFingerprint)
                 if !automatic { gate.unmarkHandled(request.sessionId) }
                 container.toasts.show(text: AccountText.error(error, context: .pairing), tone: .error)
             }

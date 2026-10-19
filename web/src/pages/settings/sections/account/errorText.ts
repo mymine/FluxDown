@@ -22,7 +22,7 @@ export const REASON_KEYS: Partial<Record<ErrorReason, string>> = {
   registrationIncomplete: 'accountErrorRegistrationIncomplete',
   mailNotConfigured: 'errReasonMailNotConfigured',
   deviceLimit: 'accountErrorDeviceLimit',
-  syncDeviceLimit: 'cloudSyncErrorDeviceLimit',
+  onlineDeviceLimit: 'cloudSyncErrorOnlineLimit',
   deviceUntrusted: 'cloudSyncErrorDeviceUntrusted',
   sessionExpired: 'errReasonSessionExpired',
   cloudUnreachable: 'accountErrorNetwork',
@@ -41,6 +41,19 @@ export const REASON_KEYS: Partial<Record<ErrorReason, string>> = {
   pairingVersionMismatch: 'errReasonPairingVersionMismatch',
   peerNotPaired: 'errReasonPeerNotPaired',
   peerOffline: 'errReasonPeerOffline',
+  peerOutdated: 'errReasonPeerOutdated',
+  linkUnavailable: 'errReasonLinkUnavailable',
+  paymentDisabled: 'accountPlanErrorPaymentDisabled',
+  paymentGatewayFailed: 'accountPlanErrorGateway',
+  planNotPurchasable: 'accountPlanErrorNotPurchasable',
+  planAlreadyOwned: 'accountPlanErrorAlreadyOwned',
+  planNotUpgrade: 'accountPlanErrorNotUpgrade',
+  planTierNotHigher: 'accountPlanErrorTierNotHigher',
+  referralCodeInvalid: 'accountPlanErrorReferralInvalid',
+  referralSelfUse: 'accountPlanErrorReferralSelfUse',
+  referralAlreadyUsed: 'accountPlanErrorReferralAlreadyUsed',
+  referralPlanExcluded: 'accountPlanErrorReferralPlanExcluded',
+  referralCodeTaken: 'accountReferralCodeTaken',
 }
 
 function codeKey(error: RpcError): string {

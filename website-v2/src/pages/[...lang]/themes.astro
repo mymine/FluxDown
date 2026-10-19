@@ -3,14 +3,14 @@ import Layout from "@/layouts/Layout.astro";
 import PageHeader from "@/components/site/PageHeader.astro";
 import ThemeMarket from "@/components/markets/ThemeMarket";
 import HowTo from "@/components/markets/HowTo.astro";
-import { BrandIcon } from "@/components/icons/brand";
-import { THEMES_GUIDE_URL } from "@/components/markets/theme-data";
 import { markets } from "@/i18n/messages/markets";
 import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
-import { Palette } from "lucide-react";
+import { THEMES_REPO, contributeGuidePath, githubUrl } from "@/lib/ecosystem";
+import { ArrowRight, Palette } from "lucide-react";
 export const getStaticPaths = langStaticPaths;
 const lang = resolveLang(Astro.params.lang);
 const t = markets[lang].themes;
+const guide = href(contributeGuidePath(lang, "contributing/themes"), lang);
 ---
 
 <Layout lang={lang} title={t.metaTitle} description={t.metaDescription}>
@@ -19,9 +19,9 @@ const t = markets[lang].themes;
       <Palette size={15} aria-hidden="true" />
       {t.builderCta}
     </a>
-    <a class="btn btn-secondary" href={THEMES_GUIDE_URL} target="_blank" rel="noopener noreferrer">
-      <BrandIcon name="github" size={15} />
+    <a class="btn btn-secondary" href={guide}>
       {t.submitCta}
+      <ArrowRight size={15} aria-hidden="true" />
     </a>
   </PageHeader>
 
@@ -33,6 +33,9 @@ const t = markets[lang].themes;
     eyebrow={t.howTo.eyebrow}
     title={t.howTo.title}
     steps={[t.howTo.step1, t.howTo.step2, t.howTo.step3]}
-    guide={{ href: THEMES_GUIDE_URL, label: t.howTo.guideLink }}
+    links={[
+      { href: guide, label: t.howTo.guideLink },
+      { href: githubUrl(THEMES_REPO), label: THEMES_REPO, external: true, brand: "github" },
+    ]}
   />
 </Layout>

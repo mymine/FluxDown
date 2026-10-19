@@ -3,6 +3,7 @@ import Foundation
 import Testing
 @testable import FluxDown
 
+#if FULL_P2P
 @MainActor
 struct SettingsBtEd2kTests {
     private func form(_ values: [String: String]) -> SettingsConfigForm {
@@ -145,3 +146,4 @@ struct SettingsBtEd2kTests {
         #expect(Ed2kSettingsRow.readout(none) == nil)
     }
 }
+#endif

@@ -15,6 +15,7 @@
 //! 来自边车 blob——任何一环断了（重建占位文件、边界字节丢失、路径映射
 //! 失效），`finished` 都到不了 true 或目录断言立刻红。
 
+#![cfg(feature = "bt")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashSet;

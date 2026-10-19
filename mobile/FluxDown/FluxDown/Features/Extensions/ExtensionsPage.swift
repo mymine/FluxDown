@@ -72,6 +72,7 @@ private struct ExtensionsContent: View {
         .fluxAnimation(.smooth, value: tab)
         .pluginAutoDisabledToasts()
         .task(id: readOnly) { await model.ensureMarketLoaded() }
+        .task(id: readOnly) { await model.loadSiteDefaults() }
         .fileImporter(isPresented: $importing, allowedContentTypes: Self.packageTypes, allowsMultipleSelection: false) { result in
             switch result {
             case let .success(urls):
@@ -175,6 +176,18 @@ private struct ExtensionsContent: View {
             Text(L("pluginsSectionTitle"))
         }
 
+        if !model.siteDefaults.isEmpty {
+            Section {
+                ForEach(model.siteDefaults) { entry in
+                    SiteDefaultRow(entry: entry, plugins: list, readOnly: readOnly)
+                }
+            } header: {
+                Text(L("pluginSiteDefaultsTitle"))
+            } footer: {
+                Text(L("pluginSiteDefaultsDesc"))
+            }
+        }
+
         Section {
             Button {
                 importing = true
@@ -245,6 +258,65 @@ private struct ExtensionsContent: View {
     }
 }
 
+/// 站点默认插件一行：站点名 + 候选插件选择器；未确认（automatic）的条目带提示与「确认」按钮。
+private struct SiteDefaultRow: View {
+    @Environment(ExtensionsModel.self) private var model
+    let entry: PluginSiteDefault
+    let plugins: [PluginDto]
+    let readOnly: Bool
+
+    private func name(_ identity: String) -> String {
+        plugins.first { $0.identity == identity }?.name ?? identity
+    }
+
+    var body: some View {
+        let busy = model.siteDefaultBusy.contains(entry.site)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(entry.site).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                Spacer(minLength: 8)
+                Picker(entry.site, selection: Binding(
+                    get: { entry.identity },
+                    set: { new in
+                        guard new != entry.identity else { return }
+                        Task { await model.setSiteDefault(site: entry.site, identity: new) }
+                    }
+                )) {
+                    ForEach(entry.candidates, id: \.self) { identity in
+                        Text(name(identity)).tag(identity)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+            }
+            if entry.automatic {
+                Label(L("pluginSiteDefaultAutomatic"), systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.fdStatusPaused)
+                Text(L("pluginSiteDefaultAutomaticHint"))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 12) {
+                if entry.automatic {
+                    Button(L("pluginSiteDefaultConfirm")) {
+                        Task { await model.setSiteDefault(site: entry.site, identity: entry.identity) }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+                Button(L("pluginSiteDefaultRemove"), role: .destructive) {
+                    Task { await model.setSiteDefault(site: entry.site, identity: nil) }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 4)
+        .disabled(readOnly || busy)
+    }
+}
+
 // MARK: - 行
 
 /// 已安装插件行（纯信息）：图标 · 名称 / 版本 / 主页 / 描述 / 徽标流 / 加载错误；启用开关在详情页。
@@ -302,6 +374,9 @@ struct PluginRow: View {
             }
             if plugin.disabledReason == "CircuitBreaker" {
                 StatusBadge(text: L("pluginDisabledCircuitBreaker"), tone: .failure, systemImage: FluxSymbol.cancelBoost)
+            }
+            if plugin.disabledReason == "Revoked" {
+                StatusBadge(text: L("pluginDisabledRevoked"), tone: .failure, systemImage: "exclamationmark.octagon.fill")
             }
             if let yanked, let key = PluginMarket.yankedLabelKey(yanked) {
                 StatusBadge(text: L("pluginInstalledVersionYanked", ["label": L(key)]), tone: .failure, systemImage: "exclamationmark.octagon.fill")

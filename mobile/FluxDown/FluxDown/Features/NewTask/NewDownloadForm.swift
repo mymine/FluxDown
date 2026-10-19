@@ -148,7 +148,7 @@ final class NewDownloadForm {
     /// 当前选中的远端目标；目标已不在候选里（登出 / 解除配对）时回落到当前主机。
     func target(in targets: [DispatchTarget]) -> DispatchTarget? {
         guard let targetId else { return nil }
-        return targets.first { $0.id == targetId }
+        return DeviceRules.resolveTarget(id: targetId, in: targets)
     }
 
     /// 下发条目：单条链接时重命名优先于 `out=`；空名交给目标设备推断。

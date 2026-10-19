@@ -8,9 +8,10 @@
 //! - [`address`]：对端地址模型（http/https、域名、反代 base path）。
 //! - [`discovery`]：发现层：mDNS 广播/浏览 + 手动地址 `/ping` 探测。
 //! - [`pairing`]：配对协议（一次性码 + 临时公钥承诺-揭示 + X25519 ECDH + SAS + 身份签名）。
-//! - [`transport`]：**数据面传输 seam** —— Direct(v1) / 未来 iroh、relay 插拔。
+//! - [`transport`]：**数据面传输 seam** —— Direct(v2) / 未来 iroh、relay 插拔。
 //! - [`storage`]：持久化 trait（身份种子 + 已配对设备名册）。
-//! - [`crypto`]：指纹 / SAS / 链路密钥 / HMAC 鉴权原语。
+//! - [`crypto`]：指纹 / SAS / 链路密钥 / 数据面 v2 的 MAC 与 AEAD 原语。
+//! - [`text`]：对端自报文本的清洗（控制 / 双向控制字符、长度）。
 
 pub mod address;
 pub mod crypto;
@@ -20,23 +21,27 @@ pub mod identity;
 pub mod manager;
 pub mod pairing;
 pub mod storage;
+pub mod text;
 pub mod transport;
 pub mod types;
 pub mod wire;
 
 pub use address::PeerAddress;
+pub use crypto::{LINK_ENC_V2, LINK_PROTOCOL_VERSION};
 pub use error::{LinkError, LinkResult};
 pub use identity::LinkIdentity;
 pub use manager::{
-    BeginPairingResult, LinkEngineEvent, LinkManager, LinkOptions, LinkRequest, PairConfirmOutcome,
-    WireHello, WireHelloResponse, WireReveal, WireRevealResponse,
+    BeginPairingResult, LINK_INFO_PATH, LINK_TASKS_PATH, LINK_UNPAIR_PATH, LinkEngineEvent,
+    LinkManager, LinkOptions, LinkRequest, PairConfirmOutcome, PeerInfoAnswer, WireHello,
+    WireHelloResponse, WireReveal, WireRevealResponse,
 };
 pub use pairing::{
     HelloRequest, HelloResponse, PAIRING_PROTOCOL_VERSION, PairingInitiator, PairingResponder,
     RevealAccepted, RevealRequest, RevealResponse, SelfInfo,
 };
-pub use storage::LinkStorage;
+pub use storage::{LinkStorage, RecordUpdate};
 pub use transport::{DirectTransport, PeerConn, Transport, TransportStack};
 pub use types::{
-    DiscoveredPeer, DiscoveryKind, PeerCandidate, PeerInfo, PeerRecord, TransportKind,
+    DiscoveredPeer, DiscoveryKind, MAX_DIRECT_CANDIDATES, PeerCandidate, PeerInfo, PeerRecord,
+    TransportKind,
 };

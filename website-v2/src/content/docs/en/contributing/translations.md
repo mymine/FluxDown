@@ -1,8 +1,8 @@
 ---
 title: Translating FluxDown
-description: Help translate the app, the web UI, and this website by contributing on GitHub.
+description: Help translate the app and the web UI by contributing on GitHub.
 section: contributing
-order: 2
+order: 4
 ---
 
 FluxDown translations are maintained in the public [zerx-lab/FluxDown](https://github.com/zerx-lab/FluxDown) repository. Community members contribute language updates through GitHub pull requests.
@@ -14,7 +14,6 @@ FluxDown translations are maintained in the public [zerx-lab/FluxDown](https://g
 | --- | --- |
 | **Desktop & Mobile App** | Every string in the Windows/macOS/Linux app and the mobile app |
 | **Web App** | The web UI served by the headless server |
-| **Website** | fluxdown.zerx.dev — landing page, FAQ, changelog |
 
 English is the source language; Simplified Chinese is maintained by the core team. Everything else is yours to build.
 
@@ -24,7 +23,6 @@ English is the source language; Simplified Chinese is maintained by the core tea
 2. Add or update the relevant translation file:
    - **Desktop & Mobile App**: `assets/i18n/`
    - **Web App**: `web/src/lib/locales/`
-   - **Website**: `website/src/lib/locales/`
 3. Open a pull request against `main`. A maintainer will review and merge it.
 
 ## Placeholders
@@ -38,7 +36,7 @@ Your language isn't listed yet? Add a translation file for it in the relevant co
 After it merges:
 
 - **App**: your language appears automatically in *Settings → Language* in the next release.
-- **Web UI & website**: the language shows up in the language switcher with the next deploy.
+- **Web UI**: the language shows up in the language switcher with the next deploy.
 
 ## Tips
 

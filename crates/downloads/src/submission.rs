@@ -129,6 +129,8 @@ struct SubmissionPlan {
 struct RemoteInfo {
     device: String,
     offline: bool,
+    /// 经局域网直连下发（一次性投递，进度要在目标设备上看）。
+    direct: bool,
 }
 
 impl NewDownloadSubmission {
@@ -267,6 +269,7 @@ impl NewDownloadSubmission {
                     save_dir,
                     captures,
                 } = remote;
+                let direct = matches!(target, DispatchTarget::Paired(_));
                 let commands = items
                     .into_iter()
                     .filter_map(|item| match &target {
@@ -304,6 +307,7 @@ impl NewDownloadSubmission {
                     remote: Some(RemoteInfo {
                         device: device_label,
                         offline: target_offline,
+                        direct,
                     }),
                 }
             }
@@ -519,6 +523,7 @@ pub struct SubmissionReport {
 pub struct SubmitNotice {
     /// `false` = 至少一条失败（用错误样式展示）。
     pub ok: bool,
+    /// 空串 = 无需提示（全部新建成功：任务已出现在列表中，不再弹 toast 遮挡列表）。
     pub message: String,
 }
 
@@ -564,6 +569,7 @@ impl SubmissionReport {
                     summary.succeeded,
                     &remote.device,
                     remote.offline,
+                    remote.direct,
                 ),
             },
             (Some(remote), Some(reason)) => SubmitNotice {
@@ -598,7 +604,7 @@ impl SubmissionReport {
             },
             (false, None) => SubmitNotice {
                 ok: true,
-                message: strings.created.to_string(),
+                message: String::new(),
             },
             (false, Some(reason)) if added == 0 => SubmitNotice {
                 ok: false,
@@ -1056,6 +1062,28 @@ mod tests {
         let notice = report.notice(&translator);
         assert!(notice.ok);
         assert!(notice.message.contains("offline"), "{}", notice.message);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_dispatch_toast_says_progress_is_on_the_target_device() -> Result<(), I18nError> {
+        let catalog = std::sync::Arc::new(I18nCatalog::load_embedded()?);
+        let translator = catalog.translator("en");
+        let report = block_on(run_submission(
+            NewDownloadSubmission::Remote(remote(
+                DispatchTarget::Paired("fp1".to_owned()),
+                &["https://a/1"],
+                None,
+            )),
+            |_| Box::pin(async { Ok(DownloadsResult::Unit) }),
+            hooks(),
+        ));
+        let notice = report.notice(&translator);
+        assert!(notice.ok);
+        assert_eq!(
+            notice.message,
+            translator.text_with("linkDispatchedToDevice", &[("device", "Mac")])
+        );
         Ok(())
     }
 

@@ -35,7 +35,7 @@ fun DownloadServiceEffect() {
                 .distinctUntilChanged()
                 .collect { busy ->
                     if (!busy) return@collect
-                    DownloadServiceController.start(context)
+                    DownloadServiceController.start(context, "foreground")
                     if (DownloadServiceController.shouldRequestNotificationPermission(context)) {
                         DownloadServiceController.markNotificationPermissionAsked(context)
                         requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)

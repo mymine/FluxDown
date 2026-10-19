@@ -137,12 +137,11 @@ FluxDown/
 │   ├── cli/            `fluxdown_cli`：二进制 `fluxdown`——见 `hosts-and-api.md`「宿主与客户端 crate」
 │   └── nmh/            Native Messaging Host 中继二进制
 ├── web/                Web SPA（React 19 + TanStack + Tailwind v4，bun）——见 `clients.md`「Web SPA」
-├── website-v2/         官网主站（Astro SSR + 内容集文档系统，根路径部署）——见 `clients.md`「官网」
-├── website/            旧官网存档（挂 `/v1/`，不再更新内容）——见 `clients.md`「官网」
+├── website-v2/         官网（Astro SSR + 内容集文档系统，根路径部署）——见 `clients.md`「官网」
 ├── fluxDown/           WXT 浏览器扩展（Chrome/Firefox MV3）——见 `clients.md`「浏览器扩展与用户脚本」
 ├── userscript/         Tampermonkey 用户脚本（扩展替代）——见 `clients.md`「浏览器扩展与用户脚本」
 ├── examples/plugins/   插件示例（.fxplug 源）
-├── packaging/          NAS 包脚本（synology/qnap/openwrt）——见 `hosts-and-api.md`「Headless 服务器」
+├── packaging/          NAS 包脚本（synology/qnap/openwrt/fnos）——见 `hosts-and-api.md`「Headless 服务器」
 ├── promotion/          分发模板（unraid/casaos/awesome-selfhosted/mcp）
 ├── docker/             server.Dockerfile + docker-compose.yml
 ├── installer/windows/  Inno Setup

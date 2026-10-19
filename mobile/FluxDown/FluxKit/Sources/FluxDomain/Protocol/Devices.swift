@@ -225,6 +225,8 @@ public enum DeviceRules {
 
 /// 远程下发目标：云账号其他设备（经 FluxCloud）或局域网已配对设备（直连）。设备页下发与新建下载「下载到」共用，
 /// 镜像 `crates/downloads/src/model/devices.rs::DeviceEntry`。
+///
+/// 同一台机器既是同账号云设备又是直连设备时合并为一条云条目（`linkFingerprint` 挂接）：直连在线走局域网直连，否则走云。
 public struct DispatchTarget: Sendable, Hashable, Identifiable {
     public enum Kind: Sendable, Hashable { case cloud, link }
 
@@ -232,15 +234,20 @@ public struct DispatchTarget: Sendable, Hashable, Identifiable {
     /// 云设备 `deviceId`（`RemoteDispatchParams.toDevice`）/ 已配对设备指纹（`LinkDispatchParams.fingerprint`）。
     public var deviceId: String
     public var name: String
-    /// 在线状态；nil = 未知（云端 presence 不可信 / 本地服务未就绪）。
+    /// 在线状态；nil = 未知（云端 presence 不可信 / 本地服务未就绪）。挂接条目 = 云与直连任一在线即在线。
     public var online: Bool?
     /// 目标自报的默认下载目录（已去首尾空白；空 = nil）。
     public var defaultSaveDir: String?
     /// 目标的有效路径风格（自报 → 平台推断）；未知为 nil。
     public var pathStyle: PathStyle?
+    /// 挂接到该云条目的直连设备指纹（仅云条目）。
+    public var linkFingerprint: String?
+    /// 挂接直连设备的在线状态；nil = 未知（本地服务未就绪）。
+    public var linkOnline: Bool?
 
     public init(
-        kind: Kind, deviceId: String, name: String, online: Bool?, defaultSaveDir: String?, pathStyle: PathStyle?
+        kind: Kind, deviceId: String, name: String, online: Bool?, defaultSaveDir: String?, pathStyle: PathStyle?,
+        linkFingerprint: String? = nil, linkOnline: Bool? = nil
     ) {
         self.kind = kind
         self.deviceId = deviceId
@@ -249,17 +256,23 @@ public struct DispatchTarget: Sendable, Hashable, Identifiable {
         let dir = defaultSaveDir?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         self.defaultSaveDir = dir.isEmpty ? nil : dir
         self.pathStyle = pathStyle
+        self.linkFingerprint = linkFingerprint
+        self.linkOnline = linkOnline
     }
 
-    /// 云端完整记录（设备页）；presence 不可信时在线状态记为未知。
-    public init(cloud record: CloudDeviceRecord, presenceKnown: Bool) {
+    /// 云端完整记录（设备页）；presence 不可信时在线状态记为未知。`link` = 挂接的直连记录（同账号同机）。
+    public init(cloud record: CloudDeviceRecord, presenceKnown: Bool, link: LinkDeviceInfo? = nil) {
+        let cloudOnline: Bool? = presenceKnown ? record.isOnline : nil
+        let attached = link.flatMap { $0.revoked || $0.fingerprint.isEmpty ? nil : $0 }
         self.init(
             kind: .cloud,
             deviceId: record.deviceId,
             name: record.name,
-            online: presenceKnown ? record.isOnline : nil,
-            defaultSaveDir: record.defaultSaveDir,
-            pathStyle: record.effectivePathStyle
+            online: attached.map { DeviceRules.combineOnline(cloudOnline, $0.online) } ?? cloudOnline,
+            defaultSaveDir: record.defaultSaveDir ?? attached?.defaultSaveDir,
+            pathStyle: record.effectivePathStyle ?? attached?.effectivePathStyle,
+            linkFingerprint: attached?.fingerprint,
+            linkOnline: attached?.online
         )
     }
 
@@ -275,18 +288,36 @@ public struct DispatchTarget: Sendable, Hashable, Identifiable {
         )
     }
 
-    /// 选择键：`cloud:<deviceId>` / `link:<fingerprint>`（同 GPUI `DispatchTarget::to_pref`）。
+    /// 选择键：`cloud:<deviceId>` / `link:<fingerprint>`（挂接条目用 `cloud:`；同 GPUI `DispatchTarget::to_pref`）。
     public var id: String { (kind == .cloud ? "cloud:" : "link:") + deviceId }
 
     public var isCloud: Bool { kind == .cloud }
+
+    /// 本次下发是否走局域网直连：独立直连条目，或云条目挂接的直连设备在线。
+    public var routesViaLink: Bool { kind == .link || (linkFingerprint != nil && linkOnline == true) }
+
+    /// 直连下发使用的指纹（`routesViaLink` 为 true 时有值）。
+    public var dispatchFingerprint: String? {
+        guard routesViaLink else { return nil }
+        return kind == .link ? deviceId : linkFingerprint
+    }
 
     /// 已知离线：云设备由云端排队、上线后执行；局域网设备直连送不到。
     public var isOffline: Bool { online == false }
 }
 
 extension DeviceRules {
-    /// 「下载到」候选（`crates/downloads/src/model/devices.rs::other_devices`）：云设备去掉本机与空 id、
-    /// 已配对设备去掉空指纹，各自按 id 去重；名称为空用短码，多台同名（忽略大小写与首尾空白）时全部追加 ` · 短码`。
+    /// 挂接条目在线合并：任一为 true → true；否则任一未知 → 未知；否则 false。
+    static func combineOnline(_ a: Bool?, _ b: Bool?) -> Bool? {
+        if a == true || b == true { return true }
+        if a == nil || b == nil { return nil }
+        return false
+    }
+
+    /// 「下载到」候选（`crates/downloads/src/model/devices.rs::other_devices`），按 pairing-contract 合并规则：
+    /// 云设备去掉本机与空 id、按 id 去重；已配对设备去掉空指纹与 revoked、按指纹去重；link 的 `cloudDeviceId`
+    /// 命中尚未挂接的云条目时挂接到该条目，否则成为独立直连条目。顺序：云条目（含挂接）→ 独立直连；
+    /// 名称为空用短码，多台同名（忽略大小写与首尾空白）时全部追加 ` · 短码`。
     ///
     /// - `cloudPresenceKnown`：云端在线状态可信（``CloudPresence/isKnown(_:localReady:)``），否则云设备在线未知；
     /// - `localReady`：本地服务已就绪，否则局域网设备在线未知。
@@ -299,8 +330,10 @@ extension DeviceRules {
         var seenCloud = Set<String>()
         var seenLink = Set<String>()
         var targets: [DispatchTarget] = []
+        var cloudIndex: [String: Int] = [:]
         for device in cloud where !device.isCurrent && !device.deviceId.isEmpty {
             guard seenCloud.insert(device.deviceId).inserted else { continue }
+            cloudIndex[device.deviceId] = targets.count
             targets.append(DispatchTarget(
                 kind: .cloud,
                 deviceId: device.deviceId,
@@ -310,17 +343,33 @@ extension DeviceRules {
                 pathStyle: device.effectivePathStyle
             ))
         }
-        for device in link where !device.fingerprint.isEmpty {
+        var standalone: [DispatchTarget] = []
+        for device in link where !device.fingerprint.isEmpty && !device.revoked {
             guard seenLink.insert(device.fingerprint).inserted else { continue }
-            targets.append(DispatchTarget(
+            let linkOnline: Bool? = localReady ? device.online : nil
+            if let cloudId = device.cloudDeviceId, !cloudId.isEmpty,
+               let index = cloudIndex[cloudId], targets[index].linkFingerprint == nil
+            {
+                targets[index].linkFingerprint = device.fingerprint
+                targets[index].linkOnline = linkOnline
+                targets[index].online = combineOnline(targets[index].online, linkOnline)
+                if targets[index].defaultSaveDir == nil {
+                    let dir = device.defaultSaveDir?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    targets[index].defaultSaveDir = dir.isEmpty ? nil : dir
+                }
+                if targets[index].pathStyle == nil { targets[index].pathStyle = device.effectivePathStyle }
+                continue
+            }
+            standalone.append(DispatchTarget(
                 kind: .link,
                 deviceId: device.fingerprint,
                 name: device.name.trimmingCharacters(in: .whitespacesAndNewlines),
-                online: localReady ? device.online : nil,
+                online: linkOnline,
                 defaultSaveDir: device.defaultSaveDir,
                 pathStyle: device.effectivePathStyle
             ))
         }
+        targets += standalone
         var counts: [String: Int] = [:]
         for target in targets { counts[target.name.lowercased(), default: 0] += 1 }
         for index in targets.indices {
@@ -332,6 +381,19 @@ extension DeviceRules {
             }
         }
         return targets
+    }
+
+    /// 侧栏「设备」区 / 设备筛选：只列云条目（含挂接）；独立直连条目是一次性投递，没有任务视图。
+    public static func sidebarTargets(_ targets: [DispatchTarget]) -> [DispatchTarget] {
+        targets.filter(\.isCloud)
+    }
+
+    /// 解析选择 / 持久化 id：`link:<fp>` 已挂接到某云条目时解析为该云条目；找不到返回 nil。
+    public static func resolveTarget(id: String, in targets: [DispatchTarget]) -> DispatchTarget? {
+        if let exact = targets.first(where: { $0.id == id }) { return exact }
+        guard id.hasPrefix("link:") else { return nil }
+        let fingerprint = String(id.dropFirst("link:".count))
+        return targets.first { $0.linkFingerprint == fingerprint }
     }
 
     /// 设备 id 的短码（末 4 位 ASCII 字母数字），用于同名设备消歧。

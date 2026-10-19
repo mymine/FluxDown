@@ -1,0 +1,79 @@
+#!/bin/bash
+# FluxDown Server 飞牛 fnOS 应用生命周期脚本（应用中心 start / stop / status 入口）。
+# 以专用应用用户运行（config/privilege run-as package）；数据与日志落在 TRIM_PKGVAR，
+# 默认保存目录为 config/resource 声明、安装时由系统创建并授权的 data-share 目录。
+# 退出码约定：0 成功 / 运行中，1 失败，3 未运行（status）。
+
+BIN_DIR="${TRIM_APPDEST}/bin"
+PID_FILE="${TRIM_PKGVAR}/fluxdown-server.pid"
+LOG_FILE="${TRIM_PKGVAR}/fluxdown-server.log"
+PORT="${TRIM_SERVICE_PORT:-17800}"
+
+fail() {
+	echo "$1" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+	exit 1
+}
+
+is_running() {
+	[ -f "$PID_FILE" ] || return 1
+	pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		return 0
+	fi
+	rm -f "$PID_FILE"
+	return 1
+}
+
+start_server() {
+	is_running && return 0
+	[ -x "$BIN_DIR/fluxdown-agent" ] || fail "FluxDown binary missing: $BIN_DIR/fluxdown-agent"
+	mkdir -p "$TRIM_PKGVAR" || fail "Cannot create data directory: $TRIM_PKGVAR"
+	# 多个 data-share 以 : 分隔；本包只声明一个（fluxdown），取第一个。
+	save_dir="${TRIM_DATA_SHARE_PATHS%%:*}"
+	# FLUXDOWN_INSTALL_SOURCE：二进制归应用中心管理，应用内更新只提示安装新 fpk。
+	FLUXDOWN_DATA_DIR="$TRIM_PKGVAR" \
+	FLUXDOWN_BIND="0.0.0.0:${PORT}" \
+	FLUXDOWN_INSTALL_SOURCE=fnos \
+	FLUXDOWN_SAVE_DIR="$save_dir" \
+		"$BIN_DIR/fluxdown-agent" --server >> "$LOG_FILE" 2>&1 &
+	echo "$!" > "$PID_FILE"
+	# 端口占用、数据目录不可写等启动期错误会让进程立即退出：把日志尾部交给应用中心展示。
+	sleep 2
+	if ! is_running; then
+		fail "FluxDown failed to start: $(tail -n 5 "$LOG_FILE" 2>/dev/null)"
+	fi
+}
+
+stop_server() {
+	is_running || return 0
+	pid=$(head -n 1 "$PID_FILE" | tr -d '[:space:]')
+	# SIGTERM → agent 优雅退出并关停 fluxdownd；最多等 10s，超时强杀。
+	kill -TERM "$pid" 2>/dev/null
+	i=0
+	while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 10 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+	rm -f "$PID_FILE"
+}
+
+case "$1" in
+	start)
+		start_server
+		exit 0
+		;;
+	stop)
+		stop_server
+		exit 0
+		;;
+	status)
+		if is_running; then
+			exit 0
+		fi
+		exit 3
+		;;
+	*)
+		fail "Unknown command: $1"
+		;;
+esac

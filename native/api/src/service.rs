@@ -25,6 +25,30 @@ use fluxdown_protocol::daemon::{
 /// 两种 404 可被客户端区分，避免跨 crate 硬编码字符串漂移。
 pub const UNKNOWN_ENDPOINT_MESSAGE: &str = "unknown endpoint";
 
+/// 数据面链路鉴权失败的**诊断**原因（401 响应 JSON 的 `reason`）。响应本身未经认证，只用于排错，
+/// 调用方**不得**据此持久化任何状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkAuthReason {
+    /// 请求方未配对（本机名册里没有它，或它已被解除）。
+    NotPaired,
+    /// 请求时间戳与本机时钟相差超出容忍窗口。
+    ClockSkew,
+    /// 其它鉴权失败（方案头 / MAC / 重放 / 解密）。
+    Unauthorized,
+}
+
+impl LinkAuthReason {
+    /// 401 响应 JSON 里的 `reason` 取值。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotPaired => "notPaired",
+            Self::ClockSkew => "clockSkew",
+            Self::Unauthorized => "unauthorized",
+        }
+    }
+}
+
 /// API 操作错误。由 HTTP 层映射为响应状态码。
 ///
 /// # Examples
@@ -54,6 +78,9 @@ pub enum ApiError {
     /// 鉴权失败（链路 HMAC 不符 / 设备未配对 / 时间戳过期）→ 401。
     #[error("unauthorized")]
     Unauthorized,
+    /// 数据面链路鉴权失败 → 401，响应 JSON 额外带诊断 `reason` 与本机时间 `serverTime`。
+    #[error("unauthorized")]
+    LinkAuth(LinkAuthReason),
     /// 其它内部错误 → 500。
     #[error("{0}")]
     Internal(String),
@@ -438,17 +465,26 @@ pub trait ApiHost: Send + Sync {
         Err(link_unsupported())
     }
 
-    /// 已配对设备下发下载任务：先校验 `auth`（链路 HMAC，含 body 摘要），再反序列化
-    /// `body`（原始请求体字节，须与签名覆盖的字节一致）为任务并创建，返回任务 ID。
-    async fn link_create_task(&self, auth: LinkAuth, body: Vec<u8>) -> Result<String, ApiError> {
+    /// 已配对设备下发下载任务：先校验 `auth`（链路 MAC，含 body 摘要与收发双方指纹），再用
+    /// 链路密钥解密 `body`（原始请求体字节，须与签名覆盖的字节一致）为任务并创建。返回
+    /// **已封装**的响应体（`{"taskId":…}` 的 AEAD 密文，HTTP 层原样回给对端并带
+    /// `X-FluxLink-Enc: v2`）。
+    async fn link_create_task(&self, auth: LinkAuth, body: Vec<u8>) -> Result<Vec<u8>, ApiError> {
         let _ = (auth, body);
         Err(link_unsupported())
     }
 
-    /// 已配对设备经已认证链路交换设备信息：校验 `auth`（同 [`ApiHost::link_create_task`]），
-    /// 记下请求方自报信息，返回用链路密钥加密的本机信息（响应体原样二进制回给对端）。
-    /// 默认不支持（旧版宿主没有该端点，对端按「未知」处理）。
+    /// 已配对设备经已认证链路双向交换设备信息：校验 `auth`（同 [`ApiHost::link_create_task`]），
+    /// 并入请求方自报信息，返回已封装的本机信息（响应体原样二进制回给对端）。
+    /// 默认不支持。
     async fn link_peer_info(&self, auth: LinkAuth, body: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        let _ = (auth, body);
+        Err(link_unsupported())
+    }
+
+    /// 已配对设备通知本机「我已解除与你的配对」：校验 `auth`（同 [`ApiHost::link_create_task`]），
+    /// 把请求方记录标记为已撤销，返回已封装的确认响应。默认不支持。
+    async fn link_unpair(&self, auth: LinkAuth, body: Vec<u8>) -> Result<Vec<u8>, ApiError> {
         let _ = (auth, body);
         Err(link_unsupported())
     }

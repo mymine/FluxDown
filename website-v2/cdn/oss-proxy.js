@@ -1,5 +1,5 @@
 /**
- * dl-fluxdown.zerx.dev：Cloudflare 边缘缓存 + 私有阿里云 OSS 回源。
+ * dl.fluxdown.com（旧域名 dl-fluxdown.zerx.dev 同指本 Worker）：Cloudflare 边缘缓存 + 私有阿里云 OSS 回源。
  *
  * 官网 source=auto 与旧客户端 / 应用内更新 302 到这里。
  * 命中边缘缓存不计 OSS 外网流出；auto 链在 OSS 失败时回退精确 GitHub release asset。

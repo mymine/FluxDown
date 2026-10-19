@@ -31,8 +31,10 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 uuid = { version = "1.23.4", features = ["v4"] }
 
 [features]
-# fluxdownd 只作为桌面/headless 下载核心分发：插件与受管组件默认开启；
-# 移动端不打包 daemon，需要裁剪时用 --no-default-features。
-default = ["plugins", "components"]
+# fluxdownd 只作为桌面/headless 下载核心分发：插件、受管组件与 P2P（BT / eD2K）默认开启；
+# 移动端不打包 daemon，需要裁剪时用 --no-default-features（iOS 商店构建关闭 bt / ed2k）。
+default = ["plugins", "components", "bt", "ed2k"]
 plugins = ["fluxdown_engine/plugins", "fluxdown_engine_protocol/plugins"]
 components = ["fluxdown_engine/components", "fluxdown_engine_protocol/components"]
+bt = ["fluxdown_engine/bt", "fluxdown_engine_protocol/bt"]
+ed2k = ["fluxdown_engine/ed2k", "fluxdown_engine_protocol/ed2k"]

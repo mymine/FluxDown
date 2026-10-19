@@ -105,4 +105,41 @@ class UpdateViewTest {
         assertEquals("中文", UpdateView.localizedReleaseBody("<!-- fluxdown:lang:zh -->\n中文", "en"))
         assertEquals("English", UpdateView.localizedReleaseBody("<!-- fluxdown:lang:en -->\nEnglish", "zh"))
     }
+
+    // 与 GPUI `sections/about.rs` 的测试为同一组用例。
+    @Test fun releaseNotesDropTheHeadingThatRepeatsTheVersion() {
+        assertEquals(
+            "### 🚀 新功能\n- 批量导入",
+            UpdateView.stripVersionHeading("## 0.5.7 - 2026-10-15\n\n### 🚀 新功能\n- 批量导入", "0.5.7"),
+        )
+        for (heading in listOf("## [0.5.6] - 2026-10-12", "## v0.5.6 - 2026-10-12", "# 0.5.6")) {
+            val body = "$heading\r\n\r\n- fix\r\n"
+            assertEquals(heading, "- fix\r\n", UpdateView.stripVersionHeading(body, "0.5.6"))
+            assertEquals(heading, "- fix\r\n", UpdateView.stripVersionHeading(body, "v0.5.6"))
+        }
+        assertEquals("", UpdateView.stripVersionHeading("\n  ## 0.5.7\n", "0.5.7"))
+    }
+
+    @Test fun releaseNotesKeepHeadingsOfOtherVersionsAndSections() {
+        for ((body, version) in listOf(
+            "## 0.5.10 - 2026-11-01\n- a" to "0.5.1",
+            "## 0.5.7-rc.1 - 2026-10-14\n- a" to "0.5.7",
+            "## 问题修复\n- a" to "0.5.7",
+            "##0.5.7\n- a" to "0.5.7",
+            "####### 0.5.7\n- a" to "0.5.7",
+            "- 0.5.7 修复\n## 0.5.7" to "0.5.7",
+            "## 0.5.7\n- a" to "",
+        )) {
+            assertEquals("$body / $version", body, UpdateView.stripVersionHeading(body, version))
+        }
+    }
+
+    @Test fun releaseDatesTakeTheCalendarDayOfIsoTimestamps() {
+        assertEquals("2026-10-15", UpdateView.releaseDate("2026-10-15T06:14:16Z"))
+        assertEquals("2026-10-15", UpdateView.releaseDate(" 2026-10-15 "))
+        assertEquals("2026-10-15", UpdateView.releaseDate("2026-10-15 06:14:16"))
+        for (invalid in listOf("", "2026-10", "2026/10/15T00:00:00Z", "2026-10-150", "十月十五日之后")) {
+            assertNull(invalid, UpdateView.releaseDate(invalid))
+        }
+    }
 }

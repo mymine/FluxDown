@@ -3,14 +3,15 @@ import Layout from "@/layouts/Layout.astro";
 import PageHeader from "@/components/site/PageHeader.astro";
 import PluginMarket from "@/components/markets/PluginMarket";
 import HowTo from "@/components/markets/HowTo.astro";
-import { PLUGIN_PUBLISH_GUIDE_URL } from "@/components/markets/plugin-data";
 import { markets } from "@/i18n/messages/markets";
 import { common } from "@/i18n/messages/common";
 import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
-import { ArrowUpRight, Download } from "lucide-react";
+import { PLUGIN_INDEX_REPO, PLUGIN_SDK_NPM_URL, PLUGIN_SDK_PACKAGE, contributeGuidePath, githubUrl } from "@/lib/ecosystem";
+import { ArrowRight, Download } from "lucide-react";
 export const getStaticPaths = langStaticPaths;
 const lang = resolveLang(Astro.params.lang);
 const t = markets[lang].plugins;
+const guide = href(contributeGuidePath(lang, "contributing/plugins"), lang);
 ---
 
 <Layout lang={lang} title={t.metaTitle} description={t.metaDescription}>
@@ -19,9 +20,9 @@ const t = markets[lang].plugins;
       <Download size={15} aria-hidden="true" />
       {common[lang].nav.download}
     </a>
-    <a class="btn btn-secondary" href={PLUGIN_PUBLISH_GUIDE_URL} target="_blank" rel="noopener noreferrer">
+    <a class="btn btn-secondary" href={guide}>
       {t.submitCta}
-      <ArrowUpRight size={15} aria-hidden="true" />
+      <ArrowRight size={15} aria-hidden="true" />
     </a>
   </PageHeader>
 
@@ -33,6 +34,10 @@ const t = markets[lang].plugins;
     eyebrow={t.howTo.eyebrow}
     title={t.howTo.title}
     steps={[t.howTo.step1, t.howTo.step2, t.howTo.step3]}
-    guide={{ href: PLUGIN_PUBLISH_GUIDE_URL, label: t.howTo.guideLink }}
+    links={[
+      { href: guide, label: t.howTo.guideLink },
+      { href: githubUrl(PLUGIN_INDEX_REPO), label: PLUGIN_INDEX_REPO, external: true, brand: "github" },
+      { href: PLUGIN_SDK_NPM_URL, label: PLUGIN_SDK_PACKAGE, external: true, brand: "npm" },
+    ]}
   />
 </Layout>

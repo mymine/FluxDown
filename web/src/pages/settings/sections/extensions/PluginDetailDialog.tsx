@@ -2,7 +2,7 @@
 
 import type { ReactNode } from 'react'
 import { useT } from '../../../../i18n'
-import { Badge, ConfirmFooter, Dialog } from '../../../../ui'
+import { Badge, Button, ConfirmFooter, Dialog } from '../../../../ui'
 import { ExtLink } from './common'
 import type { PluginDetail } from './detail'
 import { permissionKeys, safeHttpUrl, yankedLabelKey } from './logic'
@@ -20,7 +20,16 @@ function SectionTitle({ children }: { children: ReactNode }) {
   return <div className="pt-2 text-caption font-medium text-text-tertiary">{children}</div>
 }
 
-export function PluginDetailDialog({ detail, onClose }: { detail: PluginDetail | null; onClose: () => void }) {
+export function PluginDetailDialog({
+  detail,
+  onClose,
+  onAudit,
+}: {
+  detail: PluginDetail | null
+  onClose: () => void
+  /** 已安装插件才提供：打开该插件的审计记录。 */
+  onAudit?: (identity: string) => void
+}) {
   const t = useT()
   const shown = detail
   const yankedKey = shown ? yankedLabelKey(shown.yanked) : null
@@ -29,7 +38,21 @@ export function PluginDetailDialog({ detail, onClose }: { detail: PluginDetail |
       open={detail !== null}
       onOpenChange={(open) => !open && onClose()}
       title={shown?.name ?? ''}
-      footer={<ConfirmFooter cancelLabel={null} okLabel={t('close')} onCancel={onClose} onOk={onClose} />}
+      footer={
+        <ConfirmFooter
+          cancelLabel={null}
+          okLabel={t('close')}
+          onCancel={onClose}
+          onOk={onClose}
+          extra={
+            shown && onAudit ? (
+              <Button variant="outline" onClick={() => onAudit(shown.identity)}>
+                {t('pluginAuditOpenForPlugin')}
+              </Button>
+            ) : undefined
+          }
+        />
+      }
     >
       {shown ? (
         <div className="flex w-full flex-col gap-2 pb-2">

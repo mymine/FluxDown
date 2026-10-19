@@ -17,7 +17,7 @@ const MAX_ENTRIES: usize = 200;
 
 /// 从 zip 字节安装到 `<root>/<identity>/`，返回 identity。
 pub fn install_from_zip(root: &Path, bytes: &[u8]) -> Result<String, PluginError> {
-    let outcome = install_from_zip_with_backup(root, bytes)?;
+    let outcome = install_from_zip_with_backup(root, bytes, |_| Ok(()))?;
     if let Err(error) = commit_install(&outcome) {
         if let Err(rollback_error) = rollback_install(&outcome) {
             crate::logger::report_error("plugin", "rollback_install", &rollback_error);
@@ -28,9 +28,13 @@ pub fn install_from_zip(root: &Path, bytes: &[u8]) -> Result<String, PluginError
 }
 
 /// 安装插件但保留旧版本，供 manager 在源码校验后提交或回滚。
+///
+/// `check_manifest` 在 manifest 解析+校验通过后、替换任何已安装目录之前运行；
+/// 返回 `Err` 则中止安装（旧版本不动，暂存目录照常清理）。
 pub(crate) fn install_from_zip_with_backup(
     root: &Path,
     bytes: &[u8],
+    check_manifest: impl FnOnce(&PluginManifest) -> Result<(), PluginError>,
 ) -> Result<InstallOutcome, PluginError> {
     let tmp = root.join(format!(".tmp_install_{}", uuid::Uuid::new_v4()));
     let result = (|| {
@@ -40,6 +44,7 @@ pub(crate) fn install_from_zip_with_backup(
         // 剥壳：若根无 manifest.json 但唯一子目录含，则以该子目录为根。
         let src_root = resolve_pkg_root(&tmp)?;
         let manifest = read_manifest(&src_root)?;
+        check_manifest(&manifest)?;
         let identity = manifest.identity.clone();
         install_staged_dir(root, &src_root, identity)
     })();

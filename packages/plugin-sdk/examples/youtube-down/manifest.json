@@ -1,0 +1,119 @@
+{
+  "identity": "fluxdown@youtube-down",
+  "name": "YouTube 下载 YouTube Down",
+  "version": "1.0.0",
+  "description": "经 FluxDown yt-dlp 组件把 YouTube 视频 / Shorts / 直播回放 / 播放列表解析为直链，交回引擎多段下载、音视频自动合并；下载时按清晰度弹框选择。附带浏览器扩展嗅探规则：在 YouTube 播放器上直接出现下载浮钮。",
+  "homepage": "https://fluxdown.com/docs/plugins/sdk",
+  "resolvers": [
+    {
+      "match": {
+        "urls": [
+          "*://www.youtube.com/watch*",
+          "*://youtube.com/watch*",
+          "*://m.youtube.com/watch*",
+          "*://music.youtube.com/watch*",
+          "*://www.youtube.com/shorts/*",
+          "*://youtube.com/shorts/*",
+          "*://m.youtube.com/shorts/*",
+          "*://www.youtube.com/live/*",
+          "*://youtube.com/live/*",
+          "*://m.youtube.com/live/*",
+          "*://www.youtube.com/embed/*",
+          "*://www.youtube-nocookie.com/embed/*",
+          "*://youtu.be/*",
+          "*://www.youtube.com/playlist*",
+          "*://youtube.com/playlist*",
+          "*://m.youtube.com/playlist*",
+          "*://music.youtube.com/playlist*"
+        ]
+      },
+      "entry": "resolve.js",
+      "timeoutMs": 30000,
+      "multi": true
+    }
+  ],
+  "contributes": {
+    "sniffRules": "rules.json"
+  },
+  "settings": [
+    {
+      "key": "quality",
+      "title": "清晰度",
+      "description": "「每次询问」在下载时弹框列出可用清晰度（60 秒未选按最高画质）；其余选项直接下载不超过该高度的最佳档。播放列表条目从不弹框，「每次询问」按最高画质处理。",
+      "type": "string",
+      "widget": "select",
+      "options": [
+        { "value": "ask", "label": "每次询问" },
+        { "value": "best", "label": "最高画质" },
+        { "value": "2160", "label": "≤ 2160p（4K）" },
+        { "value": "1440", "label": "≤ 1440p" },
+        { "value": "1080", "label": "≤ 1080p" },
+        { "value": "720", "label": "≤ 720p" },
+        { "value": "480", "label": "≤ 480p" },
+        { "value": "360", "label": "≤ 360p" },
+        { "value": "audio", "label": "仅音频" }
+      ],
+      "default": "ask"
+    },
+    {
+      "key": "codec",
+      "title": "编码偏好",
+      "description": "兼容优先：同一清晰度先选 H.264 视频 + AAC 音频（MP4），老设备与剪辑软件都能直接用；1440p 以上通常只有 VP9 / AV1。画质优先：同一清晰度选码率最高的 AV1 / VP9。",
+      "type": "string",
+      "widget": "select",
+      "options": [
+        { "value": "compat", "label": "兼容优先（H.264 / MP4）" },
+        { "value": "quality", "label": "画质优先（AV1 / VP9）" }
+      ],
+      "default": "compat"
+    },
+    {
+      "key": "useTaskCookies",
+      "title": "使用浏览器传来的 Cookie",
+      "description": "从浏览器扩展发起的下载会携带 youtube.com 的登录 Cookie，可通过「确认你不是机器人」校验并下载会员 / 年龄限制视频。关闭后只使用下方的备用 Cookie。",
+      "type": "boolean",
+      "default": "true"
+    },
+    {
+      "key": "cookies",
+      "title": "备用 Cookie",
+      "description": "任务没有携带 Cookie（如在 App 里粘贴链接）时使用。支持浏览器 Cookie 头（k=v; k2=v2）或 Netscape cookies.txt 全文。登录会话 Cookie 多为 HttpOnly，请从开发者工具网络面板复制请求头，或用 cookies.txt 导出扩展。",
+      "type": "string",
+      "widget": "textarea",
+      "default": ""
+    },
+    {
+      "key": "jsRuntime",
+      "title": "JS 运行时",
+      "description": "yt-dlp 需要 JavaScript 运行时求解 YouTube 的签名挑战，运行时须在终端里能直接运行（App 按登录 shell / 系统环境变量的 PATH 查找）。自动：按 Deno → Node.js → QuickJS → Bun 的顺序取第一个可用的。",
+      "type": "string",
+      "widget": "select",
+      "options": [
+        { "value": "auto", "label": "自动" },
+        { "value": "deno", "label": "Deno" },
+        { "value": "node", "label": "Node.js" },
+        { "value": "quickjs", "label": "QuickJS" },
+        { "value": "bun", "label": "Bun" }
+      ],
+      "default": "auto"
+    },
+    {
+      "key": "playlistLimit",
+      "title": "播放列表最多条目",
+      "description": "解析播放列表时最多列出的视频数。",
+      "type": "number",
+      "min": 1,
+      "max": 1000,
+      "default": "200"
+    },
+    {
+      "key": "playerClients",
+      "title": "播放器客户端（高级）",
+      "description": "传给 yt-dlp 的 youtube:player_client，逗号分隔（如 default,tv,web_safari）。留空使用 yt-dlp 默认值。",
+      "type": "string",
+      "pattern": "^[a-z_,]*$",
+      "default": ""
+    }
+  ],
+  "permissions": ["ytdlp", "browserRules"]
+}

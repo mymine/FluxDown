@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use fluxdown_agent::egress::Egress;
 use fluxdown_agent::update::{
     DelegatedParts, InstallTarget, UpdateDelegate, UpdateError, UpdateService,
 };
@@ -149,7 +150,7 @@ pub struct AppUpdater {
 }
 
 impl AppUpdater {
-    pub(crate) fn new(runtime: Handle, config: AppUpdateConfig) -> Self {
+    pub(crate) fn new(runtime: Handle, config: AppUpdateConfig, egress: Egress) -> Self {
         let (status_tx, mut status_rx) = watch::channel(UpdateStatusDto::default());
         let (install_tx, install_rx) = mpsc::channel(INSTALL_QUEUE);
         let delegate = Arc::new(Channels {
@@ -165,6 +166,7 @@ impl AppUpdater {
             ),
             delegate: delegate.clone(),
             user_agent_product: "fluxdown-android",
+            egress,
         }));
         // 首个 `next_signal` 立即给出当前状态。
         delegate
@@ -419,7 +421,7 @@ mod tests {
         let dir = temp_dir();
         let mut cfg = config(&dir, "1.0.0");
         cfg.manual_reason = Some(UpdateManualReasonDto::ManagedPackage);
-        let updater = AppUpdater::new(Handle::current(), cfg);
+        let updater = AppUpdater::new(Handle::current(), cfg, Egress::system_default());
         let Some(AppUpdateSignalDto::Status { status }) = updater.next_signal().await else {
             panic!("status signal expected");
         };
@@ -435,10 +437,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn dev_version_is_unofficial_and_reconcile_without_record_is_none() {
         let dir = temp_dir();
-        let updater = AppUpdater::new(Handle::current(), config(&dir, "0.1.0-dev+local"));
+        let updater = AppUpdater::new(
+            Handle::current(),
+            config(&dir, "0.1.0-dev+local"),
+            Egress::system_default(),
+        );
         // SemVer 可解析的开发版仍按版本比较；完全不可解析的版本才判为非官方构建。
         assert_eq!(updater.status().manual_reason, None);
-        let dev = AppUpdater::new(Handle::current(), config(&dir, "dev"));
+        let dev = AppUpdater::new(
+            Handle::current(),
+            config(&dir, "dev"),
+            Egress::system_default(),
+        );
         assert_eq!(
             dev.status().manual_reason,
             Some(UpdateManualReasonDto::UnofficialBuild)
@@ -450,7 +460,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn install_failure_outside_installing_is_ignored() {
         let dir = temp_dir();
-        let updater = AppUpdater::new(Handle::current(), config(&dir, "1.0.0"));
+        let updater = AppUpdater::new(
+            Handle::current(),
+            config(&dir, "1.0.0"),
+            Egress::system_default(),
+        );
         let status = updater
             .report_install_failure(UpdateFailureDto::Install, "late".to_owned())
             .await

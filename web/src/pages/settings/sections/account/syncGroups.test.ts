@@ -39,7 +39,7 @@ describe('同步分组', () => {
     const base = { enabled: true, lastError: null, dirtyKeys: [] as string[] }
     expect(syncPhase({ ...base, enabled: false, halted: true })).toBe('off')
     expect(syncPhase({ ...base, halted: true, lastError: 'x' })).toBe('halted')
-    expect(syncPhase({ ...base, lastErrorReason: 'syncDeviceLimit' })).toBe('error')
+    expect(syncPhase({ ...base, lastErrorReason: 'onlineDeviceLimit' })).toBe('error')
     expect(syncPhase({ ...base, connected: false })).toBe('connecting')
     expect(syncPhase({ ...base, connected: true, dirtyKeys: ['a'] })).toBe('syncing')
     expect(syncPhase({ ...base, connected: true })).toBe('synced')

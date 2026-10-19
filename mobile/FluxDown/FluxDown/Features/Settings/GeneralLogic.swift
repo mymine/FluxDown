@@ -104,8 +104,18 @@ nonisolated enum GeneralRow: String, CaseIterable, Identifiable {
     static var entriesRows: [GeneralRow] {
         FeatureFlags.webhooks ? [.activityRss, .activityWebhooks, .activityTheme] : [.activityRss, .activityTheme]
     }
+
+    /// 本构建是否提供该行（store 构建没有 magnet / ed2k / .torrent 打开方式声明，不展示「链接与文件」）。
+    var isAvailable: Bool {
+        #if FULL_P2P
+        return true
+        #else
+        return self != .linkHandling
+        #endif
+    }
 }
 
+#if FULL_P2P
 // MARK: - 链接与文件打开方式
 
 /// iOS 的打开方式是 Info.plist 的静态声明（无法检测是否被其它 App 抢占）；这里只如实读取本 App 的声明。
@@ -173,6 +183,7 @@ enum GeneralLinkHandling {
         }
     }
 }
+#endif
 
 // MARK: - 分类图标
 

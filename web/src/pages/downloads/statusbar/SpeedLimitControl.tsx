@@ -7,6 +7,8 @@ import { useConfigValue } from '../../../lib/rpc'
 import { Button, Icon, Input, Popover, Tooltip } from '../../../ui'
 import { setDaemonNumber } from '../../settings/kit/writeStore'
 import { formatBytes } from '../model/task'
+import { popoverSide, RAIL_BUTTON, resolveSide, useDaemonReady } from './widget'
+import type { WidgetProps } from './widget'
 
 /** 限速预设（MB/s），同 GPUI `SPEED_PRESETS_MB`。 */
 const SPEED_PRESETS_MB = [1, 5, 10, 50]
@@ -21,14 +23,15 @@ export function SpeedLimitControl({
   icon,
   titleKey,
   configKey,
-  disabled,
+  orientation = 'horizontal',
+  side,
 }: {
   icon: LucideIcon
   titleKey: 'speedLimitTitle' | 'uploadLimit'
   configKey: 'speed_limit_bytes' | 'upload_limit_bytes'
-  disabled: boolean
-}) {
+} & WidgetProps) {
   const t = useT()
+  const disabled = !useDaemonReady()
   const raw = useConfigValue(configKey)
   const parsed = Number.parseInt(raw ?? '', 10)
   const value = Number.isFinite(parsed) ? parsed : 0
@@ -62,24 +65,28 @@ export function SpeedLimitControl({
     setDaemonNumber(configKey, kbToBytes(kb))
   }
 
+  const rail = orientation === 'rail'
   return (
     <Popover
       title={title}
+      side={popoverSide(orientation)}
       align="end"
       trigger={
-        <Tooltip content={title} side="top">
+        <Tooltip content={rail ? `${title}: ${label}` : title} side={resolveSide(orientation, side)}>
           <button
             type="button"
             disabled={disabled}
             aria-label={`${title} ${label}`}
             className={cn(
-              'inline-flex h-status-control shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded-sm px-1.5 text-caption tabular-nums hover:bg-nav-hover disabled:opacity-50 coarse:min-h-touch coarse:min-w-touch',
+              rail
+                ? RAIL_BUTTON
+                : 'inline-flex h-status-control shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded-sm px-1.5 text-caption tabular-nums hover:bg-nav-hover disabled:opacity-50 coarse:min-h-touch coarse:min-w-touch',
               value > 0 ? 'text-accent-text' : 'text-muted-foreground',
             )}
           >
-            <Icon icon={icon} />
-            {/* 窄屏且未限速时只留图标，避免状态栏横向溢出。 */}
-            <span className={cn(value <= 0 && 'narrow:hidden')}>{label}</span>
+            <Icon icon={icon} size={rail ? 'xl' : 'lg'} />
+            {/* 窄屏且未限速时只留图标，避免状态栏横向溢出；活动栏恒为纯图标（数值在气泡里）。 */}
+            {rail ? null : <span className={cn(value <= 0 && 'narrow:hidden')}>{label}</span>}
           </button>
         </Tooltip>
       }

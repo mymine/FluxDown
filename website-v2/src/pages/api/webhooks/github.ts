@@ -29,7 +29,7 @@ import { bustApiCaches } from "../../../lib/api-cache";
 export const prerender = false;
 
 const WEBHOOK_SECRET = GITHUB_WEBHOOK_SECRET ?? "";
-const SITE_URL = "https://fluxdown.zerx.dev";
+const SITE_URL = "https://fluxdown.com";
 
 // ── 签名验证 ──
 

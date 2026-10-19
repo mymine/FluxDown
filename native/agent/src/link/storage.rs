@@ -2,8 +2,9 @@
 //!
 //! 名册沿用 daemon 迁移时写入 `AgentState::linked_devices` 的 JSON 形状（`fingerprint` /
 //! `identityPubB64` / `name` / `platform` / `linkSecretB64` / `candidatesJson` / `pairedAt` /
-//! `lastSeenAt`），并向后兼容地追加两个可选字段 `defaultSaveDir` / `pathStyle`（对端经已认证
-//! 链路自报，旧记录没有）。链路密钥只存在这里与内存里，永远不进快照 / 事件。
+//! `lastSeenAt`），并向后兼容地追加可选字段 `defaultSaveDir` / `pathStyle` / `appVersion` /
+//! `cloudDeviceId`（对端经已认证链路自报）、`customName`（本机备注名）与 `revoked`（对端已解除
+//! 配对）。旧记录没有这些字段，读回时取默认值。链路密钥只存在这里与内存里，永远不进快照 / 事件。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
-use fluxdown_link::{LinkError, LinkResult, LinkStorage, PeerCandidate, PeerInfo, PeerRecord};
+use fluxdown_link::{LinkError, LinkResult, LinkStorage, PeerCandidate, PeerRecord, RecordUpdate};
 use fluxdown_protocol::{LinkDeviceInfo, PathStyle};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -70,6 +71,7 @@ fn path_style_from_text(text: &str) -> Option<PathStyle> {
 /// `None`（不让一条坏数据毒死整份名册）。
 pub(super) fn record_from_value(value: &Value) -> Option<PeerRecord> {
     let text = |key: &str| value.get(key).and_then(Value::as_str);
+    let non_empty = |key: &str| text(key).filter(|text| !text.is_empty()).map(str::to_owned);
     let bytes = |key: &str| text(key).and_then(|s| B64.decode(s).ok());
     let fingerprint = text("fingerprint")?.to_owned();
     let identity_pub = bytes("identityPubB64")?;
@@ -81,21 +83,22 @@ pub(super) fn record_from_value(value: &Value) -> Option<PeerRecord> {
         fingerprint,
         identity_pub,
         name: text("name").unwrap_or_default().to_owned(),
-        platform: text("platform")
-            .filter(|platform| !platform.is_empty())
-            .map(str::to_owned),
+        platform: non_empty("platform"),
         link_secret,
         candidates,
         paired_at: value.get("pairedAt").and_then(Value::as_i64).unwrap_or(0),
         last_seen_at: value.get("lastSeenAt").and_then(Value::as_i64).unwrap_or(0),
-        info: PeerInfo {
-            default_save_dir: text("defaultSaveDir")
-                .filter(|dir| !dir.is_empty())
-                .map(str::to_owned),
-            path_style: text("pathStyle")
-                .filter(|style| path_style_from_text(style).is_some())
-                .map(str::to_owned),
-        },
+        app_version: non_empty("appVersion"),
+        cloud_device_id: non_empty("cloudDeviceId"),
+        default_save_dir: non_empty("defaultSaveDir"),
+        path_style: text("pathStyle")
+            .filter(|style| path_style_from_text(style).is_some())
+            .map(str::to_owned),
+        custom_name: non_empty("customName"),
+        revoked: value
+            .get("revoked")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -110,11 +113,20 @@ pub(super) fn value_from_record(record: &PeerRecord) -> Value {
         "pairedAt": record.paired_at,
         "lastSeenAt": record.last_seen_at,
     });
-    if let Some(dir) = &record.info.default_save_dir {
-        value["defaultSaveDir"] = Value::String(dir.clone());
+    let optional = [
+        ("defaultSaveDir", &record.default_save_dir),
+        ("pathStyle", &record.path_style),
+        ("appVersion", &record.app_version),
+        ("cloudDeviceId", &record.cloud_device_id),
+        ("customName", &record.custom_name),
+    ];
+    for (key, field) in optional {
+        if let Some(text) = field {
+            value[key] = Value::String(text.clone());
+        }
     }
-    if let Some(style) = &record.info.path_style {
-        value["pathStyle"] = Value::String(style.clone());
+    if record.revoked {
+        value["revoked"] = Value::Bool(true);
     }
     value
 }
@@ -141,17 +153,18 @@ fn position(state: &AgentState, fingerprint: &str) -> Option<usize> {
 pub fn device_info(record: &PeerRecord, online: bool) -> LinkDeviceInfo {
     LinkDeviceInfo {
         fingerprint: record.fingerprint.clone(),
-        name: record.name.clone(),
+        name: record.effective_name().to_owned(),
         platform: record.platform.clone(),
-        online,
+        // 被对端解除配对的设备不可达也不可下发：不论探测结果都不算在线。
+        online: online && !record.revoked,
         paired_at: record.paired_at,
         last_seen_at: record.last_seen_at,
-        default_save_dir: record.info.default_save_dir.clone(),
-        path_style: record
-            .info
-            .path_style
-            .as_deref()
-            .and_then(path_style_from_text),
+        default_save_dir: record.default_save_dir.clone(),
+        path_style: record.path_style.as_deref().and_then(path_style_from_text),
+        custom_name: record.custom_name.clone().filter(|name| !name.is_empty()),
+        app_version: record.app_version.clone(),
+        cloud_device_id: record.cloud_device_id.clone(),
+        revoked: record.revoked,
     }
 }
 
@@ -192,7 +205,16 @@ pub(super) fn local_path_style_text() -> &'static str {
 impl LinkStorage for AgentLinkStorage {
     async fn load_identity_seed(&self) -> LinkResult<Option<[u8; 32]>> {
         let state = self.state.lock().await;
-        Ok(state.link_identity.as_ref().and_then(seed_from_identity))
+        match state.link_identity.as_ref() {
+            None | Some(Value::Null) => Ok(None),
+            // 种子存在但读不出来：报错而不是当作「没有」——否则互联层会生成新身份覆盖它，
+            // 指纹一变，所有已配对设备立即失效。
+            Some(value) => seed_from_identity(value).map(Some).ok_or_else(|| {
+                LinkError::Store(
+                    "the stored link identity seed is present but unreadable".to_owned(),
+                )
+            }),
+        }
     }
 
     async fn save_identity_seed(&self, seed: &[u8; 32]) -> LinkResult<()> {
@@ -205,13 +227,17 @@ impl LinkStorage for AgentLinkStorage {
         let mut state = self.state.lock().await;
         let mut fresh = record.clone();
         let existing = position(&state, &record.fingerprint);
-        // 重新配对不带对端信息：沿用旧记录里已交换到的信息，直到下一次交换刷新。
-        if fresh.info == PeerInfo::default()
-            && let Some(old) = existing
-                .and_then(|index| state.linked_devices.get(index))
-                .and_then(record_from_value)
+        // 重新配对不带对端自报信息 / 备注名：沿用旧记录里已有的，直到下一次交换刷新；
+        // `revoked` 不沿用——重新配对就是重新建立信任。
+        if let Some(old) = existing
+            .and_then(|index| state.linked_devices.get(index))
+            .and_then(record_from_value)
         {
-            fresh.info = old.info;
+            fresh.default_save_dir = fresh.default_save_dir.or(old.default_save_dir);
+            fresh.path_style = fresh.path_style.or(old.path_style);
+            fresh.app_version = fresh.app_version.or(old.app_version);
+            fresh.cloud_device_id = fresh.cloud_device_id.or(old.cloud_device_id);
+            fresh.custom_name = fresh.custom_name.or(old.custom_name);
         }
         let value = value_from_record(&fresh);
         match existing {
@@ -266,38 +292,25 @@ impl LinkStorage for AgentLinkStorage {
         Ok(true)
     }
 
-    async fn set_peer_info(&self, fingerprint: &str, info: &PeerInfo) -> LinkResult<bool> {
+    async fn update_record(
+        &self,
+        fingerprint: &str,
+        update: RecordUpdate<'_>,
+    ) -> LinkResult<Option<bool>> {
         let mut state = self.state.lock().await;
         let Some(index) = position(&state, fingerprint) else {
-            return Ok(false);
+            return Ok(None);
         };
-        let current = state
-            .linked_devices
-            .get(index)
-            .and_then(record_from_value)
-            .map(|record| record.info);
-        if current.as_ref() == Some(info) {
-            return Ok(true);
+        let Some(mut record) = state.linked_devices.get(index).and_then(record_from_value) else {
+            return Ok(None);
+        };
+        // 读-改-写在同一把状态锁内完成；没有改动就不写盘（空闲时的信息交换零写入）。
+        if !update(&mut record) {
+            return Ok(Some(false));
         }
-        let entry = &mut state.linked_devices[index];
-        match &info.default_save_dir {
-            Some(dir) => entry["defaultSaveDir"] = Value::String(dir.clone()),
-            None => {
-                if let Some(map) = entry.as_object_mut() {
-                    map.remove("defaultSaveDir");
-                }
-            }
-        }
-        match &info.path_style {
-            Some(style) => entry["pathStyle"] = Value::String(style.clone()),
-            None => {
-                if let Some(map) = entry.as_object_mut() {
-                    map.remove("pathStyle");
-                }
-            }
-        }
+        state.linked_devices[index] = value_from_record(&record);
         self.persist(&state).await?;
-        Ok(true)
+        Ok(Some(true))
     }
 }
 
@@ -321,13 +334,25 @@ mod tests {
             }],
             paired_at: 100,
             last_seen_at: 200,
-            info: PeerInfo::default(),
+            ..PeerRecord::default()
         }
+    }
+
+    async fn storage(
+        label: &str,
+    ) -> (AgentLinkStorage, Arc<Mutex<AgentState>>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown-link-storage-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let store = Arc::new(StateStore::open(dir.clone()).await.unwrap());
+        let state = Arc::new(Mutex::new(AgentState::default()));
+        (AgentLinkStorage::new(state.clone(), store), state, dir)
     }
 
     #[test]
     fn migrated_daemon_roster_shape_is_readable() {
-        // daemon `link_migration_export` 写入的形状（没有 defaultSaveDir / pathStyle）。
+        // daemon `link_migration_export` 写入的形状（没有 defaultSaveDir / pathStyle 等新增字段）。
         let value = json!({
             "fingerprint": "fp-1",
             "identityPubB64": B64.encode([1u8; 32]),
@@ -341,8 +366,13 @@ mod tests {
         let record = record_from_value(&value).unwrap();
         assert_eq!(record.platform, None);
         assert_eq!(record.candidates.len(), 1);
-        assert_eq!(record.info, PeerInfo::default());
-        assert!(device_info(&record, false).default_save_dir.is_none());
+        assert_eq!(record.default_save_dir, None);
+        assert_eq!(record.custom_name, None);
+        assert!(!record.revoked);
+        let info = device_info(&record, false);
+        assert!(info.default_save_dir.is_none());
+        assert!(!info.revoked);
+        assert_eq!(info.name, "Phone");
     }
 
     #[test]
@@ -359,16 +389,113 @@ mod tests {
     #[test]
     fn peer_info_survives_a_roster_roundtrip_and_maps_to_dto() {
         let mut original = record();
-        original.info = PeerInfo {
-            default_save_dir: Some("/mnt/downloads".into()),
-            path_style: Some("posix".into()),
-        };
+        original.default_save_dir = Some("/mnt/downloads".into());
+        original.path_style = Some("posix".into());
+        original.app_version = Some("1.2.3".into());
+        original.cloud_device_id = Some("cloud-9".into());
+        original.custom_name = Some("书房".into());
+        original.revoked = true;
         let back = record_from_value(&value_from_record(&original)).unwrap();
-        assert_eq!(back.info, original.info);
+        assert_eq!(back.default_save_dir, original.default_save_dir);
+        assert_eq!(back.cloud_device_id, original.cloud_device_id);
+        assert_eq!(back.custom_name, original.custom_name);
+        assert!(back.revoked);
         let dto = device_info(&back, true);
-        assert!(dto.online);
+        // 备注名优先于对端自报名；被对端解除的设备恒为离线。
+        assert_eq!(dto.name, "书房");
+        assert_eq!(dto.custom_name.as_deref(), Some("书房"));
+        assert_eq!(dto.app_version.as_deref(), Some("1.2.3"));
+        assert_eq!(dto.cloud_device_id.as_deref(), Some("cloud-9"));
+        assert!(dto.revoked);
+        assert!(!dto.online);
         assert_eq!(dto.default_save_dir.as_deref(), Some("/mnt/downloads"));
         assert_eq!(dto.path_style, Some(PathStyle::Posix));
+        let mut healthy = back;
+        healthy.revoked = false;
+        assert!(device_info(&healthy, true).online);
+    }
+
+    #[tokio::test]
+    async fn update_record_writes_only_on_change_and_repairing_clears_revoked() {
+        let (storage, state, dir) = storage("update").await;
+        storage.upsert(&record()).await.unwrap();
+        let snapshot = |state: &Arc<Mutex<AgentState>>| {
+            let state = state.clone();
+            async move { state.lock().await.linked_devices.clone() }
+        };
+        let before = snapshot(&state).await;
+        // 无变化：返回 Some(false)，名册原样。
+        assert_eq!(
+            storage
+                .update_record("fp-1", Box::new(|_| false))
+                .await
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(snapshot(&state).await, before);
+        // 有变化：落盘并可读回。
+        assert_eq!(
+            storage
+                .update_record(
+                    "fp-1",
+                    Box::new(|record| {
+                        record.revoked = true;
+                        record.custom_name = Some("书房".into());
+                        true
+                    })
+                )
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        let stored = storage.get("fp-1").await.unwrap().unwrap();
+        assert!(stored.revoked);
+        assert_eq!(stored.custom_name.as_deref(), Some("书房"));
+        // 未知设备：None。
+        assert_eq!(
+            storage
+                .update_record("missing", Box::new(|_| true))
+                .await
+                .unwrap(),
+            None
+        );
+        // 重新配对：覆盖记录并清除 revoked，但沿用本机备注名。
+        storage.upsert(&record()).await.unwrap();
+        let repaired = storage.get("fp-1").await.unwrap().unwrap();
+        assert!(!repaired.revoked);
+        assert_eq!(repaired.custom_name.as_deref(), Some("书房"));
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(%error, "link storage test cleanup failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_identity_seed_is_an_error_not_a_missing_seed() {
+        let (storage, state, dir) = storage("seed").await;
+        // 从未生成：没有种子。
+        assert_eq!(storage.load_identity_seed().await.unwrap(), None);
+        // 存在但读不出来（既不是 base64 字符串也不是 `{secretB64}` 对象）：报错，绝不当作没有。
+        state.lock().await.link_identity = Some(Value::String("not base64!".into()));
+        assert!(matches!(
+            storage.load_identity_seed().await,
+            Err(LinkError::Store(_))
+        ));
+        state.lock().await.link_identity = Some(json!({"unexpected": true}));
+        assert!(matches!(
+            storage.load_identity_seed().await,
+            Err(LinkError::Store(_))
+        ));
+        // 失败不会改写已有值。
+        assert_eq!(
+            state.lock().await.link_identity,
+            Some(json!({"unexpected": true}))
+        );
+        let seed = [7u8; 32];
+        state.lock().await.link_identity = Some(Value::String(B64.encode(seed)));
+        assert_eq!(storage.load_identity_seed().await.unwrap(), Some(seed));
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(%error, "link storage test cleanup failed");
+        }
     }
 
     #[test]

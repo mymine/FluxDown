@@ -120,6 +120,32 @@ Unraid Community Applications 模板见 [zerx-lab/unraid-templates](https://gith
 
 升级即手动安装更新版本的 `.spk` 覆盖安装——`var` 里的数据库、访问密钥与设置全部保留。套件现在包含 `fluxdown-agent` + `fluxdownd`（启动脚本运行 `fluxdown-agent --server`，日志文件仍为 `var/fluxdown-server.log`）。在套件中心卸载会停止服务并移除套件。
 
+## 飞牛 fnOS（原生 .fpk 应用）
+
+每个 Server release 都附带飞牛 fnOS 原生应用包——无需 Docker：
+
+| 应用包 | CPU |
+|---|---|
+| `FluxDown-Server-<ver>-fnos-x64.fpk` | Intel / AMD（x86） |
+| `FluxDown-Server-<ver>-fnos-arm64.fpk` | ARM64 |
+
+### 安装
+
+1. 打开**应用中心 → 手动安装**，选择对应架构的 `.fpk`，按提示完成安装（手动安装的第三方应用未经飞牛应用中心审核）。
+2. 安装后启动应用，点击桌面上的 **FluxDown** 图标——在新标签页打开端口 `17800` 的 Web 界面（`http://<NAS-IP>:17800`）。
+3. 首次打开时设置访问密钥（至少 8 位，须同时包含字母和数字），之后可在**设置 → 安全与访问**更换。
+
+### 权限与数据位置
+
+- 服务以专用应用用户 `fluxdown` 运行（非 root）。
+- 安装时系统会自动创建共享文件夹 `fluxdown` 并授予应用读写权限，它是默认保存目录。
+- 要保存到其他共享文件夹，在**应用设置 → 授权目录**里为 FluxDown 添加该目录；未授权的目录在保存目录选择器中会提示「服务进程无权读取此目录」。
+- 数据库、访问密钥与日志（`fluxdown-server.log`）位于应用数据目录 `/var/apps/fluxdown/var`。
+
+### 升级
+
+应用内更新只会提示新版本，不会替换二进制：在应用中心手动安装更新版本的 `.fpk` 覆盖安装即可，数据库、访问密钥与设置保留。
+
 ## 安全地对外暴露
 
 镜像在容器内绑定 `0.0.0.0:17800`，映射到宿主机。与任何 headless 部署一样，访问密钥是守护完整远程控制权的唯一屏障——在把它暴露到可信局域网之外前，请先阅读[反向代理与 TLS 指引](/docs/zh/headless-server/setup/)。

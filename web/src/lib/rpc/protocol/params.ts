@@ -170,6 +170,12 @@ export interface PluginSetEnabledParams {
   enabled: boolean;
 }
 
+/** `daemon.plugin.setSiteDefault` 参数；`identity` 为 null = 移除条目（下次下载重新询问）。 */
+export interface PluginSetSiteDefaultParams {
+  site: string;
+  identity: string | null;
+}
+
 export interface PluginUpdateSettingsParams {
   identity: string;
   /** 设置键 → 字符串值。 */
@@ -424,6 +430,12 @@ export interface LinkApproveParams {
 
 export interface LinkDeviceParams {
   fingerprint: string;
+}
+
+export interface LinkRenameParams {
+  fingerprint: string;
+  /** 省略 / 空白 = 清除备注名。 */
+  name?: string;
 }
 
 export interface LinkDispatchParams {

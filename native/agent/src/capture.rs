@@ -22,6 +22,8 @@ use crate::shell::ShellState;
 
 /// 不小于 NMH 单批上限（1000），否则合法的整批多选会被确认队列整体拒绝。
 const CAPTURE_CAPACITY: usize = 1000;
+/// 已结束事务结局的保留数量；超出时丢弃最旧记录，仅供扩展轮询 `capture_status`。
+const CAPTURE_OUTCOME_CAPACITY: usize = 1024;
 
 /// 「免打扰下载」：外部接管请求不弹确认，直接按默认设置建任务（设置页 `download.rs`）。
 pub(crate) const SILENT_DOWNLOAD_PREF: &str = "download.silent_download";
@@ -30,6 +32,24 @@ pub(crate) const SILENT_SKIP_SELECTION_PREF: &str = "download.silent_skip_select
 /// 「跟随上次保存位置」与其记录（官方 UI 新建下载写入）。
 const REMEMBER_LAST_SAVE_DIR_PREF: &str = "download.remember_last_save_dir";
 const LAST_SAVE_DIR_PREF: &str = "download.last_save_dir";
+
+/// 确认事务的终态，供浏览器扩展判断被拒 / 失败后的回退。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureOutcome {
+    Accepted,
+    Rejected,
+    Failed,
+}
+
+impl CaptureOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+        }
+    }
+}
 
 /// 捕获来源，决定是否需要用户确认。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +117,8 @@ pub struct CaptureService {
     /// 静默建成单个任务且没有就绪 UI 时按需拉起官方 UI 承载进度 / 完成提示（待确认捕获的
     /// 拉起由外壳控制循环按快照电平触发，见 `shell::prompt_launch`）。
     shell: Arc<ShellState>,
+    /// 最近的事务结局（最新在队尾）；std 锁只在内存操作期间短持有，不跨 await。
+    outcomes: std::sync::Mutex<VecDeque<(String, CaptureOutcome)>>,
 }
 
 impl CaptureService {
@@ -107,7 +129,45 @@ impl CaptureService {
             events,
             pending: Mutex::new(VecDeque::new()),
             shell,
+            outcomes: std::sync::Mutex::new(VecDeque::new()),
         }
+    }
+
+    fn record_outcome(&self, id: &str, outcome: CaptureOutcome) {
+        let mut outcomes = self
+            .outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if outcomes.len() >= CAPTURE_OUTCOME_CAPACITY {
+            outcomes.pop_front();
+        }
+        outcomes.push_back((id.to_owned(), outcome));
+    }
+
+    /// 按事务 ID 查询状态：待确认为 `pending`，已结束取最新结局，查不到为 `unknown`。
+    pub async fn statuses(&self, ids: &[String]) -> serde_json::Map<String, Value> {
+        let pending = self.pending.lock().await;
+        let outcomes = self
+            .outcomes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ids.iter()
+            .map(|id| {
+                let status = if pending
+                    .iter()
+                    .any(|transaction| transaction.public.transaction_id == *id)
+                {
+                    "pending"
+                } else {
+                    outcomes
+                        .iter()
+                        .rev()
+                        .find(|(outcome_id, _)| outcome_id == id)
+                        .map_or("unknown", |(_, outcome)| outcome.as_str())
+                };
+                (id.clone(), Value::from(status))
+            })
+            .collect()
     }
 
     /// 按来源分流：`Direct` 与开启免打扰的 `External` 直接提交 daemon，其余排入确认队列（外壳
@@ -331,6 +391,7 @@ impl CaptureService {
                     .position(|transaction| transaction.public.transaction_id == transaction_id)
                     .ok_or(CaptureError::NotFound)?;
                 pending.remove(index).ok_or(CaptureError::NotFound)?;
+                service.record_outcome(&transaction_id, CaptureOutcome::Accepted);
             }
             service.publish().await;
             if let Some(save_auth) = save_auth
@@ -379,13 +440,23 @@ impl CaptureService {
         };
         self.publish().await;
         if !accepted {
+            self.record_outcome(transaction_id, CaptureOutcome::Rejected);
             return Ok(json!({ "accepted": false }));
         }
         let spec = match confirmed {
             Some(confirmed) => merge_confirmed_request(transaction.request, confirmed),
             None => captured_create_request(transaction.request),
         };
-        self.create(spec, None, false).await
+        match self.create(spec, None, false).await {
+            Ok(created) => {
+                self.record_outcome(transaction_id, CaptureOutcome::Accepted);
+                Ok(created)
+            }
+            Err(error) => {
+                self.record_outcome(transaction_id, CaptureOutcome::Failed);
+                Err(error)
+            }
+        }
     }
 
     async fn create(

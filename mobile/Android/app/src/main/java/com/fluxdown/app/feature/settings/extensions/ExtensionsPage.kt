@@ -47,6 +47,9 @@ import com.fluxdown.core.protocol.MarketEntry
 import com.fluxdown.core.protocol.PluginDto
 import com.fluxdown.core.protocol.has
 import com.fluxdown.fluxui.controls.ButtonVariant
+import com.fluxdown.fluxui.controls.ButtonSize
+import com.fluxdown.fluxui.controls.FluxTag
+import com.fluxdown.fluxui.controls.SelectOption
 import com.fluxdown.fluxui.controls.FluxActionRow
 import com.fluxdown.fluxui.controls.FluxButton
 import com.fluxdown.fluxui.controls.FluxListRow
@@ -134,6 +137,7 @@ private fun ExtensionsContent() {
         else if (key in PluginTabKeys) model.tab = ExtensionsModel.Tab.Plugins
     }
     LaunchedEffect(readOnly, hasPlugins) { if (hasPlugins) model.ensureMarketLoaded(env) }
+    LaunchedEffect(readOnly, hasPlugins) { if (hasPlugins && !readOnly) model.refreshSiteDefaults() }
     PluginAutoDisabledEffect(env)
 
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -219,6 +223,13 @@ private fun ExtensionsContent() {
                         }
                     }
                 }
+                if (model.siteDefaults.isNotEmpty()) {
+                    flowItem(index++, gate, "siteDefaults") {
+                        SettingRowBox(ctx, "extensions.siteDefaults", null) {
+                            SiteDefaultsSection(model, env, plugins, readOnly) { picker = it }
+                        }
+                    }
+                }
                 flowItem(index++, gate, "market") {
                     SettingRowBox(ctx, "extensions.market", null) {
                         GlassSection {
@@ -247,7 +258,73 @@ private fun ExtensionsContent() {
 }
 
 /** 属于「插件」页签的行 key（搜索定位时据此切页签）。 */
-private val PluginTabKeys = setOf("plugins", "install", "market")
+private val PluginTabKeys = setOf("plugins", "install", "market", "siteDefaults")
+
+/** 站点默认插件：每行 站点 + 候选插件选择器；自动选定（未确认）的条目带警示标签与「确认」按钮。 */
+@Composable
+private fun SiteDefaultsSection(
+    model: ExtensionsModel,
+    env: ExtensionsEnv,
+    plugins: List<PluginDto>,
+    readOnly: Boolean,
+    openPicker: (PickerSpec) -> Unit,
+) {
+    val c = FluxTheme.colors
+    val t = FluxTheme.type
+    val names = remember(plugins) { plugins.associate { it.identity to it.name.ifEmpty { it.identity } } }
+    GlassSection(title = str(R.string.pluginSiteDefaultsTitle)) {
+        custom(padded = true) {
+            FluxText(str(R.string.pluginSiteDefaultsDesc), style = t.sm, color = c.inkMuted)
+        }
+        for (entry in model.siteDefaults) {
+            val enabled = !readOnly && entry.site !in model.siteDefaultBusy
+            val pickerTitle = entry.site
+            row {
+                FluxListRow(
+                    title = entry.site,
+                    subtitle = if (entry.automatic) str(R.string.pluginSiteDefaultAutomaticHint) else null,
+                    value = names[entry.identity] ?: entry.identity,
+                    trailing = if (entry.automatic) {
+                        { FluxTag(str(R.string.pluginSiteDefaultAutomatic), tone = Tone.Amber) }
+                    } else {
+                        null
+                    },
+                    chevron = true,
+                    enabled = enabled,
+                    onClick = {
+                        openPicker(
+                            PickerSpec(
+                                pickerTitle,
+                                entry.candidates.map { SelectOption(it, names[it] ?: it) },
+                                entry.identity,
+                            ) { id -> if (id != entry.identity) model.setSiteDefault(env, entry.site, id) },
+                        )
+                    },
+                )
+            }
+            custom(padded = true) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (entry.automatic) {
+                        FluxButton(
+                            str(R.string.pluginSiteDefaultConfirm),
+                            { model.setSiteDefault(env, entry.site, entry.identity) },
+                            variant = ButtonVariant.Secondary,
+                            size = ButtonSize.Sm,
+                            enabled = enabled,
+                        )
+                    }
+                    FluxButton(
+                        str(R.string.pluginSiteDefaultRemove),
+                        { model.setSiteDefault(env, entry.site, null) },
+                        variant = ButtonVariant.Ghost,
+                        size = ButtonSize.Sm,
+                        enabled = enabled,
+                    )
+                }
+            }
+        }
+    }
+}
 
 // ───────────────────────────── 行 ─────────────────────────────
 
@@ -263,6 +340,7 @@ internal fun pluginBadges(plugin: PluginDto, update: MarketEntry?, yanked: Strin
     }
     if (plugin.disabledReason == "Manual") out += Badge(str(R.string.pluginDisabledManual), Tone.Neutral, FluxIcons.CirclePause)
     if (plugin.disabledReason == "CircuitBreaker") out += Badge(str(R.string.pluginDisabledCircuitBreaker), Tone.Coral, FluxIcons.ZapOff)
+    if (plugin.disabledReason == "Revoked") out += Badge(str(R.string.pluginDisabledRevoked), Tone.Coral, FluxIcons.ShieldAlert)
     val yankedRes = yanked?.let { yankedLabelRes(it) }
     if (yankedRes != null) {
         out += Badge(str(R.string.pluginInstalledVersionYanked, "label" to str(yankedRes)), Tone.Coral, FluxIcons.ShieldAlert)

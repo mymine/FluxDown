@@ -13,14 +13,19 @@ import { Button, Checkbox, Dialog, DialogFooter, FieldHint, Icon, Input } from '
 import { toastRpcError } from '../../../lib/rpcToast'
 import { cn } from '../../../lib/cn'
 import { formatBytes, useNow } from './utils'
+import { PluginChoiceDialog } from './PluginChoiceDialog'
 
-type ChoiceKind = Exclude<SelectionKind, { type: 'fileExists' }>
+type ChoiceKind = Exclude<SelectionKind, { type: 'fileExists' | 'plugin' }>
 
 /** 一次只展示队首请求；其余排队，前一个解决后自动轮到下一个。`fileExists` 由 `FileConflictDialog` 聚合处理，这里跳过。 */
 export function SelectionHost({ requests }: { requests: readonly SelectionRequestDto[] }) {
   for (const request of requests) {
     const kind = request.kind
-    if (kind.type !== 'fileExists') return <SelectionDialog key={request.requestId} request={request} kind={kind} />
+    if (kind.type === 'fileExists') continue
+    if (kind.type === 'plugin') {
+      return <PluginChoiceDialog key={request.requestId} request={request} site={kind.site} url={kind.url} candidates={kind.candidates} />
+    }
+    return <SelectionDialog key={request.requestId} request={request} kind={kind} />
   }
   return null
 }

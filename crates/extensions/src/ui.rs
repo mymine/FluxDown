@@ -142,6 +142,44 @@ pub(crate) fn tone_pill(text: impl Into<SharedString>, color: Hsla, frame: Frame
         .text_color(color)
 }
 
+/// 风险等级的色调：`elevated` = warning，`full` = destructive，`standard` 无强调。
+pub(crate) fn risk_color(risk: &str, frame: Frame<'_>) -> Option<Hsla> {
+    match risk {
+        "elevated" => Some(frame.extended.colors.warning),
+        "full" => Some(frame.tokens.colors.destructive),
+        _ => None,
+    }
+}
+
+/// 风险等级的（名称，说明）文案键；未知等级按 standard。
+pub(crate) fn risk_keys(risk: &str) -> (&'static str, &'static str) {
+    match risk {
+        "elevated" => ("pluginRiskElevated", "pluginRiskTooltipElevated"),
+        "full" => ("pluginRiskFull", "pluginRiskTooltipFull"),
+        _ => ("pluginRiskStandard", "pluginRiskTooltipStandard"),
+    }
+}
+
+/// 风险徽标：只对 `elevated` / `full` 显示（standard 不打扰），悬停给出说明。
+pub(crate) fn risk_pill(
+    id: impl Into<gpui::ElementId>,
+    risk: &str,
+    frame: Frame<'_>,
+) -> Option<gpui::Stateful<Div>> {
+    use gpui::InteractiveElement as _;
+    use gpui::StatefulInteractiveElement as _;
+    let color = risk_color(risk, frame)?;
+    let (name_key, tip_key) = risk_keys(risk);
+    let tip = SharedString::from(frame.translator.text(tip_key).to_owned());
+    Some(
+        tone_pill(frame.translator.text(name_key).to_owned(), color, frame)
+            .id(id)
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            }),
+    )
+}
+
 /// 空状态：32px 图标（text_tertiary）+ sm MEDIUM 标题 + 可选 xs 说明，居中。
 pub(crate) fn empty_state(
     icon: impl IconNamed,

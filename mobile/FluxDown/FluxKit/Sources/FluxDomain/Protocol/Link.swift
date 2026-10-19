@@ -15,10 +15,18 @@ public struct LinkDeviceInfo: Sendable, Hashable, Identifiable, Codable {
     public var lastSeenAt: Int64
     public var defaultSaveDir: String?
     public var pathStyle: PathStyle?
+    /// 本机备注名（`name` 已是生效名，备注名优先）；仅用于重命名对话框预填。
+    public var customName: String?
+    public var appVersion: String?
+    /// 对端已登录云账号时的云设备 id；与云名册同 id 时合并为一条。
+    public var cloudDeviceId: String?
+    /// 对端已解除配对：拒绝其入站请求、不可再下发，只能删除。
+    public var revoked: Bool
 
     public init(
         fingerprint: String, name: String, platform: String? = nil, online: Bool = false, pairedAt: Int64 = 0,
-        lastSeenAt: Int64 = 0, defaultSaveDir: String? = nil, pathStyle: PathStyle? = nil
+        lastSeenAt: Int64 = 0, defaultSaveDir: String? = nil, pathStyle: PathStyle? = nil,
+        customName: String? = nil, appVersion: String? = nil, cloudDeviceId: String? = nil, revoked: Bool = false
     ) {
         self.fingerprint = fingerprint
         self.name = name
@@ -28,6 +36,10 @@ public struct LinkDeviceInfo: Sendable, Hashable, Identifiable, Codable {
         self.lastSeenAt = lastSeenAt
         self.defaultSaveDir = defaultSaveDir
         self.pathStyle = pathStyle
+        self.customName = customName
+        self.appVersion = appVersion
+        self.cloudDeviceId = cloudDeviceId
+        self.revoked = revoked
     }
 
     public var id: String { fingerprint }
@@ -44,6 +56,27 @@ public struct LinkDeviceInfo: Sendable, Hashable, Identifiable, Codable {
         lastSeenAt = try c.decodeIfPresent(Int64.self, forKey: .lastSeenAt) ?? 0
         defaultSaveDir = try c.decodeIfPresent(String.self, forKey: .defaultSaveDir)
         pathStyle = try c.decodeIfPresent(PathStyle.self, forKey: .pathStyle)
+        customName = try c.decodeIfPresent(String.self, forKey: .customName)
+        appVersion = try c.decodeIfPresent(String.self, forKey: .appVersion)
+        cloudDeviceId = try c.decodeIfPresent(String.self, forKey: .cloudDeviceId)
+        revoked = try c.decodeIfPresent(Bool.self, forKey: .revoked) ?? false
+    }
+}
+
+/// `agent.link.rename` 参数：`name` 省略 / 空白 = 清除备注名；非空 trim 后 1–64 字符、无控制字符。
+public struct LinkRenameParams: Sendable, Hashable, Codable {
+    public var fingerprint: String
+    public var name: String?
+
+    public init(fingerprint: String, name: String?) {
+        self.fingerprint = fingerprint
+        self.name = name
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(fingerprint, forKey: .fingerprint)
+        try c.encodeIfPresent(name, forKey: .name)
     }
 }
 
@@ -220,6 +253,38 @@ public struct LinkDispatchResult: Sendable, Hashable, Codable {
 
 public enum LinkRules {
     public static let pairingCodeLength = 6
+
+    public static let renameMaxLength = 64
+
+    /// 备注名校验：空白 = 清除（合法）；否则 trim 后 1–64 字符且无控制字符。
+    public static func isValidRename(_ input: String) -> Bool {
+        let name = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty { return true }
+        return name.unicodeScalars.count <= renameMaxLength && !name.unicodeScalars.contains { $0.properties.generalCategory == .control }
+    }
+
+    /// 备注名提交值：空白 = nil（清除）。
+    public static func renameValue(_ input: String) -> String? {
+        let name = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
+
+    /// 本机局域网直连三态（契约「本机配对码区三态」）。
+    public enum LanAccess: Sendable, Hashable {
+        /// 未开启「允许局域网访问」：隐藏配对码，提示去设置开启。
+        case disabled
+        /// 已开启但本次运行未生效（需重启）。
+        case restartRequired
+        /// 网关实际监听非回环地址：正常显示配对码。
+        case active
+    }
+
+    /// 由 `agent.gateway` 状态判定三态；分区缺失（远端主机 / server 模式不带网关分区）按 active，由申请配对码的结果如实报错。
+    public static func lanAccess(_ gateway: GatewayStatusDto?) -> LanAccess {
+        guard let gateway else { return .active }
+        if gateway.lanActive { return .active }
+        return gateway.lanEnabled ? .restartRequired : .disabled
+    }
 
     /// 发现的对端 → `agent.link.pairBegin` 接受的 `host:port`（IPv6 加方括号）。
     public static func address(of peer: LinkDiscoveredPeer) -> String {

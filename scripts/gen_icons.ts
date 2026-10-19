@@ -33,7 +33,7 @@
  *     {16,32,48,128}.png  {16,32,48,128}-disabled.png
  *     fluxdown_logo.png (128×128)  fluxdown_logo.svg (副本)
  *
- *   website-v2/public/（主站；website/ 为 /v1 旧站存档，不再更新）
+ *   website-v2/public/（官网）
  *     favicon.ico  favicon.svg  logo.png (1024×1024)  logo.svg (副本)
  */
 

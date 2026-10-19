@@ -1,5 +1,5 @@
 // 下载页共享状态：任务行投影、筛选/搜索、视图偏好（300ms 防抖写回）、选中集、详情面板绑定。
-// 页面内所有组件（侧栏 / 标题栏 / 表格 / 状态栏 / 选择条 / 详情）通过 `useDownloads()` 读取。
+// 页面内组件（侧栏 / 标题栏 / 表格 / 选择条 / 详情）通过 `useDownloads()` 读取；状态栏小部件直接读全局 store，不经此处。
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
@@ -7,10 +7,8 @@ import { useT } from '../../i18n'
 import { useIsMobile } from '../../ui'
 import {
   rpc,
-  shallowEqual,
   useAgent,
   useAgentSnapshot,
-  useConnection,
   useDaemon,
   usePref,
   useTasks,
@@ -18,7 +16,6 @@ import {
 import type {
   AgentSessionDto,
   CloudDevice,
-  DaemonRuntimeStatsDto,
   GroupDto,
   JsonValue,
   LinkDeviceInfo,
@@ -40,6 +37,7 @@ import { buildLocalView, buildRemoteView, isLocalKey, sourceSite, STATE_RANK } f
 import type { DownloadTaskView, RowKey } from './model/task'
 import { useStableRowOrder } from './model/useStableRowOrder'
 import { queueLabelById } from './dialogs/utils'
+import { useDaemonReady } from './statusbar/widget'
 import { compareViews, dateBucketOf, DATE_BUCKET_ORDER, matchesQuery, parseViewPrefs, VIEW_PREFS_KEY } from './model/viewPrefs'
 import type { ViewPrefs } from './model/viewPrefs'
 
@@ -94,7 +92,6 @@ export interface DownloadsContextValue {
   groupSummaries: readonly GroupSummary[]
   cloudDevices: readonly CloudDevice[]
   linkedDevices: readonly LinkDeviceInfo[]
-  runtimeStats: DaemonRuntimeStatsDto
 
   sidebarSelection: SidebarSelection
   setSidebarSelection: (selection: SidebarSelection) => void
@@ -157,14 +154,6 @@ const EMPTY_QUEUE_POSITIONS: readonly QueuePositionDto[] = []
 const EMPTY_GROUPS: readonly GroupDto[] = []
 const EMPTY_CLOUD: readonly CloudDevice[] = []
 const EMPTY_LINKED: readonly LinkDeviceInfo[] = []
-const EMPTY_STATS: DaemonRuntimeStatsDto = {
-  activeTasks: 0,
-  pendingTasks: 0,
-  totalDownloadBps: 0,
-  totalUploadBps: 0,
-  diskFreeBytes: null,
-  saveDir: '',
-}
 const EMPTY_SELECTED: ReadonlySet<RowKey> = new Set()
 const PREFS_DEBOUNCE_MS = 300
 
@@ -173,9 +162,7 @@ const selectPriority = (daemon: { priority: string[] }) => daemon.priority
 const selectQueuePositions = (daemon: { queuePositions: QueuePositionDto[] }) => daemon.queuePositions
 const selectQueues = (daemon: { queues: QueueDto[] }) => daemon.queues
 const selectGroups = (daemon: { groups: GroupDto[] }) => daemon.groups
-const selectStats = (daemon: { runtimeStats: DaemonRuntimeStatsDto }) => daemon.runtimeStats
 const selectRemote = (snapshot: { remoteTasks: RemoteTaskDto[] }) => snapshot.remoteTasks
-const selectDaemonConnected = (snapshot: { daemonConnected: boolean }) => snapshot.daemonConnected
 const selectSession = (snapshot: { session: AgentSessionDto | null }) => snapshot.session
 const selectCloud = (snapshot: { cloudDevices: CloudDevice[] }) => snapshot.cloudDevices
 const selectLinked = (snapshot: { linkedDevices: LinkDeviceInfo[] }) => snapshot.linkedDevices
@@ -263,16 +250,13 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   const queuePositions = useDaemon(selectQueuePositions, EMPTY_QUEUE_POSITIONS as QueuePositionDto[])
   const queues = useDaemon(selectQueues, EMPTY_QUEUES as QueueDto[])
   const groups = useDaemon(selectGroups, EMPTY_GROUPS as GroupDto[])
-  const runtimeStats = useDaemon(selectStats, EMPTY_STATS, shallowEqual)
   const remoteTasks = useAgent(selectRemote, EMPTY_REMOTE as RemoteTaskDto[])
-  const daemonConnected = useAgent(selectDaemonConnected, false)
   const session = useAgent(selectSession, null)
   const cloudDevices = useAgent(selectCloud, EMPTY_CLOUD as CloudDevice[])
   const linkedDevices = useAgent(selectLinked, EMPTY_LINKED as LinkDeviceInfo[])
   const categoriesPref = usePref<unknown>('custom_categories')
-  const phase = useConnection().phase
   const live = useLiveSpeeds()
-  const connected = phase === 'ready' && daemonConnected
+  const connected = useDaemonReady()
 
   // 页面可见 / 连接就绪时重扫已完成文件（daemon 空闲不再定时扫描）；节流镜像 GPUI RescanThrottle。
   const rescanThrottle = useRef(new RescanThrottle())
@@ -689,7 +673,6 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       groupSummaries,
       cloudDevices,
       linkedDevices,
-      runtimeStats,
       sidebarSelection,
       setSidebarSelection,
       query,
@@ -728,7 +711,6 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       groupSummaries,
       cloudDevices,
       linkedDevices,
-      runtimeStats,
       sidebarSelection,
       setSidebarSelection,
       query,

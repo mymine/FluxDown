@@ -1,8 +1,5 @@
 package com.fluxdown.app.feature.settings.general
 
-import android.net.Uri
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.StringRes
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -35,10 +32,8 @@ import com.fluxdown.app.feature.settings.RemoteDirectoryPickerSheet
 import com.fluxdown.app.feature.settings.rememberLastNonNull
 import com.fluxdown.app.i18n.fill
 import com.fluxdown.app.i18n.str
-import com.fluxdown.app.ui.canRequestStorageAccess
-import com.fluxdown.app.ui.rememberStorageAccessPrompt
+import com.fluxdown.app.ui.rememberLocalDirectoryPicker
 import com.fluxdown.app.ui.isLocalDirWritable
-import com.fluxdown.app.ui.treeUriToPath
 import com.fluxdown.core.protocol.CategoryBuild
 import com.fluxdown.core.protocol.CategoryDraft
 import com.fluxdown.core.protocol.CategoryRules
@@ -76,8 +71,8 @@ private fun CategoryValidationError.message(): Int = when (this) {
 
 /**
  * 分类编辑器（新建 / 编辑）。自包含：只依赖分类条目与回调，保存 / 删除由调用方写回 `custom_categories`。
- * 校验与条目生成全部走 [CategoryRules.build]。[target] = null 时收起；本机主机的保存目录用系统目录选择器
- * （SAF → 绝对路径 + 可写检查），远端主机可手填或浏览服务器目录。有未保存修改时只能经按钮关闭（先确认丢弃）。
+ * 校验与条目生成全部走 [CategoryRules.build]。[target] = null 时收起；本机使用应用内目录浏览与存储授权，
+ * 远端主机可手填或浏览服务器目录。有未保存修改时只能经按钮关闭（先确认丢弃）。
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -102,11 +97,7 @@ internal fun CategoryEditorSheet(
 
     val title = str(if (existing == null) R.string.addCategory else R.string.editCategory)
     val notWritable = str(R.string.mobileSaveDirNotWritable)
-    val unmappable = str(R.string.mobilePickDirUnmappable)
     val cancel = str(R.string.cancel)
-    // 授权后以同一目录重试（已授权时不会再弹授权）
-    var retryDir: (String) -> Unit = {}
-    val promptAccess = rememberStorageAccessPrompt { retryDir(it) }
 
     fun change(next: CategoryDraft) {
         draft = next
@@ -167,32 +158,10 @@ internal fun CategoryEditorSheet(
         }
     }
 
-    fun applyLocalDir(dir: String) {
-        when {
-            isLocalDirWritable(dir) -> {
-                haptics.tick()
-                change(draft.copy(saveDir = dir))
-            }
-            canRequestStorageAccess(context, dir) -> {
-                haptics.reject()
-                promptAccess(dir)
-            }
-            else -> {
-                haptics.reject()
-                overlays.toast(notWritable.fill("dir" to dir), FluxToastKind.Error)
-            }
-        }
-    }
-    retryDir = ::applyLocalDir
-
-    val treePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri: Uri? ->
-        if (uri == null) return@rememberLauncherForActivityResult
-        val path = treeUriToPath(uri)
-        if (path == null) {
-            haptics.reject()
-            overlays.toast(unmappable, FluxToastKind.Warn)
-        } else {
-            applyLocalDir(path)
+    val pickDirectory = rememberLocalDirectoryPicker { dir ->
+        if (isLocalHost && target != null) {
+            haptics.tick()
+            change(draft.copy(saveDir = dir))
         }
     }
 
@@ -229,7 +198,7 @@ internal fun CategoryEditorSheet(
                     isLocalHost = isLocalHost,
                     canDelete = canDelete,
                     onChange = ::change,
-                    onBrowseLocal = { treePicker.launch(null) },
+                    onBrowseLocal = { pickDirectory(draft.saveDir) },
                     onBrowseRemote = { showRemotePicker = true },
                     onDelete = ::confirmDelete,
                 )
@@ -362,17 +331,21 @@ private fun ColumnScope.EditorBody(
 }
 
 /**
- * 保存目录：本机 = 只读展示 + 系统目录选择器（手填路径极易写成不可写目录）；远端 = 可手填，也可浏览服务器目录。
+ * 保存目录：本机 = 只读展示 + 应用内目录浏览与授权；远端 = 可手填，也可浏览服务器目录。
  */
 @Composable
 private fun SaveDirField(value: String, isLocalHost: Boolean, onChange: (String) -> Unit, onBrowse: () -> Unit) {
+    val context = LocalContext.current
+    val display = androidx.compose.runtime.remember(value, isLocalHost) {
+        if (isLocalHost) com.fluxdown.app.ui.friendlyLocalPath(context, value) else value
+    }
     FluxField(
-        value = value,
+        value = display,
         onValueChange = onChange,
         label = str(R.string.categorySaveDir),
         placeholder = str(R.string.mobileSaveDirUnset),
         hint = str(R.string.categorySaveDirDesc),
-        mono = true,
+        mono = !isLocalHost,
         singleLine = false,
         readOnly = isLocalHost,
         trailing = {

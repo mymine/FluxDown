@@ -1,6 +1,6 @@
 # 把 release 资产同步到阿里云 OSS（release.yml 各 upload-<组件> job 共用）
 #
-# 对象布局与官网 website*/src/lib/oss.ts 的 releaseObjectKey 契约（改一处须同步另一处）：
+# 对象布局与官网 website-v2/src/lib/oss.ts 的 releaseObjectKey 契约（改一处须同步另一处）：
 #   oss://<bucket>/<prefix>/<版本>/<组件>/<asset-name>
 # 目录由 GitHub Release 的 tag 推导：v0.4.8 → v0.4.8/app/（历史目录名；统一 release 起各组件
 # 都上传到这个 vX.Y.Z release，资产全部落在该目录，文件名互不重复）；历史组件 release

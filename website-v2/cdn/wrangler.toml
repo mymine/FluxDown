@@ -2,7 +2,12 @@ name = "fluxdown-oss-cdn"
 main = "oss-proxy.js"
 compatibility_date = "2026-10-01"
 workers_dev = false
-routes = [{ pattern = "dl-fluxdown.zerx.dev", custom_domain = true }]
+# dl.fluxdown.com 为现行下载域名；dl-fluxdown.zerx.dev 保留给旧客户端 / 已分发链接。
+# wrangler deploy 以此列表为准同步自定义域，删掉某项会解绑对应域名。
+routes = [
+  { pattern = "dl.fluxdown.com", custom_domain = true },
+  { pattern = "dl-fluxdown.zerx.dev", custom_domain = true },
+]
 
 [vars]
 OSS_BUCKET = "zerx-lab"

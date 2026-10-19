@@ -14,12 +14,19 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "FluxDown API",
-        description = "FluxDown 桌面应用的本机 HTTP API。仅监听 `127.0.0.1`（默认端口 17800，\
-可在 设置 → API 服务 中修改）。\n\n\
-- **takeover**（脚本接管）：油猴脚本提交下载，进入快速下载确认流程；需 `X-FluxDown-Client` 头\n\
-- **aria2**：aria2 JSON-RPC 兼容垫片，「发送到 aria2」类脚本与 AriaNg 可直接对接\n\
-- **management**（管理 API）：任务查询/创建/暂停/恢复/删除与队列查询，供 MCP/自动化客户端使用；\
-强制要求 token（`Authorization: Bearer <token>` 或 `X-FluxDown-Token` 头）",
+        description = "FluxDown HTTP API，用于提交下载、管理任务和连接自动化客户端。\
+本机默认地址为 `http://127.0.0.1:17800`，端口可在「设置 → API 服务」中修改。\n\n\
+## 接入方式\n\n\
+- **脚本接管（takeover）**：接收浏览器脚本提交的下载请求，进入下载确认流程；需提供 `X-FluxDown-Client` 请求头。\n\
+- **aria2**：提供兼容的 JSON-RPC 接口，可连接 AriaNg 等 aria2 客户端。\n\
+- **MCP**：供 AI 客户端查询和调用下载工具。\n\
+- **管理 API（management）**：直接创建和管理下载任务，无需界面确认；支持队列查询与站点凭据管理。\n\
+- **任务组、插件与 RSS**：管理多文件下载、插件和自动订阅下载。\n\
+- **设备互联（link）**：发现、配对设备，并向已配对设备发送下载任务。\n\n\
+## 访问认证\n\n\
+管理 API、MCP、任务组、插件和 RSS 接口必须提供访问令牌：\
+使用 `Authorization: Bearer <token>` 或 `X-FluxDown-Token: <token>` 请求头。\
+设备互联的配对和设备通信接口使用独立认证机制，具体要求见各接口说明。",
         license(name = "MIT", identifier = "MIT")
     ),
     servers((url = "http://127.0.0.1:17800", description = "本机 API 服务（默认端口）")),
@@ -74,6 +81,7 @@ use utoipa::{Modify, OpenApi};
         crate::server::api_link_pair_confirm,
         crate::server::api_link_create_task,
         crate::server::api_link_info,
+        crate::server::api_link_unpair,
         crate::server::api_link_generate_code,
         crate::server::api_link_stop_advertising,
         crate::server::api_link_discovery,
@@ -87,15 +95,15 @@ use utoipa::{Modify, OpenApi};
         crate::server::api_link_device_tasks,
     ),
     tags(
-        (name = "system", description = "探活与基础信息"),
-        (name = "takeover", description = "浏览器脚本接管（Tampermonkey / Violentmonkey）"),
-        (name = "aria2", description = "aria2 JSON-RPC 兼容"),
-        (name = "mcp", description = "MCP（Model Context Protocol）—— AI 客户端工具调用"),
-        (name = "management", description = "管理 API（强制 token）"),
-        (name = "groups", description = "任务组与前置预解析（多文件任务组；强制 token）"),
-        (name = "plugins", description = "插件系统（安装/启停/设置/卸载；强制 token）"),
-        (name = "rss", description = "RSS 订阅自动下载（订阅 CRUD / 条目流 / 手动操作 / feed 验证；强制 token）"),
-        (name = "link", description = "设备互联（配对/发现/数据面下发；`pair/hello`·`pair/reveal`·`pair/confirm`·`link/tasks` 无 token，由一次性码/会话/链路 HMAC 守卫，其余强制 management token）"),
+        (name = "system", description = "服务状态"),
+        (name = "takeover", description = "浏览器脚本下载接管"),
+        (name = "aria2", description = "aria2 兼容接口"),
+        (name = "mcp", description = "MCP 工具调用"),
+        (name = "management", description = "下载任务与站点凭据管理"),
+        (name = "groups", description = "任务组与文件预览"),
+        (name = "plugins", description = "插件安装与管理"),
+        (name = "rss", description = "RSS 订阅与自动下载"),
+        (name = "link", description = "设备发现、配对与任务传输"),
     ),
     modifiers(&SecurityAddon)
 )]
@@ -192,6 +200,7 @@ mod tests {
             routes::API_LINK_PAIR_CONFIRM,
             routes::API_LINK_TASKS,
             routes::API_LINK_INFO,
+            routes::API_LINK_UNPAIR,
             routes::API_LINK_CODE,
             routes::API_LINK_DISCOVERY,
             routes::API_LINK_DISCOVERED,

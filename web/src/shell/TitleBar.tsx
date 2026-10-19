@@ -1,6 +1,7 @@
-// 标题栏：`density.titleBar`（40）高、chrome 底、hairline 下边；左侧为当前路由的插槽。
+// 标题栏：`density.titleBar`（40）高、chrome 底、hairline 下边；依次为 Logo、可自定义的前置区域（titleLeading）、
+// 当前路由的插槽、后置区域（titleTrailing）与连接状态点。
 // 页面用 `<TitleBarSlot>` 把内容传送进来（Downloads：新建 / 搜索 / 视图；RSS、Webhooks 无插槽）。
-// 移动端顶部避开安全区；无插槽的路由显示默认页名。
+// 移动端顶部避开安全区；无插槽的路由显示默认页名；自定义区域只在桌面渲染。
 
 import { createContext, useContext, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
@@ -38,12 +39,13 @@ export function TitleBarSlot({ children }: { children: ReactNode }) {
   return createPortal(children, context.element)
 }
 
-/** AppShell 内部使用：标题栏本体。 */
-export function TitleBar({ defaultTitle, trailing }: { defaultTitle: string; trailing?: ReactNode }) {
+/** AppShell 内部使用：标题栏本体。`leading` 在 Logo 之后、页面插槽之前；`trailing` 在页面插槽之后。 */
+export function TitleBar({ defaultTitle, leading, trailing }: { defaultTitle: string; leading?: ReactNode; trailing?: ReactNode }) {
   const context = useContext(SlotContext)
   return (
     <header className="flex h-title-bar shrink-0 items-center gap-2 border-b border-hairline bg-chrome box-content pt-safe pl-[max(0.75rem,env(safe-area-inset-left))] pr-[max(0.5rem,env(safe-area-inset-right))]">
       <img src="/favicon.svg" alt="" className="size-4 shrink-0 mobile:hidden" draggable={false} />
+      {leading}
       {context && context.used === 0 ? (
         <div className={cn('min-w-0 truncate text-sm font-medium text-foreground desktop:sr-only')}>{defaultTitle}</div>
       ) : null}

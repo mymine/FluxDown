@@ -35,8 +35,11 @@
  * 与原版行为完全一致；随后异步补一次缓存填充，供后续调用使用真实值。
  */
 
-import { browser } from "wxt/browser";
 import * as nmh from "./native-messaging";
+import {
+  getCachedSettings,
+  peekCachedSettings,
+} from "@/background/settings-cache";
 import type {
   ApiResponse,
   DownloadRequest,
@@ -48,8 +51,7 @@ import {
   remotePing,
 } from "./remote-server";
 import type { RemoteServerConfig } from "./remote-server";
-import { REMOTE_SETTINGS_KEY } from "./remote-settings";
-import { loadSettings, ensureRemoteSettingsVerified } from "./settings";
+import { ensureRemoteSettingsVerified } from "./settings";
 import type { FluxDownSettings, RemoteMode } from "./settings";
 
 // NMH 侧代表"不可达"（连接层/瞬态失败）而非 App 业务拒绝的 message 集合，
@@ -87,29 +89,16 @@ export function isUnreachableFailure(response: ApiResponse): boolean {
 }
 
 // ──────────────────────────────────────────────────────────────
-// 设置缓存（见文件头说明）
+// 设置读取：与 background 共用 settings-cache（单一缓存，见该模块说明）
 // ──────────────────────────────────────────────────────────────
 
-let _settingsCache: FluxDownSettings | null = null;
-
 async function getRoutingSettings(): Promise<FluxDownSettings> {
-  const settings = _settingsCache ?? await loadSettings();
-  _settingsCache = await ensureRemoteSettingsVerified(settings);
-  return _settingsCache;
+  return ensureRemoteSettingsVerified(await getCachedSettings());
 }
 
-try {
-  browser.storage.onChanged.addListener((changes, area) => {
-    if (
-      (area === "sync" && changes.settings) ||
-      (area === "local" && changes[REMOTE_SETTINGS_KEY])
-    ) {
-      _settingsCache = null;
-    }
-  });
-} catch {
-  // storage.onChanged 在个别环境不可用；缓存仍会在下次 SW 生命周期内
-  // 按需重新读取，只是不能感知运行期设置变化，属可接受的降级。
+/** 当前设置下的实际路由模式（remoteUrl 未配置或未验证时为 "off"）。 */
+export async function effectiveRemoteMode(): Promise<RemoteMode> {
+  return effectiveMode(toRoutingConfig(await getRoutingSettings()));
 }
 
 interface RoutingConfig {
@@ -120,6 +109,13 @@ interface RoutingConfig {
 /** 给路由结果盖上实际处理通道的戳（供上层按通道分流通知等行为） */
 function stamp(response: ApiResponse, channel: "local" | "remote"): ApiResponse {
   return { ...response, channel };
+}
+
+function remoteConfigOf(settings: FluxDownSettings): RemoteServerConfig {
+  return {
+    remoteUrl: settings.remoteUrl?.trim() ?? "",
+    remoteToken: settings.remoteToken ?? "",
+  };
 }
 
 function toRoutingConfig(settings: FluxDownSettings): RoutingConfig {
@@ -137,9 +133,21 @@ function effectiveMode(cfg: RoutingConfig): RemoteMode {
   return cfg.remote.remoteUrl ? cfg.mode : "off";
 }
 
+/** 显式指定通道时（UI 的「发到本机 / 发到远程」）绕过 remoteMode 路由。 */
+export type DispatchChannel = "local" | "remote";
+
 export async function sendDownloadRequest(
   request: DownloadRequest,
+  channel?: DispatchChannel,
 ): Promise<ApiResponse> {
+  if (channel === "local") {
+    return stamp(await nmh.nmhSendDownloadRequest(request), "local");
+  }
+  if (channel === "remote") {
+    const remote = remoteConfigOf(await getRoutingSettings());
+    if (!remote.remoteUrl) return stamp({ success: false, message: "remote_not_configured" }, "remote");
+    return stamp(await remoteSendDownloadRequest(request, remote), "remote");
+  }
   const cfg = toRoutingConfig(await getRoutingSettings());
   const mode = effectiveMode(cfg);
 
@@ -280,7 +288,16 @@ async function remoteSendBatchPreservingAudio(
 
 export async function sendBatchDownloadRequest(
   items: BatchDownloadItem[],
+  channel?: DispatchChannel,
 ): Promise<ApiResponse> {
+  if (channel === "local") {
+    return stamp(await nmh.nmhSendBatchDownloadRequest(items), "local");
+  }
+  if (channel === "remote") {
+    const remote = remoteConfigOf(await getRoutingSettings());
+    if (!remote.remoteUrl) return stamp({ success: false, message: "remote_not_configured" }, "remote");
+    return stamp(await remoteSendBatchPreservingAudio(items, remote), "remote");
+  }
   const cfg = toRoutingConfig(await getRoutingSettings());
   const mode = effectiveMode(cfg);
 
@@ -317,14 +334,15 @@ export async function sendBatchDownloadRequest(
  * 缓存未命中或 "off"/"fallback" 一律照常预热 NMH。
  */
 export function warmupNativeHost(): void {
-  const cfg = _settingsCache ? toRoutingConfig(_settingsCache) : null;
+  const cached = peekCachedSettings();
+  const cfg = cached ? toRoutingConfig(cached) : null;
   if (cfg && effectiveMode(cfg) === "always") return;
 
   nmh.nmhWarmupNativeHost();
 
   // 缓存尚未填充（SW 冷启动后首次调用）时顺带异步预热一次，不阻塞本次调用，
   // 让后续调用（以及本函数下次调用）尽快用上真实设置值。
-  if (!_settingsCache) void getRoutingSettings();
+  if (!cached) void getCachedSettings().catch(() => {});
 }
 
 export async function checkFluxDownAvailable(): Promise<boolean> {

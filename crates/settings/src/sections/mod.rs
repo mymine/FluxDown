@@ -22,6 +22,7 @@ mod icon_pack;
 pub(crate) mod notify;
 pub(crate) mod proxy;
 pub(crate) mod rate_limit;
+pub(crate) mod shortcuts;
 pub(crate) mod site_auth;
 pub(crate) mod subscription;
 pub(crate) mod user_agent;

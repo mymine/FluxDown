@@ -29,6 +29,8 @@ struct BatchModel {
     recent_order: VecDeque<String>,
     deadline: Option<Instant>,
     cooldown: Option<Instant>,
+    /// The open window is handing a file to the system and closes once that settles.
+    closing: bool,
 }
 
 impl BatchModel {
@@ -61,6 +63,12 @@ impl BatchModel {
         if !self.enabled || self.deadline.is_none_or(|due| due > now) {
             return None;
         }
+        if self.closing {
+            // Never append to a view that is about to close: the batch waits for the close (and
+            // its cooldown) or for the handoff to end with the window kept open.
+            self.deadline = Some(now + CLOSE_COOLDOWN);
+            return None;
+        }
         self.deadline = None;
         Some((
             std::mem::take(&mut self.pending),
@@ -68,11 +76,31 @@ impl BatchModel {
         ))
     }
 
+    /// A file handoff started or succeeded: the window closes once the opened program takes over.
+    /// Due batches are held back meanwhile; the cooldown starts at the actual close.
+    fn closing(&mut self) {
+        self.closing = true;
+    }
+
+    /// The window was removed.
     fn closed(&mut self, now: Instant) {
+        self.closing = false;
         let until = now + CLOSE_COOLDOWN;
         self.cooldown = Some(until);
         if let Some(due) = self.deadline.as_mut() {
             *due = (*due).max(until);
+        }
+    }
+
+    /// The handoff failed or more completions remain: the window stays, and batches held back
+    /// while it was closing become due as if they had just been enqueued.
+    fn kept(&mut self, now: Instant) {
+        self.closing = false;
+        let earliest = self
+            .cooldown
+            .map_or(now + BATCH_DELAY, |until| until.max(now + BATCH_DELAY));
+        if let Some(due) = self.deadline.as_mut() {
+            *due = (*due).min(earliest);
         }
     }
 
@@ -178,18 +206,27 @@ pub(crate) fn forget(task_id: &str, cx: &mut App) {
     }
 }
 
-/// Start the cooldown before a file handoff can wait for foreground transfer.
-/// The actual close extends it again, so no batch is appended to a closing view.
+/// A file handoff started (or succeeded): stop appending to the view until it closes or
+/// [`window_kept`] reports that it stays.
 pub(crate) fn window_closing(cx: &mut App) {
+    cx.global_mut::<CompletionWindows>().model.closing();
+}
+
+/// The handoff failed or the view moved on to another completion: it keeps receiving batches.
+pub(crate) fn window_kept(cx: &mut App) {
     cx.global_mut::<CompletionWindows>()
         .model
-        .closed(Instant::now());
+        .kept(Instant::now());
+    // The deadline may have moved earlier than the running timer sleeps: restart it.
+    cancel_pending(cx);
     schedule(cx);
 }
 
 pub(crate) fn window_closed(cx: &mut App) {
-    cx.global_mut::<CompletionWindows>().view = None;
-    window_closing(cx);
+    let state = cx.global_mut::<CompletionWindows>();
+    state.view = None;
+    state.model.closed(Instant::now());
+    schedule(cx);
 }
 
 fn cancel_pending(cx: &mut App) {
@@ -203,9 +240,9 @@ fn cancel_pending(cx: &mut App) {
 }
 
 fn shutdown(cx: &mut App) {
-    cx.global_mut::<CompletionWindows>()
-        .model
-        .set_enabled(false);
+    let state = cx.global_mut::<CompletionWindows>();
+    state.model.set_enabled(false);
+    state.model.kept(Instant::now());
     cancel_pending(cx);
     cx.global_mut::<CompletionWindows>().view = None;
 }
@@ -405,15 +442,61 @@ mod tests {
     fn file_handoff_holds_the_next_batch_until_after_actual_close() {
         let now = Instant::now();
         let mut model = enabled_model();
-        model.closed(now);
+        model.closing();
         model.enqueue("next".into(), now + Duration::from_millis(100));
-        assert!(model.take_due(now + BATCH_DELAY).is_none());
+        let first_due = now + Duration::from_millis(100) + BATCH_DELAY;
+        assert_eq!(model.deadline, Some(first_due));
+        assert!(model.take_due(first_due).is_none());
         let actual_close = now + Duration::from_millis(1500);
         model.closed(actual_close);
         let due = actual_close + CLOSE_COOLDOWN;
         assert_eq!(model.deadline, Some(due));
         assert!(model.take_due(due - Duration::from_millis(1)).is_none());
         assert_eq!(model.take_due(due).expect("handoff cooldown ended").1, 1);
+    }
+
+    #[test]
+    fn a_long_handoff_never_feeds_the_closing_window() {
+        let now = Instant::now();
+        let mut model = enabled_model();
+        model.closing();
+        model.enqueue("late".into(), now);
+        let mut due = now + BATCH_DELAY;
+        // Still handing off (e.g. waiting on an elevation prompt): keep deferring, never append.
+        for _ in 0..3 {
+            assert!(model.take_due(due).is_none());
+            due += CLOSE_COOLDOWN;
+            assert_eq!(model.deadline, Some(due));
+        }
+        let actual_close = due + Duration::from_secs(1);
+        model.closed(actual_close);
+        let due = actual_close + CLOSE_COOLDOWN;
+        assert_eq!(model.deadline, Some(due));
+        assert_eq!(model.take_due(due).expect("next window").1, 1);
+    }
+
+    #[test]
+    fn a_window_kept_after_a_failed_handoff_gets_held_batches_promptly() {
+        let now = Instant::now();
+        let mut model = enabled_model();
+        model.closing();
+        model.enqueue("late".into(), now);
+        assert!(model.take_due(now + BATCH_DELAY).is_none());
+        let failed = now + Duration::from_secs(1);
+        model.kept(failed);
+        let due = failed + BATCH_DELAY;
+        assert_eq!(model.deadline, Some(due));
+        let (ids, count) = model.take_due(due).expect("appended to the kept window");
+        assert_eq!(ids, ["late"]);
+        assert_eq!(count, 1);
+        // A batch that was not held back keeps its own earlier deadline.
+        model.closing();
+        model.enqueue("fresh".into(), failed + Duration::from_secs(2));
+        model.kept(failed + Duration::from_secs(2) + Duration::from_millis(100));
+        assert_eq!(
+            model.deadline,
+            Some(failed + Duration::from_secs(2) + BATCH_DELAY)
+        );
     }
 
     #[test]

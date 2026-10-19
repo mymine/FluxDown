@@ -28,6 +28,7 @@ import com.fluxdown.core.protocol.MarketAction
 import com.fluxdown.core.protocol.MarketEntry
 import com.fluxdown.core.protocol.PluginAutoDisabledNotice
 import com.fluxdown.core.protocol.PluginDto
+import com.fluxdown.core.protocol.PluginSiteDefault
 import com.fluxdown.core.protocol.PluginMarket
 import com.fluxdown.core.protocol.PluginPackage
 import com.fluxdown.core.protocol.callJson
@@ -36,6 +37,7 @@ import com.fluxdown.core.protocol.pluginIdentityParams
 import com.fluxdown.core.protocol.pluginInstallParams
 import com.fluxdown.core.protocol.pluginMarketInstallParams
 import com.fluxdown.core.protocol.pluginSetEnabledParams
+import com.fluxdown.core.protocol.pluginSetSiteDefaultParams
 import com.fluxdown.core.protocol.str
 import com.fluxdown.core.protocol.strOrNull
 import com.fluxdown.fluxui.overlay.FluxToastKind
@@ -180,6 +182,43 @@ internal class ExtensionsModel(val container: AppContainer, val hostId: String) 
     private fun noteMissing(result: InstalledPlugin?) {
         val missing = result?.missingComponents.orEmpty()
         if (missing.isNotEmpty()) missingComponents = missing
+    }
+
+    // ───────────── 站点默认插件 ─────────────
+
+    /** `daemon.plugin.siteDefaults`（按 site 升序）；非空才渲染「站点默认插件」区块。 */
+    var siteDefaults by mutableStateOf<List<PluginSiteDefault>>(emptyList())
+        private set
+    var siteDefaultBusy by mutableStateOf(emptySet<String>())
+        private set
+
+    /** 打开扩展页与每次修改后重新拉取；失败（含主机不支持）保持上次列表，不打扰用户。 */
+    fun refreshSiteDefaults() {
+        container.appScope.launch { fetchSiteDefaults() }
+    }
+
+    private suspend fun fetchSiteDefaults() {
+        try {
+            siteDefaults = PluginSiteDefault.listFromJson(session.callJson(HostMethod.daemonPluginSiteDefaults))
+        } catch (e: HostException) {
+            // 不支持 / 暂不可达：保留现状
+        }
+    }
+
+    /** [identity] = null → 删除条目；非 null → 确认 / 更换默认插件。 */
+    fun setSiteDefault(env: ExtensionsEnv, site: String, identity: String?) {
+        if (site in siteDefaultBusy) return
+        siteDefaultBusy = siteDefaultBusy + site
+        container.appScope.launch {
+            try {
+                session.callUnit(HostMethod.daemonPluginSetSiteDefault, pluginSetSiteDefaultParams(site, identity))
+            } catch (e: HostException) {
+                env.toast(env.text(R.string.pluginSiteDefaultSaveFailed, "error" to env.error(e)), FluxToastKind.Error)
+            } finally {
+                fetchSiteDefaults()
+                siteDefaultBusy = siteDefaultBusy - site
+            }
+        }
     }
 
     // ───────────── 文件安装（远端主机） ─────────────
@@ -425,7 +464,8 @@ internal fun PluginAutoDisabledEffect(env: ExtensionsEnv) {
             if (notice.name != HostNotice.pluginAutoDisabled) return@collect
             val payload = PluginAutoDisabledNotice.fromJson(Json.parseOrNull(notice.json)) ?: return@collect
             val name = latest.firstOrNull { it.identity == payload.identity }?.name ?: payload.identity
-            env.toast(env.text(R.string.pluginAutoDisabledToast, "name" to name), FluxToastKind.Warn)
+            val toastKey = if (payload.reason == "Revoked") R.string.pluginRevokedToast else R.string.pluginAutoDisabledToast
+            env.toast(env.text(toastKey, "name" to name), FluxToastKind.Warn)
         }
     }
 }

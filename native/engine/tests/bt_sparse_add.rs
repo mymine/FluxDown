@@ -13,7 +13,7 @@
 //! 3. `{hash}.bitv` fast-resume 位图照常由持久化层写出——冒名工厂不影响
 //!    BitVFactory 面。
 
-#![cfg(windows)]
+#![cfg(all(windows, feature = "bt"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};

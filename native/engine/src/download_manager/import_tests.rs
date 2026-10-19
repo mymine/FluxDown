@@ -692,6 +692,18 @@ async fn meta_probe_waits_for_a_gate_permit() {
         ),
         manager.client.clone(),
         ProxyConfig::default(),
+        crate::intercept::noop(),
+        crate::intercept::TaskCtx {
+            id: "probe-task".into(),
+            url: format!("http://127.0.0.1:{port}/file.bin"),
+            source_url: format!("http://127.0.0.1:{port}/file.bin"),
+            file_name: String::new(),
+            save_dir: String::new(),
+            protocol: "http",
+            track_pair: false,
+            is_resume: false,
+        },
+        crate::intercept::RunMeta::default(),
     );
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())

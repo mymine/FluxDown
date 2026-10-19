@@ -10,6 +10,7 @@
 
 import { RpcError } from '../../../lib/rpc/error'
 import type { CreateTaskRequest, DaemonCreateTasksParams, DaemonCreateTasksResult, CreateTaskItem, RpcErrorData } from '../../../lib/rpc/protocol'
+import { randomUuid } from '../../../lib/uuid'
 
 /** 每次 `createMany` 的条目数（协议上限 512 的一半）。 */
 export const IMPORT_CHUNK_SIZE = 256
@@ -55,7 +56,7 @@ export interface ImportOptions {
   sleep: (ms: number) => Promise<void>
   signal?: AbortSignal
   onProgress?: (progress: ImportProgress) => void
-  /** 每块的幂等键生成器；默认 `crypto.randomUUID()`。 */
+  /** 每块的幂等键生成器；默认 `randomUuid()`（非安全上下文也可用）。 */
   newBatchId?: () => string
 }
 
@@ -121,7 +122,7 @@ export async function runImport(options: ImportOptions): Promise<ImportReport> {
   const total = items.length
   const outcomes: ItemOutcome[] = new Array<ItemOutcome>(total).fill({ status: 'notSubmitted' })
   const report: ImportReport = { outcomes, cancelled: false, succeeded: 0, failed: 0, notSubmitted: 0, firstError: null }
-  const newBatchId = options.newBatchId ?? (() => crypto.randomUUID())
+  const newBatchId = options.newBatchId ?? randomUuid
 
   const fail = (index: number, error: RpcErrorData) => {
     outcomes[index] = { status: 'failed', error }

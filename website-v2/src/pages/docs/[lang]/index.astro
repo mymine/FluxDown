@@ -1,6 +1,6 @@
 ---
 /**
- * 文档首页(静态预渲染,en/zh 各一条路由):hero + 内联搜索(支持 `?q=`)+ 分区卡片 + 社区共建条。
+ * 文档首页(静态预渲染,en/zh 各一条路由):hero + 内联搜索(支持 `?q=`)+ 分区卡片 + 参与贡献(各仓库入口)。
  */
 import { getCollection } from "astro:content";
 import { ArrowRight, ArrowUpRight } from "lucide-react";
@@ -10,6 +10,15 @@ import { BrandIcon } from "@/components/icons/brand";
 import { SECTION_ICONS, docsAlternates, docsRepoTree } from "@/components/docs/meta";
 import { buildDocsNav, type DocsLang } from "@/lib/docs-nav";
 import { docs } from "@/i18n/messages/docs";
+import { contribute } from "@/i18n/messages/contribute";
+import {
+  CONTRIBUTE_AREAS,
+  CONTRIBUTE_OVERVIEW,
+  PLUGIN_SDK_NPM_URL,
+  PLUGIN_SDK_PACKAGE,
+  contributeGuidePath,
+  githubUrl,
+} from "@/lib/ecosystem";
 import { withBase } from "@/lib/base";
 
 export const prerender = true;
@@ -22,10 +31,12 @@ const lang = Astro.params.lang as DocsLang;
 const t = docs[lang];
 const all = await getCollection("docs");
 const { groups } = buildDocsNav(all, lang);
-// contributing 由底部共建条承载,卡片区保持 3 × 2 平衡
+// contributing 由底部「参与贡献」区承载,卡片区保持 3 × 2 平衡
 const cards = groups.filter((g) => g.id !== "contributing");
 const firstPage = groups[0]?.items[0]?.href ?? `/docs/${lang}/`;
-const titleHtml = t.index.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+const serif = (html: string) => html.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+const titleHtml = serif(t.index.title);
+const c = contribute[lang];
 ---
 
 <Layout
@@ -98,22 +109,66 @@ const titleHtml = t.index.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif"
     <div class="rule"></div>
   </section>
 
-  <section class="frame" id="contributing">
-    <div class="section-tight docs-community">
-      <div class="max-w-[60ch]">
-        <h2 class="h3">{t.index.communityTitle}</h2>
-        <p class="mt-3 text-[15px] leading-relaxed text-muted">{t.index.communityBody}</p>
+  <section class="frame" id="contributing" aria-labelledby="docs-contrib-title">
+    <div class="section-tight docs-contrib-head">
+      <div class="max-w-[62ch]">
+        <span class="eyebrow">{c.eyebrow}</span>
+        <h2 id="docs-contrib-title" class="h3 mt-3" data-reveal set:html={serif(c.title)} />
+        <p class="mt-3 text-[15px] leading-relaxed text-muted" data-reveal style="--d:1">{c.lede}</p>
       </div>
-      <div class="flex shrink-0 flex-wrap gap-3">
-        <a href={withBase(`/docs/${lang}/contributing/translations/`)} class="btn btn-secondary">
-          {t.index.translate}
-          <ArrowUpRight size={14} aria-hidden="true" />
-        </a>
-        <a href={withBase(`/docs/${lang}/contributing/docs/`)} class="btn btn-ghost">
-          {t.index.guide}
-          <ArrowRight size={14} aria-hidden="true" />
-        </a>
-      </div>
+      <a href={withBase(contributeGuidePath(lang, CONTRIBUTE_OVERVIEW))} class="btn btn-secondary shrink-0">
+        {c.overview}
+        <ArrowRight size={14} aria-hidden="true" />
+      </a>
+    </div>
+    <div class="cells docs-contrib border-t border-line">
+      {
+        CONTRIBUTE_AREAS.map((area, i) => {
+          const copy = c.areas[area.id];
+          return (
+            <article class="cell spot docs-contrib-card" data-reveal style={`--d:${i}`}>
+              <div class="docs-card-top">
+                <span class="docs-card-icon">
+                  <area.icon size={16} strokeWidth={1.6} aria-hidden="true" />
+                </span>
+                <span class="eyebrow-plain num">{String(i + 1).padStart(2, "0")}</span>
+              </div>
+              <h3 class="docs-contrib-title">{copy.title}</h3>
+              <p class="docs-card-desc">{copy.desc}</p>
+              <div class="docs-contrib-links">
+                <a href={withBase(contributeGuidePath(lang, area.guide))} class="docs-contrib-guide">
+                  {c.guide}
+                  <ArrowRight size={14} aria-hidden="true" />
+                </a>
+                <a
+                  href={githubUrl(area.repo)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="docs-contrib-repo"
+                  aria-label={`${c.repo}: ${area.repo}`}
+                >
+                  <BrandIcon name="github" size={13} />
+                  <span>{area.repo}</span>
+                  <ArrowUpRight size={12} aria-hidden="true" />
+                </a>
+                {area.id === "plugins" && (
+                  <a
+                    href={PLUGIN_SDK_NPM_URL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="docs-contrib-repo"
+                    aria-label={`${c.sdk}: ${c.sdkDesc}`}
+                  >
+                    <BrandIcon name="npm" size={13} />
+                    <span>{PLUGIN_SDK_PACKAGE}</span>
+                    <ArrowUpRight size={12} aria-hidden="true" />
+                  </a>
+                )}
+              </div>
+            </article>
+          );
+        })
+      }
     </div>
   </section>
 </Layout>
@@ -228,16 +283,103 @@ const titleHtml = t.index.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif"
     padding-top: 20px;
   }
 
-  .docs-community {
+  .docs-contrib-head {
     display: flex;
     flex-direction: column;
+    align-items: flex-start;
     gap: 24px;
   }
   @media (min-width: 900px) {
-    .docs-community {
+    .docs-contrib-head {
       flex-direction: row;
-      align-items: center;
+      align-items: flex-end;
       justify-content: space-between;
     }
+  }
+
+  /* 5 张卡:窄屏单列;中屏两列、末张通栏;宽屏 6 栅格——插件 / 主题各占半行,其余三张各占三分之一 */
+  .docs-contrib {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  @media (min-width: 720px) {
+    .docs-contrib {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .docs-contrib-card:last-child {
+      grid-column: span 2;
+    }
+  }
+  @media (min-width: 1100px) {
+    .docs-contrib {
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+    }
+    .docs-contrib-card {
+      grid-column: span 2;
+    }
+    .docs-contrib-card:nth-child(-n + 2) {
+      grid-column: span 3;
+    }
+  }
+  .docs-contrib-card {
+    display: flex;
+    flex-direction: column;
+  }
+  .docs-contrib-title {
+    margin-top: 20px;
+    font-size: 17px;
+    font-weight: 560;
+    letter-spacing: -0.01em;
+    color: var(--fg);
+  }
+  .docs-contrib-links {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px 18px;
+    margin-top: auto;
+    padding-top: 22px;
+  }
+  .docs-contrib-guide {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--accent-ink);
+  }
+  .docs-contrib-guide :global(svg) {
+    transition: transform 160ms var(--ease-out);
+  }
+  .docs-contrib-guide:hover :global(svg) {
+    transform: translateX(3px);
+  }
+  .docs-contrib-repo {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 3px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--fg-muted);
+    transition:
+      color 160ms var(--ease-out),
+      border-color 160ms var(--ease-out);
+  }
+  .docs-contrib-repo > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .docs-contrib-repo :global(svg) {
+    flex: none;
+  }
+  .docs-contrib-repo:hover {
+    color: var(--fg);
+    border-color: var(--line-strong);
   }
 </style>

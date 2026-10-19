@@ -49,13 +49,17 @@ const PARTS_VERSION: u32 = 1;
 /// header JSON 长度上限（正常几 KB；超限视为损坏，防解析放大）。
 const MAX_HEADER_LEN: u32 = 16 * 1024 * 1024;
 
+/// librqbit 会话持久化目录：`<app_data_dir>/bt_session`（session.json /
+/// `{hash}.bitv` / `{hash}.torrent` / dht.json / 边车）。
+pub fn persistence_dir(app_data_dir: &str) -> PathBuf {
+    PathBuf::from(app_data_dir).join("bt_session")
+}
+
 /// 边车文件路径：`<app_data_dir>/bt_session/<task_id>.parts`。
 /// 与 librqbit 会话数据（session.json / {hash}.bitv / dht.json）同目录，
 /// task_id 为 UUID，不会与上述文件名冲突。
 pub fn sidecar_path(app_data_dir: &str, task_id: &str) -> PathBuf {
-    PathBuf::from(app_data_dir)
-        .join("bt_session")
-        .join(format!("{task_id}.parts"))
+    persistence_dir(app_data_dir).join(format!("{task_id}.parts"))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -359,6 +363,73 @@ pub fn load_seed_factory(
     sidecar_path: &Path,
     save_dir: &Path,
 ) -> Result<Option<PartsSeedStorageFactory>, String> {
+    Ok(
+        load_seed_layout(sidecar_path, save_dir)?.map(|layout| PartsSeedStorageFactory {
+            inner: Arc::new(layout),
+        }),
+    )
+}
+
+/// 读取边车的只读视图（完整性校验用），语义同 [`load_seed_factory`]。
+pub fn load_sidecar_layout(
+    sidecar_path: &Path,
+    save_dir: &Path,
+) -> Result<Option<SidecarLayout>, String> {
+    Ok(load_seed_layout(sidecar_path, save_dir)?.map(|inner| SidecarLayout { inner }))
+}
+
+/// 边车的只读视图：选中文件的最终路径 + 未选文件的边界字节。
+pub struct SidecarLayout {
+    inner: SeedLayout,
+}
+
+impl SidecarLayout {
+    /// 写入边车时记录的 info-hash（hex，可能为空）。
+    pub fn info_hash(&self) -> &str {
+        &self.inner.info_hash
+    }
+
+    /// 选中文件 `file_id` 的最终磁盘路径。
+    pub fn selected_path(&self, file_id: usize) -> Option<&Path> {
+        self.inner.selected.get(&file_id).map(PathBuf::as_path)
+    }
+
+    /// 打开边界字节读取器（只读；无任何边界区间时不打开 blob）。
+    pub fn into_boundary_reader(self) -> std::io::Result<BoundaryReader> {
+        let blob = if self.inner.parts.values().any(|segs| !segs.is_empty()) {
+            Some(File::open(&self.inner.sidecar_path)?)
+        } else {
+            None
+        };
+        Ok(BoundaryReader {
+            blob,
+            parts: self.inner.parts,
+        })
+    }
+}
+
+/// 未选文件边界字节的只读来源（边车 blob）。
+pub struct BoundaryReader {
+    blob: Option<File>,
+    parts: HashMap<usize, Vec<SegSpec>>,
+}
+
+impl BoundaryReader {
+    /// 读取未选文件 `file_id` 的 `[offset, offset+buf.len())`；未提取的空洞零填充
+    /// （需要的边界 piece 不会落在空洞上，落上即哈希不符）。
+    pub fn read(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        let segments = self.parts.get(&file_id).map_or(&[][..], Vec::as_slice);
+        match &self.blob {
+            Some(blob) => read_parts_ranges(blob, segments, offset, buf).map(|_| ()),
+            None => {
+                buf.fill(0);
+                Ok(())
+            }
+        }
+    }
+}
+
+fn load_seed_layout(sidecar_path: &Path, save_dir: &Path) -> Result<Option<SeedLayout>, String> {
     let mut f = match File::open(sidecar_path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -425,14 +496,12 @@ pub fn load_seed_factory(
         segs.sort_by_key(|s| s.offset);
     }
 
-    Ok(Some(PartsSeedStorageFactory {
-        inner: Arc::new(SeedLayout {
-            sidecar_path: sidecar_path.to_path_buf(),
-            info_hash: header.info_hash,
-            selected,
-            parts,
-            max_file_id,
-        }),
+    Ok(Some(SeedLayout {
+        sidecar_path: sidecar_path.to_path_buf(),
+        info_hash: header.info_hash,
+        selected,
+        parts,
+        max_file_id,
     }))
 }
 

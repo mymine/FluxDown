@@ -44,8 +44,8 @@ import kotlinx.coroutines.launch
 /** 退场动画结束后清除内存中的访问密钥。 */
 private const val SECRET_CLEAR_DELAY_MS = 600L
 
-/** 打开计数：每次从关闭到打开新建一份表单；退场动画期间沿用同一份。 */
-private class OpenTracker {
+/** 打开计数：每次从关闭到打开新建一份表单 / 状态机；退场动画期间沿用同一份（添加主机 / 添加设备共用）。 */
+internal class OpenTracker {
     var wasOpen = false
     var generation = 0
 }

@@ -33,6 +33,8 @@ export interface DashTrack {
   periodId?: string;
   /** SegmentTemplate/SegmentList 只有轨道线索，没有单个完整文件 URL。 */
   downloadable?: boolean;
+  /** 轨道受 DRM 保护（MPD ContentProtection），下载得到的是密文。 */
+  protected?: boolean;
 }
 
 /** 一份 manifest 里的全部轨道，按清晰度/码率降序排列。 */
@@ -443,12 +445,21 @@ function childSegmentTemplate(node: XmlNode): XmlNode | undefined {
   return directChild(node, "segmenttemplate") || directChild(node, "segmentlist");
 }
 
-function templateTrackUrl(template: XmlNode, baseUrl: string): string | null {
+/** 未展开的分片序号 / 时间占位符；只出现在 `downloadable: false` 的模板轨 URL 里。 */
+export const SEGMENT_PLACEHOLDER = "__fluxdown_segment__";
+
+function templateTrackUrl(template: XmlNode, baseUrl: string, representation: XmlNode): string | null {
   const segmentUrl = directChild(template, "segmenturl");
   const raw = template.attributes.media || segmentUrl?.attributes.media;
   if (!raw) return null;
   // 仅用于轨道/分片关联的稳定线索，绝不把未展开的 $Number$ 当真实 URL 下载。
-  const placeholder = raw.replace(/\$[^$]*\$/g, "__fluxdown_segment__");
+  // $RepresentationID$ / $Bandwidth$ 在清单里已知，展开后同一档的分片目录与文件名前缀是确定的，
+  // 才能把实际请求到的分片归到对应轨道。
+  const expanded = raw.replace(/\$(RepresentationID|Bandwidth)(%0\d+d)?\$/g, (_whole, name: string) => {
+    const value = name === "RepresentationID" ? representation.attributes.id : representation.attributes.bandwidth;
+    return value ?? SEGMENT_PLACEHOLDER;
+  });
+  const placeholder = expanded.replace(/\$[^$]*\$/g, SEGMENT_PLACEHOLDER);
   try {
     return new URL(placeholder, baseUrl).href;
   } catch {
@@ -522,6 +533,8 @@ export function parseDashXml(text: string, baseUrl: string): DashManifest | null
           (node.attributes.contenttype === "video" ? "video/mp4" :
             node.attributes.contenttype === "audio" ? "audio/mp4" : undefined);
         const adaptationCodecs = node.attributes.codecs;
+        // ContentProtection（cenc / Widevine / PlayReady / FairPlay）：分片是密文，下载无法播放
+        const adaptationProtected = !!directChild(node, "contentprotection");
         for (const representation of node.children.filter(
           (child) => child.name === "representation",
         )) {
@@ -529,7 +542,7 @@ export function parseDashXml(text: string, baseUrl: string): DashManifest | null
           const mimeType = representation.attributes.mimetype || adaptationMime;
           const codecs = representation.attributes.codecs || adaptationCodecs;
           const template = childSegmentTemplate(representation) || ownTemplate;
-          const templateUrl = template ? templateTrackUrl(template, representationBase) : null;
+          const templateUrl = template ? templateTrackUrl(template, representationBase, representation) : null;
           const hasTemplate = !!template;
           const rawUrl = hasTemplate ? templateUrl : representationBase;
           if (!rawUrl || rawUrl.endsWith("/")) continue;
@@ -545,6 +558,7 @@ export function parseDashXml(text: string, baseUrl: string): DashManifest | null
             frameRate: parseFrameRate(representation.attributes.framerate),
             downloadable: !hasTemplate,
           };
+          if (adaptationProtected || directChild(representation, "contentprotection")) track.protected = true;
           if (periodId) track.periodId = periodId;
           if (isXmlVideo(mimeType, codecs, representation)) video.push(track);
           else if (isXmlAudio(mimeType, codecs)) audio.push(track);
@@ -586,6 +600,7 @@ function normalizeDashTrack(value: unknown): DashTrack | null {
     track.periodId = raw.periodId.trim();
   }
   if (typeof raw.downloadable === "boolean") track.downloadable = raw.downloadable;
+  if (raw.protected === true) track.protected = true;
   return track;
 }
 

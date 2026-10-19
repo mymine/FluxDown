@@ -109,6 +109,11 @@ pub enum DownloadError {
     /// 终态失败，而是把任务原样交给普通 HTTP 下载器按字面文件保存。
     #[error("not an HLS playlist: {0}")]
     NotAnHlsPlaylist(String),
+    /// 插件拦截器要求中止任务（`fail` 返回值或 `onFailure: "fail"` 的出错，见
+    /// [`crate::intercept::InterceptAbort`]）。重试不会改变插件的决定：段级 / 请求级
+    /// 重试遇到它都直接上抛。
+    #[error("{0}")]
+    PluginAbort(String),
     #[error("{0}")]
     Other(String),
 }
@@ -129,6 +134,11 @@ pub(crate) fn is_server_rejection(e: &DownloadError) -> bool {
         }
         _ => false,
     }
+}
+
+/// 检测下载错误是否为插件中止（见 [`DownloadError::PluginAbort`]）。
+pub(crate) fn is_plugin_abort(e: &DownloadError) -> bool {
+    matches!(e, DownloadError::PluginAbort(_))
 }
 
 /// 检测下载错误是否为本地磁盘写满 / 配额耗尽（ENOSPC、`ERROR_DISK_FULL`、EDQUOT）。
@@ -293,6 +303,10 @@ pub struct ProgressUpdate {
     /// Restored/truncated counter before body reads. Unlike an ordinary lower
     /// progress sample, this explicitly resets host traffic measurement.
     pub download_baseline: Option<i64>,
+    /// 本次运行从网络读到的 body 字节累计（单调，含随后被重试丢弃的部分）。
+    /// `Some` 时测速与宿主流量统计都以它为准，`downloaded_bytes` 只表示进度：
+    /// 先整段缓冲、再按序写盘的协议（HLS）落盘计数只能按段跳变，拿它测速会锯齿。
+    pub transfer_bytes: Option<i64>,
     pub total_bytes: i64,
     pub status: i32,
     pub error_message: String,
@@ -451,6 +465,21 @@ pub struct DownloadParams {
     /// 同样的阶梯（否则永久性失败要等两倍时间）；`None`（hint / 续传 / 序幕未探测
     /// 或被取消 / 非 HTTP 协议）时下载器自己探测。
     pub preprobed: Option<Result<PreprobedInfo, DownloadError>>,
+    /// 本任务的插件拦截器（无匹配插件时为 [`crate::intercept::noop`]）。
+    pub interceptor: std::sync::Arc<dyn crate::intercept::TaskInterceptor>,
+    /// 本次运行的连接数硬上限（插件 `maxConnections`）；0 = 不限。
+    pub connection_cap: i32,
+    /// 只读网络信息与有效 UA（插件上下文用）。
+    pub run_meta: crate::intercept::RunMeta,
+}
+
+impl DownloadParams {
+    /// 用 `spec` 回填 `cookies` / `referrer` / `extra_headers` 三个冗余字段。
+    pub fn sync_request_mirrors(&mut self) {
+        self.cookies.clone_from(&self.spec.cookies);
+        self.referrer.clone_from(&self.spec.referrer);
+        self.extra_headers.clone_from(&self.spec.extra_headers);
+    }
 }
 
 /// 启动序幕（`download_manager::finalize_start_file_name`）用与下载相同的 client / spec
@@ -498,26 +527,13 @@ pub(crate) fn apply_extra_headers(
         return req;
     }
 
-    /// Headers that must never be forwarded from the browser extension.
-    /// Compared case-insensitively via `HeaderName` (which lowercases).
-    const BLOCKED_HEADERS: &[&str] = &[
-        "accept-encoding",
-        "content-encoding",
-        "transfer-encoding",
-        "host",
-        "content-length",
-        "connection",
-        "range",
-        "if-range",
-    ];
-
     let mut map = reqwest::header::HeaderMap::with_capacity(extra_headers.len());
     for (name, value) in extra_headers {
         if let (Ok(header_name), Ok(header_value)) = (
             reqwest::header::HeaderName::from_bytes(name.as_bytes()),
             reqwest::header::HeaderValue::from_str(value),
         ) {
-            if BLOCKED_HEADERS
+            if BLOCKED_REQUEST_HEADERS
                 .iter()
                 .any(|&blocked| header_name.as_str() == blocked)
             {
@@ -533,6 +549,52 @@ pub(crate) fn apply_extra_headers(
     // req.headers(map) 内部用 insert 逐个替换同名头，
     // 确保浏览器的真实 User-Agent 等值覆盖 build_client 设的默认值。
     req.headers(map)
+}
+
+/// 永不从外部输入（扩展捕获 / 插件改写）转发的请求头，由 HTTP 栈或下载引擎独占管理。
+/// 按小写比较（`HeaderName` 恒为小写）。
+pub(crate) const BLOCKED_REQUEST_HEADERS: [&str; 8] = [
+    "accept-encoding",
+    "content-encoding",
+    "transfer-encoding",
+    "host",
+    "content-length",
+    "connection",
+    "range",
+    "if-range",
+];
+
+/// 一条按站点附加的请求头规则：只对 [`crate::auth::site_key`] 等于 `origin` 的请求生效。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OriginHeaders {
+    pub origin: String,
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+/// 对 `url` 所属站点附加 `rules` 中匹配的请求头（过滤规则同 [`apply_extra_headers`]）。
+pub(crate) fn apply_origin_headers(
+    mut req: reqwest::RequestBuilder,
+    url: &str,
+    rules: &[OriginHeaders],
+) -> reqwest::RequestBuilder {
+    if rules.is_empty() {
+        return req;
+    }
+    let Some(site) = crate::auth::site_key(url) else {
+        return req;
+    };
+    for rule in rules.iter().filter(|r| r.origin == site) {
+        req = apply_extra_headers(req, &rule.headers);
+    }
+    req
+}
+
+/// 插件显式指定、引擎自适应逻辑不得改动的请求身份字段。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RequestPins {
+    pub user_agent: bool,
+    pub referrer: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -572,20 +634,25 @@ pub enum RequestBodyDecoded {
 ///   - `extra_headers`：扩展捕获的其他请求头（UA/Accept/Sec-Fetch-* 等），
 ///     由 `apply_extra_headers` 过滤危险头后注入
 ///   - `body`：仅非 GET 有意义；GET 请求即使携带也会被忽略（见 build_request）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RequestSpec {
     pub method: reqwest::Method,
     pub cookies: String,
     pub referrer: String,
     pub extra_headers: std::collections::HashMap<String, String>,
     pub body: Option<RequestBodyDecoded>,
+    /// 插件锁定的 UA / Referer：自适应改写（换 UA、补 Referer、质询脱困）跳过被锁字段。
+    pub pins: RequestPins,
+    /// 按站点附加的请求头（插件下发，不落库）。
+    pub origin_headers: Vec<OriginHeaders>,
 }
 
 /// 浏览器扩展/Native Messaging 捕获的原始请求体——引擎侧的传输无关表示。
 /// 捕获请求的宿主从 Native Messaging wire 格式转换为此类型后再调用
 /// [`RequestSpec::from_captured`]，使得 `downloader` / `download_manager`
 /// 不直接依赖 Native Messaging 协议。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
 pub enum CapturedRequestBody {
     FormData {
         fields: std::collections::HashMap<String, Vec<String>>,
@@ -595,22 +662,70 @@ pub enum CapturedRequestBody {
     },
     /// `bytes_b64`：base64 编码的原始字节(XHR/fetch 直接发送 ArrayBuffer 场景)。
     Raw {
+        #[serde(rename = "bytesB64")]
         bytes_b64: String,
+        #[serde(rename = "contentType", default)]
         content_type: Option<String>,
     },
+}
+
+/// 把传输表示的请求体解码为可直接发送的形式。base64 非法时返回错误文案。
+pub(crate) fn decode_captured_body(
+    body: CapturedRequestBody,
+) -> Result<RequestBodyDecoded, String> {
+    use base64::Engine;
+    match body {
+        CapturedRequestBody::FormData { fields } => {
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            for (k, vs) in fields {
+                for v in vs {
+                    pairs.push((k.clone(), v));
+                }
+            }
+            Ok(RequestBodyDecoded::Form(pairs))
+        }
+        CapturedRequestBody::Urlencoded { raw } => Ok(RequestBodyDecoded::Urlencoded(raw)),
+        CapturedRequestBody::Raw {
+            bytes_b64,
+            content_type,
+        } => base64::engine::general_purpose::STANDARD
+            .decode(&bytes_b64)
+            .map(|bytes| RequestBodyDecoded::Raw {
+                bytes,
+                content_type,
+            })
+            .map_err(|e| format!("请求体 base64 解码失败: {e}")),
+    }
+}
+
+/// [`decode_captured_body`] 的逆：表单按 key 聚合（同 key 的值保持出现顺序）。
+pub(crate) fn encode_decoded_body(body: &RequestBodyDecoded) -> CapturedRequestBody {
+    use base64::Engine;
+    match body {
+        RequestBodyDecoded::Form(pairs) => {
+            let mut fields: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            for (k, v) in pairs {
+                fields.entry(k.clone()).or_default().push(v.clone());
+            }
+            CapturedRequestBody::FormData { fields }
+        }
+        RequestBodyDecoded::Urlencoded(raw) => CapturedRequestBody::Urlencoded { raw: raw.clone() },
+        RequestBodyDecoded::Raw {
+            bytes,
+            content_type,
+        } => CapturedRequestBody::Raw {
+            bytes_b64: base64::engine::general_purpose::STANDARD.encode(bytes),
+            content_type: content_type.clone(),
+        },
+    }
 }
 
 impl RequestSpec {
     /// 默认 GET、无 cookies/headers/body——用于 download_manager 内部的"裸"
     /// HTTP 请求场景(如 BT/HLS 元数据获取,无浏览器会话上下文)。
     pub fn empty_get() -> Self {
-        Self {
-            method: reqwest::Method::GET,
-            cookies: String::new(),
-            referrer: String::new(),
-            extra_headers: std::collections::HashMap::new(),
-            body: None,
-        }
+        Self::default()
     }
 
     /// GET / HEAD 请求——可以多段下载、可以做 HEAD probe。
@@ -639,8 +754,6 @@ impl RequestSpec {
         extra_headers: std::collections::HashMap<String, String>,
         body: Option<CapturedRequestBody>,
     ) -> Self {
-        use base64::Engine;
-
         let method = method
             .and_then(|s| {
                 let upper = s.trim().to_ascii_uppercase();
@@ -659,30 +772,12 @@ impl RequestSpec {
             })
             .unwrap_or(reqwest::Method::GET);
 
-        let body = body.and_then(|b| match b {
-            CapturedRequestBody::FormData { fields } => {
-                let mut pairs: Vec<(String, String)> = Vec::new();
-                for (k, vs) in fields {
-                    for v in vs {
-                        pairs.push((k.clone(), v.clone()));
-                    }
-                }
-                Some(RequestBodyDecoded::Form(pairs))
+        let body = body.and_then(|b| match decode_captured_body(b) {
+            Ok(decoded) => Some(decoded),
+            Err(e) => {
+                log_info!("[request-spec] {}", e);
+                None
             }
-            CapturedRequestBody::Urlencoded { raw } => Some(RequestBodyDecoded::Urlencoded(raw)),
-            CapturedRequestBody::Raw {
-                bytes_b64,
-                content_type,
-            } => match base64::engine::general_purpose::STANDARD.decode(&bytes_b64) {
-                Ok(bytes) => Some(RequestBodyDecoded::Raw {
-                    bytes,
-                    content_type,
-                }),
-                Err(e) => {
-                    log_info!("[request-spec] failed to base64-decode raw body: {}", e);
-                    None
-                }
-            },
         });
 
         Self {
@@ -691,6 +786,7 @@ impl RequestSpec {
             referrer,
             extra_headers,
             body,
+            ..Self::default()
         }
     }
 }
@@ -748,6 +844,7 @@ pub fn build_request(
         req = req.header(reqwest::header::REFERER, &spec.referrer);
     }
     req = apply_extra_headers(req, &spec.extra_headers);
+    req = apply_origin_headers(req, url, &spec.origin_headers);
 
     if attaches_body && let Some(body) = &spec.body {
         match body {
@@ -1492,17 +1589,17 @@ pub async fn resolve_file_info(
 
 /// 去掉 extra_headers 里的浏览器 UA（回落到 client 的 DEFAULT_UA / 任务 UA）。
 fn spec_without_browser_ua(spec: &RequestSpec) -> RequestSpec {
+    if spec.pins.user_agent {
+        return spec.clone();
+    }
     RequestSpec {
-        method: spec.method.clone(),
-        cookies: spec.cookies.clone(),
-        referrer: spec.referrer.clone(),
         extra_headers: spec
             .extra_headers
             .iter()
             .filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent"))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
-        body: spec.body.clone(),
+        ..spec.clone()
     }
 }
 
@@ -1510,6 +1607,9 @@ fn spec_without_browser_ua(spec: &RequestSpec) -> RequestSpec {
 /// UA，也覆盖 client 级 UA（任务 / 队列 / 全局设置）——后者只删请求头无法摆脱，
 /// 用户若选了 Chrome 预设，删掉请求头后回落的仍是浏览器 UA。
 fn spec_with_neutral_ua(spec: &RequestSpec) -> RequestSpec {
+    if spec.pins.user_agent {
+        return spec.clone();
+    }
     let mut s = spec_without_browser_ua(spec);
     s.extra_headers
         .insert("User-Agent".to_string(), DEFAULT_UA.to_string());
@@ -1523,12 +1623,14 @@ fn has_neutral_ua(spec: &RequestSpec) -> bool {
         .any(|(k, v)| k.eq_ignore_ascii_case("user-agent") && v == DEFAULT_UA)
 }
 
-/// 一次 HTTP 下载运行内共享的请求头。
+/// 一次下载运行内共享的请求身份（HTTP 分段 / 单流，以及 HLS / DASH 的分片请求）。
 ///
-/// 探测被跳过（扩展给了文件大小提示的 hint 模式）时，首个真实下载请求才可能撞上
-/// 反机器人质询（Cloudflare `cf-mitigated: challenge`：浏览器 UA × rustls TLS
-/// 指纹）。请求点经 `escape_bot_challenge` 切到中性 UA 重发一次；切换对本次运行内
-/// 其后的全部请求（其他分段 worker、单流回退、续传窗口）生效，并落库供续传沿用。
+/// 两种运行中切换对本次运行内其后的全部请求立即生效：
+/// - 反机器人质询：探测被跳过（hint 模式）时首个真实请求才可能撞上质询（浏览器 UA ×
+///   rustls 指纹）。请求点经 [`Self::escape_bot_challenge`] 切到中性 UA 重发一次，并落库供续传沿用。
+/// - 凭据刷新：请求被拒（401 / 403 / 410）且有插件声明 `refresh` 阶段时，经
+///   [`Self::refresh_after_rejection`] 单飞换发凭据（并发失败的请求合并为一次插件调用），
+///   新凭据只活在本次运行内、不落库。
 ///
 /// ```
 /// use fluxdown_engine::downloader::{DownloadSpec, RequestSpec};
@@ -1538,22 +1640,99 @@ fn has_neutral_ua(spec: &RequestSpec) -> bool {
 /// ```
 #[derive(Debug)]
 pub struct DownloadSpec {
-    base: RequestSpec,
-    neutral: std::sync::OnceLock<RequestSpec>,
+    state: std::sync::RwLock<SpecState>,
+    /// 本次运行的连接数硬上限（插件 `maxConnections`）；`None` = 不限。
+    connection_cap: Option<usize>,
+    refresher: Option<crate::intercept::Refresher>,
+    /// 凭据刷新单飞闸门：持有期间其他被拒请求排队，拿到闸门后先看是否已被刷新。
+    refresh_gate: tokio::sync::Mutex<RefreshLedger>,
+    /// 已取得成功响应的最新身份代际 + 1（0 = 尚无）。见 [`Self::confirm`]。
+    confirmed_generation: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug)]
+struct SpecState {
+    current: std::sync::Arc<RequestSpec>,
+    /// 每次替换 `current` 递增。
+    generation: u64,
+    /// 已切换为中性 UA（每次运行至多一次）。
+    neutral: bool,
+    /// 凭据刷新改写后的任务 URL（只替换发往 [`crate::intercept::Refresher::origin_url`] 的请求）。
+    url: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct RefreshLedger {
+    /// 本次运行已成功刷新的次数（插件上下文 `refreshCount`）。
+    total: u32,
+    /// 连续的「换发后尚未取得过成功响应」的刷新次数；达到
+    /// [`crate::intercept::refresh::MAX_UNCONFIRMED_REFRESHES`] 即停止刷新。
+    unconfirmed: u32,
+    /// 插件已对该代际表示无可刷新：同代际的后续被拒请求不再询问。
+    declined_generation: Option<u64>,
 }
 
 impl DownloadSpec {
     /// 以任务（或探测自适应后）的请求头起步。
     pub fn new(base: RequestSpec) -> Self {
         Self {
-            base,
-            neutral: std::sync::OnceLock::new(),
+            state: std::sync::RwLock::new(SpecState {
+                current: std::sync::Arc::new(base),
+                generation: 0,
+                neutral: false,
+                url: None,
+            }),
+            connection_cap: None,
+            refresher: None,
+            refresh_gate: tokio::sync::Mutex::new(RefreshLedger::default()),
+            confirmed_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// 当前应使用的请求头：已从质询脱困则为中性 UA 版本，否则为原始请求头。
-    pub fn current(&self) -> &RequestSpec {
-        self.neutral.get().unwrap_or(&self.base)
+    /// 设置连接数硬上限；`cap <= 0` 表示不限。
+    pub(crate) fn with_connection_cap(mut self, cap: i32) -> Self {
+        if cap > 0 {
+            self.connection_cap = Some(cap as usize);
+        }
+        self
+    }
+
+    /// 挂上凭据刷新器（`None` = 无插件声明 `refresh`，被拒请求按原逻辑处理）。
+    pub(crate) fn with_refresher(mut self, refresher: Option<crate::intercept::Refresher>) -> Self {
+        self.refresher = refresher;
+        self
+    }
+
+    /// 连接数硬上限（`None` = 不限）。
+    pub(crate) fn connection_cap(&self) -> Option<usize> {
+        self.connection_cap
+    }
+
+    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, SpecState> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, SpecState> {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 当前应使用的请求身份（已含质询脱困 / 凭据刷新的结果）。
+    pub fn current(&self) -> std::sync::Arc<RequestSpec> {
+        self.read_state().current.clone()
+    }
+
+    /// 发往 `url` 的请求应改用的地址：仅当凭据刷新改写了任务 URL 且 `url` 是起跑时的
+    /// 任务 URL 时返回 `Some`（CDN 备选节点、重定向终点等其他地址不受影响）。
+    pub(crate) fn route_url(&self, url: &str) -> Option<String> {
+        let refresher = self.refresher.as_ref()?;
+        if url != refresher.origin_url() {
+            return None;
+        }
+        self.read_state().url.clone()
     }
 
     /// `resp` 是用 `used` 发出的下载请求的响应。它是反机器人质询且 `used` 还不是
@@ -1566,15 +1745,25 @@ impl DownloadSpec {
         resp: &reqwest::Response,
         db: &Db,
         task_id: &str,
-    ) -> Option<&RequestSpec> {
-        if resp.status().is_success() || !is_bot_challenge(resp.headers()) || has_neutral_ua(used) {
+    ) -> Option<std::sync::Arc<RequestSpec>> {
+        if used.pins.user_agent
+            || resp.status().is_success()
+            || !is_bot_challenge(resp.headers())
+            || has_neutral_ua(used)
+        {
             return None;
         }
-        let mut first = false;
-        let neutral = self.neutral.get_or_init(|| {
-            first = true;
-            spec_with_neutral_ua(&self.base)
-        });
+        let (neutral, first) = {
+            let mut state = self.write_state();
+            if state.neutral {
+                (state.current.clone(), false)
+            } else {
+                state.current = std::sync::Arc::new(spec_with_neutral_ua(&state.current));
+                state.generation += 1;
+                state.neutral = true;
+                (state.current.clone(), true)
+            }
+        };
         if first {
             log_info!(
                 "[download] task {} bot challenge (status={}) on download request: switching \
@@ -1582,43 +1771,128 @@ impl DownloadSpec {
                 task_id,
                 resp.status().as_u16()
             );
-            persist_adapted_spec(db, task_id, neutral).await;
+            persist_adapted_spec(db, task_id, &neutral).await;
         }
         Some(neutral)
+    }
+
+    /// 记录用 `used` 发出的请求取得了成功响应。此后该身份再被拒属于「凭据被正常
+    /// 消耗」（如每请求一个令牌），不计入连续无效刷新上限。无刷新器时为空操作。
+    pub(crate) fn confirm(&self, used: &std::sync::Arc<RequestSpec>) {
+        if self.refresher.is_none() {
+            return;
+        }
+        let state = self.read_state();
+        if std::sync::Arc::ptr_eq(&state.current, used) {
+            self.confirmed_generation
+                .fetch_max(state.generation + 1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// 用 `used` 发出的请求得到 `status`。可刷新（401 / 403 / 410 且有插件声明
+    /// `refresh`）时返回应重发所用的新请求身份：
+    /// - `used` 已不是当前身份（别的请求刚刷新过 / 已质询脱困）→ 直接返回当前身份，不调用插件；
+    /// - 否则单飞调用插件，成功换发则返回新身份；
+    /// - 插件不换发、连续换发后都没换来成功响应（达
+    ///   [`crate::intercept::refresh::MAX_UNCONFIRMED_REFRESHES`] 次）或不可刷新 → `None`，
+    ///   调用方按原错误处理。
+    ///
+    /// 调用方须保证同一个请求至多因刷新重发一次，并在请求成功时调用 [`Self::confirm`]。
+    /// 插件以 `onFailure: "fail"` 出错时返回错误。
+    pub(crate) async fn refresh_after_rejection(
+        &self,
+        used: &std::sync::Arc<RequestSpec>,
+        status: reqwest::StatusCode,
+    ) -> Result<Option<std::sync::Arc<RequestSpec>>, DownloadError> {
+        let Some(refresher) = self.refresher.as_ref() else {
+            return Ok(None);
+        };
+        if !crate::intercept::refresh::is_refresh_status(status) {
+            return Ok(None);
+        }
+        let mut ledger = self.refresh_gate.lock().await;
+        let (generation, mut url, mut spec) = {
+            let state = self.read_state();
+            if !std::sync::Arc::ptr_eq(&state.current, used) {
+                return Ok(Some(state.current.clone()));
+            }
+            (
+                state.generation,
+                state
+                    .url
+                    .clone()
+                    .unwrap_or_else(|| refresher.origin_url().to_string()),
+                (**used).clone(),
+            )
+        };
+        // 被拒的身份此前成功过：凭据是被正常用掉的，连续无效计数归零。
+        if self
+            .confirmed_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > generation
+        {
+            ledger.unconfirmed = 0;
+        }
+        if ledger.declined_generation == Some(generation)
+            || ledger.unconfirmed >= crate::intercept::refresh::MAX_UNCONFIRMED_REFRESHES
+        {
+            return Ok(None);
+        }
+        let changed = refresher
+            .refresh(&mut url, &mut spec, status.as_u16(), ledger.total)
+            .await?;
+        if !changed {
+            ledger.declined_generation = Some(generation);
+            return Ok(None);
+        }
+        ledger.total += 1;
+        ledger.unconfirmed += 1;
+        let fresh = std::sync::Arc::new(spec);
+        let mut state = self.write_state();
+        state.current = fresh.clone();
+        state.generation += 1;
+        state.url = (url != refresher.origin_url()).then_some(url);
+        Ok(Some(fresh))
     }
 }
 
 /// 为请求附加默认浏览器 UA（用于服务器拒绝非浏览器 UA / FluxDown 默认 UA 的场景）。
 fn spec_with_browser_ua(spec: &RequestSpec) -> RequestSpec {
     let mut s = spec.clone();
-    s.extra_headers
-        .insert("User-Agent".to_string(), DEFAULT_BROWSER_UA.to_string());
+    if !s.pins.user_agent {
+        s.extra_headers
+            .insert("User-Agent".to_string(), DEFAULT_BROWSER_UA.to_string());
+    }
     s
 }
 
 /// 为请求附加推导来源页 Referer（用于 CDN 防盗链拒绝无 Referer 的场景）。
 fn spec_with_inferred_referrer(spec: &RequestSpec, url: &str) -> RequestSpec {
     let mut s = spec.clone();
-    if s.referrer.is_empty()
-        && let Some(ref_url) = infer_origin_referrer(url)
-    {
-        s.referrer = ref_url;
-    }
+    fill_inferred_referrer(&mut s, url);
     s
 }
 
-/// 同时附加浏览器 UA 与推导 Referer。
+/// 同时附加浏览器 UA 与推导 Referer（两者各自尊重锁定）。
 fn spec_with_browser_ua_and_referrer(spec: &RequestSpec, url: &str) -> RequestSpec {
     let mut s = spec_with_browser_ua(spec);
-    if s.referrer.is_empty()
+    fill_inferred_referrer(&mut s, url);
+    s
+}
+
+fn fill_inferred_referrer(s: &mut RequestSpec, url: &str) {
+    if !s.pins.referrer
+        && s.referrer.is_empty()
         && let Some(ref_url) = infer_origin_referrer(url)
     {
         s.referrer = ref_url;
     }
-    s
 }
 
 /// 把请求头自适应结果写回任务的持久化请求头，使后续分段 worker 与续传（尤其免探测的 hint 续传）沿用。
+///
+/// 自适应只改 UA 与 Referer，因此只同步这两项（且跳过插件锁定的字段）；其余请求头
+/// 可能是插件按次运行叠加的改写，绝不写回持久化的基础上下文。
 pub(crate) async fn persist_adapted_spec(db: &Db, task_id: &str, adapted: &RequestSpec) {
     let Ok(Some((cookies, current_referrer, headers_json))) =
         db.load_task_request_context(task_id).await
@@ -1645,23 +1919,18 @@ pub(crate) async fn persist_adapted_spec(db: &Db, task_id: &str, adapted: &Reque
     let before_headers = headers.clone();
     let before_referrer = current_referrer.clone();
 
-    // 同步 extra_headers（如去掉了浏览器 UA，或补充了默认浏览器 UA）。
-    // 插入前按大小写不敏感移除同名键，避免库里的 `user-agent` 与新写入的
-    // `User-Agent` 并存成两个 UA 键。
-    for (k, v) in &adapted.extra_headers {
-        headers.retain(|existing, _| !existing.eq_ignore_ascii_case(k));
-        headers.insert(k.clone(), v.clone());
-    }
-    // 如果 adapted 中显式移除了 user-agent，也从持久化 headers 中移除
-    if !adapted
-        .extra_headers
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("user-agent"))
-    {
+    if !adapted.pins.user_agent {
         headers.retain(|k, _| !k.eq_ignore_ascii_case("user-agent"));
+        if let Some((k, v)) = adapted
+            .extra_headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        {
+            headers.insert(k.clone(), v.clone());
+        }
     }
 
-    let next_referrer = if !adapted.referrer.is_empty() {
+    let next_referrer = if !adapted.pins.referrer && !adapted.referrer.is_empty() {
         &adapted.referrer
     } else {
         &current_referrer
@@ -1730,6 +1999,14 @@ pub(crate) async fn resolve_file_info_with_ua_fallback(
                 );
                 let rejection = probe_rejection(&e);
                 last_err = Some(e);
+                // 仅在可能触发去重时才快照刚发出的请求身份（锁定了 UA / Referer）。
+                let sent_identity = (spec.pins.user_agent || spec.pins.referrer).then(|| {
+                    (
+                        attempt_spec.extra_headers.clone(),
+                        attempt_spec.referrer.clone(),
+                        attempt_spec.cookies.clone(),
+                    )
+                });
 
                 if attempt + 1 < PROBE_MAX_RETRIES {
                     if rejection == Some(ProbeRejection::BotChallenge) {
@@ -1777,6 +2054,24 @@ pub(crate) async fn resolve_file_info_with_ua_fallback(
                         // 最后一轮重试前的兜底降级（即便不是明确 403）：尝试剥离浏览器 UA（保留可能已设置的 Referer）
                         let base = current_adapted.as_ref().unwrap_or(spec);
                         current_adapted = Some(spec_without_browser_ua(base));
+                    }
+
+                    // 锁定（插件指定 UA / Referer）后自适应阶梯可能原样重发：下一轮请求身份
+                    // 与刚发出的相同则立即停止，不白耗一次性令牌。
+                    if let Some((sent_headers, sent_referrer, sent_cookies)) = sent_identity {
+                        let next = current_adapted.as_ref().unwrap_or(spec);
+                        if rejection.is_some()
+                            && next.extra_headers == sent_headers
+                            && next.referrer == sent_referrer
+                            && next.cookies == sent_cookies
+                        {
+                            log_info!(
+                                "[resolve] pinned request identity rejected; not resending an identical probe"
+                            );
+                            return Err(last_err.unwrap_or_else(|| {
+                                DownloadError::Other("probe failed after retries".to_string())
+                            }));
+                        }
                     }
 
                     // 服务端拒绝无需长时退避，短等待 200ms 即可切换新请求头重试；
@@ -2632,16 +2927,94 @@ const SINGLE_RESUME_ALIGNMENT_BYTES: i64 = 1024 * 1024;
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// 完成前的插件后处理（`finalize` 阶段）。产物位于任务行的 `save_dir/file_name`；
+/// 返回插件替换后的 `(文件名, 大小)`，未替换为 `None`。插件 `fail` 或
+/// `onFailure: "fail"` 的出错返回错误，任务随之失败。
+pub(crate) async fn finalize_with_interceptors(
+    p: &DownloadParams,
+    protocol: crate::intercept::ProtocolKind,
+) -> Result<Option<(String, i64)>, DownloadError> {
+    use crate::intercept::{ActivityNotes, InterceptStage, ctx, drive, wants};
+
+    if !wants(p.interceptor.as_ref(), InterceptStage::Finalize) {
+        return Ok(None);
+    }
+    let notes = ActivityNotes::of(p);
+    let row = match p.db.load_task_by_id(&p.task_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            log_warn!(
+                "[intercept] task {} finalize skipped, failed to load task row: {e}",
+                p.task_id
+            );
+            notes
+                .add("插件后处理已跳过：读取任务信息失败".to_string())
+                .await;
+            return Ok(None);
+        }
+    };
+    let save_dir = PathBuf::from(&row.save_dir);
+    let path = save_dir.join(&row.file_name);
+    let total_bytes = match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.is_file() => i64::try_from(meta.len()).unwrap_or(i64::MAX),
+        _ => {
+            notes
+                .add("插件后处理已跳过：找不到下载文件".to_string())
+                .await;
+            return Ok(None);
+        }
+    };
+    let audio_path = if p.audio_url.is_some() {
+        let audio = crate::dash_downloader::build_audio_path(&path);
+        tokio::fs::try_exists(&audio)
+            .await
+            .unwrap_or(false)
+            .then(|| audio.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+    notes.add("正在执行插件下载后处理".to_string()).await;
+    let task = ctx::task_ctx(p, protocol);
+    drive::run_finalize(
+        p.interceptor.as_ref(),
+        &notes,
+        &p.cancel_token,
+        drive::FinalizeInput {
+            task: &task,
+            db: &p.db,
+            task_id: &p.task_id,
+            save_dir,
+            file_name: row.file_name,
+            total_bytes,
+            audio_path,
+        },
+    )
+    .await
+    .map_err(DownloadError::from)
+}
+
 pub async fn run_download(mut params: DownloadParams) {
     let task_id_log = params.task_id.clone();
     let preprobed = params.preprobed.take();
     let result = match run_download_inner(&params, preprobed).await {
-        Ok(completed) => params
-            .db
-            .update_task_status(&params.task_id, 3, "")
-            .await
-            .map(|()| completed)
-            .map_err(DownloadError::Db),
+        Ok((total, renamed)) => {
+            match finalize_with_interceptors(&params, crate::intercept::ProtocolKind::Http).await {
+                Ok(replaced) => {
+                    let (total, renamed) = match replaced {
+                        Some((name, size)) => (size, Some(name)),
+                        None => (total, renamed),
+                    };
+                    params
+                        .db
+                        .update_task_status(&params.task_id, 3, "")
+                        .await
+                        .map(|()| (total, renamed))
+                        .map_err(DownloadError::Db)
+                }
+                Err(e) => Err(e),
+            }
+        }
         Err(error) => Err(error),
     };
 
@@ -3032,6 +3405,7 @@ async fn run_download_inner(
     //          skip probe to preserve one-time tokens
     //    0   — no hint, run normal probe
     let mut applied_spec: Option<RequestSpec> = None;
+    let mut probed_decision = crate::intercept::drive::ProbedDecision::default();
     let info = if p.hint_file_size != 0 {
         // fresh hint 任务：持久化 Range 验证状态。浏览器扩展 hint → 0（未验证，
         // coordinator 首响应证实支持后置回 1；resume 据此延续「首连接 plain GET」
@@ -3137,13 +3511,48 @@ async fn run_download_inner(
             ""
         };
         record_naming_evidence(&p.db, &p.task_id, disposition, &info.content_type).await;
+        if crate::intercept::wants(
+            p.interceptor.as_ref(),
+            crate::intercept::InterceptStage::Probed,
+        ) {
+            let task_ctx = crate::intercept::ctx::task_ctx(p, crate::intercept::ProtocolKind::Http);
+            let notes = crate::intercept::ActivityNotes::of(p);
+            probed_decision = crate::intercept::drive::run_probed(
+                p.interceptor.as_ref(),
+                &notes,
+                &p.cancel_token,
+                &task_ctx,
+                crate::intercept::patch::request_snapshot(&p.url, &p.spec, &p.run_meta),
+                crate::intercept::ctx::ConnectionsCtx {
+                    segments: p.segment_count,
+                    max_connections: p.connection_cap,
+                    auto_max_connections: p.auto_max_connections,
+                },
+                crate::intercept::ctx::ProbeCtx {
+                    total_bytes: info.total_bytes,
+                    supports_range: info.supports_range,
+                    file_name: info.file_name.clone(),
+                    content_type: info.content_type.clone(),
+                    etag: info.etag.clone(),
+                    last_modified: info.last_modified.clone(),
+                },
+            )
+            .await?;
+        }
         info
     };
     // 本次运行内所有下载请求共享：hint 模式下首个真实请求撞上反机器人质询时，
     // 切换到中性 UA 对其余分段 worker 与单流回退同时生效。
-    let spec_ref = std::sync::Arc::new(DownloadSpec::new(
-        applied_spec.unwrap_or_else(|| p.spec.clone()),
-    ));
+    let requested_segments = probed_decision.segments.unwrap_or(p.segment_count);
+    let connection_cap = probed_decision.max_connections.unwrap_or(p.connection_cap);
+    let spec_ref = std::sync::Arc::new(
+        DownloadSpec::new(applied_spec.unwrap_or_else(|| p.spec.clone()))
+            .with_connection_cap(connection_cap)
+            .with_refresher(crate::intercept::Refresher::for_params(
+                p,
+                crate::intercept::ProtocolKind::Http,
+            )),
+    );
 
     // Safety net (probe 阶段)：服务器在 probe 阶段返回 HTML 但用户期望二进制
     // 文件——典型场景：Lanzou 等 CDN transit page、form-POST 端点用 GET 访问。
@@ -3388,7 +3797,7 @@ async fn run_download_inner(
     };
 
     // Dynamic segment calculation when user chose "auto" (segment_count <= 0).
-    let segments = if p.segment_count <= 0 {
+    let mut segments = if requested_segments <= 0 {
         // When resuming, check if DB already has segment rows from a previous
         // run.  If so, reuse that count — avoids a redundant bandwidth probe
         // and guarantees segment definitions stay consistent with what's on disk.
@@ -3406,8 +3815,11 @@ async fn run_download_inner(
             compute_segments_with_advisor(p, &info).await
         }
     } else {
-        p.segment_count
+        requested_segments
     };
+    if connection_cap > 0 {
+        segments = segments.min(connection_cap);
+    }
 
     // BUG: a resume whose effective concurrency was forced down to 1 (domain
     // single-connection cache — see `is_single_conn_domain` in
@@ -3490,8 +3902,9 @@ async fn run_download_inner(
         // summary 事件需要在多段下载结束后读取节点贡献统计。
         let nodes_for_summary = nodes.clone();
         // hint 解封仅 Auto 默认档：用户显式段数或自定义 auto_max 时尊重其天花板。
-        let allow_hint_uncap = p.segment_count <= 0
-            && p.auto_max_connections == crate::download_manager::DEFAULT_AUTO_MAX_CONNECTIONS;
+        let allow_hint_uncap = requested_segments <= 0
+            && p.auto_max_connections == crate::download_manager::DEFAULT_AUTO_MAX_CONNECTIONS
+            && connection_cap <= 0;
         let ms_outcome = download_multi_segment(
             &p.task_id,
             &p.url,
@@ -4317,6 +4730,33 @@ async fn download_single(
 /// 所以慢速但健康的连接不受影响；不设在共享 client 上，避免误伤大文件 body。
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 响应被拒（401 / 403 / 410）且有插件声明 `refresh` 阶段时，用换发后的请求身份重发
+/// 同一请求一次（调用方保证每个请求只调用一次）；否则原样返回 `resp`。
+async fn resend_after_refresh(
+    spec: &DownloadSpec,
+    used: &mut std::sync::Arc<RequestSpec>,
+    resp: reqwest::Response,
+    build: &impl Fn(&RequestSpec) -> reqwest::RequestBuilder,
+    cancel_token: &CancellationToken,
+) -> Result<reqwest::Response, DownloadError> {
+    if resp.status().is_success() {
+        spec.confirm(used);
+        return Ok(resp);
+    }
+    match spec.refresh_after_rejection(used, resp.status()).await? {
+        Some(fresh) => {
+            drop(resp);
+            *used = fresh;
+            let resp = send_cancellable(build(used.as_ref()), cancel_token).await?;
+            if resp.status().is_success() {
+                spec.confirm(used);
+            }
+            Ok(resp)
+        }
+        None => Ok(resp),
+    }
+}
+
 /// 发送请求并与取消令牌、响应头超时竞速。服务器接受连接却迟迟不回头时，
 /// 暂停/删除必须立即生效，超时则按停滞错误交给自动重试。
 async fn send_cancellable(
@@ -4440,7 +4880,12 @@ async fn download_single_once(
         format!("bytes={existing_len}-")
     };
     let build = |used: &RequestSpec| {
-        let req = build_request(client, url, used.method.clone(), used);
+        let req = build_request(
+            client,
+            spec.route_url(url).as_deref().unwrap_or(url),
+            used.method.clone(),
+            used,
+        );
         if want_resume {
             // 与 aria2 一致，续传首枪只发送 Range。部分一次性签名端点会把
             // If-Range 视为签名外请求头并立即作废 URL；收到 403 后再降级已经太晚。
@@ -4450,15 +4895,25 @@ async fn download_single_once(
             req
         }
     };
+    let build_full = |used: &RequestSpec| {
+        build_request(
+            client,
+            spec.route_url(url).as_deref().unwrap_or(url),
+            used.method.clone(),
+            used,
+        )
+    };
     let mut used = spec.current();
     let mut refetched_full = false;
-    let mut resp = send_cancellable(build(used), cancel_token).await?;
+    let mut resp = send_cancellable(build(&used), cancel_token).await?;
     // hint 模式跳过了探测：反机器人质询只能在这里首次暴露，换中性 UA 重发同一请求。
-    if let Some(neutral) = spec.escape_bot_challenge(used, &resp, db, task_id).await {
+    if let Some(neutral) = spec.escape_bot_challenge(&used, &resp, db, task_id).await {
         drop(resp);
         used = neutral;
-        resp = send_cancellable(build(used), cancel_token).await?;
+        resp = send_cancellable(build(&used), cancel_token).await?;
     }
+    // 被拒（401 / 403 / 410）且有插件声明 refresh：用换发后的凭据重发同一请求一次。
+    resp = resend_after_refresh(spec, &mut used, resp, &build, cancel_token).await?;
     // BUG-HTTP-416-RETRY-EXHAUST：续传 Range 偏移越界时服务器回 416（临时文件
     // 被外部截断、或服务器文件在两次探测间缩小）。error_for_status() 会把它
     // 变成不可恢复的错误直接终止任务；416 语义明确——重试同一 Range 必然拿到
@@ -4472,8 +4927,15 @@ async fn download_single_once(
             existing_len
         );
         drop(resp);
-        let full_req = build_request(client, url, used.method.clone(), used);
-        resp = send_cancellable(full_req, cancel_token).await?;
+        let full_req = build_full(&used);
+        resp = resend_after_refresh(
+            spec,
+            &mut used,
+            send_cancellable(full_req, cancel_token).await?,
+            &build_full,
+            cancel_token,
+        )
+        .await?;
         refetched_full = true;
     }
     let mut resp = resp.error_for_status()?;
@@ -4521,10 +4983,16 @@ async fn download_single_once(
                     existing_len
                 );
                 drop(resp);
-                let full_req = build_request(client, url, used.method.clone(), used);
-                resp = send_cancellable(full_req, cancel_token)
-                    .await?
-                    .error_for_status()?;
+                let full_req = build_full(&used);
+                resp = resend_after_refresh(
+                    spec,
+                    &mut used,
+                    send_cancellable(full_req, cancel_token).await?,
+                    &build_full,
+                    cancel_token,
+                )
+                .await?
+                .error_for_status()?;
                 refetched_full = true;
             } else {
                 log_warn!(
@@ -4565,10 +5033,16 @@ async fn download_single_once(
                 existing_len
             );
             drop(resp);
-            let full_req = build_request(client, url, used.method.clone(), used);
-            resp = send_cancellable(full_req, cancel_token)
-                .await?
-                .error_for_status()?;
+            let full_req = build_full(&used);
+            resp = resend_after_refresh(
+                spec,
+                &mut used,
+                send_cancellable(full_req, cancel_token).await?,
+                &build_full,
+                cancel_token,
+            )
+            .await?
+            .error_for_status()?;
             refetched_full = true;
         }
     }
@@ -4996,6 +5470,118 @@ async fn download_multi_segment(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// 跨模块测试共享：构造带拦截器的最小 `DownloadParams`，以及可编程的 refresh 拦截器。
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use super::DownloadParams;
+    use crate::intercept::{InterceptStage, InterceptorEntry, TaskInterceptor};
+
+    /// 构造最小 `DownloadParams`（内存库已插入同名任务，进度通道自动排空）。
+    pub(crate) async fn params_with_interceptor(
+        url: &str,
+        interceptor: Arc<dyn TaskInterceptor>,
+    ) -> Result<DownloadParams, Box<dyn std::error::Error>> {
+        let db = crate::db::Db::connect("sqlite::memory:").await?;
+        db.insert_task("t-refresh", url, "f.bin", "", 0, 0, "", "", "", 0)
+            .await?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        Ok(DownloadParams {
+            spawn_gen: 1,
+            unattended: true,
+            preprobed: None,
+            interceptor,
+            connection_cap: 0,
+            run_meta: crate::intercept::RunMeta::default(),
+            auto_proxy: None,
+            multi_nic: None,
+            task_id: "t-refresh".to_string(),
+            url: url.to_string(),
+            save_dir: String::new(),
+            file_name: "f.bin".to_string(),
+            segment_count: 0,
+            is_resume: false,
+            range_verified: true,
+            db,
+            client: reqwest::Client::builder().no_proxy().build()?,
+            progress_tx: tx,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            sink: Arc::new(crate::NoopSink),
+            cookies: String::new(),
+            referrer: String::new(),
+            speed_limiter: crate::speed_limiter::SpeedLimiter::new(0),
+            hint_file_size: 0,
+            proxy_config: crate::proxy_config::ProxyConfig::default(),
+            selector: Arc::new(crate::NoopSelection),
+            checksum: String::new(),
+            extra_headers: std::collections::HashMap::new(),
+            spec: super::RequestSpec::empty_get(),
+            audio_url: None,
+            auto_max_connections: 0,
+            use_server_time: false,
+            overwrite: crate::file_exists::OverwritePolicy::Never,
+            ffmpeg_path: None,
+            cdn: crate::cdn::CdnTaskInput::default(),
+        })
+    }
+
+    /// 只声明 `refresh` 阶段的拦截器：第 n 次调用（从 1 起）的返回值由 `reply(n)` 决定，
+    /// 并可人为拉长每次调用以暴露并发竞争。
+    pub(crate) struct RefreshScript {
+        entries: Vec<InterceptorEntry>,
+        pub calls: AtomicUsize,
+        delay: Duration,
+        reply: Box<dyn Fn(usize) -> Option<String> + Send + Sync>,
+    }
+
+    impl RefreshScript {
+        pub(crate) fn new(
+            delay: Duration,
+            reply: impl Fn(usize) -> Option<String> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                entries: vec![InterceptorEntry {
+                    identity: "r@p".to_string(),
+                    stages: vec![InterceptStage::Refresh],
+                    fail_task: false,
+                }],
+                calls: AtomicUsize::new(0),
+                delay,
+                reply: Box::new(reply),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TaskInterceptor for RefreshScript {
+        fn entries(&self) -> &[InterceptorEntry] {
+            &self.entries
+        }
+
+        fn source_url(&self) -> &str {
+            "https://example.com/source"
+        }
+
+        async fn call(
+            &self,
+            _identity: &str,
+            _stage: InterceptStage,
+            _arg_json: String,
+            _file_root: Option<std::path::PathBuf>,
+        ) -> Result<Option<String>, String> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok((self.reply)(n))
+        }
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -5432,6 +6018,442 @@ mod tests {
             .expect("exists");
         assert_eq!(json, corrupt, "corrupt headers must not be overwritten");
         assert_eq!(loaded_ref, "", "referrer must not be written either");
+    }
+
+    #[tokio::test]
+    async fn persist_adapted_spec_writes_only_unpinned_ua_and_referrer() {
+        let db = crate::db::Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        let task_id = "test-adapt-persist-overlay";
+        db.insert_task(
+            task_id,
+            "https://example.com/file.bin",
+            "test.bin",
+            "/tmp",
+            1,
+            0,
+            "",
+            "",
+            "",
+            1,
+        )
+        .await
+        .expect("insert task");
+        db.set_task_request_context(task_id, "", "", r#"{"A":"1"}"#)
+            .await
+            .expect("seed context");
+
+        // 改写后的 spec 带插件叠加头与中性 UA：只有 UA 允许写回。
+        let mut adapted = super::RequestSpec::empty_get();
+        adapted
+            .extra_headers
+            .insert("X-Overlay".to_string(), "secret".to_string());
+        adapted
+            .extra_headers
+            .insert("User-Agent".to_string(), super::DEFAULT_UA.to_string());
+        super::persist_adapted_spec(&db, task_id, &adapted).await;
+
+        let (_, _, json) = db
+            .load_task_request_context(task_id)
+            .await
+            .expect("load")
+            .expect("exists");
+        let headers: std::collections::HashMap<String, String> =
+            serde_json::from_str(&json).expect("parse json");
+        assert_eq!(
+            headers,
+            std::collections::HashMap::from([
+                ("A".to_string(), "1".to_string()),
+                ("User-Agent".to_string(), super::DEFAULT_UA.to_string()),
+            ])
+        );
+
+        // 锁定 UA / Referer 时一律不写回。
+        let mut pinned = adapted.clone();
+        pinned
+            .extra_headers
+            .insert("User-Agent".to_string(), "Pinned/1".to_string());
+        pinned.referrer = "https://example.com/p".to_string();
+        pinned.pins = super::RequestPins {
+            user_agent: true,
+            referrer: true,
+        };
+        super::persist_adapted_spec(&db, task_id, &pinned).await;
+        let (_, referrer, json) = db
+            .load_task_request_context(task_id)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert_eq!(referrer, "");
+        assert!(!json.contains("Pinned/1"), "{json}");
+    }
+
+    #[tokio::test]
+    async fn bot_challenge_escape_skipped_when_ua_pinned() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    if stream.read(&mut buf).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let resp = "HTTP/1.1 404 Not Found\r\ncf-mitigated: challenge\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    if let Err(error) = stream.write_all(resp.as_bytes()).await {
+                        tracing::debug!(%error, "test client closed");
+                    }
+                    if let Err(error) = stream.shutdown().await {
+                        tracing::debug!(%error, "test client closed");
+                    }
+                });
+            }
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let db = crate::db::Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+
+        let mut base = super::RequestSpec::empty_get();
+        base.extra_headers
+            .insert("User-Agent".to_string(), "Mozilla/5.0 Pinned".to_string());
+
+        // 对照：未锁定时会切到中性 UA。
+        let resp = client.get(&url).send().await.unwrap();
+        let free = super::DownloadSpec::new(base.clone());
+        assert!(
+            free.escape_bot_challenge(&base, &resp, &db, "t")
+                .await
+                .is_some()
+        );
+
+        // 锁定后不得改 UA。
+        let mut pinned_spec = base.clone();
+        pinned_spec.pins.user_agent = true;
+        let pinned = super::DownloadSpec::new(pinned_spec.clone());
+        let resp = client.get(&url).send().await.unwrap();
+        assert!(
+            pinned
+                .escape_bot_challenge(&pinned_spec, &resp, &db, "t")
+                .await
+                .is_none()
+        );
+    }
+
+    fn token_reply(n: usize) -> Option<String> {
+        Some(format!(r#"{{"setHeaders":{{"X-Token":"tok{n}"}}}}"#))
+    }
+
+    async fn refreshable_spec(
+        script: std::sync::Arc<super::test_support::RefreshScript>,
+    ) -> super::DownloadSpec {
+        let params = super::test_support::params_with_interceptor(
+            "http://127.0.0.1:1/f.bin",
+            script as std::sync::Arc<dyn crate::intercept::TaskInterceptor>,
+        )
+        .await
+        .unwrap();
+        super::DownloadSpec::new(super::RequestSpec::empty_get()).with_refresher(
+            crate::intercept::Refresher::for_params(&params, crate::intercept::ProtocolKind::Http),
+        )
+    }
+
+    #[tokio::test]
+    async fn concurrent_rejections_with_same_identity_trigger_one_refresh() {
+        use super::test_support::RefreshScript;
+        use std::sync::atomic::Ordering;
+        let script = std::sync::Arc::new(RefreshScript::new(
+            std::time::Duration::from_millis(50),
+            token_reply,
+        ));
+        let spec = refreshable_spec(script.clone()).await;
+        let used = spec.current();
+        let forbidden = reqwest::StatusCode::FORBIDDEN;
+        let (a, b) = tokio::join!(
+            spec.refresh_after_rejection(&used, forbidden),
+            spec.refresh_after_rejection(&used, forbidden)
+        );
+        let (a, b) = (a.unwrap().unwrap(), b.unwrap().unwrap());
+        assert_eq!(script.calls.load(Ordering::SeqCst), 1);
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
+        assert!(std::sync::Arc::ptr_eq(&a, &spec.current()));
+        assert_eq!(
+            a.extra_headers.get("X-Token").map(String::as_str),
+            Some("tok1")
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_declined_is_not_asked_again_for_same_generation() {
+        use super::test_support::RefreshScript;
+        use std::sync::atomic::Ordering;
+        let script = std::sync::Arc::new(RefreshScript::new(std::time::Duration::ZERO, |_| None));
+        let spec = refreshable_spec(script.clone()).await;
+        let used = spec.current();
+        let status = reqwest::StatusCode::UNAUTHORIZED;
+        assert!(
+            spec.refresh_after_rejection(&used, status)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            spec.refresh_after_rejection(&used, status)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(script.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_stops_after_unconfirmed_limit() {
+        use super::test_support::RefreshScript;
+        use std::sync::atomic::Ordering;
+        let limit = crate::intercept::refresh::MAX_UNCONFIRMED_REFRESHES as usize;
+        let script =
+            std::sync::Arc::new(RefreshScript::new(std::time::Duration::ZERO, token_reply));
+        let spec = refreshable_spec(script.clone()).await;
+        for _ in 0..limit {
+            let used = spec.current();
+            let fresh = spec
+                .refresh_after_rejection(&used, reqwest::StatusCode::GONE)
+                .await
+                .unwrap();
+            assert!(fresh.is_some());
+        }
+        let used = spec.current();
+        assert!(
+            spec.refresh_after_rejection(&used, reqwest::StatusCode::GONE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(script.calls.load(Ordering::SeqCst), limit);
+    }
+
+    /// 每请求一个令牌：每次换发的令牌都先成功用过一次再被拒，属于正常消耗，
+    /// 刷新次数不受连续无效上限约束。
+    #[tokio::test]
+    async fn confirmed_identities_keep_refresh_available() {
+        use super::test_support::RefreshScript;
+        use std::sync::atomic::Ordering;
+        let rounds = crate::intercept::refresh::MAX_UNCONFIRMED_REFRESHES as usize * 3;
+        let script =
+            std::sync::Arc::new(RefreshScript::new(std::time::Duration::ZERO, token_reply));
+        let spec = refreshable_spec(script.clone()).await;
+        for round in 0..rounds {
+            let used = spec.current();
+            spec.confirm(&used);
+            let fresh = spec
+                .refresh_after_rejection(&used, reqwest::StatusCode::FORBIDDEN)
+                .await
+                .unwrap();
+            assert!(
+                fresh.is_some(),
+                "refresh {round} refused after confirmed use"
+            );
+        }
+        assert_eq!(script.calls.load(Ordering::SeqCst), rounds);
+    }
+
+    #[tokio::test]
+    async fn refresh_ignores_statuses_other_than_401_403_410() {
+        use super::test_support::RefreshScript;
+        use std::sync::atomic::Ordering;
+        let script =
+            std::sync::Arc::new(RefreshScript::new(std::time::Duration::ZERO, token_reply));
+        let spec = refreshable_spec(script.clone()).await;
+        let used = spec.current();
+        for status in [
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::RANGE_NOT_SATISFIABLE,
+        ] {
+            assert!(
+                spec.refresh_after_rejection(&used, status)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(script.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn route_url_only_replaces_the_task_url() {
+        use super::test_support::RefreshScript;
+        let script = std::sync::Arc::new(RefreshScript::new(std::time::Duration::ZERO, |_| {
+            Some(r#"{"url":"http://127.0.0.1:1/g.bin"}"#.to_string())
+        }));
+        let spec = refreshable_spec(script).await;
+        assert_eq!(spec.route_url("http://127.0.0.1:1/f.bin"), None);
+        let used = spec.current();
+        assert!(
+            spec.refresh_after_rejection(&used, reqwest::StatusCode::FORBIDDEN)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            spec.route_url("http://127.0.0.1:1/f.bin").as_deref(),
+            Some("http://127.0.0.1:1/g.bin")
+        );
+        assert_eq!(spec.route_url("http://127.0.0.1:1/other.bin"), None);
+        assert_eq!(spec.route_url("http://127.0.0.1:2/f.bin"), None);
+    }
+
+    /// 恒 403 的本地服务端，返回端口与请求计数。
+    async fn always_forbidden_server() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = count.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = stream.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    served.fetch_add(1, Ordering::SeqCst);
+                    let resp =
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    if let Err(error) = stream.write_all(resp.as_bytes()).await {
+                        tracing::debug!(%error, "test client closed");
+                    }
+                    if let Err(error) = stream.shutdown().await {
+                        tracing::debug!(%error, "test client closed");
+                    }
+                });
+            }
+        });
+        (port, count)
+    }
+
+    #[tokio::test]
+    async fn pinned_probe_rejection_does_not_resend_identical_request() {
+        use std::sync::atomic::Ordering;
+        let client = super::build_client(&crate::proxy_config::ProxyConfig::default(), "").unwrap();
+        let mut base = super::RequestSpec::empty_get();
+        base.extra_headers
+            .insert("User-Agent".to_string(), "Pinned/1".to_string());
+
+        let (port, free_count) = always_forbidden_server().await;
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        assert!(
+            super::resolve_file_info_with_ua_fallback(&client, &url, &base)
+                .await
+                .is_err()
+        );
+
+        let mut ua_only = base.clone();
+        ua_only.pins.user_agent = true;
+        let (port, ua_count) = always_forbidden_server().await;
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        assert!(
+            super::resolve_file_info_with_ua_fallback(&client, &url, &ua_only)
+                .await
+                .is_err()
+        );
+
+        let mut both = ua_only.clone();
+        both.pins.referrer = true;
+        let (port, both_count) = always_forbidden_server().await;
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        assert!(
+            super::resolve_file_info_with_ua_fallback(&client, &url, &both)
+                .await
+                .is_err()
+        );
+
+        let (free, ua, both) = (
+            free_count.load(Ordering::SeqCst),
+            ua_count.load(Ordering::SeqCst),
+            both_count.load(Ordering::SeqCst),
+        );
+        // 锁定 UA 后阶梯第一步（剥离 UA）得到相同身份，只发第一轮；Referer 是否锁定
+        // 不改变这一点。未锁定：走完整个自适应阶梯。
+        assert!(ua > 0, "first round must still be sent");
+        assert_eq!(both, ua, "both={both} ua={ua}");
+        assert!(ua < free, "ua={ua} free={free}");
+    }
+
+    #[tokio::test]
+    async fn pinned_user_agent_survives_probe_rejection_adaptation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        {
+            let seen = seen.clone();
+            let count = count.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let seen = seen.clone();
+                    let count = count.clone();
+                    tokio::spawn(async move {
+                        let mut buf = Vec::new();
+                        let mut tmp = [0u8; 1024];
+                        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let n = stream.read(&mut tmp).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                        }
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        let ua = text
+                            .lines()
+                            .find(|l| l.to_lowercase().starts_with("user-agent:"))
+                            .map(|l| l[11..].trim().to_string())
+                            .unwrap_or_default();
+                        seen.lock().unwrap().push(ua);
+                        let resp = if count.fetch_add(1, Ordering::SeqCst) < 1000 {
+                            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        } else if text.starts_with("HEAD") {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                        } else {
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1000\r\nContent-Length: 1\r\nConnection: close\r\n\r\nX"
+                        };
+                        if let Err(error) = stream.write_all(resp.as_bytes()).await {
+                            tracing::debug!(%error, "test client closed");
+                        }
+                        if let Err(error) = stream.shutdown().await {
+                            tracing::debug!(%error, "test client closed");
+                        }
+                    });
+                }
+            });
+        }
+        let client = super::build_client(&crate::proxy_config::ProxyConfig::default(), "").unwrap();
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let mut spec = super::RequestSpec::empty_get();
+        spec.extra_headers
+            .insert("User-Agent".to_string(), "Pinned/1".to_string());
+        spec.pins.user_agent = true;
+
+        // 锁定 UA 后自适应阶梯不会产生不同的请求身份：第一轮被拒即停止，
+        // 已发出的所有请求都带插件指定的 UA。
+        let result = super::resolve_file_info_with_ua_fallback(&client, &url, &spec).await;
+        assert!(result.is_err(), "pinned identity must not be adapted away");
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "{seen:?}");
+        assert!(seen.iter().all(|ua| ua == "Pinned/1"), "{seen:?}");
     }
 
     #[tokio::test]
@@ -6917,6 +7939,7 @@ mod tests {
             referrer: String::new(),
             extra_headers: std::collections::HashMap::new(),
             body: None,
+            ..Default::default()
         };
         assert!(!spec.is_get_like());
     }
@@ -6971,6 +7994,7 @@ mod tests {
             referrer: String::new(),
             extra_headers: std::collections::HashMap::new(),
             body: Some(super::RequestBodyDecoded::Urlencoded("k=v".to_string())),
+            ..Default::default()
         };
         let req = super::build_request(&client, "https://example.com", reqwest::Method::GET, &spec);
         let built = req
@@ -6996,6 +8020,7 @@ mod tests {
                 ("autodl".to_string(), "2".to_string()),
                 ("updates".to_string(), "1".to_string()),
             ])),
+            ..Default::default()
         };
         let req = super::build_request(
             &client,
@@ -7030,6 +8055,7 @@ mod tests {
             referrer: "https://referrer.example.com/page".to_string(),
             extra_headers: extra,
             body: None,
+            ..Default::default()
         };
         let req = super::build_request(
             &client,
@@ -7062,6 +8088,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_request_applies_origin_headers_only_to_matching_site() {
+        let client = reqwest::Client::new();
+        let spec = super::RequestSpec {
+            origin_headers: vec![super::OriginHeaders {
+                origin: "https://example.com".to_string(),
+                headers: std::collections::HashMap::from([(
+                    "X-Site".to_string(),
+                    "on".to_string(),
+                )]),
+            }],
+            ..Default::default()
+        };
+        let build = |url: &str| {
+            super::build_request(&client, url, reqwest::Method::GET, &spec)
+                .build()
+                .unwrap()
+        };
+        assert_eq!(
+            build("https://example.com/a.bin")
+                .headers()
+                .get("X-Site")
+                .unwrap(),
+            "on"
+        );
+        // 不同主机 / 不同 scheme 都不命中。
+        assert!(
+            build("https://other.example.org/a.bin")
+                .headers()
+                .get("X-Site")
+                .is_none()
+        );
+        assert!(
+            build("http://example.com/a.bin")
+                .headers()
+                .get("X-Site")
+                .is_none()
+        );
+    }
+
     /// 伪 referrer（fetch 规范占位符 "about:client" 等非 http(s) 值）不得
     /// 进入 Referer 头——部分 CDN 防盗链对非法 Referer 直接回 403。
     #[test]
@@ -7074,6 +8140,7 @@ mod tests {
                 referrer: bogus.to_string(),
                 extra_headers: std::collections::HashMap::new(),
                 body: None,
+                ..Default::default()
             };
             let built = super::build_request(
                 &client,
@@ -7524,6 +8591,7 @@ mod single_resume_tests {
             referrer: String::new(),
             extra_headers: std::collections::HashMap::new(),
             body: None,
+            ..Default::default()
         };
         let res = download_single(
             "t1",
@@ -7573,7 +8641,7 @@ mod single_resume_tests {
                 upload_limit_bps: 0,
                 default_save_dir: dir.to_string_lossy().into_owned(),
                 app_data_dir: dir.to_string_lossy().into_owned(),
-                bt_config: crate::bt_downloader::BtConfig::default(),
+                bt_config: crate::bt_config::BtConfig::default(),
                 proxy_config: crate::proxy_config::ProxyConfig::default(),
                 user_agent: String::new(),
                 data_dir_override: Some(dir.clone()),
@@ -7726,7 +8794,7 @@ mod single_resume_tests {
                     upload_limit_bps: 0,
                     default_save_dir: dir.to_string_lossy().into_owned(),
                     app_data_dir: dir.to_string_lossy().into_owned(),
-                    bt_config: crate::bt_downloader::BtConfig::default(),
+                    bt_config: crate::bt_config::BtConfig::default(),
                     proxy_config: crate::proxy_config::ProxyConfig::default(),
                     user_agent: String::new(),
                     data_dir_override: Some(dir.clone()),
@@ -7919,6 +8987,7 @@ mod single_resume_tests {
             referrer: String::new(),
             extra_headers: std::collections::HashMap::new(),
             body: None,
+            ..Default::default()
         });
         let attempt = || {
             download_single(

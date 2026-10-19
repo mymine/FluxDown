@@ -4,5 +4,5 @@
   <Profile>
     zerx-lab builds FluxDown, a Rust-powered multi-protocol download manager (HTTP/HTTPS/FTP/BitTorrent/HLS) with a Web UI, browser extension, aria2-compatible JSON-RPC and an MCP endpoint. Free, no ads, no tracking.
   </Profile>
-  <WebPage>https://fluxdown.zerx.dev</WebPage>
+  <WebPage>https://fluxdown.com</WebPage>
 </Maintainer>

@@ -141,6 +141,11 @@ impl LocalHost {
         })
     }
 
+    /// App 自更新的统一出口来源（本机 daemon 的全局代理 / 插件改写方案）。
+    pub(crate) fn egress_source(&self) -> Arc<dyn fluxdown_agent::egress::EgressSource> {
+        self.agent.egress_source()
+    }
+
     /// 会话驱动的取消令牌（本机会话取其子令牌）。
     pub(crate) fn session_token(&self) -> CancellationToken {
         self.sessions_cancel.child_token()

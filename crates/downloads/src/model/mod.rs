@@ -207,6 +207,18 @@ pub(crate) enum TaskState {
 }
 
 impl TaskState {
+    /// 引擎原始 status → 展示态。5（准备中：探测 / 插件解析 / 分配）归入 `Pending`，
+    /// 由 [`DownloadTaskView::preparing`] 区分；状态文案统一经 `DownloadStrings` 的行级规则。
+    pub(crate) fn from_status(status: i32) -> Self {
+        match status {
+            0 | 5 => Self::Pending,
+            1 => Self::Downloading,
+            2 => Self::Paused,
+            3 => Self::Completed,
+            _ => Self::Failed,
+        }
+    }
+
     /// 状态优先级（「状态」列排序、按状态分组的组顺序）：
     /// 下载中 > 等待 > 失败 > 暂停 > 完成。失败排在暂停前：失败需要用户处理，暂停是主动操作。
     pub(crate) fn status_rank(self) -> u8 {
@@ -447,13 +459,7 @@ impl DownloadTaskView {
             completed_at_secs: 0,
             progress,
             progress_label: format!("{:.1}%", progress * 100.0),
-            state: match status {
-                0 | 5 => TaskState::Pending,
-                1 => TaskState::Downloading,
-                2 => TaskState::Paused,
-                3 => TaskState::Completed,
-                _ => TaskState::Failed,
-            },
+            state: TaskState::from_status(status),
             preparing: status == 5,
             queue_order: 0,
             queue_position: 0,

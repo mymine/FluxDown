@@ -11,6 +11,7 @@ import com.fluxdown.core.host.ImportRetry
 import com.fluxdown.core.host.ImportRules
 import com.fluxdown.core.host.ImportUpdate
 import com.fluxdown.core.model.FileExistsAction
+import com.fluxdown.core.model.PluginCandidate
 import com.fluxdown.core.model.SeedingStatus
 import com.fluxdown.core.model.SelectionKind
 import com.fluxdown.core.model.SelectionOutcome
@@ -107,6 +108,8 @@ class MappingTest {
             SelectionOutcome.Hls(2),
             SelectionOutcome.Bt(listOf(0, 3)),
             SelectionOutcome.Variant(1),
+            SelectionOutcome.Plugin("com.x.a", remember = true),
+            SelectionOutcome.Plugin("com.x.b", remember = false),
             SelectionOutcome.FileExists(FileExistsAction.Rename),
             SelectionOutcome.FileExists(FileExistsAction.Overwrite),
             SelectionOutcome.FileExists(FileExistsAction.Skip),
@@ -135,6 +138,23 @@ class MappingTest {
                 incomingSize = null,
                 renamePreview = "a (1).bin",
                 actions = listOf(FileExistsAction.Rename, FileExistsAction.Overwrite),
+            ),
+            dto.toCore(),
+        )
+    }
+
+    @Test
+    fun pluginKindKeepsCandidates() {
+        val dto = SelectionKindDto.Plugin(
+            site = "bilibili.com",
+            url = "https://www.bilibili.com/video/BV1",
+            candidates = listOf(PluginCandidateDto("com.x.a", "A", "1.0.0", "desc a"), PluginCandidateDto("com.x.b", "B", "2.0.0", "")),
+        )
+        assertEquals(
+            SelectionKind.Plugin(
+                site = "bilibili.com",
+                url = "https://www.bilibili.com/video/BV1",
+                candidates = listOf(PluginCandidate("com.x.a", "A", "1.0.0", "desc a"), PluginCandidate("com.x.b", "B", "2.0.0", "")),
             ),
             dto.toCore(),
         )

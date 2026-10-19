@@ -15,7 +15,7 @@ interruptMode: never
 | 面 | 基线文件 | 备注 |
 |---|---|---|
 | GPUI（`crates/*`）+ Web SPA（`web/`）+ 原生 Android/iOS（`mobile/`） | `assets/i18n/en.json` + `assets/i18n/zh.json` | 四端共用同一 camelCase 键：GPUI `ctx.t("key")`；Web `useT()`；Android 构建期生成 `R.string`；iOS `L("key")`。删键前检查 `crates/`、`web/src/` 与 `mobile/` 的消费者 |
-| 官网（主站 `website-v2/`） | `website-v2/src/i18n/messages/<ns>.ts` | 每个模块用 `defineMessages({ en, zh })` 同时声明两语，zh 结构必须与 en 完全一致，缺键/多键 `astro check` 直接报错；只有 en + zh，无社区语言。`website/` 是 /v1 旧站存档，文案不再改 |
+| 官网（`website-v2/`） | `website-v2/src/i18n/messages/<ns>.ts` | 每个模块用 `defineMessages({ en, zh })` 同时声明两语，zh 结构必须与 en 完全一致，缺键/多键 `astro check` 直接报错；只有 en + zh，无社区语言 |
 | 浏览器扩展 | `fluxDown/utils/locales/zh-CN.ts` + `en.ts` | 反过来：`MessageKey` 类型由 **`zh-CN.ts`** 推导，`en.ts` 是 `Record<MessageKey, string>`，少一个键直接 tsc 报错 |
 
 官网文档另算：`website-v2/src/content/docs/{en,zh}/`，改了 en 正文要在 `website-v2/` 下跑 `npm run docs:hash <zh 文件>` 刷新 zh 的 `sourceHash`；en-only 页会自动回退，不必为其造 zh 占位。

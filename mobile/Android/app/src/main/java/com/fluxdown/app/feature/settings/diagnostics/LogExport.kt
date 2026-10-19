@@ -25,6 +25,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.fluxdown.app.AppContainer
 import com.fluxdown.app.R
 import com.fluxdown.app.actions.LocalTaskActions
+import com.fluxdown.app.diag.AppDiagnostics
 import com.fluxdown.app.feature.settings.SettingRowBox
 import com.fluxdown.app.feature.settings.SettingsCtx
 import com.fluxdown.app.feature.settings.SettingsEntry
@@ -181,6 +182,14 @@ internal class LogExportModel(private val context: Context, private val containe
                 is HostRef.Remote -> {
                     exportRemotely(host, target)
                     target
+                }
+            }
+            // 手机侧进程诊断（退出原因 / 前台服务事件 / 崩溃）与当前主机无关，一并附上
+            withContext(Dispatchers.IO) {
+                try {
+                    AppDiagnostics.appendTo(context, produced)
+                } catch (e: IOException) {
+                    throw HostException(HostErrorCode.Internal, message = e.message ?: "append diagnostics failed", cause = e)
                 }
             }
             if (share(produced)) {

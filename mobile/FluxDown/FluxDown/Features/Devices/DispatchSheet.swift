@@ -51,14 +51,14 @@ enum Dispatcher {
         agent: AgentAPI
     ) async throws(HostError) {
         let url = item.entry.url
-        switch target.kind {
-        case .cloud:
+        // 独立直连条目 / 挂接直连在线的云条目走局域网直连（一次性投递），否则走云。
+        if let fingerprint = target.dispatchFingerprint {
+            _ = try await agent.linkDispatch(
+                LinkDispatchParams(fingerprint: fingerprint, url: url, fileName: item.fileName, saveDir: saveDir)
+            )
+        } else {
             _ = try await agent.remoteDispatch(
                 RemoteDispatchParams(toDevice: target.deviceId, url: url, fileName: item.fileName, saveDir: saveDir)
-            )
-        case .link:
-            _ = try await agent.linkDispatch(
-                LinkDispatchParams(fingerprint: target.deviceId, url: url, fileName: item.fileName, saveDir: saveDir)
             )
         }
     }
@@ -68,7 +68,9 @@ enum Dispatcher {
         let device = target.name
         if summary.failures == 0 {
             let text: String
-            if target.isCloud, target.isOffline {
+            if target.routesViaLink {
+                text = L("linkDispatchedToDevice", ["device": device])
+            } else if target.isCloud, target.isOffline {
                 text = L("downloadToDispatchedOffline", ["count": summary.successes, "device": device])
             } else if summary.successes == 1 {
                 text = L("dispatchedToDevice", ["device": device])
@@ -79,7 +81,7 @@ enum Dispatcher {
             FluxHaptic.success.play()
             return nil
         }
-        let reason = summary.firstError.map { AccountText.error($0, context: target.isCloud ? .general : .pairing) }
+        let reason = summary.firstError.map { AccountText.error($0, context: target.routesViaLink ? .pairing : .general) }
             ?? L("dispatchFailed")
         if summary.successes > 0 {
             let partial = L(
@@ -277,7 +279,7 @@ private struct DispatchForm: View {
                 .frame(minHeight: 110)
                 .overlay(alignment: .topLeading) {
                     if text.isEmpty {
-                        Text(L("batchUrlPlaceholder"))
+                        Text(L(BuildFlavor.key(full: "batchUrlPlaceholder", store: "batchUrlPlaceholderGeneric")))
                             .font(.callout.monospaced())
                             .foregroundStyle(.tertiary)
                             .padding(.top, 8)
@@ -288,9 +290,12 @@ private struct DispatchForm: View {
                 }
                 .accessibilityLabel(L("downloadUrl"))
             if noValid {
-                Label(L("newDownloadNoValidUrl"), systemImage: FluxSymbol.failure)
-                    .font(.footnote)
-                    .foregroundStyle(Color.fdStatusFailedText)
+                Label(
+                    L(BuildFlavor.key(full: "newDownloadNoValidUrl", store: "newDownloadNoValidUrlGeneric")),
+                    systemImage: FluxSymbol.failure
+                )
+                .font(.footnote)
+                .foregroundStyle(Color.fdStatusFailedText)
             }
         } header: {
             HStack {

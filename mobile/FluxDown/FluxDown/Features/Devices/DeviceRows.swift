@@ -42,11 +42,13 @@ struct CloudDeviceRow: View {
     }
 }
 
-/// 局域网已配对设备行：在线点 + 名称 +「在线 / 离线 · 平台」。
+/// 局域网已配对设备行：在线点 + 名称 +「在线 / 离线 · 平台」+ tag（对方已解除 / 同一账号）。
 struct LinkDeviceRow: View {
     let name: String
     let platform: String?
     let online: Bool
+    var revoked = false
+    var sameAccount = false
 
     var body: some View {
         HStack(spacing: 14) {
@@ -63,10 +65,15 @@ struct LinkDeviceRow: View {
                     .font(.body)
                     .lineLimit(2)
                     .truncationMode(.middle)
-                Text(DevicePresentation.subtitle(online: online, platform: platform, version: nil))
+                Text(DevicePresentation.subtitle(online: online && !revoked, platform: platform, version: nil))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
+                if revoked {
+                    StatusBadge(text: L("linkedDeviceRevokedTag"), tone: .warning)
+                } else if sameAccount {
+                    StatusBadge(text: L("linkedDeviceSameAccountTag"), tone: .neutral)
+                }
             }
             Spacer(minLength: 0)
         }
@@ -166,6 +173,68 @@ extension View {
         onDeleted: @escaping (CloudDeviceRecord) -> Void = { _ in }
     ) -> some View {
         modifier(CloudDeviceDeleteConfirmation(record: record, deleting: deleting, onDeleted: onDeleted))
+    }
+}
+
+/// 直连设备重命名目标：只带指纹与当前备注名（预填输入框；留空 = 清除备注名）。
+struct LinkRenameTarget: Equatable, Identifiable {
+    var fingerprint: String
+    var customName: String
+    var id: String { fingerprint }
+}
+
+extension View {
+    /// 直连设备的重命名 `alert`（`accountDeviceRenameTitle` / `linkedDeviceRenameHint`，留空恢复对方设备名，非空 1–64 字符）。
+    func linkDeviceRenameAlert(renaming: Binding<LinkRenameTarget?>) -> some View {
+        modifier(LinkDeviceRenameAlert(renaming: renaming))
+    }
+}
+
+private struct LinkDeviceRenameAlert: ViewModifier {
+    @Environment(AppContainer.self) private var container
+    @Environment(DevicesModel.self) private var model
+    @Binding var renaming: LinkRenameTarget?
+
+    @State private var draft: String?
+    /// 对话框关闭时 `renaming` 会先被清空：保留最近一次的目标供确认按钮使用。
+    @State private var target: LinkRenameTarget?
+
+    func body(content: Content) -> some View {
+        let text = draft ?? renaming?.customName ?? ""
+        let valid = LinkRules.isValidRename(text)
+        content
+            .onChange(of: renaming) { _, new in
+                if let new {
+                    target = new
+                    draft = nil
+                }
+            }
+            .alert(
+                L("accountDeviceRenameTitle"),
+                isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+            ) {
+                TextField(
+                    L("accountFieldDeviceName"),
+                    text: Binding(get: { text }, set: { draft = $0 })
+                )
+                Button(L("cancel"), role: .cancel) { draft = nil }
+                Button(L("confirm")) { submit(text) }
+                    .disabled(!valid)
+            } message: {
+                Text(valid ? L("linkedDeviceRenameHint") : L("accountDeviceRenameInvalid"))
+            }
+    }
+
+    private func submit(_ text: String) {
+        guard let target else { return }
+        draft = nil
+        guard LinkRules.isValidRename(text) else { return }
+        let name = LinkRules.renameValue(text)
+        Task {
+            if let error = await model.renameLink(fingerprint: target.fingerprint, name: name) {
+                container.toasts.show(text: AccountText.error(error, context: .pairing), tone: .error)
+            }
+        }
     }
 }
 

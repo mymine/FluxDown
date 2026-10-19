@@ -592,6 +592,52 @@ async fn task_notice_is_never_forwarded_to_ui_subscribers() {
 }
 
 #[tokio::test]
+async fn plugin_view_events_are_forwarded_verbatim_to_ui_subscribers() {
+    use fluxdown_protocol::{AgentEvent, PluginViewFrameDto, ServiceEvent, ViewOp};
+
+    let events = AgentEventHub::new(AgentSnapshot::default());
+    let (mut ui, _) = events.subscribe_and_snapshot();
+    let (sender, mut receiver) = notice_channel();
+    let sent = [
+        DaemonEvent::PluginViewFrame(PluginViewFrameDto {
+            session: "s".to_owned(),
+            seq: 1,
+            ops: vec![ViewOp::Error {
+                message: "boom".to_owned(),
+            }],
+        }),
+        DaemonEvent::PluginViewClosed {
+            session: "s".to_owned(),
+            reason: "pluginUnloaded".to_owned(),
+        },
+        DaemonEvent::PluginToast {
+            identity: "a@b".to_owned(),
+            level: "info".to_owned(),
+            text: "hi".to_owned(),
+        },
+    ];
+    for event in sent.iter().cloned() {
+        route_daemon_event(&events, &sender, event);
+    }
+    for expected in sent {
+        let frame = ui
+            .try_recv()
+            .expect("plugin view event reaches the UI stream");
+        let ServiceEvent::Agent(AgentEvent::Daemon(forwarded)) = frame.event else {
+            panic!("plugin view events travel as forwarded daemon events");
+        };
+        assert_eq!(
+            serde_json::to_value(&forwarded).expect("forwarded event serializes"),
+            serde_json::to_value(&expected).expect("sent event serializes"),
+        );
+    }
+    assert!(
+        receiver.try_recv().is_err(),
+        "cloud module sees none of them"
+    );
+}
+
+#[tokio::test]
 async fn catalog_is_pulled_anonymously_at_startup_even_when_logged_out() {
     let fixture = Fixture::start_with(on(), overview_json(&["task.completed"]), false, false).await;
     fixture.wait_catalog(Some(&["email", "telegram"])).await;

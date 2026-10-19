@@ -36,8 +36,10 @@ private struct SettingsStack: View {
                     case .appearance: AppearancePage()
                     case .notify: NotifyPage()
                     case .download: DownloadPage()
+                    #if FULL_P2P
                     case .bt: BtPage()
                     case .ed2k: Ed2kPage()
+                    #endif
                     case .network: NetworkPage()
                     case .extensions: ExtensionsPage()
                     case .webhook: WebhookPage()
@@ -127,11 +129,13 @@ private struct SettingsHomeList: View {
 
         Section {
             tile(.download, L("settingsCatDownload"), downloadReadout(state.config), "arrow.down.circle.fill", .accentColor)
+            #if FULL_P2P
             tile(
                 .bt, L("settingsCatBt"), BtPage.readout(ctx) ?? L("settingsCatBtDesc"),
                 "point.3.connected.trianglepath.dotted", .green
             )
             tile(.ed2k, L("ed2kSettings"), Ed2kPage.readout(ctx) ?? L("ed2kSettingsDesc"), "server.rack", .orange)
+            #endif
             tile(.network, L("settingsCatProxy"), NetworkPage.readout(ctx) ?? L("settingsCatProxyDesc"), "globe", .blue)
             tile(.extensions, L("settingsCatExtensions"), L("settingsCatExtensionsDesc"), "puzzlepiece.extension.fill", .purple)
             // 功能开关关闭时无入口；开启后 `ui.show_activity_webhooks` = false 仍可隐藏首页行（搜索仍可进入）。

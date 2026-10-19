@@ -26,7 +26,7 @@
 [![Unraid CA](https://img.shields.io/badge/Unraid-CA-F15A2C?style=flat-square)](https://github.com/selfhosters/unRAID-CA-templates/blob/master/templates/fluxdown.xml)
 [![Chinese Indie Dev](https://img.shields.io/badge/Chinese%20Indie-Dev-ef4444?style=flat-square)](https://github.com/1c7/chinese-independent-developer)
 
-[**官网**](https://fluxdown.zerx.dev) · [**下载**](https://fluxdown.zerx.dev/#download) · [**更新日志**](https://fluxdown.zerx.dev/changelog) · [**常见问题**](https://fluxdown.zerx.dev/faq) · [**反馈**](https://fluxdown.zerx.dev/feedback)
+[**官网**](https://fluxdown.com) · [**下载**](https://fluxdown.com/#download) · [**更新日志**](https://fluxdown.com/changelog) · [**常见问题**](https://fluxdown.com/faq) · [**反馈**](https://fluxdown.com/feedback)
 
 [English](README.md) | **简体中文**
 
@@ -77,7 +77,7 @@
 
 ## 安装
 
-从 [**GitHub Releases**](https://github.com/zerx-lab/FluxDown/releases/latest) 或 [**fluxdown.zerx.dev**](https://fluxdown.zerx.dev/#download) 获取最新版本：
+从 [**GitHub Releases**](https://github.com/zerx-lab/FluxDown/releases/latest) 或 [**fluxdown.com**](https://fluxdown.com/#download) 获取最新版本：
 
 | 平台 | 安装包 |
 |---|---|
@@ -213,7 +213,7 @@ flowchart TD
 | Web 管理界面 | React + TypeScript + Vite | [`web/`](web) |
 | CLI | HTTP 客户端或内嵌引擎 | [`native/cli/`](native/cli) |
 | 浏览器集成 | WXT + TypeScript、Native Messaging、用户脚本 | [`fluxDown/`](fluxDown)、[`native/nmh/`](native/nmh)、[`userscript/`](userscript) |
-| 官网 | Astro + React；`website/` 为旧站存档 | [`website-v2/`](website-v2) |
+| 官网 | Astro + React | [`website-v2/`](website-v2) |
 
 ## 从源码构建
 
@@ -291,8 +291,8 @@ cargo test -p fluxdown_mobile        # 原生移动端共享核心
 
 ## 参与贡献与社区
 
-- **Bug 反馈 / 功能建议** —— [GitHub Issues](https://github.com/zerx-lab/FluxDown/issues) 或[官网反馈页](https://fluxdown.zerx.dev/feedback)
-- **QQ 群** —— [832143651](https://fluxdown.zerx.dev/qq-group)
+- **Bug 反馈 / 功能建议** —— [GitHub Issues](https://github.com/zerx-lab/FluxDown/issues) 或[官网反馈页](https://fluxdown.com/feedback)
+- **QQ 群** —— [832143651](https://fluxdown.com/qq-group)
 
 欢迎提交 Pull Request！请从 `main` 拉分支并把 PR 提到 `main` —— `main` 是开发分支，`stable` 只承载稳定版本（由维护者从 `main` 合并前进）。提交前请确保通过：
 

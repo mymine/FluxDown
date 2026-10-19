@@ -10,6 +10,7 @@ import androidx.compose.runtime.setValue
 import com.fluxdown.core.capture.ExternalDownload
 import com.fluxdown.core.host.CreateTaskRequest
 import com.fluxdown.core.model.TaskProtocol
+import com.fluxdown.core.protocol.DeviceRules
 import com.fluxdown.core.protocol.DispatchTarget
 import com.fluxdown.core.store.HostState
 
@@ -147,8 +148,8 @@ internal class NewDownloadState(
             targetId != null || remoteSaveDir.isNotBlank() ||
             advanced.modified(single = true, singleHttp = true).isNotEmpty()
 
-    /** 当前选中的远端目标；目标已不在候选里（登出 / 解除配对）时回落到当前主机。 */
-    fun target(targets: List<DispatchTarget>): DispatchTarget? = targetId?.let { id -> targets.firstOrNull { it.id == id } }
+    /** 当前选中的远端目标；目标已不在候选里（登出 / 解除配对 / 对方解除）时回落到当前主机；`link:<fp>` 已挂接时解析为云条目。 */
+    fun target(targets: List<DispatchTarget>): DispatchTarget? = targetId?.let { id -> DeviceRules.resolveTarget(id, targets) }
 
     /**
      * 下发条目：单条链接时重命名优先于 `out=`；空名交给目标设备推断。

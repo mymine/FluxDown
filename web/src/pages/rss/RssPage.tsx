@@ -7,7 +7,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent, PointerEvent, ReactNode } from 'react'
 import { useT } from '../../i18n'
 import { useAgent, useConnection, useDaemon } from '../../lib/rpc'
-import type { QueueDto, RssSourceDto } from '../../lib/rpc'
+import type { PluginDto, QueueDto, RssSourceDto } from '../../lib/rpc'
 import { TitleBarSlot } from '../../shell'
 import { Button, EmptyState, Icon, useIsMobile } from '../../ui'
 import { sourceDisplayName } from './filter'
@@ -18,6 +18,7 @@ import { useNowSeconds } from './useNow'
 
 const EMPTY_SOURCES: readonly RssSourceDto[] = []
 const EMPTY_QUEUES: readonly QueueDto[] = []
+const EMPTY_PLUGINS: readonly PluginDto[] = []
 
 const COLUMN_DEFAULT = 240
 const COLUMN_MIN = 176
@@ -75,6 +76,7 @@ export function RssPage() {
   const mobile = useIsMobile()
   const rawSources = useDaemon((daemon) => daemon.rssSources, EMPTY_SOURCES)
   const queues = useDaemon((daemon) => daemon.queues, EMPTY_QUEUES)
+  const plugins = useDaemon((daemon) => daemon.plugins, EMPTY_PLUGINS)
   const daemonConnected = useAgent((snapshot) => snapshot.daemonConnected, false)
   const { phase } = useConnection()
   const stale = !daemonConnected || phase !== 'ready'
@@ -188,6 +190,7 @@ export function RssPage() {
           open
           source={editor.source}
           queues={queues}
+          plugins={plugins}
           onOpenChange={(open) => {
             if (!open) setEditor(null)
           }}

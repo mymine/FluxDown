@@ -1,0 +1,49 @@
+{
+  "format": "fluxdown-sniff-pack",
+  "packId": "youtube-down",
+  "sequence": 1,
+  "engine": 1,
+  "issuedAt": "2026-10-17T00:00:00Z",
+  "rules": [
+    {
+      "id": "ignore-googlevideo",
+      "version": 1,
+      "tier": "plugin",
+      "title": "YouTube 播放分片不作为下载资源",
+      "stage": "response",
+      "match": { "host": ["googlevideo.com"], "pageHost": ["youtube.com"] },
+      "action": { "kind": "ignore" }
+    },
+    {
+      "id": "watch-page",
+      "version": 1,
+      "tier": "plugin",
+      "title": "YouTube 播放页交给桌面端解析",
+      "stage": "dom",
+      "match": {
+        "pageHost": ["youtube.com"],
+        "url": [
+          "*://www.youtube.com/watch?*",
+          "*://music.youtube.com/watch?*",
+          "*://www.youtube.com/shorts/*",
+          "*://www.youtube.com/live/*"
+        ]
+      },
+      "action": {
+        "kind": "dom",
+        "selector": "#movie_player video, #shorts-player video",
+        "attr": "src",
+        "emit": { "mode": "resource", "url": "${page}", "type": "video" }
+      }
+    },
+    {
+      "id": "watch-title",
+      "version": 1,
+      "tier": "plugin",
+      "title": "YouTube 视频标题",
+      "stage": "page",
+      "match": { "pageHost": ["youtube.com"] },
+      "action": { "kind": "title", "selector": "ytd-watch-metadata h1" }
+    }
+  ]
+}

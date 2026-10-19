@@ -1,0 +1,295 @@
+{
+  "version": 1,
+  "limits": { "maxNodes": 5000, "maxDepth": 64, "maxImageSrcBytes": 1048576 },
+  "enums": {
+    "direction": ["row", "column"],
+    "gap": ["none", "xs", "sm", "md", "lg", "xl"],
+    "align": ["start", "center", "end", "stretch"],
+    "justify": ["start", "center", "end", "between"],
+    "size": ["xs", "sm", "md", "lg", "xl"],
+    "weight": ["normal", "medium", "semibold"],
+    "tone": ["neutral", "accent", "success", "warning", "danger", "info", "muted"],
+    "buttonVariant": ["primary", "outline", "ghost", "danger"],
+    "inputKind": ["text", "password", "number"],
+    "columnKind": ["text", "bytes", "speed", "percent", "progress", "time", "badge"]
+  },
+  "kinds": {
+    "stack": {
+      "doc": "弹性布局容器。",
+      "children": true,
+      "props": {
+        "direction": { "type": "enum", "enum": "direction", "default": "column" },
+        "gap": { "type": "enum", "enum": "gap", "default": "sm" },
+        "align": { "type": "enum", "enum": "align", "default": "stretch" },
+        "justify": { "type": "enum", "enum": "justify", "default": "start" },
+        "wrap": { "type": "bool", "default": false },
+        "padding": { "type": "enum", "enum": "gap", "default": "none" },
+        "grow": { "type": "bool", "default": false }
+      }
+    },
+    "scroll": {
+      "doc": "可滚动容器。",
+      "children": true,
+      "props": {
+        "maxHeight": { "type": "number", "min": 0 }
+      }
+    },
+    "card": {
+      "doc": "带边框的卡片容器。",
+      "children": true,
+      "props": {
+        "title": { "type": "string" },
+        "padding": { "type": "enum", "enum": "gap", "default": "md" }
+      }
+    },
+    "section": {
+      "doc": "带标题的分区容器。",
+      "children": true,
+      "props": {
+        "title": { "type": "string", "required": true },
+        "description": { "type": "string" }
+      }
+    },
+    "divider": { "doc": "分隔线。", "props": {} },
+    "text": {
+      "doc": "单段文本。",
+      "props": {
+        "text": { "type": "string", "required": true },
+        "tone": { "type": "enum", "enum": "tone", "default": "neutral" },
+        "size": { "type": "enum", "enum": "size", "default": "sm" },
+        "weight": { "type": "enum", "enum": "weight", "default": "normal" },
+        "mono": { "type": "bool", "default": false },
+        "truncate": { "type": "bool", "default": false }
+      }
+    },
+    "heading": {
+      "doc": "标题。",
+      "props": {
+        "text": { "type": "string", "required": true },
+        "level": { "type": "int", "min": 1, "max": 3, "default": 2 }
+      }
+    },
+    "markdown": {
+      "doc": "Markdown 文本（渲染端只做段落与代码块）。",
+      "props": { "text": { "type": "string", "required": true } }
+    },
+    "code": {
+      "doc": "等宽代码块。",
+      "props": { "text": { "type": "string", "required": true } }
+    },
+    "link": {
+      "doc": "外链，只接受 http/https。",
+      "props": {
+        "text": { "type": "string", "required": true },
+        "href": { "type": "string", "required": true, "format": "httpUrl" }
+      }
+    },
+    "image": {
+      "doc": "内联图片，只接受 data:image/(png|jpeg|webp);base64,。",
+      "props": {
+        "src": { "type": "string", "required": true, "format": "imageDataUri" },
+        "alt": { "type": "string", "default": "" },
+        "width": { "type": "number", "min": 0 },
+        "height": { "type": "number", "min": 0 }
+      }
+    },
+    "badge": {
+      "doc": "徽标。",
+      "props": {
+        "text": { "type": "string", "required": true },
+        "tone": { "type": "enum", "enum": "tone", "default": "neutral" }
+      }
+    },
+    "progress": {
+      "doc": "进度条；value 为 null 表示不确定进度。",
+      "props": {
+        "value": { "type": "number", "min": 0, "max": 1, "nullable": true, "default": null },
+        "label": { "type": "string" }
+      }
+    },
+    "spinner": {
+      "doc": "加载指示。",
+      "props": { "label": { "type": "string" } }
+    },
+    "kv": {
+      "doc": "键值列表。",
+      "props": {
+        "items": {
+          "type": "array",
+          "default": [],
+          "item": {
+            "fields": {
+              "key": { "type": "string", "required": true },
+              "value": { "type": "string", "required": true }
+            }
+          }
+        }
+      }
+    },
+    "callout": {
+      "doc": "提示条。",
+      "props": {
+        "tone": { "type": "enum", "enum": "tone", "default": "info" },
+        "title": { "type": "string" },
+        "text": { "type": "string", "required": true }
+      }
+    },
+    "empty": {
+      "doc": "空状态。",
+      "props": {
+        "title": { "type": "string", "required": true },
+        "description": { "type": "string" }
+      }
+    },
+    "button": {
+      "doc": "按钮。",
+      "props": {
+        "text": { "type": "string", "required": true },
+        "variant": { "type": "enum", "enum": "buttonVariant", "default": "outline" },
+        "disabled": { "type": "bool", "default": false },
+        "loading": { "type": "bool", "default": false }
+      },
+      "events": { "press": {} }
+    },
+    "switch": {
+      "doc": "开关。",
+      "props": {
+        "label": { "type": "string" },
+        "checked": { "type": "bool", "default": false },
+        "disabled": { "type": "bool", "default": false }
+      },
+      "events": { "change": { "payload": { "value": "bool" } } }
+    },
+    "checkbox": {
+      "doc": "复选框。",
+      "props": {
+        "label": { "type": "string" },
+        "checked": { "type": "bool", "default": false },
+        "disabled": { "type": "bool", "default": false }
+      },
+      "events": { "change": { "payload": { "value": "bool" } } }
+    },
+    "select": {
+      "doc": "下拉选择。",
+      "props": {
+        "options": {
+          "type": "array",
+          "required": true,
+          "item": {
+            "fields": {
+              "value": { "type": "string", "required": true },
+              "label": { "type": "string", "required": true }
+            }
+          }
+        },
+        "value": { "type": "string" },
+        "placeholder": { "type": "string" },
+        "disabled": { "type": "bool", "default": false }
+      },
+      "events": { "change": { "payload": { "value": "string" } } }
+    },
+    "input": {
+      "doc": "单行输入框。",
+      "props": {
+        "value": { "type": "string", "default": "" },
+        "placeholder": { "type": "string" },
+        "kind": { "type": "enum", "enum": "inputKind", "default": "text" },
+        "disabled": { "type": "bool", "default": false }
+      },
+      "events": {
+        "change": { "payload": { "value": "string" }, "debounceMs": 300 },
+        "submit": { "payload": { "value": "string" } }
+      }
+    },
+    "textarea": {
+      "doc": "多行输入框。",
+      "props": {
+        "value": { "type": "string", "default": "" },
+        "placeholder": { "type": "string" },
+        "rows": { "type": "int", "min": 1, "max": 50, "default": 4 },
+        "disabled": { "type": "bool", "default": false }
+      },
+      "events": { "change": { "payload": { "value": "string" }, "debounceMs": 300 } }
+    },
+    "tabs": {
+      "doc": "标签页切换条（内容由插件按 value 自行渲染）。",
+      "props": {
+        "items": {
+          "type": "array",
+          "required": true,
+          "item": {
+            "fields": {
+              "value": { "type": "string", "required": true },
+              "label": { "type": "string", "required": true }
+            }
+          }
+        },
+        "value": { "type": "string", "required": true }
+      },
+      "events": { "change": { "payload": { "value": "string" } } }
+    },
+    "table": {
+      "doc": "数据表格；rows 为键控数组，可按 key 增量更新。",
+      "keyedProp": "rows",
+      "props": {
+        "columns": {
+          "type": "array",
+          "required": true,
+          "item": {
+            "fields": {
+              "key": { "type": "string", "required": true },
+              "title": { "type": "string", "required": true },
+              "kind": { "type": "enum", "enum": "columnKind", "default": "text" },
+              "width": { "type": "number", "min": 0 }
+            }
+          }
+        },
+        "rows": {
+          "type": "array",
+          "default": [],
+          "maxItems": 10000,
+          "item": {
+            "fields": { "key": { "type": "string", "required": true } },
+            "additional": true
+          }
+        },
+        "rowActions": {
+          "type": "array",
+          "item": {
+            "fields": {
+              "id": { "type": "string", "required": true },
+              "label": { "type": "string", "required": true },
+              "tone": { "type": "enum", "enum": "tone" }
+            }
+          }
+        },
+        "emptyText": { "type": "string" }
+      },
+      "events": {
+        "rowAction": { "payload": { "key": "string", "action": "string" } },
+        "select": { "payload": { "key": "string" } }
+      }
+    },
+    "list": {
+      "doc": "列表；items 为键控数组，可按 key 增量更新。",
+      "keyedProp": "items",
+      "props": {
+        "items": {
+          "type": "array",
+          "default": [],
+          "maxItems": 5000,
+          "item": {
+            "fields": {
+              "key": { "type": "string", "required": true },
+              "title": { "type": "string", "required": true },
+              "description": { "type": "string" },
+              "badge": { "type": "string" },
+              "tone": { "type": "enum", "enum": "tone" }
+            }
+          }
+        }
+      },
+      "events": { "select": { "payload": { "key": "string" } } }
+    }
+  }
+}

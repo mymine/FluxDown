@@ -1,9 +1,12 @@
 //! FluxDown GPUI 桌面窗口 shell。
 //!
 //! 本 crate 只提供窗口 chrome、活动栏、路由和内容槽位；业务页面由 app
-//! 创建后以 [`ShellRoute`] 注入。
+//! 创建后以 [`ShellRoute`] 注入，状态栏等可摆放控件以 [`ShellWidget`] 注入，
+//! 摆放位置由 [`ChromeLayout`] 决定。
 
 mod assets;
+mod chrome;
+mod chrome_layout;
 mod view;
 mod window_controls;
 
@@ -14,6 +17,8 @@ use gpui::{
 use gpui_component::TitleBar;
 
 pub use assets::*;
+pub use chrome::{LayoutChangeHandler, ShellChrome, ShellWidget, ShellWidgetRender};
+pub use chrome_layout::*;
 pub use view::*;
 
 /// 交通灯对齐的顶栏高度（逻辑像素）：窗口创建时写入平台窗口选项，是窗口级而非主题值，

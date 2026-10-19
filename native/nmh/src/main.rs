@@ -47,7 +47,16 @@ const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 /// beats a multi-second cold-start stall for a popup that has nothing to
 /// show anyway. `download`/`warmup` are deliberately excluded — those are
 /// the entry points that must launch the App.
-const NO_LAUNCH_ACTIONS: &[&str] = &["ping", "tasks", "task_op", "open_file", "reveal_file"];
+const NO_LAUNCH_ACTIONS: &[&str] = &[
+    "ping",
+    "tasks",
+    "task_op",
+    "open_file",
+    "reveal_file",
+    "capabilities",
+    "capture_status",
+    "sniff_rules",
+];
 
 /// Whether `action` belongs to [`NO_LAUNCH_ACTIONS`].
 fn is_no_launch_action(action: &str) -> bool {
@@ -750,7 +759,16 @@ mod tests {
 
     #[test]
     fn no_launch_set_covers_ping_and_task_panel_actions() {
-        for action in ["ping", "tasks", "task_op", "open_file", "reveal_file"] {
+        for action in [
+            "ping",
+            "tasks",
+            "task_op",
+            "open_file",
+            "reveal_file",
+            "capabilities",
+            "capture_status",
+            "sniff_rules",
+        ] {
             assert!(is_no_launch_action(action), "{action} should be no-launch");
         }
     }

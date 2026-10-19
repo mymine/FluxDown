@@ -12,6 +12,9 @@
 //!   字段，晚加不破坏兼容（JSON）。当前信任模型 = 内容寻址 + 传输层 TLS + Git 历史。
 //! - `.fxplug` = 插件目录（manifest.json + *.js）的 zip；安装复用
 //!   [`super::install::install_from_zip`]（zip-slip / 压缩炸弹防护 + manifest 校验）。
+//! - 包内 manifest 是**不可信声明**：授权界面展示的是索引条目的 `permissions`，故
+//!   安装前（替换旧版本之前）强制核对 manifest 的 identity / version 与条目完全相等、
+//!   permissions 为条目声明的子集，否则拒绝（第三方 fork 索引不可信）。
 
 use std::collections::HashMap;
 
@@ -23,6 +26,7 @@ use crate::logger::{log_warn, sanitize_log_str};
 use crate::proxy_config::ProxyConfig;
 
 use super::manager::PluginManager;
+use super::manifest::PluginManifest;
 use super::runtime::PluginError;
 
 /// 内置官方索引候选源（不同法域/托管，共享同一 index_id；任一存活即可用）。
@@ -93,6 +97,9 @@ pub struct MarketEntry {
     /// 供安装前展示授权。旧索引缺省 → 空，不影响安装）。
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// 插件桌面视图声明的网络主机；授权界面展示它，包内 manifest 须为其子集。
+    #[serde(default)]
+    pub network_hosts: Vec<String>,
     /// 预留：未来作者签名方案（`none` / `sigstore` / `ed25519`）。
     #[serde(default = "sig_none")]
     pub sig_scheme: String,
@@ -137,6 +144,8 @@ pub struct MarketClient {
     /// 包下载专用：重定向逐跳复查 https 与字面量 IP 守卫（初始 URL 的
     /// `mirror_url_allowed` 只管第一跳）。
     download_client: reqwest::Client,
+    /// 宿主自身下载的统一出口：包（content_hash 钉住）可经插件改写来源（如 GitHub 加速）。
+    egress: crate::egress::Egress,
     sources: Vec<String>,
 }
 
@@ -156,12 +165,12 @@ impl MarketClient {
         } else {
             sources
         };
-        let client = crate::downloader::build_client_builder(proxy, "", false)
+        let client = crate::egress::client_builder(proxy, "")
             .map_err(client_build_error)?
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .map_err(network_error)?;
-        let download_client = crate::downloader::build_client_builder(proxy, "", false)
+        let download_client = crate::egress::client_builder(proxy, "")
             .map_err(client_build_error)?
             .timeout(std::time::Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -179,11 +188,13 @@ impl MarketClient {
             }))
             .build()
             .map_err(network_error)?;
+        let egress = crate::egress::Egress::new(db.clone()).with_plugins(manager.clone());
         Ok(Self {
             manager,
             db,
             client,
             download_client,
+            egress,
             sources,
         })
     }
@@ -293,7 +304,10 @@ impl MarketClient {
             return Err(MarketError::Yanked(entry.yanked.clone()));
         }
         let bytes = self.download_verified(entry).await?;
-        let identity = self.manager.install_from_zip(bytes).await?;
+        let identity = self
+            .manager
+            .install_from_zip_checked(bytes, |manifest| verify_package_claim(entry, manifest))
+            .await?;
         Ok(identity)
     }
 
@@ -320,30 +334,45 @@ impl MarketClient {
                 );
                 continue;
             }
-            let error = match self.download_one(url).await {
-                Ok(bytes) => {
-                    let actual = sha256_hex(&bytes);
-                    if actual == expected {
-                        return Ok(bytes);
-                    }
-                    MarketError::HashMismatch {
-                        expected: expected.clone(),
-                        actual,
-                    }
+            // 插件改写（如 GitHub 加速）只换来源，内容仍由 content_hash 钉住；改写地址
+            // 同样过镜像守卫，失败或内容不符回退原镜像地址。索引不经插件（它是完整性锚）。
+            let route = self.egress.route_verified(url).await;
+            for attempt in route.attempts() {
+                if !mirror_url_allowed(&attempt.url) {
+                    log_warn!(
+                        "[market] plugin={:?} version={:?} source={} rewritten by {:?} rejected by URL guard",
+                        entry.plugin_id,
+                        entry.version,
+                        safe_url(&attempt.url),
+                        attempt.plugin
+                    );
+                    continue;
                 }
-                Err(error) => error,
-            };
-            log_warn!(
-                "[market] plugin={:?} version={:?} mirror={} failed, trying next mirror: {error:#}",
-                entry.plugin_id,
-                entry.version,
-                safe_url(url)
-            );
-            if matches!(
-                error,
-                MarketError::HashMismatch { .. } | MarketError::TooLarge
-            ) {
-                verification_error = Some(error);
+                let error = match self.download_one(&attempt.url, &attempt.headers).await {
+                    Ok(bytes) => {
+                        let actual = sha256_hex(&bytes);
+                        if actual == expected {
+                            return Ok(bytes);
+                        }
+                        MarketError::HashMismatch {
+                            expected: expected.clone(),
+                            actual,
+                        }
+                    }
+                    Err(error) => error,
+                };
+                log_warn!(
+                    "[market] plugin={:?} version={:?} source={} failed, trying next source: {error:#}",
+                    entry.plugin_id,
+                    entry.version,
+                    safe_url(&attempt.url)
+                );
+                if matches!(
+                    error,
+                    MarketError::HashMismatch { .. } | MarketError::TooLarge
+                ) {
+                    verification_error = Some(error);
+                }
             }
         }
         let error = verification_error.unwrap_or(MarketError::AllMirrorsFailed);
@@ -356,13 +385,16 @@ impl MarketClient {
         Err(error)
     }
 
-    async fn download_one(&self, url: &str) -> Result<Vec<u8>, MarketError> {
-        let resp = self
-            .download_client
-            .get(url)
-            .send()
-            .await
-            .map_err(network_error)?;
+    async fn download_one(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<Vec<u8>, MarketError> {
+        let mut request = self.download_client.get(url);
+        for (name, value) in headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        let resp = request.send().await.map_err(network_error)?;
         if !resp.status().is_success() {
             return Err(MarketError::Network(format!(
                 "HTTP {} at {}",
@@ -465,6 +497,44 @@ fn client_build_error(error: crate::downloader::DownloadError) -> MarketError {
         "构造市场 HTTP 客户端失败: {}",
         safe_error_chain(&error)
     ))
+}
+
+/// 核对已解析校验的包内 manifest 与索引条目：identity、version 必须完全相等，
+/// permissions 必须是条目 permissions 的子集（防止越权声明绕过授权界面）。
+fn verify_package_claim(entry: &MarketEntry, manifest: &PluginManifest) -> Result<(), PluginError> {
+    if manifest.identity != entry.plugin_id {
+        return Err(PluginError::ManifestInvalid(format!(
+            "插件包 manifest 的 identity '{}' 与索引条目 '{}' 不一致",
+            manifest.identity, entry.plugin_id
+        )));
+    }
+    if manifest.version != entry.version {
+        return Err(PluginError::ManifestInvalid(format!(
+            "插件包 manifest 的 version '{}' 与索引条目 '{}' 不一致",
+            manifest.version, entry.version
+        )));
+    }
+    if let Some(extra) = manifest
+        .permissions
+        .iter()
+        .find(|p| !entry.permissions.contains(p))
+    {
+        return Err(PluginError::ManifestInvalid(format!(
+            "插件包 manifest 声明了索引条目未授权的权限 '{extra}'（manifest permissions: {:?}，索引 permissions: {:?}）",
+            manifest.permissions, entry.permissions
+        )));
+    }
+    if let Some(extra) = manifest
+        .network_hosts()
+        .into_iter()
+        .find(|h| !entry.network_hosts.contains(h))
+    {
+        return Err(PluginError::ManifestInvalid(format!(
+            "插件包 manifest 声明了索引条目未授权的网络主机 '{extra}'（索引 networkHosts: {:?}）",
+            entry.network_hosts
+        )));
+    }
+    Ok(())
 }
 
 /// 调用方确认过的版本必须与当前最新可装版本一致；未指定（旧客户端）不校验。
@@ -625,5 +695,112 @@ mod tests {
         assert_eq!(idx.entries.len(), 1);
         assert_eq!(idx.entries[0].plugin_id, "a@b");
         assert_eq!(idx.entries[0].sig_scheme, "none"); // 默认值
+    }
+
+    fn claim_entry(permissions: &[&str]) -> super::MarketEntry {
+        let json = serde_json::json!({
+            "pluginId": "zerx@demo",
+            "version": "1.0.0",
+            "sequence": 1,
+            "contentHash": "sha256:00",
+            "permissions": permissions,
+        });
+        serde_json::from_value(json).expect("entry")
+    }
+
+    fn fxplug(identity: &str, version: &str, permissions: &[&str]) -> Vec<u8> {
+        use std::io::Write;
+        let manifest = serde_json::json!({
+            "identity": identity,
+            "name": "Demo",
+            "version": version,
+            "permissions": permissions,
+        });
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer.start_file("manifest.json", options).expect("start");
+        writer
+            .write_all(manifest.to_string().as_bytes())
+            .expect("write");
+        writer.finish().expect("finish").into_inner()
+    }
+
+    struct TempRoot(std::path::PathBuf);
+    impl TempRoot {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("fx_market_claim_{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            Self(dir)
+        }
+    }
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).expect("cleanup temp root");
+        }
+    }
+
+    fn install_claimed(
+        root: &std::path::Path,
+        entry: &super::MarketEntry,
+        bytes: &[u8],
+    ) -> Result<(), super::PluginError> {
+        let outcome = crate::plugin::install::install_from_zip_with_backup(root, bytes, |m| {
+            super::verify_package_claim(entry, m)
+        })?;
+        crate::plugin::install::commit_install(&outcome)
+    }
+
+    fn dir_names(root: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn package_claim_accepts_equal_and_subset_permissions() {
+        let root = TempRoot::new();
+        let entry = claim_entry(&["ffmpeg", "auth"]);
+        install_claimed(
+            &root.0,
+            &entry,
+            &fxplug("zerx@demo", "1.0.0", &["ffmpeg", "auth"]),
+        )
+        .expect("equal");
+        install_claimed(&root.0, &entry, &fxplug("zerx@demo", "1.0.0", &["ffmpeg"]))
+            .expect("subset");
+        install_claimed(&root.0, &entry, &fxplug("zerx@demo", "1.0.0", &[])).expect("empty");
+        assert_eq!(dir_names(&root.0), vec!["zerx@demo".to_string()]);
+    }
+
+    #[test]
+    fn package_claim_rejects_mismatch_and_keeps_installed_plugin() {
+        let root = TempRoot::new();
+        let entry = claim_entry(&["ffmpeg"]);
+        install_claimed(&root.0, &entry, &fxplug("zerx@demo", "1.0.0", &["ffmpeg"])).expect("seed");
+        let manifest_path = root.0.join("zerx@demo").join("manifest.json");
+        let before = std::fs::read(&manifest_path).expect("read manifest");
+
+        let cases = [
+            (fxplug("zerx@other", "1.0.0", &["ffmpeg"]), "identity"),
+            (fxplug("zerx@demo", "1.0.1", &["ffmpeg"]), "version"),
+            (fxplug("zerx@demo", "1.0.0", &["ffmpeg", "auth"]), "auth"),
+        ];
+        for (bytes, needle) in cases {
+            let err = install_claimed(&root.0, &entry, &bytes).expect_err("must reject");
+            let super::PluginError::ManifestInvalid(msg) = err else {
+                panic!("unexpected error variant: {err:?}");
+            };
+            assert!(msg.contains(needle), "{msg}");
+            assert_eq!(
+                std::fs::read(&manifest_path).expect("read manifest"),
+                before
+            );
+            assert_eq!(dir_names(&root.0), vec!["zerx@demo".to_string()]);
+        }
     }
 }

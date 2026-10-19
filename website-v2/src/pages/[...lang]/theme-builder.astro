@@ -4,7 +4,8 @@ import PageHeader from "@/components/site/PageHeader.astro";
 import ThemeBuilder from "@/components/theme-builder/ThemeBuilder";
 import { themeBuilder } from "@/i18n/messages/themeBuilder";
 import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
-import { ArrowRight, FileJson, MousePointerClick } from "lucide-react";
+import { contributeGuidePath } from "@/lib/ecosystem";
+import { ArrowRight, FileJson, HeartHandshake, MousePointerClick } from "lucide-react";
 export const getStaticPaths = langStaticPaths;
 const lang = resolveLang(Astro.params.lang);
 const t = themeBuilder[lang];
@@ -15,6 +16,10 @@ const t = themeBuilder[lang];
     <a class="btn btn-secondary" href={href("/themes", lang)}>
       {t.browseThemes}
       <ArrowRight size={15} aria-hidden="true" />
+    </a>
+    <a class="btn btn-ghost" href={href(contributeGuidePath(lang, "contributing/themes"), lang)}>
+      <HeartHandshake size={15} aria-hidden="true" />
+      {t.submitTheme}
     </a>
   </PageHeader>
 

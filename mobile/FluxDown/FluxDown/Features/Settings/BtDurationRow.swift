@@ -1,6 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
+#if FULL_P2P
 
 /// 做种时长行：数字 + 单位菜单（分钟 / 小时 / 天）+ ± 步进。
 ///
@@ -113,3 +114,4 @@ struct BtDurationRow: View {
         draft = BtDuration.text(minutes: next, unit: unit)
     }
 }
+#endif

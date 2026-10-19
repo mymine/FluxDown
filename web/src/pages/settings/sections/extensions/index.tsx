@@ -37,7 +37,7 @@ export function ExtensionsSettings() {
       const message = outer.event.data.data
       if (message.type !== 'pluginAutoDisabled') return
       const plugin = rpcStore.peek().snapshot?.daemon.plugins.find((entry) => entry.identity === message.identity)
-      if (plugin) toast.warning(t('pluginAutoDisabledToast', { name: plugin.name }))
+      if (plugin) toast.warning(t(message.reason === 'Revoked' ? 'pluginRevokedToast' : 'pluginAutoDisabledToast', { name: plugin.name }))
     },
     [t],
   )

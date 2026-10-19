@@ -112,6 +112,16 @@ impl ResolvedTheme {
         theme
     }
 
+    /// 按注册表顺序列出每个 token 的运行时值（已按界面缩放，字体为实际字体名）。
+    #[must_use]
+    pub fn token_values(&self) -> Vec<(&'static str, TokenValue)> {
+        let mut theme = self.clone();
+        TOKENS
+            .iter()
+            .filter_map(|spec| theme.slot(spec.path).map(|slot| (spec.path, slot.get())))
+            .collect()
+    }
+
     fn slot(&mut self, path: &str) -> Option<Slot<'_>> {
         if let Some(slot) = semantic_slot(&mut self.base, path) {
             return Some(slot);

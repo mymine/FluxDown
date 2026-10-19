@@ -158,7 +158,7 @@ async function findOrCreateIssue(): Promise<number> {
           "(lifetime one-time purchase vs subscription). Final prices are TBD.",
           "",
           "**Do not close this issue.** Each comment below is one vote or one discussion post,",
-          "submitted by a GitHub-authenticated user from https://fluxdown.zerx.dev/pricing.",
+          "submitted by a GitHub-authenticated user from https://fluxdown.com/pricing.",
           "",
           "### Data format",
           "```json",

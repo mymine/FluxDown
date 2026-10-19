@@ -82,9 +82,15 @@ async fn fetch_window(
 ) -> Option<Vec<u8>> {
     let want = usize::try_from(len).ok()?;
     let range = format!("bytes={}-{}", start, start + len - 1);
-    let request = build_request(client, url, reqwest::Method::GET, spec.current())
-        .header("Range", range)
-        .header("Accept-Encoding", "identity");
+    let routed = spec.route_url(url);
+    let request = build_request(
+        client,
+        routed.as_deref().unwrap_or(url),
+        reqwest::Method::GET,
+        &spec.current(),
+    )
+    .header("Range", range)
+    .header("Accept-Encoding", "identity");
     let fetch = async {
         let resp = request.send().await.ok()?;
         if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT

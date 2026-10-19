@@ -884,17 +884,31 @@ async fn verify_ftp_rest_honoured(
 pub async fn run_ftp_download(params: DownloadParams) {
     let task_id_log = params.task_id.clone();
     let result = match run_ftp_download_inner(&params).await {
-        Ok(total) => params
-            .db
-            .update_task_status(&params.task_id, 3, "")
-            .await
-            .map(|()| total)
-            .map_err(DownloadError::Db),
+        Ok(total) => match crate::downloader::finalize_with_interceptors(
+            &params,
+            crate::intercept::ProtocolKind::Ftp,
+        )
+        .await
+        {
+            Ok(replaced) => {
+                let (total, renamed) = match replaced {
+                    Some((name, size)) => (size, Some(name)),
+                    None => (total, None),
+                };
+                params
+                    .db
+                    .update_task_status(&params.task_id, 3, "")
+                    .await
+                    .map(|()| (total, renamed))
+                    .map_err(DownloadError::Db)
+            }
+            Err(e) => Err(e),
+        },
         Err(error) => Err(error),
     };
 
     match result {
-        Ok(total) => {
+        Ok((total, renamed)) => {
             log_info!(
                 "[ftp-download] task {} completed, total={} bytes",
                 task_id_log,
@@ -908,7 +922,7 @@ pub async fn run_ftp_download(params: DownloadParams) {
                     total_bytes: total,
                     status: 3,
                     error_message: String::new(),
-                    file_name: String::new(),
+                    file_name: renamed.unwrap_or_default(),
                     segment_details: None,
                     ..Default::default()
                 })
@@ -1056,6 +1070,39 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         info.supports_range
     );
 
+    let mut requested_segments = p.segment_count;
+    let mut connection_cap = p.connection_cap;
+    if crate::intercept::wants(
+        p.interceptor.as_ref(),
+        crate::intercept::InterceptStage::Probed,
+    ) {
+        let task_ctx = crate::intercept::ctx::task_ctx(p, crate::intercept::ProtocolKind::Ftp);
+        let notes = crate::intercept::ActivityNotes::of(p);
+        let decision = crate::intercept::drive::run_probed(
+            p.interceptor.as_ref(),
+            &notes,
+            &p.cancel_token,
+            &task_ctx,
+            crate::intercept::patch::request_snapshot(&p.url, &p.spec, &p.run_meta),
+            crate::intercept::ctx::ConnectionsCtx {
+                segments: p.segment_count,
+                max_connections: p.connection_cap,
+                auto_max_connections: p.auto_max_connections,
+            },
+            crate::intercept::ctx::ProbeCtx {
+                total_bytes: info.total_bytes,
+                supports_range: info.supports_range,
+                file_name: info.file_name.clone(),
+                content_type: String::new(),
+                etag: String::new(),
+                last_modified: info.last_modified.clone(),
+            },
+        )
+        .await?;
+        requested_segments = decision.segments.unwrap_or(requested_segments);
+        connection_cap = decision.max_connections.unwrap_or(connection_cap);
+    }
+
     // p.file_name 来自外部（aria2 out、云端下发、接管请求等），与 HTTP/HLS 一致地清洗，
     // 否则 save_dir.join 可被 `..`/绝对路径带出保存目录。
     let auto_name = if p.file_name.is_empty() {
@@ -1138,7 +1185,7 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     let temp_path = PathBuf::from(format!("{}{}", dest_path.display(), TEMP_EXT));
 
     // Dynamic segment calculation
-    let segments = if p.segment_count <= 0 {
+    let segments = if requested_segments <= 0 {
         if p.is_resume {
             let existing = p.db.load_segments(&p.task_id).await?;
             if !existing.is_empty() {
@@ -1150,7 +1197,12 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             compute_ftp_segments(p, &info).await
         }
     } else {
-        p.segment_count
+        requested_segments
+    };
+    let segments = if connection_cap > 0 {
+        segments.min(connection_cap)
+    } else {
+        segments
     };
 
     let mut use_segments = info.supports_range && info.total_bytes > 1_048_576 && segments > 1;
@@ -1219,6 +1271,7 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             &tracker,
             &p.sink,
             p.spawn_gen,
+            crate::intercept::cap_connections(MAX_CONCURRENT_FTP_CONNECTIONS, connection_cap),
         )
         .await;
         // 暂停终态帧读 tasks.downloaded_bytes：退出前按已落库分段对齐（同 HTTP 多段）。
@@ -1777,6 +1830,7 @@ async fn ftp_download_multi_segment(
     tracker: &TransferTracker,
     sink: &Arc<dyn EventSink>,
     spawn_gen: i64,
+    max_connections: usize,
 ) -> Result<(), DownloadError> {
     output::ensure_parent(dest).await?;
 
@@ -1899,7 +1953,7 @@ async fn ftp_download_multi_segment(
 
     // Limit concurrent FTP connections to avoid server-side per-IP limits
     // (most FTP servers cap at 5-10 simultaneous connections per IP).
-    let ftp_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FTP_CONNECTIONS));
+    let ftp_semaphore = Arc::new(tokio::sync::Semaphore::new(max_connections));
     let mut handles = Vec::new();
 
     for (idx, start, end, already_downloaded) in &seg_defs {
@@ -1925,6 +1979,7 @@ async fn ftp_download_multi_segment(
         let proxy = proxy_config.clone();
         let tracker = tracker.clone();
         let sink = sink.clone();
+        let parallelism = max_connections as u32;
 
         let handle = tokio::spawn(async move {
             // 排队中的段遇到取消要立即退出，否则每个排队段都会先完整握手再发现已取消。
@@ -1957,6 +2012,7 @@ async fn ftp_download_multi_segment(
                 &tracker,
                 sink.as_ref(),
                 spawn_gen,
+                parallelism,
             )
             .await
         });
@@ -2025,6 +2081,7 @@ async fn ftp_do_segment_with_retry(
     tracker: &TransferTracker,
     sink: &dyn EventSink,
     spawn_gen: i64,
+    parallelism: u32,
 ) -> Result<(), DownloadError> {
     let mut attempts = 0u32;
 
@@ -2047,6 +2104,7 @@ async fn ftp_do_segment_with_retry(
             proxy_config,
             tracker,
             spawn_gen,
+            parallelism,
         )
         .await
         {
@@ -2116,6 +2174,7 @@ async fn ftp_do_segment(
     proxy_config: &ProxyConfig,
     tracker: &TransferTracker,
     spawn_gen: i64,
+    parallelism: u32,
 ) -> Result<(), DownloadError> {
     let bytes_needed = (seg_end - actual_start + 1) as u64;
     if cancel.is_cancelled() {
@@ -2324,7 +2383,7 @@ async fn ftp_do_segment(
                 };
                 let current_total = snapshot.iter().map(|s| s.downloaded_bytes).sum();
                 for segment in &mut snapshot { segment.active = Some(tracker.is_active(segment.index)); }
-                let runtime = ftp_runtime(task_id, total_bytes, MAX_CONCURRENT_FTP_CONNECTIONS as u32, tracker, &snapshot, sample_sequence);
+                let runtime = ftp_runtime(task_id, total_bytes, parallelism, tracker, &snapshot, sample_sequence);
                 if progress_tx.send(ProgressUpdate {
                     task_id: task_id.to_owned(), downloaded_bytes: current_total, total_bytes,
                     status: 1, segment_details: Some(snapshot), runtime: Some(runtime),
@@ -2828,7 +2887,7 @@ mod tests {
                 upload_limit_bps: 0,
                 default_save_dir: dir.to_string_lossy().into_owned(),
                 app_data_dir: dir.to_string_lossy().into_owned(),
-                bt_config: crate::bt_downloader::BtConfig::default(),
+                bt_config: crate::bt_config::BtConfig::default(),
                 proxy_config: crate::proxy_config::ProxyConfig::default(),
                 user_agent: String::new(),
                 data_dir_override: Some(dir.clone()),
@@ -2915,7 +2974,7 @@ mod tests {
                 upload_limit_bps: 0,
                 default_save_dir: dir.to_string_lossy().into_owned(),
                 app_data_dir: dir.to_string_lossy().into_owned(),
-                bt_config: crate::bt_downloader::BtConfig::default(),
+                bt_config: crate::bt_config::BtConfig::default(),
                 proxy_config: crate::proxy_config::ProxyConfig::default(),
                 user_agent: String::new(),
                 data_dir_override: Some(dir.clone()),

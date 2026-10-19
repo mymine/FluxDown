@@ -33,6 +33,7 @@ pub struct AccountController {
     discovered: Vec<LinkDiscoveredPeer>,
     pairing_requests: Vec<LinkPairingRequestDto>,
     lan_enabled: bool,
+    lan_active: bool,
     stale: bool,
     /// 已经提示过的入站配对请求，避免重连快照重复弹窗。
     seen_requests: BTreeSet<String>,
@@ -51,6 +52,7 @@ impl AccountController {
             discovered: Vec::new(),
             pairing_requests: Vec::new(),
             lan_enabled: false,
+            lan_active: false,
             stale: true,
             seen_requests: BTreeSet::new(),
         }
@@ -71,6 +73,7 @@ impl AccountController {
         self.pairing_requests
             .clone_from(&snapshot.link_pairing_requests);
         self.lan_enabled = snapshot.gateway.lan_enabled;
+        self.lan_active = snapshot.gateway.lan_active;
         self.stale = false;
         Transition {
             new_pairing_requests: self.take_new_requests(),
@@ -129,6 +132,7 @@ impl AccountController {
             AgentEvent::GatewayChanged(gateway) => {
                 transition.changed = true;
                 self.lan_enabled = gateway.lan_enabled;
+                self.lan_active = gateway.lan_active;
             }
             _ => {}
         }
@@ -177,6 +181,28 @@ impl AccountController {
         (!self.stale && self.cloud_connected()).then_some(device.is_online)
     }
 
+    /// 因同时在线设备数已达上限而在等待名额（连接未建立，原因为 `OnlineDeviceLimit`）。
+    pub(crate) fn online_limit_waiting(&self) -> bool {
+        !self.stale
+            && self.session.is_some()
+            && !self.cloud_connected()
+            && self.cloud_connection.last_error_reason == Some(ErrorReason::OnlineDeviceLimit)
+    }
+
+    /// 能否让该设备下线：非本机、列表标记在线，且在线状态可信（已连接）或正在等待名额。
+    pub(crate) fn can_disconnect_device(&self, device: &CloudDevice) -> bool {
+        !device.is_current
+            && device.is_online
+            && (self.device_presence(device) == Some(true) || self.online_limit_waiting())
+    }
+
+    /// 套餐的同时在线设备上限（`maxOnlineDevices`）；缺失或 0（不限）为 `None`。
+    pub(crate) fn max_online_devices(&self) -> Option<u64> {
+        self.session
+            .as_ref()
+            .and_then(|session| crate::device_list::max_online_devices(&session.entitlements))
+    }
+
     pub(crate) fn device_presence_key(&self, device: &CloudDevice) -> &'static str {
         match self.device_presence(device) {
             Some(true) => "deviceOnline",
@@ -209,6 +235,12 @@ impl AccountController {
     #[must_use]
     pub fn lan_enabled(&self) -> bool {
         self.lan_enabled
+    }
+
+    /// 本机网关本次运行是否实际监听非回环地址（`lan_enabled` 只是下次启动生效的持久化配置）。
+    #[must_use]
+    pub fn lan_active(&self) -> bool {
+        self.lan_active
     }
 
     #[must_use]

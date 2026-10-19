@@ -306,10 +306,10 @@ mod tests {
 
         let mut halted = status(true);
         halted.halted = true;
-        halted.last_error_reason = Some(ErrorReason::SyncDeviceLimit);
+        halted.last_error_reason = Some(ErrorReason::OnlineDeviceLimit);
         assert_eq!(
             sync_phase(true, &halted),
-            SyncPhase::Halted(Some(ErrorReason::SyncDeviceLimit))
+            SyncPhase::Halted(Some(ErrorReason::OnlineDeviceLimit))
         );
 
         let mut failed = status(true);

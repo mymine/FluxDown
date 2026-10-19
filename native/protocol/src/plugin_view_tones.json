@@ -1,0 +1,9 @@
+{
+  "neutral": "colors.foreground",
+  "accent": "colors.primary",
+  "success": "colors.success",
+  "warning": "colors.warning",
+  "danger": "colors.destructive",
+  "info": "colors.info",
+  "muted": "colors.mutedForeground"
+}

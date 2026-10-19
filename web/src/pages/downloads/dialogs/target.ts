@@ -1,6 +1,6 @@
 // 新建下载「下载到」目标：本服务器 / 云账号其他设备 / 已配对局域网设备的纯规则（校验、下发参数、汇总）。
 
-import { effectivePathStyle, isAbsolutePath } from '../../../lib/rpc'
+import { isAbsolutePath } from '../../../lib/rpc'
 import type {
   CloudDevice,
   LinkDeviceInfo,
@@ -8,13 +8,17 @@ import type {
   PathStyle,
   RemoteDispatchParams,
 } from '../../../lib/rpc'
-import { otherDevices } from '../model/devices'
+import { mergeDevices } from '../model/devices'
 
 export const LOCAL_TARGET = 'local'
 
-/** 下拉里的一个远端目标。`value` 形如 `cloud:<deviceId>` / `link:<fingerprint>`。 */
+/**
+ * 下拉里的一个远端目标（合并后的设备条目）。`value`：云条目（含挂接直连）= `cloud:<deviceId>`，
+ * 独立直连 = `link:<fingerprint>`。
+ */
 export interface RemoteTarget {
   value: string
+  /** `cloud` = 云条目（可能挂接直连）；`link` = 仅直连。 */
   kind: 'cloud' | 'link'
   /** cloud = deviceId；link = 指纹。 */
   id: string
@@ -24,6 +28,9 @@ export interface RemoteTarget {
   defaultSaveDir: string | null
   /** 目标路径风格；无法判定为 null（此时只能交给 agent 校验）。 */
   pathStyle: PathStyle | null
+  /** 挂接 / 独立的直连指纹；无直连为 null。 */
+  linkFingerprint: string | null
+  linkOnline: boolean | null
 }
 
 export function buildRemoteTargets(
@@ -31,25 +38,27 @@ export function buildRemoteTargets(
   linkedDevices: readonly LinkDeviceInfo[],
   presence: { cloud: boolean; local: boolean },
 ): RemoteTarget[] {
-  const cloud = otherDevices(cloudDevices).map<RemoteTarget>((device) => ({
-    value: `cloud:${device.deviceId}`,
-    kind: 'cloud',
-    id: device.deviceId,
-    name: device.name || device.deviceId,
-    online: presence.cloud ? device.isOnline : null,
-    defaultSaveDir: device.defaultSaveDir?.trim() || null,
-    pathStyle: effectivePathStyle(device),
+  return mergeDevices(cloudDevices, linkedDevices, presence).map((entry) => ({
+    ...entry,
+    value: `${entry.kind}:${entry.id}`,
   }))
-  const linked = linkedDevices.map<RemoteTarget>((device) => ({
-    value: `link:${device.fingerprint}`,
-    kind: 'link',
-    id: device.fingerprint,
-    name: device.name || device.fingerprint,
-    online: presence.local ? device.online : null,
-    defaultSaveDir: device.defaultSaveDir?.trim() || null,
-    pathStyle: effectivePathStyle(device),
-  }))
-  return [...cloud, ...linked]
+}
+
+/** 持久化 / 外部传入的目标值解析：`link:<fp>` 已挂接到云条目时解析为该云条目。 */
+export function resolveTargetValue(value: string, targets: readonly RemoteTarget[]): RemoteTarget | null {
+  const exact = targets.find((item) => item.value === value)
+  if (exact) return exact
+  if (!value.startsWith('link:')) return null
+  const fingerprint = value.slice('link:'.length)
+  return targets.find((item) => item.kind === 'cloud' && item.linkFingerprint === fingerprint) ?? null
+}
+
+/** 下发路由：独立直连或挂接且直连在线 → 直连一次性投递；否则走云。 */
+export function dispatchRoute(target: RemoteTarget): { via: 'link'; fingerprint: string } | { via: 'cloud' } {
+  if (target.linkFingerprint !== null && (target.kind === 'link' || target.linkOnline === true)) {
+    return { via: 'link', fingerprint: target.linkFingerprint }
+  }
+  return { via: 'cloud' }
 }
 
 export type SaveDirCheck = 'ok' | 'notAbsolute'

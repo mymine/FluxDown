@@ -1,0 +1,64 @@
+{
+  "identity": "fluxdown@feature-demo",
+  "name": "功能演示 Feature Demo",
+  "version": "1.0.0",
+  "description": "覆盖插件平台全部能力的演示插件：可移植视图、桌面脚本、命令、任务右键、详情 tab、设置视图、事件、定时器、任务 API、嗅探规则、resolver 与 hook。",
+  "homepage": "https://fluxdown.com/docs/plugins/sdk",
+  "resolvers": [
+    {
+      "match": { "urls": ["*://fluxdown-demo.invalid/*"] },
+      "entry": "resolve.js"
+    }
+  ],
+  "hooks": {
+    "entry": "hooks.js",
+    "events": ["onStart", "onDone", "onError"]
+  },
+  "main": {
+    "entry": "main.js",
+    "events": ["onStart", "onDone", "onError", "onCancel", "onMetaProbed"],
+    "background": true
+  },
+  "contributes": {
+    "views": [
+      { "id": "dashboard", "title": "演示面板", "location": "activity" },
+      { "id": "settings", "title": "演示设置", "location": "settings" },
+      { "id": "task-info", "title": "演示详情", "location": "taskDetail" },
+      {
+        "id": "desktop-panel",
+        "title": "桌面脚本面板",
+        "location": "activity",
+        "desktop": { "entry": "ui/panel.js", "networkHosts": ["httpbin.org"] }
+      },
+      {
+        "id": "desktop-window",
+        "title": "桌面脚本窗口",
+        "location": "window",
+        "desktop": { "entry": "ui/window.js", "networkHosts": ["httpbin.org"], "width": 720, "height": 520 }
+      }
+    ],
+    "commands": [
+      { "id": "hello", "title": "打个招呼", "palette": true },
+      { "id": "toggle-selected", "title": "暂停/继续所选任务", "palette": true, "taskMenu": true },
+      { "id": "inspect", "title": "查看任务信息", "taskMenu": true }
+    ],
+    "sniffRules": "rules.json"
+  },
+  "settings": [
+    { "key": "greeting", "title": "问候语", "type": "string", "default": "你好" },
+    {
+      "key": "mode",
+      "title": "模式",
+      "type": "string",
+      "widget": "select",
+      "options": [
+        { "value": "calm", "label": "安静" },
+        { "value": "loud", "label": "热闹" }
+      ],
+      "default": "calm"
+    },
+    { "key": "toastOnDone", "title": "任务完成时弹通知", "type": "boolean", "default": "true" },
+    { "key": "tickSeconds", "title": "面板计时间隔（秒）", "type": "number", "min": 1, "max": 60, "default": "2" }
+  ],
+  "permissions": ["tasks", "browserRules", "desktop", "background"]
+}

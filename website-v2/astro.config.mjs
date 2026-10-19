@@ -27,7 +27,7 @@ const BUILD_TIME = new Date().toISOString();
 
 // 站点语言路由:en 在根路径,zh 在 /zh 前缀(与 src/i18n/routing.ts 同契约;
 // config 无法 import TS 模块,双处以注释互指)。docs 自带 /docs/<lang>/ 结构,不走此映射。
-const SITE = "https://fluxdown.zerx.dev";
+const SITE = "https://fluxdown.com";
 
 // 站点挂载前缀:根部署留空;预览部署到子路径时构建期注入(如 SITE_BASE=/v2,见 Dockerfile)。
 // 运行期代码经 import.meta.env.BASE_URL 读取(src/lib/base.ts),与这里同源。
@@ -196,7 +196,7 @@ export default defineConfig({
       // ── 可选：阿里云 OSS 发布资产源（/api/download 优先 302 到此处，缺失回退 GitHub）──
       // 对象布局 `<OSS_RELEASE_PREFIX>/<tag>/<file>`，与 .github/actions/oss-upload 一致。
       // bucket 私有：官网用 AK/SK 做存在性探测；未配 AK/SK 时整条 OSS 路径关闭。
-      // 302 目标优先 OSS_CDN_BASE（Cloudflare 边缘缓存，见 cdn/oss-proxy.js），置空则签发 1h 预签名直链。
+      // 302 目标优先 OSS_CDN_BASE（Cloudflare 边缘缓存 dl.fluxdown.com，见 cdn/oss-proxy.js），置空则签发 1h 预签名直链。
       OSS_ACCESS_KEY_ID: envField.string({
         context: "server",
         access: "secret",
@@ -225,7 +225,7 @@ export default defineConfig({
       OSS_CDN_BASE: envField.string({
         context: "server",
         access: "secret",
-        default: "https://dl-fluxdown.zerx.dev",
+        default: "https://dl.fluxdown.com",
       }),
 
       // ── 赞助名录（Sponsor Wall）──

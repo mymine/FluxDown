@@ -1,0 +1,2078 @@
+[
+  {
+    "name": "[sniff] video 后缀 (mp4) 命中",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.mp4",
+        "pageUrl": "",
+        "size": 5000000,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[sniff] m4s 命中且不受大小影响（B站分片）",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/seg.m4s",
+        "pageUrl": "",
+        "size": 500000,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "stream"
+    }
+  },
+  {
+    "name": "[sniff] m3u8 命中",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/i.m3u8",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "stream"
+    }
+  },
+  {
+    "name": "[sniff] image 默认不命中 (png)",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.png",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[sniff] sniffImages 开启后 png 命中",
+    "setup": {
+      "options": {
+        "sniffImages": true
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.png",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "image"
+    }
+  },
+  {
+    "name": "[sniff] 未知后缀 (html) 不命中",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/page.html",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[sniff] video/* 通配命中",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/noext",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false,
+        "mime": "video/mp4"
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[sniff] dash+xml 精确命中",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/noext",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false,
+        "mime": "application/dash+xml"
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "stream"
+    }
+  },
+  {
+    "name": "[sniff] application/m4s 精确命中",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/noext",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false,
+        "mime": "application/m4s"
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "stream"
+    }
+  },
+  {
+    "name": "[sniff] 后缀优先于 MIME",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.mp4",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false,
+        "mime": "text/html"
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[sniff] size=-1 时 minSize 不拦截",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "local",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-01-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "local.bin",
+              "version": 1,
+              "tier": "local",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "bin"
+                ],
+                "minSize": 1000
+              },
+              "action": {
+                "kind": "resource",
+                "type": "other"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.bin",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "other"
+    }
+  },
+  {
+    "name": "[sniff] size=0 时 minSize 不拦截",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "local",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-01-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "local.bin",
+              "version": 1,
+              "tier": "local",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "bin"
+                ],
+                "minSize": 1000
+              },
+              "action": {
+                "kind": "resource",
+                "type": "other"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.bin",
+        "pageUrl": "",
+        "size": 0,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "other"
+    }
+  },
+  {
+    "name": "[sniff] 已知 size 小于 minSize → 不命中",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "local",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-01-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "local.bin",
+              "version": 1,
+              "tier": "local",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "bin"
+                ],
+                "minSize": 1000
+              },
+              "action": {
+                "kind": "resource",
+                "type": "other"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.bin",
+        "pageUrl": "",
+        "size": 500,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[sniff] 已知 size 大于等于 minSize → 命中",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "local",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-01-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "local.bin",
+              "version": 1,
+              "tier": "local",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "bin"
+                ],
+                "minSize": 1000
+              },
+              "action": {
+                "kind": "resource",
+                "type": "other"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.bin",
+        "pageUrl": "",
+        "size": 2000,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "other"
+    }
+  },
+  {
+    "name": "[sniff] 被 override 禁用的内置规则 → 不命中",
+    "setup": {
+      "overrides": {
+        "builtin.ext.video": {
+          "enabled": false
+        }
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.mp4",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[sniff] ignore 规则命中 → ignore（对应 blacklist）",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "local",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-01-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "local.bin",
+              "version": 1,
+              "tier": "local",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "bin"
+                ]
+              },
+              "action": {
+                "kind": "ignore"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.bin",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "ignore",
+      "rule": {
+        "id": "local.bin"
+      }
+    }
+  },
+  {
+    "name": "[sniff] 无 override 时恢复默认",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.mp4",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[noise] 不被忽略: https://a.example/tracks/123/stream.mp3",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/tracks/123/stream.mp3",
+      "",
+      false
+    ],
+    "expect": null
+  },
+  {
+    "name": "[noise] 不被忽略: https://a.example/collections/2024/movie.mp4",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/collections/2024/movie.mp4",
+      "",
+      false
+    ],
+    "expect": null
+  },
+  {
+    "name": "[noise] 不被忽略: https://a.example/api/video/play.m3u8",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/api/video/play.m3u8",
+      "",
+      false
+    ],
+    "expect": null
+  },
+  {
+    "name": "[noise] 不被忽略: https://a.example/logo",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/logo",
+      "",
+      false
+    ],
+    "expect": null
+  },
+  {
+    "name": "[noise] 不被忽略: https://a.example/track/1/song.mp3",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/track/1/song.mp3",
+      "",
+      false
+    ],
+    "expect": null
+  },
+  {
+    "name": "[noise] 不被忽略: https://a.example/static/media/clip.mp4",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/static/media/clip.mp4",
+      "",
+      false
+    ],
+    "expect": null
+  },
+  {
+    "name": "[noise] 被忽略: https://a.example/collect",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/collect",
+      "",
+      false
+    ],
+    "expect": {
+      "id": "builtin.noise.paths"
+    }
+  },
+  {
+    "name": "[noise] 被忽略: https://a.example/api/v2/items",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/api/v2/items",
+      "",
+      false
+    ],
+    "expect": {
+      "id": "builtin.noise.paths"
+    }
+  },
+  {
+    "name": "[noise] 被忽略: https://a.example/pixel.gif",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/pixel.gif",
+      "",
+      false
+    ],
+    "expect": {
+      "id": "builtin.noise.paths"
+    }
+  },
+  {
+    "name": "[noise] 被忽略: https://a.example/log/event",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/log/event",
+      "",
+      false
+    ],
+    "expect": {
+      "id": "builtin.noise.paths"
+    }
+  },
+  {
+    "name": "[noise] attachment 不受路径黑名单影响",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/download/collect",
+      "",
+      true
+    ],
+    "expect": null
+  },
+  {
+    "name": "[noise] graphql 无扩展名被忽略",
+    "call": "isIgnored",
+    "args": [
+      "https://a.example/graphql",
+      "",
+      false
+    ],
+    "expect": {
+      "id": "builtin.noise.paths"
+    }
+  },
+  {
+    "name": "[noise] google-analytics collect 被 ignore",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://www.google-analytics.com/collect",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "ignore"
+    }
+  },
+  {
+    "name": "[noise] 精确 host 黑名单",
+    "call": "isIgnored",
+    "args": [
+      "https://www.facebook.com/x",
+      "",
+      false
+    ],
+    "expect": {
+      "id": "builtin.noise.hosts"
+    }
+  },
+  {
+    "name": "[noise] 子串黑名单",
+    "call": "isIgnored",
+    "args": [
+      "https://cdn.hotjar.com/a",
+      "",
+      false
+    ],
+    "expect": {
+      "id": "builtin.noise.substr"
+    }
+  },
+  {
+    "name": "[noise] telemetry/video.mp4 因媒体扩展名不被 ignore",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://cdn.x.com/telemetry/video.mp4",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[noise] telemetry/video.mp4 isIgnored 为 null",
+    "call": "isIgnored",
+    "args": [
+      "https://cdn.x.com/telemetry/video.mp4",
+      "",
+      false
+    ],
+    "expect": null
+  },
+  {
+    "name": "[classify] 与 classifyResponse 同序：后缀规则先于 MIME 规则",
+    "call": "classify",
+    "args": [
+      "https://x/a.mp4",
+      "audio/mpeg"
+    ],
+    "expect": "video"
+  },
+  {
+    "name": "[classify] 无后缀时按 MIME 判定",
+    "call": "classify",
+    "args": [
+      "https://x/noext",
+      "audio/mpeg"
+    ],
+    "expect": "audio"
+  },
+  {
+    "name": "[classify] m4s 分片带 video/mp4 仍是 stream",
+    "call": "classify",
+    "args": [
+      "https://x/a.m4s",
+      "video/mp4"
+    ],
+    "expect": "stream"
+  },
+  {
+    "name": "[classify] audio/mpegurl 是 HLS 播放列表，不是音频文件",
+    "call": "classify",
+    "args": [
+      "https://x/live/playlist",
+      "audio/mpegurl"
+    ],
+    "expect": "stream"
+  },
+  {
+    "name": "[classify] octet-stream 回落到扩展名",
+    "call": "classify",
+    "args": [
+      "https://x/a.zip",
+      "application/octet-stream"
+    ],
+    "expect": "archive"
+  },
+  {
+    "name": "[classify] 忽略 requires：png → image",
+    "call": "classify",
+    "args": [
+      "https://x/a.png"
+    ],
+    "expect": "image"
+  },
+  {
+    "name": "[classify] Office 前缀 MIME",
+    "call": "classify",
+    "args": [
+      "https://x/d",
+      "application/vnd.openxmlformats-officedocument.foo"
+    ],
+    "expect": "document"
+  },
+  {
+    "name": "[classify] 都不中为 other",
+    "call": "classify",
+    "args": [
+      "https://x/a.unknownext",
+      "text/html"
+    ],
+    "expect": "other"
+  },
+  {
+    "name": "[#783] pbs.twimg.com format=jpg → jpg",
+    "call": "fileExtension",
+    "args": [
+      "https://pbs.twimg.com/media/AbC?format=jpg&name=orig",
+      "https://x.com/a/status/1"
+    ],
+    "expect": "jpg"
+  },
+  {
+    "name": "[#783] path 扩展名优先",
+    "call": "fileExtension",
+    "args": [
+      "https://x/a.png?format=jpg",
+      ""
+    ],
+    "expect": "png"
+  },
+  {
+    "name": "[#783] 未知 format 值不采纳",
+    "call": "fileExtension",
+    "args": [
+      "https://x/AbC?format=zzz",
+      ""
+    ],
+    "expect": ""
+  },
+  {
+    "name": "[#783] 扫描 query 值的 .ext 后缀",
+    "call": "fileExtension",
+    "args": [
+      "https://x/dl?file=movie.mp4",
+      ""
+    ],
+    "expect": "mp4"
+  },
+  {
+    "name": "[bili] 30280 判 audio（mime video/mp4）",
+    "call": "trackKind",
+    "args": [
+      {
+        "url": "https://upos-sz-mirrorcos.bilivideo.com/x/xxx-1-30280.m4s",
+        "mime": "video/mp4",
+        "pageUrl": "https://www.bilibili.com/video/BV1"
+      }
+    ],
+    "expect": "audio"
+  },
+  {
+    "name": "[bili] 30080 判 video",
+    "call": "trackKind",
+    "args": [
+      {
+        "url": "https://upos-sz-mirrorcos.bilivideo.com/x/xxx-1-30080.m4s",
+        "mime": "video/mp4",
+        "pageUrl": "https://www.bilibili.com/video/BV1"
+      }
+    ],
+    "expect": "video"
+  },
+  {
+    "name": "[bili] 仅 host 命中（无 pageUrl）",
+    "call": "trackKind",
+    "args": [
+      {
+        "url": "https://upos-sz-mirrorcos.bilivideo.com/x/xxx-1-30232.m4s",
+        "pageUrl": ""
+      }
+    ],
+    "expect": "audio"
+  },
+  {
+    "name": "[bili] 仅 pageHost 命中",
+    "call": "trackKind",
+    "args": [
+      {
+        "url": "https://cdn.example.net/x/xxx-1-30216.m4s",
+        "pageUrl": "https://www.bilibili.com/video/BV1"
+      }
+    ],
+    "expect": "audio"
+  },
+  {
+    "name": "[bili] notbilibili.com 不命中站点规则",
+    "call": "trackKind",
+    "args": [
+      {
+        "url": "https://notbilibili.com/x/xxx-1-30280.m4s",
+        "mime": "video/mp4",
+        "pageUrl": "https://notbilibili.com/"
+      }
+    ],
+    "expect": "video"
+  },
+  {
+    "name": "[bili] notbilibili.com 无 MIME 不判定",
+    "call": "trackKind",
+    "args": [
+      {
+        "url": "https://notbilibili.com/x/xxx-1-30280.m4s",
+        "pageUrl": "https://notbilibili.com/"
+      }
+    ],
+    "expect": null
+  },
+  {
+    "name": "[track] audio/* MIME → audio",
+    "call": "trackKind",
+    "args": [
+      {
+        "url": "https://x/a.m4s",
+        "mime": "audio/mp4",
+        "pageUrl": ""
+      }
+    ],
+    "expect": "audio"
+  },
+  {
+    "name": "[track] URL mime=audio 线索",
+    "call": "trackKind",
+    "args": [
+      {
+        "url": "https://x/videoplayback?mime=audio%2Fmp4",
+        "pageUrl": ""
+      }
+    ],
+    "expect": "audio"
+  },
+  {
+    "name": "[track] URL mime=video 线索",
+    "call": "trackKind",
+    "args": [
+      {
+        "url": "https://x/videoplayback?mime=video%2Fmp4",
+        "pageUrl": ""
+      }
+    ],
+    "expect": "video"
+  },
+  {
+    "name": "[track] 无线索 → null",
+    "call": "trackKind",
+    "args": [
+      {
+        "url": "https://x/a.bin",
+        "pageUrl": ""
+      }
+    ],
+    "expect": null
+  },
+  {
+    "name": "[lanzou] ref 为完整 URL",
+    "call": "extractFromBody",
+    "args": [
+      "https://wwwa.lanzoux.com/ajaxm.php?file=1",
+      "https://wwwa.lanzoux.com/iXXXX",
+      {
+        "zt": 1,
+        "dom": "https://dl.cdn.com",
+        "url": "https://other.cdn.com/f?t=1",
+        "inf": "a.zip"
+      }
+    ],
+    "expect": [
+      {
+        "rule": {
+          "id": "official.lanzou.extract"
+        },
+        "emits": [
+          {
+            "mode": "preempt",
+            "url": "https://other.cdn.com/f?t=1",
+            "filename": "a.zip"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "[lanzou] ref 以 / 开头",
+    "call": "extractFromBody",
+    "args": [
+      "https://wwwa.lanzoux.com/ajaxm.php?file=1",
+      "https://wwwa.lanzoux.com/iXXXX",
+      {
+        "zt": 1,
+        "dom": "https://dl.cdn.com",
+        "url": "/file/?abc",
+        "inf": "a.zip"
+      }
+    ],
+    "expect": [
+      {
+        "rule": {
+          "id": "official.lanzou.extract"
+        },
+        "emits": [
+          {
+            "mode": "preempt",
+            "url": "https://dl.cdn.com/file/?abc",
+            "filename": "a.zip"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "[lanzou] 仅 query（bareQueryPrefix）",
+    "call": "extractFromBody",
+    "args": [
+      "https://wwwa.lanzoux.com/ajaxm.php?file=1",
+      "https://wwwa.lanzoux.com/iXXXX",
+      {
+        "zt": 1,
+        "dom": "https://dl.cdn.com",
+        "url": "?token",
+        "inf": "a.zip"
+      }
+    ],
+    "expect": [
+      {
+        "rule": {
+          "id": "official.lanzou.extract"
+        },
+        "emits": [
+          {
+            "mode": "preempt",
+            "url": "https://dl.cdn.com/file/?token",
+            "filename": "a.zip"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "name": "[lanzou] zt != 1 不产出",
+    "call": "extractFromBody",
+    "args": [
+      "https://wwwa.lanzoux.com/ajaxm.php?file=1",
+      "https://wwwa.lanzoux.com/iXXXX",
+      {
+        "zt": 0,
+        "dom": "https://dl.cdn.com",
+        "url": "?token",
+        "inf": "a.zip"
+      }
+    ],
+    "expect": []
+  },
+  {
+    "name": "[lanzou] 字段缺失不产出",
+    "call": "extractFromBody",
+    "args": [
+      "https://wwwa.lanzoux.com/ajaxm.php?file=1",
+      "https://wwwa.lanzoux.com/iXXXX",
+      {
+        "zt": 1,
+        "dom": "https://dl.cdn.com",
+        "inf": "a.zip"
+      }
+    ],
+    "expect": []
+  },
+  {
+    "name": "[lanzou] 非 ajaxm.php URL 不触发",
+    "call": "extractFromBody",
+    "args": [
+      "https://x.com/other",
+      "",
+      {
+        "zt": 1,
+        "dom": "https://d",
+        "url": "?t",
+        "inf": "a"
+      }
+    ],
+    "expect": []
+  },
+  {
+    "name": "[dedupe] 去除 utm_source/缓存破坏参数并排序，保留 token/t",
+    "call": "dedupeKey",
+    "args": [
+      "https://x.com/a.mp4?token=1&utm_source=x&t=5&z=2&b=1&_=9#frag",
+      ""
+    ],
+    "expect": "https://x.com/a.mp4?b=1&t=5&token=1&z=2"
+  },
+  {
+    "name": "[dedupe] 无效 URL 原样返回",
+    "call": "dedupeKey",
+    "args": [
+      "not a url",
+      ""
+    ],
+    "expect": "not a url"
+  },
+  {
+    "name": "[community] 吊销列表有效时生效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "community",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "community.weird",
+              "version": 1,
+              "tier": "community",
+              "stage": "response",
+              "match": {
+                "host": [
+                  "x.com"
+                ],
+                "ext": [
+                  "weird"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "archive"
+              }
+            }
+          ],
+          "expiresAt": "2026-12-01T00:00:00Z"
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": []
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://cdn.x.com/f.weird",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "archive"
+    }
+  },
+  {
+    "name": "[community] 包过期不生效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "community",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "community.weird",
+              "version": 1,
+              "tier": "community",
+              "stage": "response",
+              "match": {
+                "host": [
+                  "x.com"
+                ],
+                "ext": [
+                  "weird"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "archive"
+              }
+            }
+          ],
+          "expiresAt": "2026-05-02T00:00:00Z"
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": []
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://cdn.x.com/f.weird",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[community] revocations 为 null 不生效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "community",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "community.weird",
+              "version": 1,
+              "tier": "community",
+              "stage": "response",
+              "match": {
+                "host": [
+                  "x.com"
+                ],
+                "ext": [
+                  "weird"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "archive"
+              }
+            }
+          ],
+          "expiresAt": "2026-12-01T00:00:00Z"
+        }
+      ],
+      "revocations": null,
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://cdn.x.com/f.weird",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[community] revocations 过期不生效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "community",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "community.weird",
+              "version": 1,
+              "tier": "community",
+              "stage": "response",
+              "match": {
+                "host": [
+                  "x.com"
+                ],
+                "ext": [
+                  "weird"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "archive"
+              }
+            }
+          ],
+          "expiresAt": "2026-12-01T00:00:00Z"
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2026-05-02T00:00:00Z",
+        "entries": []
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://cdn.x.com/f.weird",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[community] communityEnabled=false 不生效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "community",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "community.weird",
+              "version": 1,
+              "tier": "community",
+              "stage": "response",
+              "match": {
+                "host": [
+                  "x.com"
+                ],
+                "ext": [
+                  "weird"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "archive"
+              }
+            }
+          ],
+          "expiresAt": "2026-12-01T00:00:00Z"
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": []
+      },
+      "options": {
+        "now": 1780272000000,
+        "communityEnabled": false
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://cdn.x.com/f.weird",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[community] 不属于该 host 不命中",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "community",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "community.weird",
+              "version": 1,
+              "tier": "community",
+              "stage": "response",
+              "match": {
+                "host": [
+                  "x.com"
+                ],
+                "ext": [
+                  "weird"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "archive"
+              }
+            }
+          ],
+          "expiresAt": "2026-12-01T00:00:00Z"
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": []
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://cdn.y.com/f.weird",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[revoke] 未吊销时生效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "official",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "official.r1",
+              "version": 2,
+              "tier": "official",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "weird2"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "document"
+              }
+            }
+          ]
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": []
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/f.weird2",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "document"
+    }
+  },
+  {
+    "name": "[revoke] hard 吊销不生效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "official",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "official.r1",
+              "version": 2,
+              "tier": "official",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "weird2"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "document"
+              }
+            }
+          ]
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": [
+          {
+            "ruleId": "official.r1",
+            "versions": "*",
+            "action": "hard",
+            "reason": "bad"
+          }
+        ]
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/f.weird2",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[revoke] hard 吊销 override 启用仍无效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "official",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "official.r1",
+              "version": 2,
+              "tier": "official",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "weird2"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "document"
+              }
+            }
+          ]
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": [
+          {
+            "ruleId": "official.r1",
+            "versions": "*",
+            "action": "hard",
+            "reason": "bad"
+          }
+        ]
+      },
+      "overrides": {
+        "official.r1": {
+          "enabled": true,
+          "ackRevocation": 5
+        }
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/f.weird2",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[revoke] soft 吊销默认不生效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "official",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "official.r1",
+              "version": 2,
+              "tier": "official",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "weird2"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "document"
+              }
+            }
+          ]
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": [
+          {
+            "ruleId": "official.r1",
+            "versions": {
+              "max": 2
+            },
+            "action": "soft",
+            "reason": "x"
+          }
+        ]
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/f.weird2",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[revoke] soft + ackRevocation 等于 sequence 生效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "official",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "official.r1",
+              "version": 2,
+              "tier": "official",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "weird2"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "document"
+              }
+            }
+          ]
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": [
+          {
+            "ruleId": "official.r1",
+            "versions": {
+              "max": 2
+            },
+            "action": "soft",
+            "reason": "x"
+          }
+        ]
+      },
+      "overrides": {
+        "official.r1": {
+          "enabled": true,
+          "ackRevocation": 5
+        }
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/f.weird2",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "document"
+    }
+  },
+  {
+    "name": "[revoke] soft + ackRevocation 过期不生效",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "official",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "official.r1",
+              "version": 2,
+              "tier": "official",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "weird2"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "document"
+              }
+            }
+          ]
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": [
+          {
+            "ruleId": "official.r1",
+            "versions": {
+              "max": 2
+            },
+            "action": "soft",
+            "reason": "x"
+          }
+        ]
+      },
+      "overrides": {
+        "official.r1": {
+          "enabled": true,
+          "ackRevocation": 4
+        }
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/f.weird2",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[revoke] 版本超出 max 不受吊销影响",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "official",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "official.r1",
+              "version": 2,
+              "tier": "official",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "weird2"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "document"
+              }
+            }
+          ]
+        }
+      ],
+      "revocations": {
+        "format": "fluxdown-sniff-revocations",
+        "sequence": 5,
+        "issuedAt": "2026-05-01T00:00:00Z",
+        "expiresAt": "2027-01-01T00:00:00Z",
+        "entries": [
+          {
+            "ruleId": "official.r1",
+            "versions": {
+              "max": 1
+            },
+            "action": "hard",
+            "reason": "x"
+          }
+        ]
+      },
+      "options": {
+        "now": 1780272000000
+      }
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/f.weird2",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "document"
+    }
+  },
+  {
+    "name": "[priority] 官方规则先于内置规则",
+    "setup": {
+      "packs": [
+        {
+          "format": "fluxdown-sniff-pack",
+          "packId": "official",
+          "sequence": 1,
+          "engine": 1,
+          "issuedAt": "2026-05-01T00:00:00Z",
+          "rules": [
+            {
+              "id": "official.mp4",
+              "version": 1,
+              "tier": "official",
+              "stage": "response",
+              "match": {
+                "ext": [
+                  "mp4"
+                ]
+              },
+              "action": {
+                "kind": "resource",
+                "type": "document"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x/a.mp4",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "document",
+      "rule": {
+        "id": "official.mp4"
+      }
+    }
+  },
+  {
+    "name": "[noise] /api/v1/stream 返回 video/mp4 不被忽略",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/api/v1/stream/123",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false,
+        "mime": "video/mp4"
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[noise] /track/ 下无扩展名 audio/mpeg 不被忽略",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/track/9",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false,
+        "mime": "audio/mpeg"
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "audio"
+    }
+  },
+  {
+    "name": "[noise] robots.txt 被 ignore",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/robots.txt",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "ignore"
+    }
+  },
+  {
+    "name": "[noise] 静态路径下 csv 被 ignore",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/static/js/data.csv",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "ignore"
+    }
+  },
+  {
+    "name": "[noise] adservice-guide.pdf 不被忽略",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/files/adservice-guide.pdf",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "document"
+    }
+  },
+  {
+    "name": "[noise] 查询串含 sentry.io 不被忽略",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/a.mp4?next=sentry.io",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[noise] 子域 sentry.io 仍被忽略",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://o1.ingest.sentry.io/api/1/envelope",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "ignore"
+    }
+  },
+  {
+    "name": "[noise] facebook.com/trending 不被忽略",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://www.facebook.com.evil.example/trending/a.mp4",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[noise] google.com/pagead 被忽略",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://www.google.com/pagead/x",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "ignore"
+    }
+  },
+  {
+    "name": "[sniff] .ts 返回 text/javascript 不是视频",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/app/main.ts",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false,
+        "mime": "text/javascript"
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[sniff] .ts 返回 video/mp2t 是视频",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/seg/1.ts",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false,
+        "mime": "video/mp2t"
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[sniff] eot 字体 (vnd.ms-fontobject) 不是文档",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/f/a.eot",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false,
+        "mime": "application/vnd.ms-fontobject"
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[sniff] rmvb 命中 video",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/a.rmvb",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[sniff] tgz 命中 archive",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/a.tgz",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "archive"
+    }
+  },
+  {
+    "name": "[sniff] application/x-matroska 命中 video",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/noext",
+        "pageUrl": "",
+        "size": -1,
+        "attachment": false,
+        "mime": "application/x-matroska"
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "video"
+    }
+  },
+  {
+    "name": "[dedupe] ?v=a 与 ?v=b 不合并",
+    "call": "dedupeKey",
+    "args": [
+      "https://x.com/watch?v=a",
+      ""
+    ],
+    "expect": "https://x.com/watch?v=a"
+  },
+  {
+    "name": "[dedupe] ?v=b 保留",
+    "call": "dedupeKey",
+    "args": [
+      "https://x.com/watch?v=b",
+      ""
+    ],
+    "expect": "https://x.com/watch?v=b"
+  }
+]

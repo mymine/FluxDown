@@ -295,6 +295,13 @@ export interface LinkDeviceInfo {
   /** 对端自报的默认下载目录；旧版对端省略。 */
   defaultSaveDir?: string;
   pathStyle?: PathStyle;
+  /** 本机备注名；`name` 已是生效名（备注名优先）。 */
+  customName?: string;
+  appVersion?: string;
+  /** 对端登录云账号时自报的云设备 id（用于与云设备合并）。 */
+  cloudDeviceId?: string;
+  /** 对端已解除配对。 */
+  revoked: boolean;
 }
 
 /** 局域网发现的对端（`agent.link.probe` 结果 / `linkDiscoveredChanged`）。 */
@@ -358,9 +365,30 @@ export interface GatewayStatusDto {
   portEditable: boolean;
   /** 是否对局域网开放兼容 API；修改后下次 agent 启动生效。 */
   lanEnabled: boolean;
+  /** 本次运行网关是否实际监听非回环地址。 */
+  lanActive: boolean;
 }
 
 export type TrayUnavailableReason = 'notBuilt' | 'noDisplay' | 'noHost' | 'initFailed';
+
+/** agent 全局快捷键后端（Rust `GlobalShortcutBackend`）。 */
+export type GlobalShortcutBackend = 'unavailable' | 'windows' | 'macOs' | 'x11' | 'waylandPortal';
+
+/** 单个全局快捷键的注册结果（Rust `GlobalShortcutState`）。 */
+export type GlobalShortcutState = 'active' | 'inUse' | 'unsupported' | 'permissionRequired' | 'failed';
+
+export interface GlobalShortcutStatusDto {
+  action: string;
+  /** 规范触发器文本，如 `ctrl-shift-d` / `double:ctrl`。 */
+  trigger: string;
+  state: GlobalShortcutState;
+  detail?: string | null;
+}
+
+export interface GlobalShortcutsStatusDto {
+  backend: GlobalShortcutBackend;
+  entries: GlobalShortcutStatusDto[];
+}
 
 /** agent 系统外壳状态。 */
 export interface ShellStatusDto {
@@ -368,6 +396,8 @@ export interface ShellStatusDto {
   trayUnavailableReason: TrayUnavailableReason | null;
   /** true：关闭全部 UI 后 agent + daemon 继续驻留。 */
   resident: boolean;
+  /** 桌面 agent 的全局快捷键状态（Web 不展示；旧 agent 缺省）。 */
+  globalShortcuts?: GlobalShortcutsStatusDto;
 }
 
 /** 完成后关机状态。 */
@@ -531,6 +561,7 @@ export type UpdateInstallKind =
   | 'synology'
   | 'qnap'
   | 'openwrt'
+  | 'fnos'
   | 'androidApk'
   | 'unknown';
 

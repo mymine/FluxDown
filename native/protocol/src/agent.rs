@@ -548,9 +548,13 @@ pub struct GatewayStatusDto {
     /// server 模式或环境固定监听地址时为 false。
     #[serde(default = "default_true")]
     pub port_editable: bool,
-    /// 是否对局域网开放兼容 API；修改后下次 agent 启动生效。
+    /// 是否对局域网开放兼容 API（持久化配置）；修改后下次 agent 启动生效。
     #[serde(default)]
     pub lan_enabled: bool,
+    /// 本次运行的网关是否实际监听非回环地址（局域网 / 组网可达）。`lan_enabled` 已开但
+    /// 尚未重启时为 `false`，界面据此提示「重启后生效」；server 模式恒为 `true`。
+    #[serde(default)]
+    pub lan_active: bool,
 }
 
 impl Default for GatewayStatusDto {
@@ -565,6 +569,7 @@ impl Default for GatewayStatusDto {
             port: default_gateway_port(),
             port_editable: true,
             lan_enabled: false,
+            lan_active: false,
         }
     }
 }
@@ -622,6 +627,9 @@ pub struct ShellStatusDto {
     pub tray_unavailable_reason: Option<TrayUnavailableReason>,
     /// `true`：关闭全部 UI 只退出界面，agent + daemon 继续运行；`false`：随界面一起退出。
     pub resident: bool,
+    /// agent 全局快捷键后端与逐项注册状态（旧 agent 缺省 = 不可用）。
+    #[serde(default)]
+    pub global_shortcuts: crate::shortcuts::GlobalShortcutsStatusDto,
 }
 
 /// 完成后关机的调度状态（agent 拥有状态机与执行）。
@@ -750,12 +758,23 @@ pub struct LinkApproveParams {
     pub accept: bool,
 }
 
-/// `agent.link.remove` / `agent.link.rename` 的设备定位参数。
+/// `agent.link.remove` 的设备定位参数。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct LinkDeviceParams {
     pub fingerprint: String,
+}
+
+/// `agent.link.rename` 参数：给已配对设备设置仅本机可见的备注名。`name` 省略、为空或全空白
+/// = 清除备注名，恢复显示对端自报名；非空时去首尾空白后须为 1–64 个字符且不含控制字符。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkRenameParams {
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// `agent.link.dispatch` 参数：把下载直接下发到已配对的局域网设备。
@@ -1141,6 +1160,8 @@ pub enum UpdateInstallKind {
     Synology,
     Qnap,
     Openwrt,
+    /// 飞牛 fnOS 应用中心（.fpk）。
+    Fnos,
     /// Android APK（官网分发）：由 App 经系统安装器（PackageInstaller）安装。
     AndroidApk,
     #[default]
@@ -1153,7 +1174,8 @@ pub enum UpdateInstallKind {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum UpdateManualReason {
-    /// 由包管理器 / 容器镜像管理（Docker、群晖、威联通、OpenWrt），具体见 `installKind`。
+    /// 由包管理器 / 容器镜像管理（Docker、群晖、威联通、OpenWrt，或归 AUR / 发行版仓库等
+    /// 非官方系统包所有的 `linuxDeb` / `linuxArch`），具体见 `installKind`。
     ManagedPackage,
     /// 程序所在目录对当前用户不可写（如放在受保护目录、只读卷）。
     NotWritable,

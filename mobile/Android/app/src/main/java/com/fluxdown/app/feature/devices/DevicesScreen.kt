@@ -24,7 +24,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -42,11 +44,17 @@ import com.fluxdown.core.model.CloudDevice
 import com.fluxdown.core.model.HostRef
 import com.fluxdown.core.model.LinkDevice
 import com.fluxdown.core.model.TaskStatus
+import com.fluxdown.core.protocol.DeviceRules
+import com.fluxdown.core.protocol.HostCapability
+import com.fluxdown.core.protocol.has
 import com.fluxdown.core.store.Connection
+import com.fluxdown.fluxui.chrome.FluxGlassIconButton
 import com.fluxdown.fluxui.chrome.FluxHeader
 import com.fluxdown.fluxui.controls.ButtonSize
 import com.fluxdown.fluxui.controls.ButtonVariant
 import com.fluxdown.fluxui.controls.FluxButton
+import com.fluxdown.fluxui.controls.FluxIconButton
+import com.fluxdown.fluxui.controls.IconButtonSize
 import com.fluxdown.fluxui.controls.FluxDivider
 import com.fluxdown.fluxui.controls.FluxListRow
 import com.fluxdown.fluxui.controls.FluxPresenceDot
@@ -69,8 +77,8 @@ import com.fluxdown.fluxui.theme.FluxText
 import com.fluxdown.fluxui.theme.FluxTheme
 
 /**
- * V1 设备页（Dock 目的地）：当前主机卡 + 云端已信任设备 + 局域网已配对设备。
- * 配对 / 添加设备 / 设备详情依赖桥接层接口（端口内尚无），本页只读展示。
+ * V1 设备页（Dock 目的地）：当前主机卡 + 云端已信任设备 + 已配对设备（直连：在线点 / 刷新状态 / 重命名 / 解除配对）。
+ * 添加设备（账户 / 直连配对）经页头「+」打开 [AddDeviceSheet]；入站配对确认是全局弹层（[InboundPairingPrompt]）。
  */
 @Composable
 fun DevicesScreen() {
@@ -91,8 +99,18 @@ fun DevicesScreen() {
         )
     }
     val linkSorted = remember(link) {
-        link.sortedWith(compareByDescending<LinkDevice> { it.online }.thenBy(String.CASE_INSENSITIVE_ORDER) { it.name })
+        link.sortedWith(
+            compareBy<LinkDevice> { it.revoked }
+                .thenByDescending { it.online }
+                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name },
+        )
     }
+    val sameAccount = remember(cloud, link) { DeviceRules.attachedLinkFingerprints(cloud, link) }
+    val accountCap by remember { derivedStateOf { host.value.has(HostCapability.agentAuth) } }
+    val linkCap by remember { derivedStateOf { host.value.has(HostCapability.agentDeviceLink) } }
+    val readOnly by remember { derivedStateOf { host.value.isReadOnly } }
+    val links = rememberLinkedDeviceActions()
+    var renaming by remember { mutableStateOf<LinkDevice?>(null) }
 
     val listState = rememberLazyListState()
     DockMiniEffect(listState)
@@ -115,6 +133,15 @@ fun DevicesScreen() {
             FluxHeader(
                 title = str(R.string.mobileNavDevices),
                 modifier = Modifier.padding(horizontal = margin).fluxFlowIn(0, gate, "header"),
+                actions = {
+                    if (accountCap || linkCap) {
+                        FluxGlassIconButton(
+                            icon = FluxIcons.Plus,
+                            contentDescription = str(R.string.addDeviceEntry),
+                            onClick = { nav.openSheet(SheetRoute.AddDevice) },
+                        )
+                    }
+                },
             )
         }
         item(key = "host") {
@@ -140,22 +167,44 @@ fun DevicesScreen() {
                 }
             }
         }
-        if (linkSorted.isNotEmpty()) {
+        if (linkCap) {
             item(key = "link") {
                 GlassSection(
                     modifier = Modifier.padding(horizontal = margin).fluxFlowIn(3, gate, "link"),
                     title = str(R.string.linkedDevicesTitle),
                     footer = str(R.string.linkedDevicesDesc),
+                    action = {
+                        FluxButton(
+                            text = str(R.string.linkedDeviceRefresh),
+                            onClick = links::refresh,
+                            variant = ButtonVariant.Ghost,
+                            size = ButtonSize.Xs,
+                            icon = FluxIcons.RefreshCw,
+                            loading = links.refreshing,
+                            enabled = !readOnly,
+                        )
+                    },
                 ) {
+                    if (linkSorted.isEmpty()) {
+                        custom(padded = true) {
+                            FluxText(str(R.string.linkedDevicesEmpty), style = FluxTheme.type.sm, color = FluxTheme.colors.inkMuted)
+                        }
+                    }
                     linkSorted.forEach { d ->
                         row(hasIcon = true) {
-                            DeviceRow(d.name, d.platform, d.online, null, false)
+                            LinkedDeviceRow(
+                                device = d,
+                                sameAccount = d.fingerprint in sameAccount,
+                                actionsEnabled = !readOnly,
+                                onRename = { renaming = d },
+                                onRemove = { links.confirmRemove(d) },
+                            )
                         }
                     }
                 }
             }
         }
-        if (cloudSorted.isEmpty() && linkSorted.isEmpty()) {
+        if (cloudSorted.isEmpty() && !linkCap) {
             item(key = "empty") {
                 Box(Modifier.fillMaxWidth().padding(top = 24.dp), contentAlignment = Alignment.Center) {
                     FluxEmpty(glyph = FluxGlyph.Device, title = str(R.string.mobileDevicesEmptyTitle))
@@ -169,6 +218,12 @@ fun DevicesScreen() {
             )
         }
     }
+
+    LinkRenameSheet(
+        target = renaming,
+        readOnly = readOnly,
+        onDismiss = { renaming = null },
+    )
 }
 
 // ── 主机事实（派生，结构相等才触发重组）──────────────────────────────────
@@ -282,9 +337,17 @@ private fun HostCard(hostRef: HostRef, facts: HostFacts, onSwitch: () -> Unit, m
 // ── 设备行 ──────────────────────────────────────────────────────────────
 
 @Composable
-private fun DeviceRow(name: String, platform: String?, online: Boolean, version: String?, current: Boolean) {
+private fun DeviceRow(
+    name: String,
+    platform: String?,
+    online: Boolean,
+    version: String?,
+    current: Boolean,
+    subtitleOverride: String? = null,
+    trailing: (@Composable () -> Unit)? = null,
+) {
     val c = FluxTheme.colors
-    val subtitle = listOfNotNull(
+    val subtitle = subtitleOverride ?: listOfNotNull(
         str(if (online) R.string.deviceOnline else R.string.deviceOffline),
         platformLabel(platform),
         version?.takeIf { it.isNotBlank() }?.let { "v$it" },
@@ -302,7 +365,56 @@ private fun DeviceRow(name: String, platform: String?, online: Boolean, version:
                 PresenceMark(online, Modifier.align(Alignment.BottomEnd))
             }
         },
-        trailing = if (current) ({ FluxTag(str(R.string.thisDevice), tone = Tone.Accent) }) else null,
+        trailing = trailing ?: if (current) ({ FluxTag(str(R.string.thisDevice), tone = Tone.Accent) }) else null,
+    )
+}
+
+/**
+ * 已配对设备行（直连）：在线点、生效名（备注名优先）、平台 / 版本；对方已解除 = revoked 标签 + 只给「解除配对」；
+ * 挂接到同账号云设备 = 「同一账号」标签；操作：重命名、解除配对。
+ */
+@Composable
+private fun LinkedDeviceRow(
+    device: LinkDevice,
+    sameAccount: Boolean,
+    actionsEnabled: Boolean,
+    onRename: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    DeviceRow(
+        name = device.name,
+        platform = device.platform,
+        online = device.online && !device.revoked,
+        version = device.appVersion,
+        current = false,
+        subtitleOverride = if (device.revoked) str(R.string.linkedDeviceRevokedDesc) else null,
+        trailing = {
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
+                when {
+                    device.revoked -> FluxTag(str(R.string.linkedDeviceRevokedTag), tone = Tone.Coral)
+                    sameAccount -> FluxTag(str(R.string.linkedDeviceSameAccountTag), tone = Tone.Accent)
+                }
+                if (!device.revoked) {
+                    FluxIconButton(
+                        FluxIcons.Pen,
+                        str(R.string.linkedDeviceRename),
+                        onClick = onRename,
+                        size = IconButtonSize.Sm,
+                        glass = false,
+                        enabled = actionsEnabled,
+                    )
+                }
+                FluxIconButton(
+                    FluxIcons.Trash2,
+                    str(R.string.linkedDeviceRemove),
+                    onClick = onRemove,
+                    size = IconButtonSize.Sm,
+                    glass = false,
+                    danger = true,
+                    enabled = actionsEnabled,
+                )
+            }
+        },
     )
 }
 

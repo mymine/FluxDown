@@ -14,9 +14,12 @@ use gpui::{App, Context, Window};
 use crate::app::Desktop;
 
 /// 主窗口路由标识：主窗口装配与命令面板导航共用。
-pub(crate) const DOWNLOADS_ROUTE: RouteId = RouteId::new("downloads");
-pub(crate) const RSS_ROUTE: RouteId = RouteId::new("rss");
-pub(crate) const WEBHOOKS_ROUTE: RouteId = RouteId::new("webhooks");
+const DOWNLOADS_ID: &str = "downloads";
+const RSS_ID: &str = "rss";
+const WEBHOOKS_ID: &str = "webhooks";
+pub(crate) const DOWNLOADS_ROUTE: RouteId = RouteId::new(DOWNLOADS_ID);
+pub(crate) const RSS_ROUTE: RouteId = RouteId::new(RSS_ID);
+pub(crate) const WEBHOOKS_ROUTE: RouteId = RouteId::new(WEBHOOKS_ID);
 
 /// 活动栏条目，按自上而下顺序（路由在上，动作在下）。
 ///
@@ -48,6 +51,17 @@ impl ActivityEntry {
             Self::Webhooks => "activity-webhooks",
             Self::Account => "activity-account",
             Self::Settings => "activity-settings",
+        }
+    }
+
+    /// chrome 布局里的条目 id：路由沿用路由标识，动作取稳定短名（与 Web 同名）。
+    pub(crate) const fn layout_id(self) -> &'static str {
+        match self {
+            Self::Downloads => DOWNLOADS_ID,
+            Self::Rss => RSS_ID,
+            Self::Webhooks => WEBHOOKS_ID,
+            Self::Account => "account",
+            Self::Settings => "settings",
         }
     }
 

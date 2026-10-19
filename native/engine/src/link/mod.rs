@@ -132,14 +132,14 @@ fn row_to_record(row: LinkDeviceRow) -> PeerRecord {
         candidates,
         paired_at: row.paired_at,
         last_seen_at: row.last_seen_at,
-        info: fluxdown_link::PeerInfo::default(),
+        ..PeerRecord::default()
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use fluxdown_link::{PeerInfo, TransportKind};
+    use fluxdown_link::TransportKind;
 
     use super::*;
 
@@ -164,7 +164,7 @@ mod tests {
             }],
             paired_at: 10,
             last_seen_at: 20,
-            info: PeerInfo::default(),
+            ..PeerRecord::default()
         }
     }
 

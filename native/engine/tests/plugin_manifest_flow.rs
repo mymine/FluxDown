@@ -21,7 +21,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_config::BtConfig;
 use fluxdown_engine::download_manager::{CreateGroupSpec, GroupItemSpec, NewTaskSpec};
 use fluxdown_engine::events::{EngineEvent, EventSink};
 use fluxdown_engine::proxy_config::ProxyConfig;

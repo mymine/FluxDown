@@ -18,7 +18,7 @@ import AnnouncementPopup from "../components/site/AnnouncementPopup";
 import { SITE_ORIGIN, OG_IMAGE_URL, OG_IMAGE_WIDTH, OG_IMAGE_HEIGHT, HOME_META, buildGraph } from "../lib/seo";
 import { HREFLANG, HTML_LANG, LANGS, OG_LOCALE, type Lang } from "../i18n/config";
 import { common } from "../i18n/messages/common";
-import { PRODUCT_LINKS, COMMUNITY_LINKS, SPONSOR_LINK, docsPath } from "../lib/site-nav";
+import { PRODUCT_LINKS, COMMUNITY_LINKS, SPONSOR_LINK, docsPath, navHref } from "../lib/site-nav";
 import { href, switchLang } from "../i18n/routing";
 import { BASE, withBase } from "@/lib/base";
 
@@ -71,7 +71,7 @@ const paletteLinks = [
   { label: t.nav.faq, href: href("/faq", lang) },
   ...[...PRODUCT_LINKS, ...COMMUNITY_LINKS, SPONSOR_LINK].map((link) => ({
     label: t.nav[link.label],
-    href: href(link.path, lang),
+    href: navHref(link, lang),
   })),
 ];
 

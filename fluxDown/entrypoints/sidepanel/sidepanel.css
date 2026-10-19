@@ -1,0 +1,79 @@
+/* 侧边栏：宽度由浏览器决定，整页纵向布局，内容区自身滚动。 */
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+#app { height: 100%; }
+
+.sp-root { display: flex; flex-direction: column; height: 100%; position: relative; }
+
+.sp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px 6px;
+  flex-shrink: 0;
+}
+.sp-host { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; background: var(--fd-text-muted); }
+.sp-dot-ok { background: var(--fd-success); }
+.sp-dot-off { background: var(--fd-danger); }
+.sp-dot-checking { background: var(--fd-warning); }
+
+.sp-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.sp-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.sp-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 10px; }
+/* 资源页的 sp-pane 内部再套一层可滚动区，批量栏贴底 */
+.sp-pane > .sp-scroll { flex: 1; }
+
+.sp-site { display: flex; flex-direction: column; gap: 6px; }
+.sp-site-toggle,
+.sp-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: none;
+  background: transparent;
+  color: var(--fd-text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+.sp-site-toggle:hover,
+.sp-link:hover { color: var(--fd-accent); }
+.sp-link { color: var(--fd-accent); padding: 2px 6px; }
+
+.sp-lowbar,
+.sp-batchbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--fd-border);
+  font-size: 12px;
+  flex-shrink: 0;
+}
+.sp-lowbar { background: var(--fd-warning-muted); color: var(--fd-text-secondary); }
+.sp-batchbar { background: var(--fd-surface-2); }
+
+/* ===== 诊断 ===== */
+.sp-diag { display: flex; flex-direction: column; gap: 10px; }
+.sp-card { padding: 10px 12px; border: 1px solid var(--fd-border); border-radius: var(--fd-radius); background: var(--fd-surface); }
+.sp-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; font-size: 12px; font-weight: 600; color: var(--fd-text-secondary); }
+.sp-diag-row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; font-size: 12px; }
+.sp-diag-label { color: var(--fd-text-secondary); flex-shrink: 0; }
+.sp-diag-value { text-align: right; min-width: 0; overflow-wrap: anywhere; }
+.sp-diag-none { font-size: 12px; color: var(--fd-text-muted); }
+.sp-error { color: var(--fd-danger); }
+.sp-diag-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.sp-rule + .sp-rule { border-top: 1px solid var(--fd-border); }
+.sp-rule-head { display: flex; align-items: center; gap: 6px; width: 100%; padding: 6px 0; border: none; background: transparent; cursor: pointer; text-align: left; font-size: 12px; }
+.sp-rule-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-rule-items { margin: 0 0 6px; padding: 0 0 0 18px; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.sp-rule-name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-rule-url { font-size: 11px; color: var(--fd-text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

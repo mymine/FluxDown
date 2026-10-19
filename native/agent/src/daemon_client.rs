@@ -359,6 +359,28 @@ impl DaemonClient {
         };
         (client, calls)
     }
+
+    /// 已连接的客户端：每次调用都按 `reply` 现算应答，供断言 agent 对 daemon 应答的处理。
+    pub(crate) fn answering<F>(reply: F) -> Self
+    where
+        F: Fn(&str) -> Result<Value, RpcErrorObject> + Send + 'static,
+    {
+        let (commands, mut receiver) = mpsc::channel::<ClientCommand>(16);
+        tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                if command.ack.send(reply(&command.method)).is_err() {
+                    tracing::trace!("scripted daemon caller dropped its response receiver");
+                }
+            }
+        });
+        Self {
+            commands,
+            connected: Arc::new(AtomicBool::new(true)),
+            settled: Arc::new(AtomicBool::new(true)),
+            ready: Arc::new(Notify::new()),
+            cancel: CancellationToken::new(),
+        }
+    }
 }
 
 /// 本进程刚拉起、仍存活但尚未监听的 daemon 按短间隔轮询（约 10s）：冷启动 daemon 通常

@@ -242,13 +242,20 @@ struct SearchSettingsTests {
     @Test func indexCoversEveryCategoryAndItsRows() {
         let entries = SettingsIndex.entries(state: loadedState(capabilities: [HostCapability.agentAuth]), isLocalHost: true)
         let categories = Set(entries.filter { $0.id.hasPrefix("category.") }.map(\.route))
-        let expected: Set<SettingsRoute> = [
-            .account, .general, .appearance, .notify, .download, .bt, .ed2k, .network, .extensions, .diagnostics, .about,
+        var expected: Set<SettingsRoute> = [
+            .account, .general, .appearance, .notify, .download, .network, .extensions, .diagnostics, .about,
         ]
+        #if FULL_P2P
+        expected.formUnion([.bt, .ed2k])
+        #endif
         #expect(categories == expected) // 本机：没有 API 服务页；Webhook 受 `FeatureFlags.webhooks` 隐藏
         #expect(!entries.contains { $0.route == .webhook || $0.id.contains("webhook") })
         let withRows = Set(entries.filter { !$0.id.hasPrefix("category.") }.map(\.route))
-        for route in [SettingsRoute.general, .appearance, .notify, .download, .bt, .ed2k, .network, .diagnostics, .about] {
+        var routesWithRows: [SettingsRoute] = [.general, .appearance, .notify, .download, .network, .diagnostics, .about]
+        #if FULL_P2P
+        routesWithRows += [.bt, .ed2k]
+        #endif
+        for route in routesWithRows {
             #expect(withRows.contains(route), "\(route) contributes no rows to the index")
         }
         #expect(entries.allSatisfy { !$0.title.isEmpty })
@@ -283,9 +290,11 @@ struct SearchSettingsTests {
         let speedWords = SettingsIndex.words("searchKeywordsSpeedLimit")
         #expect(!speedWords.isEmpty)
         #expect(entries.first { $0.id == "download.speedLimit" }?.keywords == speedWords)
+        #if FULL_P2P
         let btWords = SettingsIndex.words("searchKeywordsBtSettings")
         #expect(!btWords.isEmpty)
         #expect(entries.first { $0.id == "category.bt" }?.keywords == btWords)
+        #endif
     }
 
     // MARK: 命令

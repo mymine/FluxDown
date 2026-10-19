@@ -172,6 +172,19 @@ impl AccountView {
         }
     }
 
+    /// 套餐购买对话框；断线 / 退出中不打开。
+    pub(crate) fn open_plan_purchase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.signing_out && !self.controller(cx).is_stale() {
+            crate::dialogs::plan_purchase::open(&self.host, window, cx);
+        }
+    }
+
+    /// 「推介有奖」入口开关：交给 app 写设备本地偏好。
+    pub(crate) fn request_show_referral(&mut self, value: bool, cx: &mut Context<Self>) {
+        self.host
+            .update(cx, |host, cx| host.request_show_referral(value, cx));
+    }
+
     /// 通用「发起命令 → 失败提示」；成功结果由快照/事件驱动的重渲染呈现。
     pub(crate) fn spawn_action(
         &mut self,
@@ -568,6 +581,7 @@ impl Render for AccountView {
                     disabled: disabled || self.signing_out,
                     refreshing: self.cloud_refreshing,
                     last_error,
+                    show_referral: self.host.read(cx).show_referral(),
                 },
                 cx,
             )),
@@ -601,12 +615,15 @@ impl Render for AccountView {
         column = column.child(pages::cloud_features::render(
             &translator,
             &tokens,
-            logged_in,
+            pages::cloud_features::CloudFeaturesState {
+                logged_in,
+                disabled,
+            },
             &sync,
             (!self.host.read(cx).controller.is_stale()
                 && self.host.read(cx).controller.cloud_connected())
             .then_some(devices.as_slice()),
-            disabled,
+            self.host.read(cx).controller.max_online_devices(),
             cx,
         ));
         if let Some(endpoint) = server_address {

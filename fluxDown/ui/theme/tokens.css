@@ -1,0 +1,104 @@
+/*
+ * FluxDown 主题 token（--fd-*）。
+ * popup / options / sidepanel 走 :root；content UI（Shadow DOM）走 :host，同一份文件两处通用。
+ * 暗色默认；[data-theme="light"] 手动浅色；未设置 data-theme 时跟随系统。
+ */
+:root,
+:host {
+  --fd-bg: #0f0f0f;
+  --fd-surface: #1a1a1a;
+  --fd-surface-2: #141414;
+  --fd-hover: #252525;
+  --fd-border: #2a2a2a;
+  --fd-border-strong: #3a3a3a;
+  --fd-text: #e5e5e5;
+  --fd-text-secondary: #888;
+  --fd-text-muted: #555;
+  --fd-accent: #3b82f6;
+  --fd-accent-hover: #2563eb;
+  --fd-accent-muted: rgba(59, 130, 246, 0.12);
+  --fd-success: #22c55e;
+  --fd-success-muted: rgba(34, 197, 94, 0.12);
+  --fd-danger: #ef4444;
+  --fd-danger-muted: rgba(239, 68, 68, 0.12);
+  --fd-warning: #f59e0b;
+  --fd-warning-muted: rgba(245, 158, 11, 0.14);
+  --fd-toggle-track: #333;
+  --fd-placeholder: #555;
+  --fd-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  --fd-overlay: rgba(0, 0, 0, 0.6);
+  --fd-tag-bg: #1e1e1e;
+  --fd-tag-border: #333;
+  --fd-radius: 8px;
+  --fd-radius-sm: 6px;
+
+  --fd-icon-video: #8b5cf6;
+  --fd-icon-audio: #ec4899;
+  --fd-icon-archive: #f59e0b;
+  --fd-icon-executable: #64748b;
+  --fd-icon-disc: #06b6d4;
+  --fd-icon-document: #3b82f6;
+  --fd-icon-image: #10b981;
+  --fd-icon-mobile: #14b8a6;
+  --fd-icon-torrent: #ef4444;
+  --fd-icon-subtitle: #a855f7;
+  --fd-icon-file: var(--fd-text-secondary);
+}
+
+:root[data-theme="light"],
+:host([data-theme="light"]) {
+  --fd-bg: #f8f9fa;
+  --fd-surface: #ffffff;
+  --fd-surface-2: #f3f4f6;
+  --fd-hover: #f0f0f0;
+  --fd-border: #e0e0e0;
+  --fd-border-strong: #c9c9c9;
+  --fd-text: #1a1a1a;
+  --fd-text-secondary: #666;
+  --fd-text-muted: #999;
+  --fd-accent: #2563eb;
+  --fd-accent-hover: #1d4ed8;
+  --fd-accent-muted: rgba(37, 99, 235, 0.08);
+  --fd-success: #16a34a;
+  --fd-success-muted: rgba(22, 163, 74, 0.08);
+  --fd-danger: #dc2626;
+  --fd-danger-muted: rgba(220, 38, 38, 0.08);
+  --fd-warning: #d97706;
+  --fd-warning-muted: rgba(217, 119, 6, 0.1);
+  --fd-toggle-track: #cbd5e1;
+  --fd-placeholder: #9ca3af;
+  --fd-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  --fd-overlay: rgba(0, 0, 0, 0.4);
+  --fd-tag-bg: #f3f4f6;
+  --fd-tag-border: #e5e7eb;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]),
+  :host(:not([data-theme])) {
+    --fd-bg: #f8f9fa;
+    --fd-surface: #ffffff;
+    --fd-surface-2: #f3f4f6;
+    --fd-hover: #f0f0f0;
+    --fd-border: #e0e0e0;
+    --fd-border-strong: #c9c9c9;
+    --fd-text: #1a1a1a;
+    --fd-text-secondary: #666;
+    --fd-text-muted: #999;
+    --fd-accent: #2563eb;
+    --fd-accent-hover: #1d4ed8;
+    --fd-accent-muted: rgba(37, 99, 235, 0.08);
+    --fd-success: #16a34a;
+    --fd-success-muted: rgba(22, 163, 74, 0.08);
+    --fd-danger: #dc2626;
+    --fd-danger-muted: rgba(220, 38, 38, 0.08);
+    --fd-warning: #d97706;
+    --fd-warning-muted: rgba(217, 119, 6, 0.1);
+    --fd-toggle-track: #cbd5e1;
+    --fd-placeholder: #9ca3af;
+    --fd-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+    --fd-overlay: rgba(0, 0, 0, 0.4);
+    --fd-tag-bg: #f3f4f6;
+    --fd-tag-border: #e5e7eb;
+  }
+}

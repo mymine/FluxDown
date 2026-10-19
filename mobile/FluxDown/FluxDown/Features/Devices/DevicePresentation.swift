@@ -55,6 +55,12 @@ enum DevicePresentation {
         }.map(\.element)
     }
 
+    /// 直连记录是否对应同账号云设备（`cloudDeviceId` 在云名册内，含本机以外全部）。
+    static func isSameAccount(_ device: LinkDevice, cloud: [CloudDevice]) -> Bool {
+        guard !device.revoked, let id = device.cloudDeviceId, !id.isEmpty else { return false }
+        return cloud.contains { $0.deviceId == id }
+    }
+
     /// 局域网已配对设备：在线优先，其次名称（不区分大小写）。
     static func sorted(link devices: [LinkDevice]) -> [LinkDevice] {
         devices.enumerated().sorted { lhs, rhs in

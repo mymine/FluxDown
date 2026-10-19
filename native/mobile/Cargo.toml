@@ -29,6 +29,11 @@ uniffi = { version = "0.32", features = ["tokio"] }
 webpki-roots = "0.26"
 
 [features]
+# 默认完整 P2P（Android / 侧载 iOS / 开发）。iOS 商店 flavor：在 cargo 命令上追加
+# `--no-default-features`，本机引擎编译期剔除 BitTorrent 与 eD2K（不链接 librqbit）。
+# UniFFI 导出面与此 feature 无关，两种构建一致。
+default = ["p2p"]
+p2p = ["fluxdown_daemon/bt", "fluxdown_daemon/ed2k"]
 # `uniffi-bindgen` 二进制（生成 Kotlin / Swift 绑定）；产物库本身不需要 CLI 依赖。
 bindgen = ["uniffi/cli"]
 

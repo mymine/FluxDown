@@ -3,7 +3,7 @@
   "name": "JSON Subscription (示例)",
   "version": "1.0.0",
   "description": "演示插件订阅 provider：从 JSON 接口返回统一订阅条目。",
-  "homepage": "https://fluxdown.zerx.dev",
+  "homepage": "https://fluxdown.com",
   "subscriptions": [
     {
       "providerId": "json-feed",

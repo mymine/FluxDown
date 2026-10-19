@@ -1,7 +1,7 @@
 {
   "format": "fluxdown.gpui-theme",
   "schemaVersion": 2,
-  "schemaUrl": "https://fluxdown.zerx.dev/schemas/gpui-theme.v2.json",
+  "schemaUrl": "https://fluxdown.com/schemas/gpui-theme.v2.json",
   "groups": [
     "colors",
     "radius",

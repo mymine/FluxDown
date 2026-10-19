@@ -22,7 +22,7 @@
 **已核实的项目事实（写条目时可直接引用）**
 
 - 仓库 `zerx-lab/FluxDown`，AGPL-3.0，1002 star，主语言 Rust（GitHub 判定）。
-- 官网 `https://fluxdown.zerx.dev`（README 全文使用此域名）。
+- 官网 `https://fluxdown.com`（README 全文使用此域名）。
 - ⚠️ **GitHub 仓库 Homepage 字段目前填的是 `https://www.fluxdown.com`，与 README 不一致**。提交前务必统一，否则审核者点开会看到两个不同官网 → 见「跨清单前置项」。
 - 浏览器扩展**已上架三家商店**（Chrome Web Store / Edge Add-ons / Firefox AMO），扩展类清单可用。
 - Android：已发 per-ABI + universal APK（`com.fluxdown.app`），**未上架 F-Droid / IzzyOnDroid / Google Play**。
@@ -54,28 +54,28 @@
 插入位置：`Deluge` 之后、`FOLX` 之前（现状顺序 aria2 / Downie / Deluge / FOLX …）
 
 ```markdown
-* [FluxDown](https://fluxdown.zerx.dev) - Multi-protocol download manager with IDM-style dynamic segmentation for HTTP, FTP, BitTorrent, eD2K, HLS and DASH. [![Open-Source Software][OSS Icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][Freeware Icon]
+* [FluxDown](https://fluxdown.com) - Multi-protocol download manager with IDM-style dynamic segmentation for HTTP, FTP, BitTorrent, eD2K, HLS and DASH. [![Open-Source Software][OSS Icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][Freeware Icon]
 ```
 
 **② `README-zh.md` → `## 下载工具`**
 插入位置：`FDM` 之后、`FOLX` 之前
 
 ```markdown
-* [FluxDown](https://fluxdown.zerx.dev) - 支持 HTTP、FTP、BitTorrent、eD2K、HLS 与 DASH 的多协议下载管理器，具备 IDM 式动态分段加速。 [![Open-Source Software][OSS Icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][Freeware Icon]
+* [FluxDown](https://fluxdown.com) - 支持 HTTP、FTP、BitTorrent、eD2K、HLS 与 DASH 的多协议下载管理器，具备 IDM 式动态分段加速。 [![Open-Source Software][OSS Icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][Freeware Icon]
 ```
 
 **③ `README-ja.md` → `## ダウンロード管理ツール`**
 插入位置：`Deluge` 之后、`FOLX` 之前
 
 ```markdown
-* [FluxDown](https://fluxdown.zerx.dev) - HTTP、FTP、BitTorrent、eD2K、HLS、DASHに対応し、IDM風の動的セグメント分割を備えたマルチプロトコル・ダウンロードマネージャー。 [![Open-Source Software][OSS Icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][Freeware Icon]
+* [FluxDown](https://fluxdown.com) - HTTP、FTP、BitTorrent、eD2K、HLS、DASHに対応し、IDM風の動的セグメント分割を備えたマルチプロトコル・ダウンロードマネージャー。 [![Open-Source Software][OSS Icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][Freeware Icon]
 ```
 
 **④ `README-ko.md` → `## 다운로드 관리 도구`**
 插入位置：`Downie` 之后、`FOLX` 之前（该文件没有 Deluge 条目）
 
 ```markdown
-* [FluxDown](https://fluxdown.zerx.dev) - HTTP, FTP, BitTorrent, eD2K, HLS, DASH를 지원하고 IDM 방식의 동적 세그먼트 분할을 갖춘 멀티 프로토콜 다운로드 관리자. [![Open-Source Software][OSS Icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][Freeware Icon]
+* [FluxDown](https://fluxdown.com) - HTTP, FTP, BitTorrent, eD2K, HLS, DASH를 지원하고 IDM 방식의 동적 세그먼트 분할을 갖춘 멀티 프로토콜 다운로드 관리자. [![Open-Source Software][OSS Icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][Freeware Icon]
 ```
 
 > 四个文件的目录（Contents）里已存在该章节，**无需**改目录。
@@ -100,7 +100,7 @@
 | 无专有成分 | ✅ | 已核查 `android/` 无 GMS / Firebase / Crashlytics |
 | 稳定（至少可用） | ✅ | 已有多个 release |
 | 在积极开发维护 | ✅ | |
-| 有文档 / 项目网站 | ✅ | fluxdown.zerx.dev |
+| 有文档 / 项目网站 | ✅ | fluxdown.com |
 | 免费 | ✅ | |
 
 其它规则：条目**按字母序**；**禁止**填 Google Play 链接或第三方 F-Droid 源；只能填官方 F-Droid 或 IzzyOnDroid。
@@ -167,7 +167,7 @@ DimitrisPa fork 的 README 顶部已自称 *"a continuation of the now archived 
 `README.md` → `#### Download Manager`（在 `### Internet` 之下），插入位置：`Flareget` 之后、`Free Download Manager` 之前
 
 ```markdown
-- [![Open-Source Software][oss icon]](https://github.com/zerx-lab/FluxDown) [FluxDown](https://fluxdown.zerx.dev/) - FluxDown is a Rust-powered multi-protocol download manager with IDM-style dynamic segmentation, supporting HTTP/HTTPS, FTP, BitTorrent, eD2K, HLS and DASH.
+- [![Open-Source Software][oss icon]](https://github.com/zerx-lab/FluxDown) [FluxDown](https://fluxdown.com/) - FluxDown is a Rust-powered multi-protocol download manager with IDM-style dynamic segmentation, supporting HTTP/HTTPS, FTP, BitTorrent, eD2K, HLS and DASH.
 ```
 
 > 该 fork 还带 ar / pt-BR / zh-CN / fr / es / th 多语言 README。原仓库不强制同步翻译（CONTRIBUTING 未提），建议**只改英文 `README.md`**；若想加分，可顺手在 `README_zh-CN.md` 的对应章节补一条。
@@ -197,7 +197,7 @@ DimitrisPa fork 的 README 顶部已自称 *"a continuation of the now archived 
 `README.md` → `### Utilities`，插入位置：`Fluid` 之后、`gfxCardStatus` 之前（现状 … Finicky / Flotato / Fluid / gfxCardStatus …）
 
 ```markdown
-- [FluxDown](https://fluxdown.zerx.dev) - Multi-protocol download manager with IDM-style dynamic segmentation for HTTP, FTP, BitTorrent, eD2K, HLS and DASH. [![Open-Source Software][OSS Icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][Freeware Icon]
+- [FluxDown](https://fluxdown.com) - Multi-protocol download manager with IDM-style dynamic segmentation for HTTP, FTP, BitTorrent, eD2K, HLS and DASH. [![Open-Source Software][OSS Icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][Freeware Icon]
 ```
 
 > 该清单 `Utilities` 章节用 `-` 而非 `*` 作列表符号，注意别抄错。
@@ -236,7 +236,7 @@ DimitrisPa fork 的 README 顶部已自称 *"a continuation of the now archived 
 `README.md` → `## File Management`，按字母序插入（`FileZilla` 之后、`FreeFileSync` 之前）
 
 ```markdown
-* [FluxDown](https://fluxdown.zerx.dev) - Multi-protocol download manager with IDM-style dynamic segmentation for HTTP, FTP, BitTorrent and HLS/DASH streams. [![Open-Source Software][oss]](https://github.com/zerx-lab/FluxDown)
+* [FluxDown](https://fluxdown.com) - Multi-protocol download manager with IDM-style dynamic segmentation for HTTP, FTP, BitTorrent and HLS/DASH streams. [![Open-Source Software][oss]](https://github.com/zerx-lab/FluxDown)
 ```
 
 ---
@@ -260,7 +260,7 @@ DimitrisPa fork 的 README 顶部已自称 *"a continuation of the now archived 
 `README.md` → `## Applications` → `### Utilities`，插入位置：`FileOptimizer` 之后、`Fraps` 之前
 
 ```markdown
-- [FluxDown](https://fluxdown.zerx.dev) - Multi-protocol download manager with IDM-style dynamic segmentation for HTTP, FTP, BitTorrent, eD2K, HLS and DASH. [![Open-Source Software][oss icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][freeware icon] ![Freeware][freeware icon light]
+- [FluxDown](https://fluxdown.com) - Multi-protocol download manager with IDM-style dynamic segmentation for HTTP, FTP, BitTorrent, eD2K, HLS and DASH. [![Open-Source Software][oss icon]](https://github.com/zerx-lab/FluxDown) ![Freeware][freeware icon] ![Freeware][freeware icon light]
 ```
 
 ---
@@ -305,7 +305,7 @@ DimitrisPa fork 的 README 顶部已自称 *"a continuation of the now archived 
 `README.md` → `## Downloader`，追加到 IDM 之后
 
 ```markdown
-* [FluxDown](https://fluxdown.zerx.dev) - Free and open-source multi-protocol download manager with IDM-style dynamic segmentation, supports HTTP/FTP/BitTorrent/eD2K/HLS/DASH.
+* [FluxDown](https://fluxdown.com) - Free and open-source multi-protocol download manager with IDM-style dynamic segmentation, supports HTTP/FTP/BitTorrent/eD2K/HLS/DASH.
 ```
 
 ---
@@ -335,7 +335,7 @@ DimitrisPa fork 的 README 顶部已自称 *"a continuation of the now archived 
 
 按阻塞程度排序：
 
-1. **【阻塞 · 必做】统一官网 URL。** GitHub 仓库 Homepage 字段是 `https://www.fluxdown.com`，README 通篇是 `https://fluxdown.zerx.dev`。所有清单条目都要填官网，审核者一定会点开；两个域名不一致会直接引发「这项目到底哪个是官网」的质疑。**先决定唯一 canonical 域名，改掉仓库 Homepage 字段**，再按最终结果批量替换本文件里所有条目文本中的 `https://fluxdown.zerx.dev`。
+1. **【阻塞 · 必做】统一官网 URL。** GitHub 仓库 Homepage 字段是 `https://www.fluxdown.com`，README 通篇是 `https://fluxdown.com`。所有清单条目都要填官网，审核者一定会点开；两个域名不一致会直接引发「这项目到底哪个是官网」的质疑。**先决定唯一 canonical 域名，改掉仓库 Homepage 字段**，再按最终结果批量替换本文件里所有条目文本中的 `https://fluxdown.com`。
 2. **【阻塞 · 仅限 0PandaDEV/awesome-windows】纯人工撰写与提交**，不得留下任何 AI 痕迹。
 3. **【非阻塞 · 强烈建议】上架 IzzyOnDroid。** 门槛远低于 F-Droid（无需进 F-Droid 构建系统，GitHub Releases 出 APK 即可申请）。收益：offa/android-foss 条目可加官方角标，可信度显著提升；也为将来进 F-Droid 铺路。**F-Droid 本身不是任何一个清单的硬性前置条件**——android-foss 与 open-source-android-apps 都接受纯 GitHub Releases 的条目。
 4. **【非阻塞 · 建议】Windows 包管理器上架。** Scoop 已进 `ScoopInstaller/Extras`；仍无 winget、无 Homebrew Cask。三个 Windows/macOS 清单**都不把包管理器列为准入条件**，所以这不阻塞提交；但 winget（`microsoft/winget-pkgs`）与 Homebrew Cask（`Homebrew/homebrew-cask`）本身就是巨型收录仓库，属独立的高价值曝光渠道，值得单开任务。
@@ -354,7 +354,7 @@ DimitrisPa fork 的 README 顶部已自称 *"a continuation of the now archived 
 
 ## 提交记录（2026-07-27）
 
-均以 `zerx-lab` 身份提交：`gh repo fork` → 分支 `add-fluxdown` → 单文件最小改动 → `gh pr create`。所有链接统一 `https://fluxdown.zerx.dev`，无 AI 署名 / Co-authored-by / emoji 标记。
+均以 `zerx-lab` 身份提交：`gh repo fork` → 分支 `add-fluxdown` → 单文件最小改动 → `gh pr create`。所有链接统一 `https://fluxdown.com`，无 AI 署名 / Co-authored-by / emoji 标记。
 
 | 清单 | PR | 改动 | 状态 |
 |---|---|---|---|

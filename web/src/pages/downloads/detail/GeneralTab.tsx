@@ -3,7 +3,8 @@ import { Check, Copy, Download, Layers, Link2 } from 'lucide-react'
 import { useT } from '../../../i18n'
 import { Button, Icon, Tooltip } from '../../../ui'
 import { copyText } from '../../../lib/copy'
-import { useDownloads, stateLabel } from '../state'
+import { useDownloads } from '../state'
+import { taskStateLabel } from '../table/text'
 import { copyUrls, downloadViewsFiles, isDownloadable } from '../model/actions'
 import { MAX_ETA_SECS, PROTOCOL_LABEL, formatBytes, formatDateTime, sourceSite } from '../model/task'
 import type { DownloadTaskView, TaskState } from '../model/task'
@@ -76,7 +77,7 @@ export function GeneralTab({ view }: { view: DownloadTaskView }) {
           {view.boosted ? <div className="text-xs text-warning">{t('detailBoostActive')}</div> : null}
         </div>
         <DetailRow label={t('infoStatus')}>
-          <span className={STATE_TEXT[view.state]}>{stateLabel(t, view.state)}</span>
+          <span className={STATE_TEXT[view.state]}>{taskStateLabel(t, view)}</span>
         </DetailRow>
         {view.sizeBytes > 0 ? <DetailRow label={t('infoSize')}>{formatBytes(view.sizeBytes)}</DetailRow> : null}
         {!completed ? <DetailRow label={t('infoDownloaded')}>{formatBytes(view.downloadedBytes)}</DetailRow> : null}

@@ -22,8 +22,8 @@ use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
-    prelude::FluentBuilder as _, px,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Task,
+    Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable as _, Icon, WindowExt as _,
@@ -35,7 +35,7 @@ use crate::{
     components::{
         file_icon::task_file_icon,
         segment_progress::render_segment_progress,
-        task_table::{progress_bar_color, progress_track_color, status_color},
+        task_table::{progress_bar_color, progress_track_color, task_status_color},
     },
     controller::{DownloadsCommand, DownloadsController, DownloadsPort},
     model::{DownloadTaskView, RowKey, TaskProtocol, TaskState, format_bytes},
@@ -73,19 +73,20 @@ const MAX_ETA_SECS: u64 = 86_400;
 pub enum ProgressWindowEvent {
     /// 关闭承载窗口（任务已删除 / 用户停止 / 用户删除）。
     Close,
-    /// 已把文件 / 所在文件夹交给系统打开：宿主应关窗，但要等打开的程序接管前台后再关，
-    /// 否则关闭本应用的前台窗口会让系统把主窗口提到前面。
+    /// 开始把文件 / 所在文件夹交给系统打开，成功后关窗：宿主从现在起等打开的程序接管前台
+    /// （窗口失活即关），兜底时限也从现在起算；结果到达前不因时限关窗，失败时窗口若还在就显示
+    /// 错误。窗口可能先于命令结束关闭，宿主须经 [`ProgressWindowView::take_hand_off_task`] 取走
+    /// 命令任务并保活到它结束（否则关掉最后一个窗口时界面退出会中断这次打开）。
+    HandOffStarted,
+    /// 交接失败，或窗口改为保留（完成集合里还有其它任务）：宿主停止等待。
+    HandOffAborted,
+    /// 已把文件 / 所在文件夹交给系统打开：窗口已失活或兜底时限已到时宿主立即关窗，否则等打开的
+    /// 程序接管前台再关——直接关闭本应用的前台窗口会让系统把主窗口提到前面、压住刚打开的程序。
     HandedOff,
     /// 用户切换全局「完成后显示完成窗口」设置。
     ShowCompletionChanged(bool),
-}
-
-/// 命令成功后的窗口去留。
-enum AfterSuccess {
-    /// 立即关窗（停止 / 删除）。
-    Close(String),
-    /// 交给系统程序后关窗（打开文件 / 文件夹）。
-    HandOff(String),
+    /// 用户点「打开主界面」：宿主关闭本窗口并显示主窗口。
+    OpenMainWindow,
 }
 
 pub struct ProgressWindowView {
@@ -99,6 +100,10 @@ pub struct ProgressWindowView {
     parts_expanded: bool,
     completed: Option<CompletedTasks>,
     closed: bool,
+    /// 打开文件 / 所在文件夹的命令执行中：期间两个按钮禁用，重复点击不会把同一文件打开多次。
+    handing_off: bool,
+    /// 会关窗的交接中执行打开命令的任务，等宿主取走（见 [`ProgressWindowEvent::HandOffStarted`]）。
+    hand_off_task: Option<Task<()>>,
     /// 删除确认框里「同时删除已下载的文件」的勾选状态（每次打开确认框重置为不删）。
     delete_files: bool,
     last_error: Option<SharedString>,
@@ -132,6 +137,8 @@ impl ProgressWindowView {
             parts_expanded: false,
             completed: None,
             closed: false,
+            handing_off: false,
+            hand_off_task: None,
             delete_files: false,
             last_error: None,
         }
@@ -238,11 +245,12 @@ impl ProgressWindowView {
 
     // ---- 动作 ----
 
-    /// 执行命令；成功后按 `then` 发出关窗类事件（`None` = 保持窗口）。
+    /// 执行命令；成功后 `close_after` 指定的任务视为处理完毕：完成集合里还有其它任务时切到
+    /// 下一项，否则关窗（`None` = 保持窗口）。
     fn run(
         &mut self,
         command: DownloadsCommand,
-        then: Option<AfterSuccess>,
+        close_after: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let future = self.port.execute(command);
@@ -255,19 +263,10 @@ impl ProgressWindowView {
                     cx.notify();
                     return;
                 }
-                match then {
-                    Some(AfterSuccess::Close(task_id)) => {
-                        if !this.finish_completed_action(&task_id, cx) {
-                            this.close(cx);
-                        }
-                    }
-                    Some(AfterSuccess::HandOff(task_id)) if !this.closed => {
-                        if !this.finish_completed_action(&task_id, cx) {
-                            this.closed = true;
-                            cx.emit(ProgressWindowEvent::HandedOff);
-                        }
-                    }
-                    Some(AfterSuccess::HandOff(_)) | None => {}
+                if let Some(task_id) = close_after
+                    && !this.finish_completed_action(&task_id, cx)
+                {
+                    this.close(cx);
                 }
             }) else {
                 // 视图已释放，结束回调而不再更新状态。
@@ -275,6 +274,57 @@ impl ProgressWindowView {
             };
         })
         .detach();
+    }
+
+    /// 把任务产物 / 所在文件夹交给系统打开；成功后该项处理完毕（规则同 [`Self::run`]）。
+    /// 会关窗时点击即请宿主等打开的程序接管前台，不等打开命令返回：Windows 上它要等系统打开
+    /// 调用返回，可能比对方出现在前台还晚。
+    fn hand_off(&mut self, command: DownloadsCommand, task_id: String, cx: &mut Context<Self>) {
+        if self.closed || self.handing_off {
+            return;
+        }
+        self.handing_off = true;
+        let closes = !self.keeps_window_after(&task_id);
+        if closes {
+            cx.emit(ProgressWindowEvent::HandOffStarted);
+        }
+        cx.notify();
+        let future = self.port.execute(command);
+        let task = cx.spawn(async move |this, cx| {
+            let failed = future.await.is_err();
+
+            let Ok(()) = this.update(cx, |this, cx| {
+                this.handing_off = false;
+                cx.notify();
+                if this.closed {
+                    return;
+                }
+                if failed {
+                    this.last_error = Some(this.strings.action_failed.clone());
+                    if closes {
+                        cx.emit(ProgressWindowEvent::HandOffAborted);
+                    }
+                } else if !this.finish_completed_action(&task_id, cx) {
+                    this.closed = true;
+                    cx.emit(ProgressWindowEvent::HandedOff);
+                } else if closes {
+                    cx.emit(ProgressWindowEvent::HandOffAborted);
+                }
+            }) else {
+                // 视图已随交接关窗释放，结束回调。
+                return;
+            };
+        });
+        if closes {
+            self.hand_off_task = Some(task);
+        } else {
+            task.detach();
+        }
+    }
+
+    /// 取走会关窗的交接中的打开命令任务（每次交接一次）；宿主保活它，窗口关闭后命令照常完成。
+    pub fn take_hand_off_task(&mut self) -> Option<Task<()>> {
+        self.hand_off_task.take()
     }
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
@@ -300,7 +350,7 @@ impl ProgressWindowView {
             DownloadsCommand::Pause {
                 task_id: task_id.clone(),
             },
-            Some(AfterSuccess::Close(task_id)),
+            Some(task_id),
             cx,
         );
     }
@@ -364,7 +414,7 @@ impl ProgressWindowView {
                                 task_id: task_id.clone(),
                                 delete_files: this.delete_files,
                             };
-                            this.run(command, Some(AfterSuccess::Close(task_id.clone())), cx);
+                            this.run(command, Some(task_id.clone()), cx);
                         })
                         .is_ok()
                 })
@@ -384,21 +434,21 @@ impl ProgressWindowView {
     }
 
     fn open_file(&mut self, task_id: String, cx: &mut Context<Self>) {
-        self.run(
+        self.hand_off(
             DownloadsCommand::OpenTask {
                 task_id: task_id.clone(),
             },
-            Some(AfterSuccess::HandOff(task_id)),
+            task_id,
             cx,
         );
     }
 
     fn reveal(&mut self, task_id: String, cx: &mut Context<Self>) {
-        self.run(
+        self.hand_off(
             DownloadsCommand::RevealTask {
                 task_id: task_id.clone(),
             },
-            Some(AfterSuccess::HandOff(task_id)),
+            task_id,
             cx,
         );
     }
@@ -536,8 +586,8 @@ impl ProgressWindowView {
                                         div()
                                             .flex_none()
                                             .font_weight(FontWeight::MEDIUM)
-                                            .text_color(status_color(row.state, cx))
-                                            .child(self.strings.state_label(row.state)),
+                                            .text_color(task_status_color(row, cx))
+                                            .child(self.strings.task_status_text(row)),
                                     )
                                     .child(
                                         div()
@@ -941,6 +991,7 @@ impl ProgressWindowView {
                     cx,
                 )),
             )
+            .child(self.render_open_main_button(cx))
             .child(self.render_delete_button(cx))
             .child(
                 Button::new("progress-stop")
@@ -965,6 +1016,16 @@ impl ProgressWindowView {
                     })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_pause(cx))),
             )
+            .into_any_element()
+    }
+
+    fn render_open_main_button(&self, cx: &mut Context<Self>) -> AnyElement {
+        Button::new("progress-open-main")
+            .outline()
+            .control_icon(cx)
+            .icon(FluxIcon::AppWindow)
+            .tooltip(self.t(cx, "progressWindowOpenMain"))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(ProgressWindowEvent::OpenMainWindow)))
             .into_any_element()
     }
 
@@ -1079,12 +1140,14 @@ impl ProgressWindowView {
         Self::footer(cx)
             .justify_end()
             .child(div().flex_1().child(self.render_delete_button(cx)))
+            .child(self.render_open_main_button(cx))
             .child(
                 Button::new("progress-open-folder")
                     .outline()
                     .control(cx)
                     .icon(FluxIcon::FolderOpen)
                     .label(self.strings.open_folder.clone())
+                    .disabled(self.handing_off)
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.reveal(folder_id.clone(), cx)),
                     ),
@@ -1095,7 +1158,7 @@ impl ProgressWindowView {
                     .control(cx)
                     .icon(FluxIcon::File)
                     .label(self.strings.open_file.clone())
-                    .disabled(missing)
+                    .disabled(missing || self.handing_off)
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.open_file(file_id.clone(), cx)),
                     ),
@@ -1164,5 +1227,168 @@ mod tests {
         assert_eq!(format_elapsed(59), "0:59");
         assert_eq!(format_elapsed(201), "3:21");
         assert_eq!(format_elapsed(3_725), "1:02:05");
+    }
+
+    mod hand_off {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use fluxdown_protocol::{
+            AgentEvent, ApplicationErrorCode, DaemonEvent, RpcErrorData, ServiceEvent, TaskDto,
+            WsServerMsg,
+        };
+        use fluxdown_ui_i18n::I18nCatalog;
+        use gpui::{AppContext as _, Entity, TestApp};
+        use serde_json::json;
+
+        use super::super::{ProgressWindowEvent, ProgressWindowView};
+        use crate::controller::{DownloadsCommand, DownloadsPort, DownloadsResult, PortFuture};
+
+        /// 打开命令立即返回给定结果，并记录执行次数。
+        struct FakePort {
+            fail: bool,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl DownloadsPort for FakePort {
+            fn execute(&self, _: DownloadsCommand) -> PortFuture<DownloadsResult> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let fail = self.fail;
+                Box::pin(async move {
+                    if fail {
+                        Err(RpcErrorData::new(ApplicationErrorCode::Internal, false))
+                    } else {
+                        Ok(DownloadsResult::Unit)
+                    }
+                })
+            }
+        }
+
+        #[derive(Debug, PartialEq)]
+        enum Seen {
+            Started,
+            Aborted,
+            HandedOff,
+        }
+
+        fn task(id: &str) -> TaskDto {
+            serde_json::from_value(json!({
+                "taskId": id, "url": "https://example.com/file", "fileName": id,
+                "saveDir": "/tmp", "status": 3, "downloadedBytes": 1, "totalBytes": 1,
+                "errorMessage": "", "createdAt": "1", "proxyUrl": "", "queueId": "main", "checksum": ""
+            }))
+            .expect("task")
+        }
+
+        /// 建视图（`completed` 非空时进入完成集合模式），返回视图、事件记录与命令计数。
+        fn view(
+            app: &mut TestApp,
+            fail: bool,
+            completed: &[&str],
+        ) -> (
+            Entity<ProgressWindowView>,
+            Rc<RefCell<Vec<Seen>>>,
+            Arc<AtomicUsize>,
+        ) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = Rc::new(RefCell::new(Vec::new()));
+            let port = Arc::new(FakePort {
+                fail,
+                calls: Arc::clone(&calls),
+            });
+            let ids: Vec<String> = completed.iter().map(|id| (*id).to_owned()).collect();
+            let record = Rc::clone(&seen);
+            let view = app.update(|cx| {
+                let catalog = Arc::new(I18nCatalog::load_embedded().expect("catalog"));
+                let translator = cx.new(|_| catalog.translator("en"));
+                let view = cx
+                    .new(|cx| ProgressWindowView::new(translator, "a".to_owned(), port, true, cx));
+                cx.subscribe(&view, move |_, event, _| {
+                    let seen = match event {
+                        ProgressWindowEvent::HandOffStarted => Seen::Started,
+                        ProgressWindowEvent::HandOffAborted => Seen::Aborted,
+                        ProgressWindowEvent::HandedOff => Seen::HandedOff,
+                        ProgressWindowEvent::Close
+                        | ProgressWindowEvent::OpenMainWindow
+                        | ProgressWindowEvent::ShowCompletionChanged(_) => {
+                            return;
+                        }
+                    };
+                    record.borrow_mut().push(seen);
+                })
+                .detach();
+                if !ids.is_empty() {
+                    view.update(cx, |view, cx| {
+                        view.controller
+                            .apply_event(&ServiceEvent::Agent(AgentEvent::Daemon(
+                                DaemonEvent::Engine(WsServerMsg::TasksSnapshot {
+                                    tasks: ids.iter().map(|id| task(id)).collect(),
+                                }),
+                            )));
+                        let total = ids.len();
+                        view.append_completed(ids, total, cx);
+                    });
+                }
+                view
+            });
+            (view, seen, calls)
+        }
+
+        #[test]
+        fn closing_hand_off_starts_at_click_and_ends_with_handed_off() {
+            let mut app = TestApp::new();
+            let (view, seen, calls) = view(&mut app, false, &[]);
+            app.update(|cx| {
+                view.update(cx, |view, cx| {
+                    view.open_file("a".to_owned(), cx);
+                    // 执行中再次点击被忽略，同一文件不会打开两次。
+                    view.reveal("a".to_owned(), cx);
+                });
+            });
+            // 宿主要保活的命令任务可取走一次。
+            assert!(
+                app.update(|cx| view.update(cx, |view, _| view.take_hand_off_task()))
+                    .is_some()
+            );
+            app.run_until_parked();
+            assert_eq!(*seen.borrow(), [Seen::Started, Seen::HandedOff]);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(app.read(|cx| view.read(cx).closed));
+        }
+
+        #[test]
+        fn failed_hand_off_aborts_and_reenables_the_buttons() {
+            let mut app = TestApp::new();
+            let (view, seen, calls) = view(&mut app, true, &[]);
+            app.update(|cx| view.update(cx, |view, cx| view.open_file("a".to_owned(), cx)));
+            app.run_until_parked();
+            assert_eq!(*seen.borrow(), [Seen::Started, Seen::Aborted]);
+            app.read(|cx| {
+                let view = view.read(cx);
+                assert!(!view.handing_off && !view.closed && view.last_error.is_some());
+            });
+            app.update(|cx| view.update(cx, |view, cx| view.open_file("a".to_owned(), cx)));
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn hand_off_that_keeps_the_window_emits_nothing_and_moves_on() {
+            let mut app = TestApp::new();
+            let (view, seen, _) = view(&mut app, false, &["a", "b"]);
+            app.update(|cx| view.update(cx, |view, cx| view.open_file("a".to_owned(), cx)));
+            assert!(
+                app.update(|cx| view.update(cx, |view, _| view.take_hand_off_task()))
+                    .is_none()
+            );
+            app.run_until_parked();
+            assert!(seen.borrow().is_empty());
+            app.read(|cx| {
+                let view = view.read(cx);
+                assert!(!view.closed && !view.handing_off);
+                assert_eq!(view.task_id(), "b");
+            });
+        }
     }
 }

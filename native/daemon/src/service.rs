@@ -17,6 +17,7 @@ use fluxdown_protocol::{
     DaemonDeleteTasksParams, DaemonTaskIdsParams, MigrationAckParams, RpcErrorData, RpcErrorObject,
     RpcRequest, RpcResponse, SelectionResolutionDto, ServiceHello, SiteAuthCredentialDto,
     SiteAuthDeleteParams, SiteAuthMatchParams, SnapshotBody, TaskActivityQuery,
+    TaskSpeedHistoryQuery,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -38,6 +39,8 @@ pub struct DaemonService {
     data_dir: PathBuf,
     #[cfg(feature = "plugins")]
     plugin_manager: Option<Arc<fluxdown_engine::plugin::PluginManager>>,
+    /// 宿主自身外网请求的统一出口（组件下载、agent 自更新等的代理与插件改写）。
+    egress: fluxdown_engine::egress::Egress,
     blobs: Arc<BlobStore>,
     #[cfg(feature = "components")]
     ffmpeg_installing: AtomicBool,
@@ -65,6 +68,12 @@ impl DaemonService {
             Arc<fluxdown_engine::plugin::PluginManager>,
         >,
     ) -> Self {
+        let egress = fluxdown_engine::egress::Egress::new(db.clone());
+        #[cfg(feature = "plugins")]
+        let egress = match &plugin_manager {
+            Some(manager) => egress.with_plugins(Arc::clone(manager)),
+            None => egress,
+        };
         Self {
             hello,
             events,
@@ -74,6 +83,7 @@ impl DaemonService {
             data_dir,
             #[cfg(feature = "plugins")]
             plugin_manager,
+            egress,
             #[cfg(feature = "components")]
             ffmpeg_installing: AtomicBool::new(false),
             #[cfg(feature = "components")]
@@ -153,7 +163,7 @@ impl DaemonService {
         }
     }
 
-    async fn call_inner(
+    pub(crate) async fn call_inner(
         &self,
         connection_id: &str,
         is_local_agent: bool,
@@ -202,6 +212,20 @@ impl DaemonService {
                     newest_id: page.newest_id,
                     truncated: page.truncated,
                 })
+            }
+            method::DAEMON_TASK_SPEED_HISTORY => {
+                let query = parse_params::<TaskSpeedHistoryQuery>(params)?;
+                if query.task_id.is_empty() {
+                    return Err(invalid_argument("taskId", "taskId is required"));
+                }
+                let history = self
+                    .db
+                    .task_speed_history(&query.task_id)
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                to_value(history.map(|history| {
+                    fluxdown_engine_protocol::task_speed_history_to_dto(query.task_id, history)
+                }))
             }
             method::DAEMON_TASK_CREATE => self.create_task(params).await,
             method::DAEMON_TASK_CREATE_MANY => self.create_tasks(params).await,
@@ -271,6 +295,18 @@ impl DaemonService {
                     upload_limit_bps: params.upload_limit_bps,
                 })
                 .await
+            }
+            method::DAEMON_TASK_VERIFY => {
+                let params = parse_params::<IdParams>(params)?;
+                match self
+                    .actor
+                    .execute(ActorOperation::VerifyTask { task_id: params.id })
+                    .await
+                {
+                    Ok(ActorResult::TaskVerify(result)) => to_value(result),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
             }
             method::DAEMON_TASK_PAUSE_MANY => {
                 let params = parse_params::<DaemonTaskIdsParams>(params)?;
@@ -677,6 +713,8 @@ impl DaemonService {
                 match self
                     .actor
                     .execute(ActorOperation::RssValidate {
+                        provider_id: request.provider_id,
+                        provider_config: request.provider_config,
                         url: request.url,
                         cookies: request.cookies,
                         user_agent: request.user_agent,
@@ -720,6 +758,19 @@ impl DaemonService {
             #[cfg(feature = "plugins")]
             method::DAEMON_PLUGIN_LIST => to_value(self.list_plugins().await?),
             #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_SNIFF_RULES => {
+                let manager = self.plugin_manager()?;
+                let plugins = manager.list().await;
+                let result = fluxdown_engine::plugin::sniff_pack::query(&plugins, &self.db)
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                to_value(fluxdown_protocol::PluginSniffRulesDto {
+                    sequence: result.sequence,
+                    epoch: result.epoch,
+                    pack: result.pack,
+                })
+            }
+            #[cfg(feature = "plugins")]
             method::DAEMON_PLUGIN_AUTH => {
                 let request = parse_params::<fluxdown_protocol::PluginAuthRequest>(params)?;
                 let result = self
@@ -754,6 +805,81 @@ impl DaemonService {
                     .await
                     .map_err(|error| invalid_argument("identity", &error.to_string()))?;
                 self.publish_plugins().await?;
+                Ok(json!({ "ok": true }))
+            }
+            #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_CONSENT => {
+                let params = parse_params::<fluxdown_protocol::PluginConsentParams>(params)?;
+                self.plugin_manager()?
+                    .grant_consent(&params.identity, &params.permissions, &params.network_hosts)
+                    .await
+                    .map_err(|error| match error {
+                        fluxdown_engine::plugin::PluginError::ManifestInvalid(message) => {
+                            invalid_argument("permissions", &message)
+                        }
+                        other => invalid_argument("identity", &other.to_string()),
+                    })?;
+                self.publish_plugins().await?;
+                Ok(json!({ "ok": true }))
+            }
+            #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_AUDIT_LIST => {
+                let params = parse_params::<fluxdown_protocol::PluginAuditListParams>(params)?;
+                let (rows, next_before_id) = self
+                    .plugin_manager()?
+                    .audit_list(
+                        params.identity.as_deref(),
+                        params.before_id,
+                        params.limit.unwrap_or(200),
+                    )
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                to_value(fluxdown_protocol::PluginAuditListDto {
+                    entries: rows
+                        .into_iter()
+                        .map(|row| fluxdown_protocol::PluginAuditEntryDto {
+                            id: row.id,
+                            at_ms: row.at_ms,
+                            identity: row.plugin_id,
+                            origin: row.origin,
+                            action: row.action,
+                            target: row.target,
+                            outcome: row.outcome,
+                            detail: row.detail,
+                        })
+                        .collect(),
+                    next_before_id,
+                })
+            }
+            #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_AUDIT_CLEAR => {
+                let params = parse_params::<fluxdown_protocol::PluginAuditClearParams>(params)?;
+                self.plugin_manager()?
+                    .audit_clear(params.identity.as_deref())
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                Ok(json!({ "ok": true }))
+            }
+            #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_AUDIT_RECORD => {
+                let params = parse_params::<fluxdown_protocol::PluginAuditRecordParams>(params)?;
+                let entries = params
+                    .entries
+                    .into_iter()
+                    .map(
+                        |entry| fluxdown_engine::plugin::manager::DesktopAuditEntry {
+                            identity: entry.identity,
+                            action: entry.action,
+                            target: entry.target,
+                            outcome: entry.outcome,
+                            detail: entry.detail,
+                        },
+                    )
+                    .collect();
+                self.plugin_manager()?
+                    .audit_record(entries)
+                    .await
+                    .map_err(|error| invalid_argument("entries", &error.to_string()))?;
                 Ok(json!({ "ok": true }))
             }
             #[cfg(feature = "plugins")]
@@ -843,6 +969,21 @@ impl DaemonService {
                     .fetch_index()
                     .await
                     .map_err(|error| market_error(&error))?;
+                // 被标记 vulnerable / malicious 的版本：已装的同版本插件强制禁用。
+                let revoked: std::collections::HashSet<(String, String)> = index
+                    .entries
+                    .iter()
+                    .filter(|entry| matches!(entry.yanked.as_str(), "vulnerable" | "malicious"))
+                    .map(|entry| (entry.plugin_id.clone(), entry.version.clone()))
+                    .collect();
+                let changed = self
+                    .plugin_manager()?
+                    .apply_market_revocations(&revoked)
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                if changed {
+                    self.publish_plugins().await?;
+                }
                 to_value(
                     index
                         .entries
@@ -882,8 +1023,60 @@ impl DaemonService {
                 })
                 .await
             }
+            #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_SITE_DEFAULTS => {
+                let defaults = self
+                    .plugin_manager()?
+                    .site_defaults()
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                to_value(
+                    defaults
+                        .into_iter()
+                        .map(|entry| fluxdown_protocol::PluginSiteDefaultDto {
+                            site: entry.site,
+                            identity: entry.identity,
+                            candidates: entry.candidates,
+                            automatic: entry.automatic,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_SET_SITE_DEFAULT => {
+                let params = parse_params::<fluxdown_protocol::PluginSetSiteDefaultParams>(params)?;
+                self.plugin_manager()?
+                    .set_site_default(&params.site, params.identity.as_deref())
+                    .await
+                    .map_err(|error| match error {
+                        fluxdown_engine::plugin::PluginError::InvalidSetting { key, message } => {
+                            invalid_argument(&key, &message)
+                        }
+                        other => internal_error(format!("{other:#}")),
+                    })?;
+                Ok(json!({ "ok": true }))
+            }
+            #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_VIEW_OPEN
+            | method::DAEMON_PLUGIN_VIEW_EVENT
+            | method::DAEMON_PLUGIN_VIEW_CLOSE
+            | method::DAEMON_PLUGIN_VIEW_SNAPSHOT
+            | method::DAEMON_PLUGIN_VIEW_KEEPALIVE
+            | method::DAEMON_PLUGIN_COMMAND
+            | method::DAEMON_PLUGIN_INVOKE => self.plugin_host_call(method_name, params).await,
+            #[cfg(not(feature = "plugins"))]
+            method::DAEMON_PLUGIN_VIEW_OPEN
+            | method::DAEMON_PLUGIN_VIEW_EVENT
+            | method::DAEMON_PLUGIN_VIEW_CLOSE
+            | method::DAEMON_PLUGIN_VIEW_SNAPSHOT
+            | method::DAEMON_PLUGIN_VIEW_KEEPALIVE
+            | method::DAEMON_PLUGIN_COMMAND
+            | method::DAEMON_PLUGIN_INVOKE => {
+                Err(unsupported_error("daemon was built without plugin support"))
+            }
             #[cfg(not(feature = "plugins"))]
             method::DAEMON_PLUGIN_LIST
+            | method::DAEMON_PLUGIN_SNIFF_RULES
             | method::DAEMON_PLUGIN_SET_ENABLED
             | method::DAEMON_PLUGIN_UPDATE_SETTINGS
             | method::DAEMON_PLUGIN_INSTALL
@@ -892,7 +1085,13 @@ impl DaemonService {
             | method::DAEMON_PLUGIN_UNINSTALL
             | method::DAEMON_PLUGIN_MARKET_LIST
             | method::DAEMON_PLUGIN_MARKET_INSTALL
-            | method::DAEMON_PLUGIN_IGNORE_RETRY => {
+            | method::DAEMON_PLUGIN_IGNORE_RETRY
+            | method::DAEMON_PLUGIN_SITE_DEFAULTS
+            | method::DAEMON_PLUGIN_SET_SITE_DEFAULT
+            | method::DAEMON_PLUGIN_CONSENT
+            | method::DAEMON_PLUGIN_AUDIT_LIST
+            | method::DAEMON_PLUGIN_AUDIT_CLEAR
+            | method::DAEMON_PLUGIN_AUDIT_RECORD => {
                 Err(unsupported_error("daemon was built without plugin support"))
             }
             #[cfg(feature = "components")]
@@ -1011,6 +1210,18 @@ impl DaemonService {
                     values: params.values,
                 })
                 .await
+            }
+            method::DAEMON_EGRESS_PLAN => {
+                let params = parse_params::<fluxdown_protocol::EgressPlanParams>(params)?;
+                if params.url.trim().is_empty() {
+                    return Err(invalid_argument("url", "url is required"));
+                }
+                let plan = self
+                    .egress
+                    .plan(&params.url, params.verified_payload)
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                to_value(fluxdown_engine_protocol::egress_plan_to_dto(plan))
             }
             method::DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH => {
                 match self
@@ -1486,27 +1697,15 @@ impl DaemonService {
         &self,
         component: fluxdown_protocol::ComponentKind,
     ) -> Result<fluxdown_protocol::ComponentVersions, RpcErrorObject> {
-        let config = self
-            .db
-            .get_all_config()
-            .await
-            .map_err(|error| internal_error(format!("{error:#}")))?;
-        let proxy = fluxdown_engine::proxy_config::ProxyConfig::from_config_map(&config);
-        let user_agent = config
-            .get("global_user_agent")
-            .map(String::as_str)
-            .unwrap_or_default();
-        let client = fluxdown_engine::downloader::build_client(&proxy, user_agent)
-            .map_err(|error| internal_error(format!("{error:#}")))?;
         match component {
             fluxdown_protocol::ComponentKind::Ffmpeg => {
-                fluxdown_engine::components::list_versions(&self.db, &client)
+                fluxdown_engine::components::list_versions(&self.db, &self.egress)
                     .await
                     .map(fluxdown_engine_protocol::ffmpeg_versions_to_dto)
                     .map_err(|error| internal_error(error.to_string()))
             }
             fluxdown_protocol::ComponentKind::Ytdlp => {
-                fluxdown_engine::components::list_ytdlp_versions(&self.db, &client)
+                fluxdown_engine::components::list_ytdlp_versions(&self.db, &self.egress)
                     .await
                     .map(fluxdown_engine_protocol::ytdlp_versions_to_dto)
                     .map_err(|error| internal_error(error.to_string()))
@@ -1524,18 +1723,6 @@ impl DaemonService {
             return Err(conflict_error("component install already in progress"));
         }
         let _guard = ComponentInstallGuard(flag);
-        let config = self
-            .db
-            .get_all_config()
-            .await
-            .map_err(|error| internal_error(format!("{error:#}")))?;
-        let proxy = fluxdown_engine::proxy_config::ProxyConfig::from_config_map(&config);
-        let user_agent = config
-            .get("global_user_agent")
-            .map(String::as_str)
-            .unwrap_or_default();
-        let client = fluxdown_engine::downloader::build_client(&proxy, user_agent)
-            .map_err(|error| internal_error(format!("{error:#}")))?;
         let component_name = component_name(component);
         let progress_events = self.events.clone();
         let progress = move |downloaded: u64, total: u64| {
@@ -1552,7 +1739,7 @@ impl DaemonService {
                 fluxdown_engine::components::install_ffmpeg(
                     &self.db,
                     &self.data_dir,
-                    &client,
+                    &self.egress,
                     version.as_deref(),
                     &progress,
                 )
@@ -1562,7 +1749,7 @@ impl DaemonService {
             fluxdown_protocol::ComponentKind::Ytdlp => fluxdown_engine::components::install_ytdlp(
                 &self.db,
                 &self.data_dir,
-                &client,
+                &self.egress,
                 version.as_deref(),
                 &progress,
             )
@@ -2043,6 +2230,10 @@ fn actor_error(error: ActorCallError) -> RpcErrorObject {
             )
         }
         ActorCallError::Operation(ActorError::NotFound) => not_found(),
+        ActorCallError::Operation(ActorError::Conflict(message)) => RpcErrorObject::application(
+            message,
+            RpcErrorData::new(ApplicationErrorCode::Conflict, false),
+        ),
     }
 }
 
@@ -2193,6 +2384,12 @@ fn unsupported_error(message: &str) -> RpcErrorObject {
         RpcErrorData::new(ApplicationErrorCode::Unsupported, false),
     )
 }
+
+/// 常驻插件宿主的 RPC 处理（视图会话 / 命令 / invoke）。以子模块形式放置，以便直接复用
+/// 本文件的私有辅助函数；本文件的 `call_inner` 只负责分发。
+#[cfg(feature = "plugins")]
+#[path = "plugin_host_rpc.rs"]
+mod plugin_host_rpc;
 
 #[cfg(test)]
 mod tests {
@@ -2447,5 +2644,390 @@ mod tests {
         method_name == fluxdown_protocol::method::DAEMON_GROUP_RESOLVE_PREVIEW
             || method_name.starts_with("daemon.plugin.")
             || method_name.starts_with("daemon.component.")
+    }
+}
+
+#[cfg(all(test, feature = "plugins"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod plugin_consent_audit_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use fluxdown_engine::events::{EngineEvent, EventSink};
+    use fluxdown_engine::plugin::PluginManager;
+    use fluxdown_engine::plugin::quickjs::QuickJsScriptRuntime;
+    use fluxdown_engine::plugin::runtime::{
+        BridgeHttpRequest, BridgeHttpResponse, PluginBridge, PluginError, PluginLogLevel,
+    };
+    use fluxdown_protocol::ApplicationErrorCode;
+    use serde_json::{Value, json};
+
+    use super::DaemonService;
+
+    const ID: &str = "acme@demo";
+
+    struct NullBridge;
+
+    #[async_trait::async_trait]
+    impl PluginBridge for NullBridge {
+        async fn http_request(
+            &self,
+            _plugin_id: &str,
+            _req: BridgeHttpRequest,
+        ) -> Result<BridgeHttpResponse, PluginError> {
+            Err(PluginError::Runtime("no network in test".to_owned()))
+        }
+        async fn storage_get(&self, _plugin_id: &str, _key: &str) -> Option<String> {
+            None
+        }
+        async fn storage_set(
+            &self,
+            _plugin_id: &str,
+            _key: &str,
+            _value: String,
+        ) -> Result<(), PluginError> {
+            Ok(())
+        }
+        fn log(&self, _plugin_id: &str, _level: PluginLogLevel, _message: &str) {}
+        fn request_retry(&self, _plugin_id: &str, _task_id: &str, _delay_ms: u64) {}
+    }
+
+    struct NullSink;
+
+    impl EventSink for NullSink {
+        fn emit(&self, _event: EngineEvent) {}
+    }
+
+    struct Fixture {
+        service: DaemonService,
+        db: fluxdown_engine::db::Db,
+        manager: Arc<PluginManager>,
+        root: PathBuf,
+        base: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.base) {
+                eprintln!("plugin test dir removal failed: {error}");
+            }
+        }
+    }
+
+    fn write_plugin(dir: &Path, permissions: &[&str]) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            json!({
+                "identity": ID, "name": "Demo", "version": "1.0.0",
+                "permissions": permissions,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    async fn fixture() -> Fixture {
+        let base =
+            std::env::temp_dir().join(format!("fluxdown-plugin-svc-{}", uuid::Uuid::new_v4()));
+        let root = base.join("plugins");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = fluxdown_engine::db::Db::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let manager = Arc::new(PluginManager::new(
+            Arc::new(QuickJsScriptRuntime::new(1).unwrap()),
+            Arc::new(NullBridge),
+            db.clone(),
+            root.clone(),
+            "1.0.0".to_owned(),
+            Arc::new(NullSink),
+        ));
+        let events = crate::event_hub::DaemonEventHub::new(Default::default(), 32);
+        let selections = crate::selection::DaemonSelection::new(events.clone());
+        let blobs = Arc::new(
+            crate::blob_store::BlobStore::open(base.join("blobs"))
+                .await
+                .unwrap(),
+        );
+        let service = DaemonService::new(
+            crate::service_hello("plugin-test", Vec::new()),
+            events,
+            selections,
+            blobs,
+            crate::actor::DaemonActorHandle::disconnected(),
+            db.clone(),
+            base.clone(),
+            Some(manager.clone()),
+        );
+        Fixture {
+            service,
+            db,
+            manager,
+            root,
+            base,
+        }
+    }
+
+    async fn call(
+        f: &Fixture,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, fluxdown_protocol::RpcErrorObject> {
+        f.service
+            .call_inner("plugin-test", true, method, Some(params))
+            .await
+    }
+
+    async fn plugin(f: &Fixture) -> Value {
+        let list = call(f, "daemon.plugin.list", json!({})).await.unwrap();
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["identity"] == ID)
+            .cloned()
+            .expect("plugin listed")
+    }
+
+    async fn audit_actions(f: &Fixture) -> Vec<String> {
+        let out = call(f, "daemon.plugin.audit.list", json!({}))
+            .await
+            .unwrap();
+        out["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["action"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_consent_gates_enable_and_requires_exact_set() {
+        let f = fixture().await;
+        // 首次加载写入迁移标记；此后安装的插件不再自动获得授权。
+        f.manager.load_all().await;
+        let src = f.base.join("src");
+        write_plugin(&src, &["tasks"]);
+        call(&f, "daemon.plugin.installDev", json!({ "dirPath": src }))
+            .await
+            .unwrap();
+
+        let p = plugin(&f).await;
+        assert_eq!(p["consentPending"], json!(["tasks"]));
+        assert_eq!(p["disabledReason"], "ConsentRequired");
+        assert_eq!(p["enabled"], false);
+
+        let err = call(
+            &f,
+            "daemon.plugin.setEnabled",
+            json!({ "identity": ID, "enabled": true }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.data.as_ref().unwrap().code,
+            ApplicationErrorCode::InvalidArgument
+        );
+        assert!(err.message.contains("consent required"), "{}", err.message);
+
+        let err = call(
+            &f,
+            "daemon.plugin.consent",
+            json!({ "identity": ID, "permissions": ["ytdlp"], "networkHosts": [] }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.data.as_ref().unwrap().code,
+            ApplicationErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            err.data.as_ref().unwrap().field.as_deref(),
+            Some("permissions")
+        );
+        assert!(
+            err.message
+                .contains("consent does not match requested capabilities")
+        );
+        assert_eq!(plugin(&f).await["disabledReason"], "ConsentRequired");
+
+        call(
+            &f,
+            "daemon.plugin.consent",
+            json!({ "identity": ID, "permissions": ["tasks"], "networkHosts": [] }),
+        )
+        .await
+        .unwrap();
+        let p = plugin(&f).await;
+        assert_eq!(p["consentPending"], json!([]));
+        assert_eq!(p["enabled"], true);
+        assert_eq!(p["disabledReason"], "None");
+
+        let raw =
+            f.db.get_config(&format!("plugin.{ID}.consent"))
+                .await
+                .unwrap()
+                .expect("consent persisted");
+        let record: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(record["source"], "user");
+        assert_eq!(record["permissions"], json!(["tasks"]));
+
+        // list 为 id 降序：最新的 consent.granted 在前，install 在后。
+        let actions = audit_actions(&f).await;
+        let granted = actions.iter().position(|a| a == "consent.granted").unwrap();
+        let installed = actions.iter().position(|a| a == "install").unwrap();
+        assert!(granted < installed, "{actions:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_consent_migration_grants_preinstalled_plugins_once() {
+        let f = fixture().await;
+        write_plugin(&f.root.join(ID), &["tasks", "ytdlp"]);
+        f.manager.load_all().await;
+
+        let p = plugin(&f).await;
+        assert_eq!(p["consentPending"], json!([]));
+        assert_eq!(p["enabled"], true);
+        let raw =
+            f.db.get_config(&format!("plugin.{ID}.consent"))
+                .await
+                .unwrap()
+                .expect("migrated consent");
+        let record: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(record["source"], "migration");
+        assert_eq!(record["permissions"], json!(["tasks", "ytdlp"]));
+        assert!(
+            audit_actions(&f)
+                .await
+                .contains(&"consent.migrated".to_owned())
+        );
+
+        // 迁移只发生一次：之后新增的插件不会被自动授权。
+        let other = f.root.join("other@demo");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            other.join("manifest.json"),
+            json!({"identity":"other@demo","name":"O","version":"1.0.0","permissions":["tasks"]})
+                .to_string(),
+        )
+        .unwrap();
+        f.manager.load_all().await;
+        let list = call(&f, "daemon.plugin.list", json!({})).await.unwrap();
+        let other = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["identity"] == "other@demo")
+            .unwrap();
+        assert_eq!(other["consentPending"], json!(["tasks"]));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_audit_record_validates_and_clear_logs_itself() {
+        let f = fixture().await;
+        write_plugin(&f.root.join(ID), &[]);
+        f.manager.load_all().await;
+
+        for entries in [
+            json!([{"identity": ID, "action": "fetch", "target": "", "outcome": "ok", "detail": ""}]),
+            json!([{"identity": "ghost@x", "action": "desktop.load", "target": "", "outcome": "ok", "detail": ""}]),
+            json!([{"identity": ID, "action": "desktop.load", "target": "", "outcome": "weird", "detail": ""}]),
+        ] {
+            let err = call(
+                &f,
+                "daemon.plugin.audit.record",
+                json!({ "entries": entries }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.data.as_ref().unwrap().code,
+                ApplicationErrorCode::InvalidArgument
+            );
+        }
+        let too_many: Vec<Value> = (0..101)
+            .map(|_| json!({"identity": ID, "action": "desktop.call", "target": "", "outcome": "ok", "detail": ""}))
+            .collect();
+        assert!(
+            call(
+                &f,
+                "daemon.plugin.audit.record",
+                json!({ "entries": too_many })
+            )
+            .await
+            .is_err()
+        );
+
+        call(
+            &f,
+            "daemon.plugin.audit.record",
+            json!({"entries": [{"identity": ID, "action": "desktop.load", "target": "ui/a.js", "outcome": "ok", "detail": "fs:all"}]}),
+        )
+        .await
+        .unwrap();
+        let out = call(&f, "daemon.plugin.audit.list", json!({ "identity": ID }))
+            .await
+            .unwrap();
+        let entry = &out["entries"][0];
+        assert_eq!(entry["origin"], "desktop");
+        assert_eq!(entry["action"], "desktop.load");
+        assert_eq!(entry["target"], "ui/a.js");
+        assert!(out.get("nextBeforeId").is_none());
+
+        call(&f, "daemon.plugin.audit.clear", json!({ "identity": ID }))
+            .await
+            .unwrap();
+        let out = call(&f, "daemon.plugin.audit.list", json!({ "identity": ID }))
+            .await
+            .unwrap();
+        let actions: Vec<_> = out["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["action"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, ["audit.clear"]);
+
+        call(&f, "daemon.plugin.audit.clear", json!({}))
+            .await
+            .unwrap();
+        let out = call(&f, "daemon.plugin.audit.list", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(out["entries"][0]["identity"], "*");
+        assert_eq!(out["entries"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_audit_list_pages_with_before_id() {
+        let f = fixture().await;
+        write_plugin(&f.root.join(ID), &[]);
+        f.manager.load_all().await;
+        let entries: Vec<Value> = (0..5)
+            .map(|i| json!({"identity": ID, "action": "desktop.call", "target": format!("m{i}"), "outcome": "ok", "detail": ""}))
+            .collect();
+        call(
+            &f,
+            "daemon.plugin.audit.record",
+            json!({ "entries": entries }),
+        )
+        .await
+        .unwrap();
+
+        let first = call(&f, "daemon.plugin.audit.list", json!({ "limit": 2 }))
+            .await
+            .unwrap();
+        assert_eq!(first["entries"].as_array().unwrap().len(), 2);
+        let cursor = first["nextBeforeId"].as_i64().expect("more pages");
+        let second = call(
+            &f,
+            "daemon.plugin.audit.list",
+            json!({ "limit": 10, "beforeId": cursor }),
+        )
+        .await
+        .unwrap();
+        // 5 条上报 + 1 条迁移记录，首页取走 2 条。
+        assert_eq!(second["entries"].as_array().unwrap().len(), 4);
+        assert!(second.get("nextBeforeId").is_none());
     }
 }

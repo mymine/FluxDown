@@ -30,6 +30,8 @@ actions!(
         ChangeSelectedUrl,
         /// 修改选中任务的线程数（右键「修改线程数」）。
         ChangeSelectedSegments,
+        /// 校验选中的已完成 BT 任务（右键「完整性校验」）。
+        VerifySelected,
         RedownloadSelected,
         ToggleBoostSelected,
         FocusSearch,

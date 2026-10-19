@@ -2,10 +2,7 @@
  * 插件市场数据契约(对应 zerx-lab/fluxdown-plugin-index 的 index.json)与纯函数。
  * 索引经同源代理 `/api/plugins/*` 拉取(服务端中转 raw.githubusercontent.com,大陆可达 + CDN 缓存)。
  */
-
-export const PLUGIN_INDEX_REPO = "zerx-lab/fluxdown-plugin-index";
-export const PLUGIN_REPO_URL = `https://github.com/${PLUGIN_INDEX_REPO}`;
-export const PLUGIN_PUBLISH_GUIDE_URL = `${PLUGIN_REPO_URL}#publishing-a-plugin`;
+import { PLUGIN_INDEX_REPO, githubUrl } from "@/lib/ecosystem";
 
 /** 索引条目:每插件每版本一条(append-only 分片 flatten 而来)。 */
 export interface MarketEntry {
@@ -43,7 +40,7 @@ export type YankState = "deprecated" | "vulnerable" | "malicious";
 
 /** 每插件的提交历史深链——逐版本变更可独立追踪。 */
 export function commitsUrl(pluginId: string): string {
-  return `${PLUGIN_REPO_URL}/commits/main/plugins/${encodeURIComponent(pluginId)}`;
+  return `${githubUrl(PLUGIN_INDEX_REPO)}/commits/main/plugins/${encodeURIComponent(pluginId)}`;
 }
 
 /** 优先取 jsDelivr 镜像(大陆可达 + CDN),回退首个镜像。 */

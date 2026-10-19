@@ -115,6 +115,22 @@ pub trait HostSelection: Send + Sync {
     ) -> SelectionOutcome<FileExistsChoice> {
         SelectionOutcome::NoSelectorConfigured(FileExistsChoice::Rename)
     }
+
+    /// 发起多插件冲突选择等待（多个已启用插件的 resolver 同时匹配任务链接，且该站点
+    /// 没有可用的默认插件）。`timeout` 到期返回
+    /// `TimedOutDefaulted(PluginChoice::Use { default_identity, remember: false })`。
+    /// 默认实现不等待，直接按 `request.default_identity` 返回 `NoSelectorConfigured`。
+    async fn select_resolver_plugin(
+        &self,
+        _task_id: &str,
+        request: &PluginChoiceRequest,
+        _timeout: Duration,
+    ) -> SelectionOutcome<PluginChoice> {
+        SelectionOutcome::NoSelectorConfigured(PluginChoice::Use {
+            identity: request.default_identity.clone(),
+            remember: false,
+        })
+    }
 }
 
 /// 「文件已存在」询问的答复。
@@ -147,4 +163,35 @@ pub struct FileConflict {
     pub rename_preview: String,
     /// 该协议是否允许「跳过」（与全局 skip 支持范围一致：HTTP/FTP）。
     pub allow_skip: bool,
+}
+
+/// 多插件选择的候选插件（来自 manifest）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginCandidate {
+    pub identity: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+}
+
+/// 多插件选择请求的上下文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginChoiceRequest {
+    /// 站点键（主机名，小写、去掉 `www.`），也是记住选择时的键。
+    pub site: String,
+    /// 任务原始链接（只用于展示）。
+    pub url: String,
+    /// 候选插件（identity 升序，至少两项）。
+    pub candidates: Vec<PluginCandidate>,
+    /// 超时 / 无界面时采用的插件。
+    pub default_identity: String,
+}
+
+/// 多插件选择的答复。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginChoice {
+    /// 本次使用 `identity`；`remember` = 记为该站点的默认插件。
+    Use { identity: String, remember: bool },
+    /// 用户关闭选择框：任务取消，下次启动时重新询问。
+    Cancel,
 }

@@ -233,6 +233,15 @@ pub struct VariantOptionDto {
     pub total_bytes: i64,
 }
 
+/// 多插件选择的候选插件（`PluginCandidateDto`）。
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct PluginCandidateDto {
+    pub identity: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+}
+
 /// `FileExistsAction`。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum FileExistsActionDto {
@@ -283,6 +292,12 @@ pub enum SelectionKindDto {
         rename_preview: String,
         actions: Vec<FileExistsActionDto>,
     },
+    /// 多个插件都能处理该链接，由用户选择本次使用的插件（可记为站点默认）。
+    Plugin {
+        site: String,
+        url: String,
+        candidates: Vec<PluginCandidateDto>,
+    },
 }
 
 /// `SelectionOutcome`。
@@ -292,6 +307,7 @@ pub enum SelectionOutcomeDto {
     Bt { indices: Vec<i32> },
     Variant { index: i32 },
     FileExists { action: FileExistsActionDto },
+    Plugin { identity: String, remember: bool },
     Cancelled,
 }
 
@@ -350,6 +366,23 @@ impl From<&proto::SelectionKind> for SelectionKindDto {
                 rename_preview: rename_preview.clone(),
                 actions: actions.iter().copied().map(Into::into).collect(),
             },
+            proto::SelectionKind::Plugin {
+                site,
+                url,
+                candidates,
+            } => Self::Plugin {
+                site: site.clone(),
+                url: url.clone(),
+                candidates: candidates
+                    .iter()
+                    .map(|candidate| PluginCandidateDto {
+                        identity: candidate.identity.clone(),
+                        name: candidate.name.clone(),
+                        version: candidate.version.clone(),
+                        description: candidate.description.clone(),
+                    })
+                    .collect(),
+            },
         }
     }
 }
@@ -365,6 +398,10 @@ impl From<&proto::SelectionOutcome> for SelectionOutcomeDto {
             proto::SelectionOutcome::FileExists { action } => Self::FileExists {
                 action: (*action).into(),
             },
+            proto::SelectionOutcome::Plugin { identity, remember } => Self::Plugin {
+                identity: identity.clone(),
+                remember: *remember,
+            },
             proto::SelectionOutcome::Cancelled => Self::Cancelled,
         }
     }
@@ -379,6 +416,9 @@ impl From<SelectionOutcomeDto> for proto::SelectionOutcome {
             SelectionOutcomeDto::FileExists { action } => Self::FileExists {
                 action: action.into(),
             },
+            SelectionOutcomeDto::Plugin { identity, remember } => {
+                Self::Plugin { identity, remember }
+            }
             SelectionOutcomeDto::Cancelled => Self::Cancelled,
         }
     }
@@ -509,6 +549,18 @@ pub struct LinkDeviceDto {
     pub default_save_dir: Option<String>,
     /// 见 [`path_style_wire`]。
     pub path_style: Option<String>,
+    /// 本机备注名（`agent.link.rename`）；`name` 已是生效名。
+    pub custom_name: Option<String>,
+    /// 对端自报的客户端版本。
+    pub app_version: Option<String>,
+    /// 对端自报的云设备 id：本机云名册里存在同 id 时合并为同一台设备展示。
+    pub cloud_device_id: Option<String>,
+    /// 对端已解除与本机的配对：不可下发，只能删除或重新配对。
+    pub revoked: bool,
+    /// 配对时间（Unix 秒）。
+    pub paired_at: i64,
+    /// 最近一次确认在线的时间（Unix 秒，0 = 未知）。
+    pub last_seen_at: i64,
 }
 
 impl From<&proto::LinkDeviceInfo> for LinkDeviceDto {
@@ -520,6 +572,12 @@ impl From<&proto::LinkDeviceInfo> for LinkDeviceDto {
             online: device.online,
             default_save_dir: device.default_save_dir.clone(),
             path_style: path_style_wire(device.path_style),
+            custom_name: device.custom_name.clone(),
+            app_version: device.app_version.clone(),
+            cloud_device_id: device.cloud_device_id.clone(),
+            revoked: device.revoked,
+            paired_at: device.paired_at,
+            last_seen_at: device.last_seen_at,
         }
     }
 }

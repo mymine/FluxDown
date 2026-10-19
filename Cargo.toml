@@ -11,14 +11,17 @@ members = ["native/*", "crates/*", "scripts/desktop-dev"]
 edition = "2024"
 
 [workspace.dependencies]
-# GPUI 走 gpui-kit 发布时精确锁定的 `gpui-pre` 快照；升级 gpui-kit 时必须同步到它
-# `Cargo.toml` 里的同一 `=` 版本，否则 gpui-component 可能与 GPUI API 不匹配。
-# 实际实现由下方 `[patch.crates-io]` 换成 gpui-fast（同名同版本的兼容壳）。
-gpui = { package = "gpui-pre", version = "=0.3.8" }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+# GPUI 走 gpui-kit main（钉 commit，见下方 `[patch.crates-io]`）所锁定的 `gpui-pre` 快照；
+# 升级 gpui-kit 时必须同步到它 `Cargo.toml` 里的同一 `=` 版本，否则 gpui-component 可能与
+# GPUI API 不匹配。实际实现由下方 `[patch.crates-io]` 换成 gpui-fast（同名同版本的兼容壳）。
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui-base = "0.7.1"
 gpui-component = "0.7.1"
 gpui-component-assets = { package = "gpui-kit-assets", version = "0.7.1" }
+# GPUI Shell（gpui-kit 的 JS 插件 UI 运行时，未发布到 crates.io）：与上面的 gpui-kit 组件同一
+# commit。关 `webview`（会引入 wry 与 gpui-fast 直连），保留 `quickjs` 引擎与 `components` 组件目录。
+gpui-shell = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563", default-features = false, features = ["quickjs", "components"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0"
@@ -52,15 +55,32 @@ librqbit-dualstack-sockets = { path = "third_party/librqbit-dualstack-sockets" }
 # 必须等 gpui-fast 的 compat 跟到同一快照版本，否则补丁不生效（cargo 警告 patch 未使用）。
 # 渲染读取的状态须在 entity / global / ListState / ScrollHandle 内，改了要 notify 读者；
 # 排查界面陈旧时用 `GPUI_VIEW_RETENTION=0`（关复用）/ `GPUI_SCROLL_LAYERS=0`（关滚动图层）对照。
-gpui-pre = { git = "https://github.com/longbridge/gpui-fast", rev = "8e1e1987fdb512bb8b0ab27261906a598aff2ab8" }
-gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast", rev = "8e1e1987fdb512bb8b0ab27261906a598aff2ab8" }
-gpui-pre-macros = { git = "https://github.com/longbridge/gpui-fast", rev = "8e1e1987fdb512bb8b0ab27261906a598aff2ab8" }
-gpui-pre-sum-tree = { git = "https://github.com/longbridge/gpui-fast", rev = "8e1e1987fdb512bb8b0ab27261906a598aff2ab8" }
+gpui-pre = { git = "https://github.com/longbridge/gpui-fast", rev = "fa133a1dd970532dce4ffaee8577438971e5dec9" }
+gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast", rev = "fa133a1dd970532dce4ffaee8577438971e5dec9" }
+gpui-pre-macros = { git = "https://github.com/longbridge/gpui-fast", rev = "fa133a1dd970532dce4ffaee8577438971e5dec9" }
+gpui-pre-sum-tree = { git = "https://github.com/longbridge/gpui-fast", rev = "fa133a1dd970532dce4ffaee8577438971e5dec9" }
+# gpui-kit 组件统一走 main 钉 commit（gpui-shell 只存在于 git，且其 `components` 组件目录
+# 必须与 FluxDown 使用的 gpui-component 是同一份类型），四个包必须同 rev。
+gpui-base = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563" }
+gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563" }
+gpui-component-macros = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563" }
+gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563" }
+# gpui-shell 的 LLRT 标准库按 crates.io 名 `rquickjs` 依赖绑定；gpui-kit 用同仓的兼容外壳把它
+# 指到 Longbridge `quickjs-jit` 分叉，使 shell 与 LLRT 共享同一 VM 类型。patch 对整个工作区生效，
+# 所以 engine 插件运行时（`rquickjs` full-async + parallel）也随之换成同一分叉。
+rquickjs = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563" }
 
 [profile.dev]
 codegen-units = 16
 debug = "limited"
 split-debuginfo = "unpacked"
+
+# 第三方依赖在 dev 下用 O1（workspace 成员保持 O0 便于调试）：O0 时 fluxdown-desktop 的
+# `__eh_frame` 约 21.7MB，超过 macOS ld compact unwind 能编码的 16MB 偏移上限，每次链接都报
+# `__eh_frame section too large`；O1 后约 11.4MB，`__text` 也从 94MB 降到 59MB。
+# 更具体的 `[profile.dev.package.<name>]`（如下方 librqbit）优先于 "*"。
+[profile.dev.package."*"]
+opt-level = 1
 
 # BT 数据面（逐字节 RC4、逐消息解析、MSE DH 大数运算）在 opt-level 0 下慢一个数量级：
 # 本地 loopback 实测 dev 基线 36.5 CPU·s/GB、吞吐封顶 165 MB/s；仅下面 5 个 crate

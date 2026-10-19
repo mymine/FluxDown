@@ -81,12 +81,13 @@ internal fun UpdateSection(ctx: SettingsCtx, openPicker: (PickerSpec) -> Unit) {
     val meteredMessage = str(R.string.mobileUpdateMeteredMessage, "size" to sizeText)
     val downloadLabel = str(R.string.downloadUpdate, "size" to sizeText)
     val cancelLabel = str(R.string.cancel)
-    // 更新说明按系统语言取区块（同 GPUI 关于页：跟随系统语言，不跟随手动界面语言）。
+    // 更新说明按界面语言取区块（同 GPUI 关于页；Android 没有应用内语言开关，界面语言即当前配置的
+    // locale：系统语言或系统设置里的应用语言），并去掉正文开头与「v版本 · 发布日期」标题重复的版本标题。
     val locale = LocalConfiguration.current.locales[0].toLanguageTag()
     var notesOverflow by remember(status.notes, locale) { mutableStateOf(false) }
     val notes = remember(status.notes, notesExpanded, locale) {
         status.notes.take(if (notesExpanded) NOTES_EXPANDED_MAX else 1)
-            .map { it.copy(body = UpdateView.localizedReleaseBody(it.body, locale)) }
+            .map { it.copy(body = UpdateView.stripVersionHeading(UpdateView.localizedReleaseBody(it.body, locale), it.version)) }
     }
 
     GlassSection(title = str(R.string.softwareUpdate)) {
@@ -163,7 +164,11 @@ internal fun UpdateSection(ctx: SettingsCtx, openPicker: (PickerSpec) -> Unit) {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     FluxText(str(R.string.mobileUpdateNotesTitle), style = t.sm, color = c.inkMuted)
                     for (note in notes) {
-                        FluxText("v${note.version}", style = t.mono, color = c.ink)
+                        FluxText(
+                            listOfNotNull("v${note.version}", UpdateView.releaseDate(note.publishedAt)).joinToString(" · "),
+                            style = t.mono,
+                            color = c.ink,
+                        )
                         if (note.body.isNotBlank()) {
                             FluxMarkdown(
                                 markdown = note.body.trim(),

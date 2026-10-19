@@ -2,7 +2,7 @@
 title: 参与文档贡献
 description: 如何改进这份文档。
 section: contributing
-order: 1
+order: 5
 sourceHash: "a38a85515fc6"
 ---
 

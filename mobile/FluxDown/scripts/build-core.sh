@@ -4,11 +4,15 @@
 #   FluxKit/Sources/FluxRustBindings/fluxdown_mobile.swift      UniFFI 生成的 Swift 绑定（独立模块，只被 FluxBridge 内部导入）
 # 两者都是构建产物（已 gitignore），改了 native/ 下任何 Rust 源码后重跑本脚本，再回 Xcode 构建。
 #
-# 用法：mobile/FluxDown/scripts/build-core.sh [--release] [--cloud-url URL] [--run]
+# 用法：mobile/FluxDown/scripts/build-core.sh [--release] [--flavor store|full] [--cloud-url URL] [--run]
 #   --release        发布 / 性能测试用；默认 debug（编译快，引擎 BT 数据面 crate 仍按 profile.dev.package 开 O3）。
+#   --flavor         full（默认，侧载 / 开发）= 引擎含 BitTorrent 与 eD2K；store（App Store / TestFlight）= iOS 目标追加
+#                    --no-default-features，编译期剔除 P2P（fluxdown_mobile 的 `p2p` feature，默认开启）。
+#                    Swift 绑定始终由宿主机默认 features 生成（UniFFI 导出面两种 flavor 一致）。
+#                    产物旁写 FluxKit/Artifacts/flavor 标记；store 的 App 另需 xcodebuild 传 FLUX_FLAVOR_CONDITIONS=（置空）。
 #   --cloud-url URL  FluxCloud 地址，编译期写入核心（等价于导出 FLUXCLOUD_BASE_URL；参数优先）。
 #                    都未提供时核心回退到 http://127.0.0.1:8720（本机 FluxCloud 开发服务），脚本会提示。
-#   --run            核心构建完后顺带构建 App，安装并重启到已启动的模拟器（无需再回 Xcode 点运行）。
+#   --run            核心构建完后顺带构建 App，安装并重启到已启动的模拟器（无需再回 Xcode 点运行）；flavor 与 App 一致。
 # 可选 FLUXDOWN_APP_VERSION：编译期产品版本（协议握手 / 云端 / UA）；testflight.sh 按 --version 注入，未设置回落 crate 版本。
 # 前置：rustup target add aarch64-apple-ios aarch64-apple-ios-sim；Xcode 命令行工具。
 set -euo pipefail
@@ -16,20 +20,32 @@ set -euo pipefail
 PROFILE_FLAG=""
 PROFILE_DIR="debug"
 RUN_APP=0
+FLAVOR="full"
 while [ $# -gt 0 ]; do
   case "$1" in
     --release) PROFILE_FLAG="--release"; PROFILE_DIR="release" ;;
     --run) RUN_APP=1 ;;
+    --flavor)
+      [ $# -ge 2 ] || { echo "--flavor needs a value (store|full)" >&2; exit 64; }
+      FLAVOR="$2"
+      shift
+      ;;
+    --flavor=*) FLAVOR="${1#--flavor=}" ;;
     --cloud-url)
       [ $# -ge 2 ] || { echo "--cloud-url needs a value" >&2; exit 64; }
       export FLUXCLOUD_BASE_URL="$2"
       shift
       ;;
     --cloud-url=*) export FLUXCLOUD_BASE_URL="${1#--cloud-url=}" ;;
-    *) echo "unknown argument: $1 (expected --release, --cloud-url URL, --run)" >&2; exit 64 ;;
+    *) echo "unknown argument: $1 (expected --release, --flavor store|full, --cloud-url URL, --run)" >&2; exit 64 ;;
   esac
   shift
 done
+case "$FLAVOR" in
+  full) CARGO_FLAVOR_ARGS=(); XCODE_FLAVOR_ARGS=() ;;
+  store) CARGO_FLAVOR_ARGS=(--no-default-features); XCODE_FLAVOR_ARGS=("FLUX_FLAVOR_CONDITIONS=") ;;
+  *) echo "--flavor must be store or full (got '$FLAVOR')" >&2; exit 64 ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IOS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -55,9 +71,9 @@ fi
 cd "$REPO_ROOT"
 TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 
-echo "==> cargo build ($PROFILE_DIR) for iOS device + simulator"
+echo "==> cargo build ($PROFILE_DIR, flavor $FLAVOR) for iOS device + simulator"
 for target in aarch64-apple-ios aarch64-apple-ios-sim; do
-  cargo build -p "$CRATE" --lib --target "$target" $PROFILE_FLAG
+  cargo build -p "$CRATE" --lib --target "$target" $PROFILE_FLAG ${CARGO_FLAVOR_ARGS[@]+"${CARGO_FLAVOR_ARGS[@]}"}
 done
 
 # 绑定从宿主机 debug 库的 proc-macro 元数据生成（同一份源码 → 校验和一致；release 会 strip 掉元数据）。
@@ -79,6 +95,7 @@ cp "$GEN_DIR/$FFI_MODULE.modulemap" "$HEADERS/module.modulemap"
 
 echo "==> xcframework"
 mkdir -p "$KIT/Artifacts"
+rm -f "$KIT/Artifacts/flavor" # 构建中途失败不留下与产物不符的标记
 rm -rf "$KIT/Artifacts/$FFI_MODULE.xcframework"
 xcodebuild -create-xcframework \
   -library "$TARGET_DIR/aarch64-apple-ios/$PROFILE_DIR/lib$CRATE.a" -headers "$HEADERS" \
@@ -88,7 +105,9 @@ xcodebuild -create-xcframework \
 mkdir -p "$KIT/Sources/FluxRustBindings"
 cp "$GEN_DIR/$CRATE.swift" "$KIT/Sources/FluxRustBindings/$CRATE.swift"
 
-echo "==> done: $KIT/Artifacts/$FFI_MODULE.xcframework ($PROFILE_DIR)"
+# flavor 标记：Xcode 之外的打包脚本（testflight.sh / sideload.sh，含 --skip-core）据此拒绝装错核心。
+printf '%s\n' "$FLAVOR" > "$KIT/Artifacts/flavor"
+echo "==> done: $KIT/Artifacts/$FFI_MODULE.xcframework ($PROFILE_DIR, flavor $FLAVOR)"
 
 [ "$RUN_APP" = 1 ] || exit 0
 
@@ -108,9 +127,9 @@ CONFIG="Debug"
 echo "==> xcodebuild FluxDown ($CONFIG) for simulator $UDID"
 cd "$IOS_ROOT"
 xcodebuild build -quiet -project FluxDown.xcodeproj -scheme FluxDown -configuration "$CONFIG" \
-  -destination "id=$UDID"
+  -destination "id=$UDID" ${XCODE_FLAVOR_ARGS[@]+"${XCODE_FLAVOR_ARGS[@]}"}
 SETTINGS="$(xcodebuild -showBuildSettings -project FluxDown.xcodeproj -scheme FluxDown -configuration "$CONFIG" \
-  -destination "id=$UDID" 2>/dev/null)"
+  -destination "id=$UDID" ${XCODE_FLAVOR_ARGS[@]+"${XCODE_FLAVOR_ARGS[@]}"} 2>/dev/null)"
 setting() { printf '%s\n' "$SETTINGS" | awk -F' = ' -v key="$1" '$1 ~ "^ +" key "$" { print $2; exit }'; }
 APP="$(setting TARGET_BUILD_DIR)/$(setting WRAPPER_NAME)"
 BUNDLE_ID="$(setting PRODUCT_BUNDLE_IDENTIFIER)"

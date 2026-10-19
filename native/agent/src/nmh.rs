@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use fluxdown_api::service::LiveSpeed;
-use fluxdown_protocol::{DownloadRequest, TaskDto};
+use fluxdown_protocol::{ApplicationErrorCode, DownloadRequest, PluginDto, TaskDto};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::capture::CaptureService;
 use crate::daemon_client::DaemonClient;
+use crate::sniff_rules::{Have, SniffRuleStore};
 
 pub mod comspec;
 
@@ -18,6 +19,21 @@ const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 const MAX_BATCH_ITEMS: usize = 1000;
 const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 const MAX_COMPLETED_TASKS: usize = 10;
+/// 扩展 ↔ agent 的 NMH 协议版本；v2 增加应答 `data`、`capabilities`、`capture_status`、`sniff_rules`。
+pub const EXTENSION_PROTOCOL_VERSION: u32 = 2;
+const SUPPORTED_ACTIONS: &[&str] = &[
+    "ping",
+    "download",
+    "batch_download",
+    "tasks",
+    "task_op",
+    "open_file",
+    "reveal_file",
+    "capabilities",
+    "capture_status",
+    "sniff_rules",
+];
+const MAX_CAPTURE_STATUS_IDS: usize = 256;
 
 #[derive(Deserialize)]
 struct PipeMessage {
@@ -46,6 +62,25 @@ struct TaskIdPayload {
     task_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureStatusPayload {
+    transaction_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SniffRulesPayload {
+    #[serde(default)]
+    have: Have,
+    /// 用户手动同步：忽略退避并等刷新完成再应答（至多 15 s）。
+    #[serde(default)]
+    force: bool,
+    /// 只取 plugin 层：本机聚合，不触发任何网络刷新（扩展关闭远程规则同步时使用）。
+    #[serde(default)]
+    plugin_only: bool,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TaskBrief {
@@ -67,6 +102,8 @@ struct PipeResponse {
     msg_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tasks: Option<Vec<TaskBrief>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
 }
 
 impl PipeResponse {
@@ -76,6 +113,7 @@ impl PipeResponse {
             message: Some(message.into()),
             msg_id,
             tasks: None,
+            data: None,
         }
     }
 
@@ -85,6 +123,7 @@ impl PipeResponse {
             message: Some(message.into()),
             msg_id,
             tasks: None,
+            data: None,
         }
     }
 
@@ -94,6 +133,17 @@ impl PipeResponse {
             message: None,
             msg_id,
             tasks: Some(tasks),
+            data: None,
+        }
+    }
+
+    fn ok_data(msg_id: u64, message: impl Into<String>, data: Value) -> Self {
+        Self {
+            success: true,
+            message: Some(message.into()),
+            msg_id,
+            tasks: None,
+            data: Some(data),
         }
     }
 }
@@ -103,6 +153,7 @@ pub struct NmhService {
     daemon: Arc<DaemonClient>,
     capture: Arc<CaptureService>,
     task_events: Option<crate::task_events::TaskEventHub>,
+    sniff_rules: Option<Arc<SniffRuleStore>>,
 }
 
 impl NmhService {
@@ -112,6 +163,7 @@ impl NmhService {
             daemon,
             capture,
             task_events: None,
+            sniff_rules: None,
         }
     }
 
@@ -119,6 +171,13 @@ impl NmhService {
     #[must_use]
     pub fn with_task_events(mut self, task_events: crate::task_events::TaskEventHub) -> Self {
         self.task_events = Some(task_events);
+        self
+    }
+
+    /// 注入嗅探规则包存储；未注入时 `sniff_rules` 动作按未知动作处理。
+    #[must_use]
+    pub fn with_sniff_rules(mut self, store: Arc<SniffRuleStore>) -> Self {
+        self.sniff_rules = Some(store);
         self
     }
 
@@ -140,7 +199,7 @@ impl NmhService {
                     .submit(request, crate::capture::CaptureOrigin::External)
                     .await
                 {
-                    Ok(_) => PipeResponse::ok(message.msg_id, "download accepted"),
+                    Ok(value) => PipeResponse::ok_data(message.msg_id, "download accepted", value),
                     Err(error) => PipeResponse::error(message.msg_id, error.to_string()),
                 },
                 Err(error) => PipeResponse::error(message.msg_id, error.to_string()),
@@ -156,6 +215,9 @@ impl NmhService {
                 self.platform_action(message.msg_id, message.payload, true)
                     .await
             }
+            "capabilities" => self.capabilities(message.msg_id).await,
+            "capture_status" => self.capture_status(message.msg_id, message.payload).await,
+            "sniff_rules" => self.sniff_rules(message.msg_id, message.payload).await,
             other => PipeResponse::error(message.msg_id, format!("unknown action: {other}")),
         }
     }
@@ -177,9 +239,122 @@ impl NmhService {
             .submit_many(batch.items, crate::capture::CaptureOrigin::External)
             .await
         {
-            Ok(_) => PipeResponse::ok(msg_id, format!("batch accepted ({count} items)")),
+            Ok(value) => {
+                PipeResponse::ok_data(msg_id, format!("batch accepted ({count} items)"), value)
+            }
             Err(error) => PipeResponse::error(msg_id, error.to_string()),
         }
+    }
+
+    /// plugin 层嗅探规则包；daemon 不支持（未编入插件）或查询失败时按「无插件规则」降级。
+    async fn plugin_sniff_rules(&self) -> Option<fluxdown_protocol::PluginSniffRulesDto> {
+        match self
+            .daemon
+            .call::<Value, fluxdown_protocol::PluginSniffRulesDto>(
+                fluxdown_protocol::method::DAEMON_PLUGIN_SNIFF_RULES,
+                None,
+            )
+            .await
+        {
+            Ok(dto) => Some(dto),
+            Err(error) => {
+                // Unsupported 是常态（无插件特性）；其余错误不应拖垮 capabilities / 官方规则同步。
+                if !matches!(error.code, ApplicationErrorCode::Unsupported) {
+                    tracing::warn!(code = ?error.code, "plugin sniff rules unavailable");
+                }
+                None
+            }
+        }
+    }
+
+    async fn capabilities(&self, msg_id: u64) -> PipeResponse {
+        let (plugins_supported, resolvers) = match self
+            .daemon
+            .call::<Value, Vec<PluginDto>>(fluxdown_protocol::method::DAEMON_PLUGIN_LIST, None)
+            .await
+        {
+            Ok(plugins) => (true, resolver_infos(plugins)),
+            Err(error) if matches!(error.code, ApplicationErrorCode::Unsupported) => {
+                (false, Vec::new())
+            }
+            Err(error) => return PipeResponse::error(msg_id, format!("{:?}", error.code)),
+        };
+        let plugin_dto = if plugins_supported {
+            self.plugin_sniff_rules().await
+        } else {
+            None
+        };
+        let plugin_rules_sequence = plugin_dto.as_ref().map_or(0, |dto| dto.sequence);
+        let plugin_rules_epoch = plugin_dto.as_ref().and_then(plugin_epoch_value);
+        PipeResponse::ok_data(
+            msg_id,
+            "ok",
+            serde_json::json!({
+                "protocol": EXTENSION_PROTOCOL_VERSION,
+                "actions": SUPPORTED_ACTIONS,
+                "pluginsSupported": plugins_supported,
+                "resolvers": resolvers,
+                "pluginRulesSequence": plugin_rules_sequence,
+                "pluginRulesEpoch": plugin_rules_epoch,
+            }),
+        )
+    }
+
+    async fn capture_status(&self, msg_id: u64, payload: Value) -> PipeResponse {
+        let request = match serde_json::from_value::<CaptureStatusPayload>(payload) {
+            Ok(request) => request,
+            Err(error) => return PipeResponse::error(msg_id, error.to_string()),
+        };
+        let count = request.transaction_ids.len();
+        if count == 0 || count > MAX_CAPTURE_STATUS_IDS {
+            return PipeResponse::error(msg_id, format!("invalid transaction count: {count}"));
+        }
+        let statuses = self.capture.statuses(&request.transaction_ids).await;
+        PipeResponse::ok_data(msg_id, "ok", serde_json::json!({ "statuses": statuses }))
+    }
+
+    async fn sniff_rules(&self, msg_id: u64, payload: Value) -> PipeResponse {
+        let Some(store) = &self.sniff_rules else {
+            return PipeResponse::error(msg_id, "unknown action: sniff_rules");
+        };
+        let request = match serde_json::from_value::<SniffRulesPayload>(payload) {
+            Ok(request) => request,
+            Err(error) => return PipeResponse::error(msg_id, error.to_string()),
+        };
+        let mut data = if request.plugin_only {
+            serde_json::json!({
+                "official": null,
+                "community": null,
+                "revocations": null,
+                "status": null,
+            })
+        } else {
+            store.query(&request.have, request.force).await
+        };
+        let plugin_dto = self.plugin_sniff_rules().await;
+        // daemon 未答复时序号与 epoch 都为 null：扩展据此不改动 plugin 层，不把「查不到」当作「已清空」。
+        let plugin_sequence = plugin_dto
+            .as_ref()
+            .map_or(Value::Null, |dto| Value::from(dto.sequence));
+        let plugin_epoch = plugin_dto
+            .as_ref()
+            .and_then(plugin_epoch_value)
+            .map_or(Value::Null, Value::String);
+        let plugin_pack = select_plugin_pack(
+            plugin_dto,
+            request.have.plugin(),
+            request.have.plugin_epoch(),
+        );
+        if let Some(object) = data.as_object_mut() {
+            object.insert("plugin".to_string(), plugin_pack);
+            object.insert("pluginSequence".to_string(), plugin_sequence);
+            object.insert("pluginEpoch".to_string(), plugin_epoch);
+        }
+        let deferred = defer_oversized_docs(&mut data);
+        if let Some(object) = data.as_object_mut() {
+            object.insert("deferred".to_string(), serde_json::json!(deferred));
+        }
+        PipeResponse::ok_data(msg_id, "ok", data)
     }
 
     async fn task_list(&self, msg_id: u64) -> PipeResponse {
@@ -250,6 +425,72 @@ impl NmhService {
             Err(error) => PipeResponse::error(msg_id, error.to_string()),
         }
     }
+}
+
+/// daemon 的 plugin 层 epoch；空串（旧 daemon 无 epoch）视为缺失。
+fn plugin_epoch_value(dto: &fluxdown_protocol::PluginSniffRulesDto) -> Option<String> {
+    (!dto.epoch.is_empty()).then(|| dto.epoch.clone())
+}
+
+/// plugin 层嗅探规则包的应答值：缺省 `have`、daemon 序号更新或 epoch 与扩展持有的不同
+/// （数据库重置后序号重新计数，旧序号作废）时给 pack，否则 `null`。
+fn select_plugin_pack(
+    dto: Option<fluxdown_protocol::PluginSniffRulesDto>,
+    have: Option<u64>,
+    have_epoch: Option<&str>,
+) -> Value {
+    dto.filter(|dto| {
+        let epoch_changed = !dto.epoch.is_empty() && have_epoch != Some(dto.epoch.as_str());
+        epoch_changed || have.is_none_or(|known| dto.sequence > known)
+    })
+    .and_then(|dto| dto.pack)
+    .unwrap_or(Value::Null)
+}
+
+/// 应答 data 的序列化体积预算：NMH 单帧上限 1 MiB（浏览器 → 扩展方向同口径），留出信封余量。
+const SNIFF_REPLY_BUDGET: usize = 900 * 1024;
+
+/// 文档合计超过 [`SNIFF_REPLY_BUDGET`] 时把后面的文档置 `null` 并返回其名（`deferred`），
+/// 扩展处理完已收到的文档后再次查询取走剩余部分。第一份文档无论多大都保留，保证每轮有进展。
+/// 顺序：吊销列表（体积小、安全相关）→ official → community → plugin。
+fn defer_oversized_docs(data: &mut Value) -> Vec<&'static str> {
+    let mut deferred = Vec::new();
+    let Some(object) = data.as_object_mut() else {
+        return deferred;
+    };
+    let mut used = 0_usize;
+    let mut kept_any = false;
+    for key in ["revocations", "official", "community", "plugin"] {
+        let size = match object.get(key) {
+            Some(value) if !value.is_null() => value.to_string().len(),
+            _ => continue,
+        };
+        if kept_any && used.saturating_add(size) > SNIFF_REPLY_BUDGET {
+            object.insert(key.to_string(), Value::Null);
+            deferred.push(key);
+        } else {
+            used = used.saturating_add(size);
+            kept_any = true;
+        }
+    }
+    deferred
+}
+
+/// 只保留声明了 resolver URL 的插件；供扩展判断页面能否交给桌面端解析。
+fn resolver_infos(plugins: Vec<PluginDto>) -> Vec<Value> {
+    plugins
+        .into_iter()
+        .filter(|plugin| !plugin.resolver_urls.is_empty())
+        .map(|plugin| {
+            serde_json::json!({
+                "identity": plugin.identity,
+                "name": plugin.name,
+                "enabled": plugin.enabled,
+                "loaded": plugin.load_status == "Loaded",
+                "urls": plugin.resolver_urls,
+            })
+        })
+        .collect()
 }
 
 fn select_task_briefs(
@@ -2511,5 +2752,267 @@ mod tests {
         assert_eq!(message.msg_id, 7);
         assert_eq!(message.payload["url"], "https://example.com/a");
         assert_eq!(MAX_BATCH_ITEMS, 1000);
+    }
+
+    fn service_with(
+        daemon: Arc<crate::daemon_client::DaemonClient>,
+    ) -> (NmhService, Arc<crate::capture::CaptureService>) {
+        let events =
+            crate::event_hub::AgentEventHub::new(fluxdown_protocol::AgentSnapshot::default());
+        let shell = crate::shell::ShellState::new(
+            crate::shell::TrayAvailability::Unavailable(
+                fluxdown_protocol::TrayUnavailableReason::NotBuilt,
+            ),
+            daemon.clone(),
+            events.clone(),
+        );
+        let capture = Arc::new(crate::capture::CaptureService::new(
+            daemon.clone(),
+            events,
+            shell,
+        ));
+        (NmhService::new(daemon, capture.clone()), capture)
+    }
+
+    /// 经长度帧协议发一问一答。
+    async fn exchange(
+        stream: &mut tokio::io::DuplexStream,
+        request: serde_json::Value,
+    ) -> serde_json::Value {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let bytes = serde_json::to_vec(&request).expect("request json");
+        let length = u32::try_from(bytes.len()).expect("frame length");
+        stream
+            .write_all(&length.to_le_bytes())
+            .await
+            .expect("write length");
+        stream.write_all(&bytes).await.expect("write body");
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length).await.expect("read length");
+        let mut body = vec![0_u8; u32::from_le_bytes(length) as usize];
+        stream.read_exact(&mut body).await.expect("read body");
+        serde_json::from_slice(&body).expect("response json")
+    }
+
+    #[tokio::test]
+    async fn download_reply_carries_transaction_ids_and_capture_status_follows_resolution() {
+        let daemon = Arc::new(crate::daemon_client::DaemonClient::disconnected());
+        let (service, capture) = service_with(daemon);
+        let (mut client, server) = tokio::io::duplex(65536);
+        let server_task = tokio::spawn(handle_stream(server, service));
+
+        let reply = exchange(
+            &mut client,
+            json!({"action": "download", "msg_id": 2, "url": "https://example.com/a.zip"}),
+        )
+        .await;
+        assert_eq!(reply["success"], true);
+        assert_eq!(reply["message"], "download accepted");
+        let ids = reply["data"]["transactionIds"].as_array().expect("ids");
+        assert_eq!(ids.len(), 1);
+        let id = ids[0].as_str().expect("id").to_owned();
+
+        let status = exchange(
+            &mut client,
+            json!({"action": "capture_status", "msg_id": 3, "transactionIds": [id, "missing"]}),
+        )
+        .await;
+        assert_eq!(status["data"]["statuses"][&id], "pending");
+        assert_eq!(status["data"]["statuses"]["missing"], "unknown");
+
+        capture.resolve(&id, false, None).await.expect("reject");
+        let status = exchange(
+            &mut client,
+            json!({"action": "capture_status", "msg_id": 4, "transactionIds": [id]}),
+        )
+        .await;
+        assert_eq!(status["data"]["statuses"][&id], "rejected");
+
+        let invalid = exchange(
+            &mut client,
+            json!({"action": "capture_status", "msg_id": 5, "transactionIds": []}),
+        )
+        .await;
+        assert_eq!(invalid["success"], false);
+        assert_eq!(invalid["message"], "invalid transaction count: 0");
+
+        drop(client);
+        server_task
+            .await
+            .expect("join")
+            .expect("clean client EOF closes NMH stream");
+    }
+
+    #[tokio::test]
+    async fn capabilities_reports_protocol_and_plugin_support() {
+        use fluxdown_protocol::{ApplicationErrorCode, RpcErrorData, RpcErrorObject};
+
+        let supported = Arc::new(crate::daemon_client::DaemonClient::answering(|_| {
+            Ok(json!([]))
+        }));
+        let (service, _) = service_with(supported);
+        let (mut client, server) = tokio::io::duplex(65536);
+        tokio::spawn(handle_stream(server, service));
+        let reply = exchange(&mut client, json!({"action": "capabilities", "msg_id": 1})).await;
+        assert_eq!(reply["data"]["protocol"], 2);
+        assert_eq!(reply["data"]["pluginsSupported"], true);
+        assert_eq!(reply["data"]["resolvers"], json!([]));
+        assert!(
+            reply["data"]["actions"]
+                .as_array()
+                .expect("actions")
+                .contains(&json!("sniff_rules"))
+        );
+
+        let unsupported = Arc::new(crate::daemon_client::DaemonClient::answering(|_| {
+            Err(RpcErrorObject::application(
+                "daemon was built without plugin support",
+                RpcErrorData::new(ApplicationErrorCode::Unsupported, false),
+            ))
+        }));
+        let (service, _) = service_with(unsupported);
+        let (mut client, server) = tokio::io::duplex(65536);
+        tokio::spawn(handle_stream(server, service));
+        let reply = exchange(&mut client, json!({"action": "capabilities", "msg_id": 1})).await;
+        assert_eq!(reply["success"], true);
+        assert_eq!(reply["data"]["pluginsSupported"], false);
+        assert_eq!(reply["data"]["resolvers"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn capabilities_reports_plugin_rules_sequence_and_epoch() {
+        let daemon = Arc::new(crate::daemon_client::DaemonClient::answering(|method| {
+            if method == fluxdown_protocol::method::DAEMON_PLUGIN_SNIFF_RULES {
+                Ok(json!({"sequence": 7, "epoch": "e1", "pack": {"rules": []}}))
+            } else {
+                Ok(json!([]))
+            }
+        }));
+        let (service, _) = service_with(daemon);
+        let (mut client, server) = tokio::io::duplex(65536);
+        tokio::spawn(handle_stream(server, service));
+        let reply = exchange(&mut client, json!({"action": "capabilities", "msg_id": 1})).await;
+        assert_eq!(reply["data"]["pluginRulesSequence"], 7);
+        assert_eq!(reply["data"]["pluginRulesEpoch"], "e1");
+    }
+
+    #[tokio::test]
+    async fn plugin_only_sniff_rules_skips_remote_docs_and_resets_on_epoch_change() {
+        let daemon = Arc::new(crate::daemon_client::DaemonClient::answering(|method| {
+            if method == fluxdown_protocol::method::DAEMON_PLUGIN_SNIFF_RULES {
+                Ok(json!({"sequence": 2, "epoch": "e2", "pack": {"packId": "plugin"}}))
+            } else {
+                Ok(json!([]))
+            }
+        }));
+        // 指向永远连不上的数据目录：plugin_only 若触碰远程文档存储会留下可观察的错误。
+        let dir = std::env::temp_dir().join(format!("fluxdown-nmh-sniff-{}", uuid::Uuid::new_v4()));
+        let (service, _) = service_with(daemon);
+        let service = service.with_sniff_rules(Arc::new(crate::sniff_rules::SniffRuleStore::new(
+            dir.clone(),
+            crate::egress::Egress::system_default(),
+        )));
+        let (mut client, server) = tokio::io::duplex(65536);
+        tokio::spawn(handle_stream(server, service));
+
+        let same_epoch = exchange(
+            &mut client,
+            json!({
+                "action": "sniff_rules", "msg_id": 1, "pluginOnly": true,
+                "have": {"plugin": 2, "pluginEpoch": "e2"},
+            }),
+        )
+        .await;
+        assert_eq!(same_epoch["success"], true);
+        assert!(same_epoch["data"]["plugin"].is_null());
+        assert_eq!(same_epoch["data"]["pluginSequence"], 2);
+        assert_eq!(same_epoch["data"]["pluginEpoch"], "e2");
+        assert!(same_epoch["data"]["status"].is_null());
+        assert_eq!(same_epoch["data"]["deferred"], json!([]));
+
+        // 序号没有更新，但 epoch 变了（数据库重置）：必须重发 plugin 包。
+        let reset = exchange(
+            &mut client,
+            json!({
+                "action": "sniff_rules", "msg_id": 2, "pluginOnly": true,
+                "have": {"plugin": 9, "pluginEpoch": "old"},
+            }),
+        )
+        .await;
+        assert_eq!(reset["data"]["plugin"], json!({"packId": "plugin"}));
+        assert_eq!(reset["data"]["pluginEpoch"], "e2");
+        assert!(
+            !dir.exists(),
+            "plugin-only must not touch the remote doc store"
+        );
+    }
+
+    #[test]
+    fn plugin_pack_is_returned_only_when_newer_than_have_or_epoch_changed() {
+        use super::select_plugin_pack;
+        use serde_json::Value;
+
+        let dto = |sequence, pack| fluxdown_protocol::PluginSniffRulesDto {
+            sequence,
+            epoch: "e1".to_owned(),
+            pack,
+        };
+        let pack = json!({"packId": "plugin"});
+        assert_eq!(
+            select_plugin_pack(Some(dto(3, Some(pack.clone()))), None, Some("e1")),
+            pack
+        );
+        assert_eq!(
+            select_plugin_pack(Some(dto(3, Some(pack.clone()))), Some(2), Some("e1")),
+            pack
+        );
+        assert_eq!(
+            select_plugin_pack(Some(dto(3, Some(pack.clone()))), Some(3), Some("e1")),
+            Value::Null
+        );
+        // epoch 不同：即使序号更小 / 相等也重发。
+        assert_eq!(
+            select_plugin_pack(Some(dto(1, Some(pack.clone()))), Some(9), Some("old")),
+            pack
+        );
+        assert_eq!(
+            select_plugin_pack(Some(dto(3, Some(pack.clone()))), Some(3), None),
+            pack
+        );
+        assert_eq!(
+            select_plugin_pack(Some(dto(0, None)), None, Some("e1")),
+            Value::Null
+        );
+        assert_eq!(select_plugin_pack(None, Some(1), Some("e1")), Value::Null);
+    }
+
+    #[test]
+    fn oversized_reply_defers_later_documents_but_always_keeps_the_first() {
+        use super::{SNIFF_REPLY_BUDGET, defer_oversized_docs};
+        use serde_json::Value;
+
+        let big = |fill: usize| Value::String("x".repeat(fill));
+        let mut data = json!({
+            "revocations": {"sequence": 1},
+            "official": big(SNIFF_REPLY_BUDGET / 2),
+            "community": big(SNIFF_REPLY_BUDGET / 2),
+            "plugin": {"packId": "plugin"},
+        });
+        let deferred = defer_oversized_docs(&mut data);
+        assert_eq!(deferred, ["community"]);
+        assert!(data["community"].is_null());
+        assert!(!data["official"].is_null());
+        assert!(!data["revocations"].is_null());
+        // 后面体积小、仍装得下的文档照常发送，不被前面的超限连坐。
+        assert!(!data["plugin"].is_null());
+
+        // 第一份文档本身超预算也要保留，否则永远没有进展。
+        let mut oversized = json!({"revocations": null, "official": big(SNIFF_REPLY_BUDGET + 1)});
+        assert!(defer_oversized_docs(&mut oversized).is_empty());
+        assert!(!oversized["official"].is_null());
+
+        let mut small = json!({"official": {"sequence": 1}, "community": null});
+        assert!(defer_oversized_docs(&mut small).is_empty());
     }
 }

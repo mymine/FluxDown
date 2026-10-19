@@ -196,9 +196,16 @@ enum RssCmd {
 struct RssAddArgs {
     // 字段名避开 `url`：全局 `--url` 已占用该 arg id，同名会被 clap 合并成
     // 同一个参数，导致订阅地址把服务基址覆盖掉。
-    /// feed 地址（RSS/Atom）。
+    /// 订阅地址：RSS/Atom 地址，或插件 provider 约定的地址（作为 `ctx.url` 交给插件）。
     #[arg(value_name = "URL")]
     feed_url: String,
+    /// 订阅来源 provider ID（省略 = 内置 RSS；插件 provider ID 见 `GET /api/v1/plugins` 的
+    /// `subscriptionProviderIds`）。
+    #[arg(long, value_name = "ID")]
+    provider: Option<String>,
+    /// 插件 provider 的专属配置，必须是合法 JSON（原样作为 `ctx.providerConfig` 交给插件）。
+    #[arg(long = "provider-config", value_name = "JSON")]
+    provider_config: Option<String>,
     /// 订阅名（省略 = 用 feed 标题回填）。
     #[arg(long)]
     name: Option<String>,
@@ -791,10 +798,32 @@ fn rss_source_state(s: &RssSourceDto) -> String {
 }
 
 async fn cmd_rss_add(client: &ApiClient, a: RssAddArgs, json: bool) -> Result<(), ClientError> {
+    let provider_id = a
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(fluxdown_engine::rss::model::RSS_PROVIDER_ID)
+        .to_string();
+    let provider_config = a.provider_config.as_deref().map_or("", str::trim);
+    if provider_id == fluxdown_engine::rss::model::RSS_PROVIDER_ID && !provider_config.is_empty() {
+        return Err(ClientError {
+            message: "--provider-config requires --provider <plugin provider id>".to_string(),
+            exit: ExitCode::BadRequest,
+        });
+    }
+    if !provider_config.is_empty()
+        && let Err(e) = serde_json::from_str::<serde_json::Value>(provider_config)
+    {
+        return Err(ClientError {
+            message: format!("--provider-config is not valid JSON: {e}"),
+            exit: ExitCode::BadRequest,
+        });
+    }
     let req = RssSourceDto {
         source_id: String::new(),
-        provider_id: "rss".to_string(),
-        provider_config: String::new(),
+        provider_id,
+        provider_config: provider_config.to_string(),
         url: a.feed_url,
         name: a.name.unwrap_or_default(),
         enabled: true,

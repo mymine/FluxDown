@@ -29,6 +29,7 @@ final class AgentSections {
     private let remoteTasks = SectionReader<[RemoteTaskDto]>(HostSection.agentRemoteTasks)
     private let pairingRequests = SectionReader<[LinkPairingRequestDto]>(HostSection.agentLinkPairingRequests)
     private let discovered = SectionReader<[LinkDiscoveredPeer]>(HostSection.agentLinkDiscovered)
+    private let gateway = SectionReader<GatewayStatusDto>(HostSection.agentGateway)
 
     /// 当前云账户会话；未登录 / 分区缺失为 nil。
     func session(_ state: HostState) -> AgentSessionDto? { session.read(state) }
@@ -45,4 +46,7 @@ final class AgentSections {
     }
 
     func discovered(_ state: HostState) -> [LinkDiscoveredPeer] { discovered.read(state) ?? [] }
+
+    /// 本机局域网直连三态（网关分区缺失按 active）。
+    func lanAccess(_ state: HostState) -> LinkRules.LanAccess { LinkRules.lanAccess(gateway.read(state)) }
 }

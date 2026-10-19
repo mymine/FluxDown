@@ -10,6 +10,9 @@ mod doctor_probe;
 pub mod event_hub;
 pub mod http;
 pub mod log_redact;
+#[cfg(feature = "plugins")]
+pub mod plugin_port;
+pub mod plugin_views;
 pub mod private_fs;
 pub mod rpc;
 pub mod runtime;

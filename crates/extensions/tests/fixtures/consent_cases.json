@@ -1,0 +1,59 @@
+{
+  "risk": [
+    { "name": "no permissions", "permissions": [], "risk": "standard" },
+    { "name": "unknown permission stays standard", "permissions": ["somethingElse"], "risk": "standard" },
+    { "name": "ffmpeg", "permissions": ["ffmpeg"], "risk": "elevated" },
+    { "name": "ytdlp", "permissions": ["ytdlp"], "risk": "elevated" },
+    { "name": "auth", "permissions": ["auth"], "risk": "elevated" },
+    { "name": "tasks", "permissions": ["tasks"], "risk": "elevated" },
+    { "name": "browserRules", "permissions": ["browserRules"], "risk": "elevated" },
+    { "name": "background", "permissions": ["background"], "risk": "elevated" },
+    { "name": "intercept", "permissions": ["intercept"], "risk": "elevated" },
+    { "name": "desktop alone", "permissions": ["desktop"], "risk": "full" },
+    { "name": "desktop wins over elevated", "permissions": ["ffmpeg", "desktop", "tasks"], "risk": "full" }
+  ],
+  "matches": [
+    {
+      "name": "nothing pending, nothing confirmed",
+      "confirmed": { "permissions": [], "networkHosts": [] },
+      "pending": { "permissions": [], "networkHosts": [] },
+      "matches": true
+    },
+    {
+      "name": "same sets in different order with duplicates",
+      "confirmed": { "permissions": ["tasks", "ffmpeg", "tasks"], "networkHosts": ["b.example.com", "a.example.com"] },
+      "pending": { "permissions": ["ffmpeg", "tasks"], "networkHosts": ["a.example.com", "b.example.com"] },
+      "matches": true
+    },
+    {
+      "name": "update confirmed only the new permission",
+      "confirmed": { "permissions": ["desktop"], "networkHosts": [] },
+      "pending": { "permissions": ["desktop"], "networkHosts": [] },
+      "matches": true
+    },
+    {
+      "name": "pending has a permission the user never saw",
+      "confirmed": { "permissions": ["ffmpeg"], "networkHosts": [] },
+      "pending": { "permissions": ["ffmpeg", "tasks"], "networkHosts": [] },
+      "matches": false
+    },
+    {
+      "name": "pending host the user never saw",
+      "confirmed": { "permissions": ["desktop"], "networkHosts": ["api.example.com"] },
+      "pending": { "permissions": ["desktop"], "networkHosts": ["api.example.com", "cdn.example.com"] },
+      "matches": false
+    },
+    {
+      "name": "user confirmed more than pending",
+      "confirmed": { "permissions": ["ffmpeg", "tasks"], "networkHosts": [] },
+      "pending": { "permissions": ["tasks"], "networkHosts": [] },
+      "matches": false
+    },
+    {
+      "name": "hosts are compared exactly",
+      "confirmed": { "permissions": [], "networkHosts": ["API.example.com"] },
+      "pending": { "permissions": [], "networkHosts": ["api.example.com"] },
+      "matches": false
+    }
+  ]
+}

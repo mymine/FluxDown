@@ -1,1 +1,6 @@
-export { StatusBar } from './StatusBar'
+export { ProxyControl } from './ProxyControl'
+export { SpeedLimitControl } from './SpeedLimitControl'
+export { STATUS_BAR_CLASS, StatusBar } from './StatusBar'
+export { DiskFreeCell, PauseAllButton, ResumeAllButton, SpeedCell } from './StatusWidgets'
+export type { ChromeOrientation, TooltipSide, WidgetProps } from './widget'
+export { useRuntimeStats } from './widget'

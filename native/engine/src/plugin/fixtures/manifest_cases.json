@@ -1,0 +1,2227 @@
+[
+ {
+  "name": "minimal ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0"
+  },
+  "files": [],
+  "ok": true,
+  "risk": "standard",
+  "networkHosts": []
+ },
+ {
+  "name": "bad identity",
+  "manifest": {
+   "identity": "Bad.id@x",
+   "name": "N",
+   "version": "1.0.0"
+  },
+  "files": [],
+  "ok": false
+ },
+ {
+  "name": "ytdlp is elevated",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "ytdlp"
+   ]
+  },
+  "files": [],
+  "ok": true,
+  "risk": "elevated"
+ },
+ {
+  "name": "tasks and browserRules are elevated",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "tasks",
+    "browserRules"
+   ]
+  },
+  "files": [],
+  "ok": true,
+  "risk": "elevated"
+ },
+ {
+  "name": "desktop is full",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "ffmpeg",
+    "desktop"
+   ]
+  },
+  "files": [],
+  "ok": true,
+  "risk": "full"
+ },
+ {
+  "name": "background permission is elevated",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "background"
+   ]
+  },
+  "files": [],
+  "ok": true,
+  "risk": "elevated"
+ },
+ {
+  "name": "unknown permission",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "root"
+   ]
+  },
+  "files": [],
+  "ok": false
+ },
+ {
+  "name": "main ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js",
+    "events": [
+     "onDone",
+     "onStart"
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "main entry file missing",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   }
+  },
+  "files": [],
+  "ok": false
+ },
+ {
+  "name": "main entry not js",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.ts"
+   }
+  },
+  "files": [
+   "main.ts"
+  ],
+  "ok": false
+ },
+ {
+  "name": "main entry traversal",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "../main.js"
+   }
+  },
+  "files": [
+   "../main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "main entry absolute",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "/main.js"
+   }
+  },
+  "files": [
+   "/main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "main unknown event",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js",
+    "events": [
+     "onBogus"
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "main background without permission",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js",
+    "background": true
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "main background with permission",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js",
+    "background": true
+   },
+   "permissions": [
+    "background"
+   ]
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": true,
+  "risk": "elevated"
+ },
+ {
+  "name": "main unknown field",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js",
+    "extra": 1
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "portable view ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "v1",
+      "title": "T",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": true,
+  "risk": "standard"
+ },
+ {
+  "name": "portable view without main",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "contributes": {
+    "views": [
+     {
+      "id": "v1",
+      "title": "T",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [],
+  "ok": false
+ },
+ {
+  "name": "view id uppercase",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "Bad",
+      "title": "T",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "view id starts with digit",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "1a",
+      "title": "T",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "view id 32 chars ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "title": "T",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "view id 33 chars",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "title": "T",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "view duplicate id",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "a",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "a",
+      "title": "T",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "view empty title",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "a",
+      "title": "",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "view title 40 unicode chars ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "a",
+      "title": "看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看看",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "view title 41 chars",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "a",
+      "title": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "view bad location",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "a",
+      "title": "T",
+      "location": "sidebar"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "view unknown field",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "v1",
+      "title": "T",
+      "location": "activity",
+      "extra": 1
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "two settings views",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "a",
+      "title": "T",
+      "location": "settings"
+     },
+     {
+      "id": "b",
+      "title": "T",
+      "location": "settings"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "settings plus taskDetail ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "a",
+      "title": "T",
+      "location": "settings"
+     },
+     {
+      "id": "b",
+      "title": "T",
+      "location": "taskDetail"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "16 views ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "v0",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v1",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v2",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v3",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v4",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v5",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v6",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v7",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v8",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v9",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v10",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v11",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v12",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v13",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v14",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v15",
+      "title": "T",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "17 views",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "views": [
+     {
+      "id": "v0",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v1",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v2",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v3",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v4",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v5",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v6",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v7",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v8",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v9",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v10",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v11",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v12",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v13",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v14",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v15",
+      "title": "T",
+      "location": "activity"
+     },
+     {
+      "id": "v16",
+      "title": "T",
+      "location": "activity"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "empty views and commands ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "contributes": {
+    "views": [],
+    "commands": []
+   }
+  },
+  "files": [],
+  "ok": true,
+  "risk": "standard"
+ },
+ {
+  "name": "empty contributes ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "contributes": {}
+  },
+  "files": [],
+  "ok": true
+ },
+ {
+  "name": "desktop-only window view ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "ui/w.mjs",
+       "width": 960,
+       "height": 640
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "ui/w.mjs"
+  ],
+  "ok": true,
+  "risk": "full"
+ },
+ {
+  "name": "desktop view portable with main ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": ["desktop"],
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [
+     { "id": "p", "title": "T", "location": "activity", "portable": true, "desktop": { "entry": "ui/p.js" } }
+    ]
+   }
+  },
+  "files": ["main.js", "ui/p.js"],
+  "ok": true,
+  "risk": "full"
+ },
+ {
+  "name": "desktop view portable without main",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": ["desktop"],
+   "contributes": {
+    "views": [
+     { "id": "p", "title": "T", "location": "activity", "portable": true, "desktop": { "entry": "ui/p.js" } }
+    ]
+   }
+  },
+  "files": ["ui/p.js"],
+  "ok": false
+ },
+ {
+  "name": "portable without desktop",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [{ "id": "p", "title": "T", "location": "activity", "portable": true }]
+   }
+  },
+  "files": ["main.js"],
+  "ok": false
+ },
+ {
+  "name": "portable not boolean",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": ["desktop"],
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [
+     { "id": "p", "title": "T", "location": "activity", "portable": "yes", "desktop": { "entry": "ui/p.js" } }
+    ]
+   }
+  },
+  "files": ["main.js", "ui/p.js"],
+  "ok": false
+ },
+ {
+  "name": "desktop without desktop permission",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "ui/w.js"
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "ui/w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "desktop entry not js",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "ui/w.ts"
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "ui/w.ts"
+  ],
+  "ok": false
+ },
+ {
+  "name": "desktop entry traversal",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "../w.js"
+      }
+     }
+    ]
+   }
+  },
+  "files": [],
+  "ok": false
+ },
+ {
+  "name": "desktop entry file missing",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "ui/w.js"
+      }
+     }
+    ]
+   }
+  },
+  "files": [],
+  "ok": false
+ },
+ {
+  "name": "desktop unknown field",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "extra": 1
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "width on activity view",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "activity",
+      "desktop": {
+       "entry": "w.js",
+       "width": 500
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "width below min",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "width": 239
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "height above max",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "height": 4097
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "size bounds ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "width": 240,
+       "height": 4096
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "networkHosts union sorted deduped",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "a",
+      "title": "T",
+      "location": "activity",
+      "desktop": {
+       "entry": "a.js",
+       "networkHosts": [
+        "b.example.com",
+        "127.0.0.1",
+        "::1"
+       ]
+      }
+     },
+     {
+      "id": "b",
+      "title": "T",
+      "location": "activity",
+      "desktop": {
+       "entry": "b.js",
+       "networkHosts": [
+        "a.example.com",
+        "b.example.com"
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "a.js",
+   "b.js"
+  ],
+  "ok": true,
+  "risk": "full",
+  "networkHosts": [
+   "127.0.0.1",
+   "::1",
+   "a.example.com",
+   "b.example.com"
+  ]
+ },
+ {
+  "name": "networkHosts duplicate in one view",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "networkHosts": [
+        "a.com",
+        "a.com"
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "networkHosts with port",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "networkHosts": [
+        "a.com:80"
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "networkHosts with scheme",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "networkHosts": [
+        "https://a.com"
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "networkHosts wildcard",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "networkHosts": [
+        "*.a.com"
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "networkHosts uppercase",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "networkHosts": [
+        "A.com"
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "networkHosts 64 ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "networkHosts": [
+        "h0.example.com",
+        "h1.example.com",
+        "h2.example.com",
+        "h3.example.com",
+        "h4.example.com",
+        "h5.example.com",
+        "h6.example.com",
+        "h7.example.com",
+        "h8.example.com",
+        "h9.example.com",
+        "h10.example.com",
+        "h11.example.com",
+        "h12.example.com",
+        "h13.example.com",
+        "h14.example.com",
+        "h15.example.com",
+        "h16.example.com",
+        "h17.example.com",
+        "h18.example.com",
+        "h19.example.com",
+        "h20.example.com",
+        "h21.example.com",
+        "h22.example.com",
+        "h23.example.com",
+        "h24.example.com",
+        "h25.example.com",
+        "h26.example.com",
+        "h27.example.com",
+        "h28.example.com",
+        "h29.example.com",
+        "h30.example.com",
+        "h31.example.com",
+        "h32.example.com",
+        "h33.example.com",
+        "h34.example.com",
+        "h35.example.com",
+        "h36.example.com",
+        "h37.example.com",
+        "h38.example.com",
+        "h39.example.com",
+        "h40.example.com",
+        "h41.example.com",
+        "h42.example.com",
+        "h43.example.com",
+        "h44.example.com",
+        "h45.example.com",
+        "h46.example.com",
+        "h47.example.com",
+        "h48.example.com",
+        "h49.example.com",
+        "h50.example.com",
+        "h51.example.com",
+        "h52.example.com",
+        "h53.example.com",
+        "h54.example.com",
+        "h55.example.com",
+        "h56.example.com",
+        "h57.example.com",
+        "h58.example.com",
+        "h59.example.com",
+        "h60.example.com",
+        "h61.example.com",
+        "h62.example.com",
+        "h63.example.com"
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "networkHosts 65",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "desktop"
+   ],
+   "contributes": {
+    "views": [
+     {
+      "id": "w",
+      "title": "T",
+      "location": "window",
+      "desktop": {
+       "entry": "w.js",
+       "networkHosts": [
+        "h0.example.com",
+        "h1.example.com",
+        "h2.example.com",
+        "h3.example.com",
+        "h4.example.com",
+        "h5.example.com",
+        "h6.example.com",
+        "h7.example.com",
+        "h8.example.com",
+        "h9.example.com",
+        "h10.example.com",
+        "h11.example.com",
+        "h12.example.com",
+        "h13.example.com",
+        "h14.example.com",
+        "h15.example.com",
+        "h16.example.com",
+        "h17.example.com",
+        "h18.example.com",
+        "h19.example.com",
+        "h20.example.com",
+        "h21.example.com",
+        "h22.example.com",
+        "h23.example.com",
+        "h24.example.com",
+        "h25.example.com",
+        "h26.example.com",
+        "h27.example.com",
+        "h28.example.com",
+        "h29.example.com",
+        "h30.example.com",
+        "h31.example.com",
+        "h32.example.com",
+        "h33.example.com",
+        "h34.example.com",
+        "h35.example.com",
+        "h36.example.com",
+        "h37.example.com",
+        "h38.example.com",
+        "h39.example.com",
+        "h40.example.com",
+        "h41.example.com",
+        "h42.example.com",
+        "h43.example.com",
+        "h44.example.com",
+        "h45.example.com",
+        "h46.example.com",
+        "h47.example.com",
+        "h48.example.com",
+        "h49.example.com",
+        "h50.example.com",
+        "h51.example.com",
+        "h52.example.com",
+        "h53.example.com",
+        "h54.example.com",
+        "h55.example.com",
+        "h56.example.com",
+        "h57.example.com",
+        "h58.example.com",
+        "h59.example.com",
+        "h60.example.com",
+        "h61.example.com",
+        "h62.example.com",
+        "h63.example.com",
+        "h64.example.com"
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "commands ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "commands": [
+     {
+      "id": "go",
+      "title": "Go",
+      "palette": true,
+      "taskMenu": true
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "commands without main",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "contributes": {
+    "commands": [
+     {
+      "id": "go",
+      "title": "Go"
+     }
+    ]
+   }
+  },
+  "files": [],
+  "ok": false
+ },
+ {
+  "name": "command bad id",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "commands": [
+     {
+      "id": "Go",
+      "title": "Go"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "command duplicate id",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "commands": [
+     {
+      "id": "go",
+      "title": "A"
+     },
+     {
+      "id": "go",
+      "title": "B"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "command empty title",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "commands": [
+     {
+      "id": "go",
+      "title": ""
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "command unknown field",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "commands": [
+     {
+      "id": "go",
+      "title": "G",
+      "extra": 1
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "32 commands ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "commands": [
+     {
+      "id": "c0",
+      "title": "C"
+     },
+     {
+      "id": "c1",
+      "title": "C"
+     },
+     {
+      "id": "c2",
+      "title": "C"
+     },
+     {
+      "id": "c3",
+      "title": "C"
+     },
+     {
+      "id": "c4",
+      "title": "C"
+     },
+     {
+      "id": "c5",
+      "title": "C"
+     },
+     {
+      "id": "c6",
+      "title": "C"
+     },
+     {
+      "id": "c7",
+      "title": "C"
+     },
+     {
+      "id": "c8",
+      "title": "C"
+     },
+     {
+      "id": "c9",
+      "title": "C"
+     },
+     {
+      "id": "c10",
+      "title": "C"
+     },
+     {
+      "id": "c11",
+      "title": "C"
+     },
+     {
+      "id": "c12",
+      "title": "C"
+     },
+     {
+      "id": "c13",
+      "title": "C"
+     },
+     {
+      "id": "c14",
+      "title": "C"
+     },
+     {
+      "id": "c15",
+      "title": "C"
+     },
+     {
+      "id": "c16",
+      "title": "C"
+     },
+     {
+      "id": "c17",
+      "title": "C"
+     },
+     {
+      "id": "c18",
+      "title": "C"
+     },
+     {
+      "id": "c19",
+      "title": "C"
+     },
+     {
+      "id": "c20",
+      "title": "C"
+     },
+     {
+      "id": "c21",
+      "title": "C"
+     },
+     {
+      "id": "c22",
+      "title": "C"
+     },
+     {
+      "id": "c23",
+      "title": "C"
+     },
+     {
+      "id": "c24",
+      "title": "C"
+     },
+     {
+      "id": "c25",
+      "title": "C"
+     },
+     {
+      "id": "c26",
+      "title": "C"
+     },
+     {
+      "id": "c27",
+      "title": "C"
+     },
+     {
+      "id": "c28",
+      "title": "C"
+     },
+     {
+      "id": "c29",
+      "title": "C"
+     },
+     {
+      "id": "c30",
+      "title": "C"
+     },
+     {
+      "id": "c31",
+      "title": "C"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "33 commands",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": {
+    "entry": "main.js"
+   },
+   "contributes": {
+    "commands": [
+     {
+      "id": "c0",
+      "title": "C"
+     },
+     {
+      "id": "c1",
+      "title": "C"
+     },
+     {
+      "id": "c2",
+      "title": "C"
+     },
+     {
+      "id": "c3",
+      "title": "C"
+     },
+     {
+      "id": "c4",
+      "title": "C"
+     },
+     {
+      "id": "c5",
+      "title": "C"
+     },
+     {
+      "id": "c6",
+      "title": "C"
+     },
+     {
+      "id": "c7",
+      "title": "C"
+     },
+     {
+      "id": "c8",
+      "title": "C"
+     },
+     {
+      "id": "c9",
+      "title": "C"
+     },
+     {
+      "id": "c10",
+      "title": "C"
+     },
+     {
+      "id": "c11",
+      "title": "C"
+     },
+     {
+      "id": "c12",
+      "title": "C"
+     },
+     {
+      "id": "c13",
+      "title": "C"
+     },
+     {
+      "id": "c14",
+      "title": "C"
+     },
+     {
+      "id": "c15",
+      "title": "C"
+     },
+     {
+      "id": "c16",
+      "title": "C"
+     },
+     {
+      "id": "c17",
+      "title": "C"
+     },
+     {
+      "id": "c18",
+      "title": "C"
+     },
+     {
+      "id": "c19",
+      "title": "C"
+     },
+     {
+      "id": "c20",
+      "title": "C"
+     },
+     {
+      "id": "c21",
+      "title": "C"
+     },
+     {
+      "id": "c22",
+      "title": "C"
+     },
+     {
+      "id": "c23",
+      "title": "C"
+     },
+     {
+      "id": "c24",
+      "title": "C"
+     },
+     {
+      "id": "c25",
+      "title": "C"
+     },
+     {
+      "id": "c26",
+      "title": "C"
+     },
+     {
+      "id": "c27",
+      "title": "C"
+     },
+     {
+      "id": "c28",
+      "title": "C"
+     },
+     {
+      "id": "c29",
+      "title": "C"
+     },
+     {
+      "id": "c30",
+      "title": "C"
+     },
+     {
+      "id": "c31",
+      "title": "C"
+     },
+     {
+      "id": "c32",
+      "title": "C"
+     }
+    ]
+   }
+  },
+  "files": [
+   "main.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "sniffRules ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "browserRules"
+   ],
+   "contributes": {
+    "sniffRules": "rules.json"
+   }
+  },
+  "files": [
+   "rules.json"
+  ],
+  "ok": true,
+  "risk": "elevated"
+ },
+ {
+  "name": "sniffRules without permission",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "contributes": {
+    "sniffRules": "rules.json"
+   }
+  },
+  "files": [
+   "rules.json"
+  ],
+  "ok": false
+ },
+ {
+  "name": "sniffRules not json",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "browserRules"
+   ],
+   "contributes": {
+    "sniffRules": "rules.txt"
+   }
+  },
+  "files": [
+   "rules.txt"
+  ],
+  "ok": false
+ },
+ {
+  "name": "sniffRules file missing",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "browserRules"
+   ],
+   "contributes": {
+    "sniffRules": "rules.json"
+   }
+  },
+  "files": [],
+  "ok": false
+ },
+ {
+  "name": "sniffRules traversal",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "browserRules"
+   ],
+   "contributes": {
+    "sniffRules": "../rules.json"
+   }
+  },
+  "files": [],
+  "ok": false
+ },
+ {
+  "name": "contributes unknown field",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "contributes": {
+    "extra": 1
+   }
+  },
+  "files": [],
+  "ok": false
+ },
+ {
+  "name": "legacy window field rejected",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "window": {
+    "entry": "w.js"
+   }
+  },
+  "files": [
+   "w.js"
+  ],
+  "ok": false
+},
+{
+ "name": "interceptors ok",
+ "manifest": {
+  "identity": "a@b",
+  "name": "N",
+  "version": "1.0.0",
+  "permissions": ["intercept"],
+  "interceptors": {
+   "entry": "intercept.js",
+   "stages": ["prepare", "segments"],
+   "match": { "urls": ["https://example.com/*"] }
+  }
+ },
+ "files": ["intercept.js"],
+ "ok": true,
+ "risk": "elevated"
+},
+{
+ "name": "interceptors refresh stage ok",
+ "manifest": {
+  "identity": "a@b",
+  "name": "N",
+  "version": "1.0.0",
+  "permissions": ["intercept"],
+  "interceptors": {
+   "entry": "intercept.js",
+   "stages": ["prepare", "refresh"],
+   "match": { "urls": ["https://example.com/*"] }
+  }
+ },
+ "files": ["intercept.js"],
+ "ok": true,
+ "risk": "elevated"
+},
+{
+ "name": "interceptors without permission",
+ "manifest": {
+  "identity": "a@b",
+  "name": "N",
+  "version": "1.0.0",
+  "interceptors": {
+   "entry": "intercept.js",
+   "stages": ["prepare"],
+   "match": { "urls": ["https://example.com/*"] }
+  }
+ },
+ "files": ["intercept.js"],
+ "ok": false
+},
+{
+ "name": "interceptors unknown stage",
+ "manifest": {
+  "identity": "a@b",
+  "name": "N",
+  "version": "1.0.0",
+  "permissions": ["intercept"],
+  "interceptors": {
+   "entry": "intercept.js",
+   "stages": ["bogus"],
+   "match": { "urls": ["https://example.com/*"] }
+  }
+ },
+ "files": ["intercept.js"],
+ "ok": false
+},
+{
+ "name": "interceptors duplicate stage",
+ "manifest": {
+  "identity": "a@b",
+  "name": "N",
+  "version": "1.0.0",
+  "permissions": ["intercept"],
+  "interceptors": {
+   "entry": "intercept.js",
+   "stages": ["prepare", "prepare"],
+   "match": { "urls": ["https://example.com/*"] }
+  }
+ },
+ "files": ["intercept.js"],
+ "ok": false
+},
+{
+ "name": "interceptors empty match urls",
+ "manifest": {
+  "identity": "a@b",
+  "name": "N",
+  "version": "1.0.0",
+  "permissions": ["intercept"],
+  "interceptors": {
+   "entry": "intercept.js",
+   "stages": ["prepare"],
+   "match": { "urls": [] }
+  }
+ },
+ "files": ["intercept.js"],
+ "ok": false
+},
+{
+ "name": "interceptors zero timeout",
+ "manifest": {
+  "identity": "a@b",
+  "name": "N",
+  "version": "1.0.0",
+  "permissions": ["intercept"],
+  "interceptors": {
+   "entry": "intercept.js",
+   "stages": ["prepare"],
+   "match": { "urls": ["https://example.com/*"] },
+   "timeoutMs": 0
+  }
+ },
+ "files": ["intercept.js"],
+ "ok": false
+},
+{
+ "name": "interceptors bad onFailure",
+ "manifest": {
+  "identity": "a@b",
+  "name": "N",
+  "version": "1.0.0",
+  "permissions": ["intercept"],
+  "interceptors": {
+   "entry": "intercept.js",
+   "stages": ["prepare"],
+   "match": { "urls": ["https://example.com/*"] },
+   "onFailure": "retry"
+  }
+ },
+ "files": ["intercept.js"],
+ "ok": false
+}
+]

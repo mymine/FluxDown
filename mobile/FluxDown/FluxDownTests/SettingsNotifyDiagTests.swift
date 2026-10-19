@@ -356,6 +356,7 @@ struct MobileChecksTests {
         #expect(MobileChecks.storage(writable: true, freeBytes: 5 << 30).level == .ok)
     }
 
+    #if FULL_P2P
     @Test func linkLevelsFollowInfoPlistDeclarations() {
         let all: Set<String> = ["magnet", "ed2k", "fluxdown"]
         #expect(MobileChecks.links(declaredSchemes: all, torrentDeclared: true, handlers: [:]).level == .ok)
@@ -380,6 +381,7 @@ struct MobileChecksTests {
         #expect(!MobileChecks.declaresTorrentDocument(in: [:]))
         #expect(MobileChecks.declaredURLSchemes(in: [:]).isEmpty)
     }
+    #endif
 
     @Test func networkLevels() {
         func snapshot(

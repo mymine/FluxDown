@@ -163,7 +163,7 @@ function CloudPlanCell({ plan, lang }: { plan: CloudPlan; lang: Lang }) {
         paid &&
         (plan.purchasable !== false ? (
           <>
-            <WebPurchase plan={{ code: plan.code, name: plan.name, priceMinor, currency: plan.currency }} lang={lang} />
+            <WebPurchase plan={{ code: plan.code, name: plan.name, priceMinor, currency: plan.currency, basePriceMinor: plan.priceMinor, priceUsdtMicros: plan.priceUsdtMicros ?? null }} lang={lang} />
             <p className="mt-2.5 text-center text-xs text-subtle">{t.buyInApp}</p>
           </>
         ) : (

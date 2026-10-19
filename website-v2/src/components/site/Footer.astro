@@ -1,11 +1,20 @@
 ---
-import { Moon, Sun } from "lucide-react";
+import { ArrowUpRight, Moon, Sun } from "lucide-react";
 import Logo from "./Logo.astro";
 import { BrandIcon } from "../icons/brand";
 import { common } from "../../i18n/messages/common";
 import { href, switchLang } from "../../i18n/routing";
 import { LANG_LABEL, LANGS, type Lang } from "../../i18n/config";
 import { GITHUB_URL, TELEGRAM_URL, docsPath } from "../../lib/site-nav";
+import {
+  CONTRIBUTE_OVERVIEW,
+  PLUGIN_INDEX_REPO,
+  PLUGIN_SDK_NPM_URL,
+  SNIFF_RULES_REPO,
+  THEMES_REPO,
+  contributeGuidePath,
+  githubUrl,
+} from "../../lib/ecosystem";
 
 interface Props {
   lang: Lang;
@@ -15,7 +24,14 @@ const t = common[lang].footer;
 const nav = common[lang].nav;
 const year = new Date().getFullYear();
 
-const columns = [
+interface FooterLink {
+  label: string;
+  /** 站内无语言前缀路径(经 `href()` 本地化),或 `external` 时为完整外链 */
+  path: string;
+  external?: boolean;
+}
+
+const columns: { title: string; links: FooterLink[] }[] = [
   {
     title: t.product,
     links: [
@@ -35,6 +51,17 @@ const columns = [
       { label: t.faq, path: "/faq" },
       { label: t.macosGatekeeper, path: "/macos-gatekeeper" },
       { label: t.securityAlert, path: "/security-alert" },
+    ],
+  },
+  {
+    title: t.openSource,
+    links: [
+      { label: t.contribute, path: contributeGuidePath(lang, CONTRIBUTE_OVERVIEW) },
+      { label: t.mainRepo, path: GITHUB_URL, external: true },
+      { label: t.pluginIndex, path: githubUrl(PLUGIN_INDEX_REPO), external: true },
+      { label: t.themeRepo, path: githubUrl(THEMES_REPO), external: true },
+      { label: t.sniffRules, path: githubUrl(SNIFF_RULES_REPO), external: true },
+      { label: t.pluginSdk, path: PLUGIN_SDK_NPM_URL, external: true },
     ],
   },
   {
@@ -61,8 +88,8 @@ const columns = [
 
 <footer class="site-footer frame">
   <div class="rule"></div>
-  <div class="grid gap-12 px-[clamp(20px,4vw,56px)] pb-10 pt-16 md:grid-cols-[1.3fr_repeat(4,1fr)]">
-    <div class="flex flex-col gap-5">
+  <div class="grid gap-x-8 gap-y-12 px-[clamp(20px,4vw,56px)] pb-10 pt-16 sm:grid-cols-3 lg:grid-cols-[1.3fr_repeat(5,1fr)]">
+    <div class="flex flex-col gap-5 sm:col-span-3 lg:col-span-1">
       <Logo size={26} />
       <p class="max-w-[30ch] text-[14px] leading-relaxed text-muted">{common[lang].brandTagline}</p>
       <div class="flex flex-wrap gap-2">
@@ -87,9 +114,16 @@ const columns = [
           <ul class="flex flex-col gap-2.5">
             {column.links.map((link) => (
               <li>
-                <a href={href(link.path, lang)} class="footer-link">
-                  {link.label}
-                </a>
+                {link.external ? (
+                  <a href={link.path} target="_blank" rel="noopener" class="footer-link footer-link-ext">
+                    {link.label}
+                    <ArrowUpRight size={12} strokeWidth={2} aria-hidden="true" />
+                  </a>
+                ) : (
+                  <a href={href(link.path, lang)} class="footer-link">
+                    {link.label}
+                  </a>
+                )}
               </li>
             ))}
           </ul>
@@ -162,6 +196,21 @@ const columns = [
     }
     .footer-link:hover {
       color: var(--fg);
+    }
+    .footer-link-ext {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+    }
+    .footer-link-ext svg {
+      color: var(--fg-subtle);
+      transition:
+        color 150ms,
+        transform 150ms;
+    }
+    .footer-link-ext:hover svg {
+      color: var(--fg);
+      transform: translate(1px, -1px);
     }
     .footer-lang {
       padding: 4px 8px;

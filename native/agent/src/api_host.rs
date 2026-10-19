@@ -538,12 +538,16 @@ impl ApiHost for AgentApiHost {
         self.link.api_approve(session_id, accept)
     }
 
-    async fn link_create_task(&self, auth: LinkAuth, body: Vec<u8>) -> Result<String, ApiError> {
+    async fn link_create_task(&self, auth: LinkAuth, body: Vec<u8>) -> Result<Vec<u8>, ApiError> {
         self.link.api_create_task(auth, body).await
     }
 
     async fn link_peer_info(&self, auth: LinkAuth, body: Vec<u8>) -> Result<Vec<u8>, ApiError> {
         self.link.api_peer_info(auth, body).await
+    }
+
+    async fn link_unpair(&self, auth: LinkAuth, body: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        self.link.api_unpair(auth, body).await
     }
 
     fn link_trusted_proxy(&self, peer: IpAddr) -> bool {

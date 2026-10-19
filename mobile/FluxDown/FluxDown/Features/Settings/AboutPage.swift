@@ -3,12 +3,12 @@ import FluxUI
 import SwiftUI
 
 enum SettingsLinks {
-    static let siteHost = "fluxdown.zerx.dev"
-    static let site = "https://fluxdown.zerx.dev"
-    static let privacy = "https://fluxdown.zerx.dev/privacy"
+    static let siteHost = "fluxdown.com"
+    static let site = "https://fluxdown.com"
+    static let privacy = "https://fluxdown.com/privacy"
     static let license = "https://github.com/zerx-lab/FluxDown/blob/main/LICENSE"
     static let dependencies = "https://github.com/zerx-lab/FluxDown/blob/main/Cargo.lock"
-    static let changelog = "https://fluxdown.zerx.dev/changelog"
+    static let changelog = "https://fluxdown.com/changelog"
     /// 远端 `--server` 主机的发布页（升级由服务器管理员在服务器上完成，App 内不提供）。
     static let serverReleases = "https://github.com/zerx-lab/FluxDown/releases"
 }

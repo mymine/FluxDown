@@ -9,5 +9,6 @@ pub(crate) mod pairing_prompt;
 pub(crate) mod password;
 pub(crate) mod password_field;
 pub(crate) mod password_reset;
+pub(crate) mod plan_purchase;
 pub(crate) mod profile;
 pub(crate) mod register;

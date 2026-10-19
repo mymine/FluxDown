@@ -45,6 +45,7 @@ function entry(id: string, name: string, description: string, author: string, ta
     yanked: '',
     tags,
     permissions: [],
+    networkHosts: [],
   }
 }
 

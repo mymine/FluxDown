@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use fluxdown_engine::auth::{self, AuthProfile};
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_config::BtConfig;
 use fluxdown_engine::plugin::{AuthRequest, PluginError, ResolveRequest};
 use fluxdown_engine::proxy_config::ProxyConfig;
 use fluxdown_engine::{Engine, EngineConfig, NoopSelection, NoopSink};
@@ -308,7 +308,10 @@ async fn uninstall_config_failure_invalidates_removed_resolver_and_preserves_oth
         resolver_item: String::new(),
     };
     assert_eq!(
-        pm.match_resolver(removed_url).await.as_deref(),
+        pm.route_resolver(removed_url)
+            .await
+            .map(|r| r.identity)
+            .as_deref(),
         Some(removed)
     );
     assert_eq!(
@@ -360,7 +363,7 @@ async fn uninstall_config_failure_invalidates_removed_resolver_and_preserves_oth
             .as_deref(),
         Some("true")
     );
-    assert_eq!(pm.match_resolver(removed_url).await, None);
+    assert_eq!(pm.route_resolver(removed_url).await, None);
     assert!(
         matches!(
             pm.resolve(removed, request(removed_url)).await,
@@ -380,7 +383,10 @@ async fn uninstall_config_failure_invalidates_removed_resolver_and_preserves_oth
     assert_eq!(other.load_status, "Loaded");
     assert!(other.enabled);
     assert_eq!(
-        pm.match_resolver(retained_url).await.as_deref(),
+        pm.route_resolver(retained_url)
+            .await
+            .map(|r| r.identity)
+            .as_deref(),
         Some(retained)
     );
     assert_eq!(

@@ -1,14 +1,23 @@
 ---
-/** 市场页底部「如何使用」:三步编号格 + 指南外链(静态渲染,不依赖索引加载)。 */
-import { ArrowUpRight } from "lucide-react";
+/** 市场页底部「如何使用」:三步编号格 + 末格贡献入口(指南 / 仓库 / SDK;静态渲染,不依赖索引加载)。 */
+import { ArrowRight, ArrowUpRight } from "lucide-react";
+import { BrandIcon, type BrandName } from "@/components/icons/brand";
+
+interface HowToLink {
+  href: string;
+  label: string;
+  /** 外链:新标签页打开 */
+  external?: boolean;
+  brand?: BrandName;
+}
 
 interface Props {
   eyebrow: string;
   title: string;
   steps: readonly string[];
-  guide: { href: string; label: string };
+  links: readonly HowToLink[];
 }
-const { eyebrow, title, steps, guide } = Astro.props;
+const { eyebrow, title, steps, links } = Astro.props;
 ---
 
 <section class="frame">
@@ -26,15 +35,22 @@ const { eyebrow, title, steps, guide } = Astro.props;
           </span>
           <p class="text-[14.5px] leading-relaxed text-muted">{step}</p>
           {i === steps.length - 1 && (
-            <a
-              href={guide.href}
-              target="_blank"
-              rel="noopener noreferrer"
-              class="link mt-auto inline-flex items-center gap-1 text-sm"
-            >
-              {guide.label}
-              <ArrowUpRight size={14} aria-hidden="true" />
-            </a>
+            <div class="mt-auto flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
+              {links.map((link) =>
+                link.external ? (
+                  <a href={link.href} target="_blank" rel="noopener noreferrer" class="link inline-flex items-center gap-1.5">
+                    {link.brand && <BrandIcon name={link.brand} size={13} />}
+                    {link.label}
+                    <ArrowUpRight size={14} aria-hidden="true" />
+                  </a>
+                ) : (
+                  <a href={link.href} class="link inline-flex items-center gap-1">
+                    {link.label}
+                    <ArrowRight size={14} aria-hidden="true" />
+                  </a>
+                ),
+              )}
+            </div>
           )}
         </li>
       ))

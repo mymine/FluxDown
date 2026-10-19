@@ -83,6 +83,7 @@ import type {
   LinkPairBeginResponse,
   LinkPairFinishParams,
   LinkPairFinishResponse,
+  LinkRenameParams,
   LinkPairingCodeDto,
   RemoteCommandParams,
   RemoteDispatchParams,
@@ -169,6 +170,8 @@ const device = {
   rename: (params: DeviceRenameParams) => call<CloudDevice>(METHOD.AGENT_DEVICE_RENAME, params),
   /** FluxCloud 原样响应（结构未固定）；删除当前设备会同时清除本机会话。 */
   delete: (params: DeviceIdParams) => call<JsonValue>(METHOD.AGENT_DEVICE_DELETE, params),
+  /** 让同账号另一台在线设备下线释放在线名额（不删除设备）；不能对本机调用。 */
+  disconnect: (params: DeviceIdParams) => call<OkResult>(METHOD.AGENT_DEVICE_DISCONNECT, params),
 };
 
 const preferences = {
@@ -199,6 +202,7 @@ const link = {
     call<LinkPairFinishResponse>(METHOD.AGENT_LINK_PAIR_FINISH, params, { timeoutMs: PAIR_FINISH_TIMEOUT_MS }),
   approve: (params: LinkApproveParams) => call<OkResult>(METHOD.AGENT_LINK_APPROVE, params),
   remove: (params: LinkDeviceParams) => call<OkResult>(METHOD.AGENT_LINK_REMOVE, params),
+  rename: (params: LinkRenameParams) => call<LinkDeviceInfo>(METHOD.AGENT_LINK_RENAME, params),
   refresh: () => call<LinkDeviceInfo[]>(METHOD.AGENT_LINK_REFRESH),
   dispatch: (params: LinkDispatchParams) =>
     call<LinkDispatchResult>(METHOD.AGENT_LINK_DISPATCH, params),

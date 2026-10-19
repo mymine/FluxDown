@@ -102,6 +102,8 @@ pub(crate) struct DownloadStrings {
     pub(crate) edit_threads_zero_hint: SharedString,
     pub(crate) edit_threads_invalid: SharedString,
     pub(crate) threads_changed: SharedString,
+    /// 右键「完整性校验」（已完成 BT 任务）。
+    pub(crate) verify_integrity: SharedString,
     pub(crate) redownload_task: SharedString,
     pub(crate) copy_url: SharedString,
     /// 复制下载地址后的成功提示。
@@ -248,6 +250,7 @@ impl DownloadStrings {
             edit_threads_zero_hint: shared(translator.text("queueDefaultSegmentsHint")),
             edit_threads_invalid: shared(translator.text("editThreadsInvalid")),
             threads_changed: shared(translator.text("threadsChanged")),
+            verify_integrity: shared(translator.text("verifyTaskIntegrity")),
             redownload_task: shared(translator.text("redownloadTask")),
             copy_url: shared(translator.text("copyUrl")),
             url_copied: shared(translator.text("urlCopied")),
@@ -349,7 +352,8 @@ impl DownloadStrings {
         }
     }
 
-    /// 行级状态名：已完成但产物已不在下载目录时显示「文件已删除」。
+    /// 行级状态名：已完成但产物已不在下载目录时显示「文件已删除」，引擎 status 5（探测 /
+    /// 插件解析）显示「准备中」。所有按任务展示状态名的地方都走这里，不得直接 `state_label`。
     pub(crate) fn task_state_label(&self, task: &crate::model::DownloadTaskView) -> SharedString {
         if task.is_file_missing() {
             self.status_file_missing.clone()
@@ -357,6 +361,23 @@ impl DownloadStrings {
             self.metadata_loading.clone()
         } else {
             self.state_label(task.state)
+        }
+    }
+
+    /// 单行状态（详情窗口状态行、进度窗口标题下）：排队中显示「排队 #n」，其余同
+    /// [`Self::task_state_label`]。
+    pub(crate) fn task_status_text(&self, task: &crate::model::DownloadTaskView) -> SharedString {
+        self.queued_label(task)
+            .map_or_else(|| self.task_state_label(task), SharedString::from)
+    }
+
+    /// 只有引擎原始 status 的场景（活动日志的状态变更）：与 [`Self::task_state_label`]
+    /// 同一规则，5 为「准备中」而非「等待中」。
+    pub(crate) fn status_code_label(&self, status: i32) -> SharedString {
+        if status == 5 {
+            self.metadata_loading.clone()
+        } else {
+            self.state_label(crate::model::TaskState::from_status(status))
         }
     }
 
@@ -573,9 +594,9 @@ pub(crate) struct NewDownloadStrings {
     path_invalid: SharedString,
     dispatched: SharedString,
     dispatched_offline: SharedString,
+    link_dispatched: SharedString,
     dispatch_partial: SharedString,
     pub(crate) dispatch_failed: SharedString,
-    pub(crate) created: SharedString,
     import_cancelled: SharedString,
     import_partial: SharedString,
 }
@@ -674,9 +695,9 @@ impl NewDownloadStrings {
             path_invalid: shared(translator.text("downloadToPathInvalid")),
             dispatched: shared(translator.text("downloadToDispatched")),
             dispatched_offline: shared(translator.text("downloadToDispatchedOffline")),
+            link_dispatched: shared(translator.text("linkDispatchedToDevice")),
             dispatch_partial: shared(translator.text("downloadToPartial")),
             dispatch_failed: shared(translator.text("dispatchFailed")),
-            created: shared(translator.text("taskCreatedToast")),
             import_cancelled: shared(translator.text("importCancelled")),
             import_partial: shared(translator.text("importPartial")),
         }
@@ -754,8 +775,18 @@ impl NewDownloadStrings {
         SharedString::from(self.path_invalid.replace("{example}", example))
     }
 
-    /// 下发成功提示；目标离线（云设备）时说明上线后才执行。
-    pub(crate) fn format_dispatched(&self, count: usize, device: &str, offline: bool) -> String {
+    /// 下发成功提示；目标离线（云设备）时说明上线后才执行；直连下发是一次性投递，
+    /// 提示进度要在目标设备上查看。
+    pub(crate) fn format_dispatched(
+        &self,
+        count: usize,
+        device: &str,
+        offline: bool,
+        direct: bool,
+    ) -> String {
+        if direct {
+            return self.link_dispatched.replace("{device}", device);
+        }
         let template = if offline {
             &self.dispatched_offline
         } else {
@@ -913,5 +944,50 @@ mod tests {
         ] {
             assert_eq!(group_digits(value), expected);
         }
+    }
+
+    /// 引擎 status 5（探测 / 插件解析）在任务表、详情、进度窗口与活动日志都是「准备中」，
+    /// 不得退回 `TaskState::Pending` 的「等待中」；排队位置只属于未开始准备的等待任务。
+    #[test]
+    fn preparing_status_is_labelled_consistently_across_surfaces()
+    -> Result<(), fluxdown_ui_i18n::I18nError> {
+        let catalog = std::sync::Arc::new(fluxdown_ui_i18n::I18nCatalog::load_embedded()?);
+        let translator = catalog.translator("en");
+        let strings = DownloadStrings::from_translator(&translator);
+        let task = |status: i32, queue_position: u32| {
+            let dto = serde_json::from_value::<fluxdown_protocol::TaskDto>(serde_json::json!({
+                "taskId": "t",
+                "url": "https://www.youtube.com/watch?v=x",
+                "fileName": "video.mp4",
+                "saveDir": "/tmp",
+                "status": status,
+                "downloadedBytes": 0,
+                "totalBytes": 0,
+                "errorMessage": "",
+                "createdAt": "1",
+                "proxyUrl": "",
+                "queueId": "main",
+                "checksum": ""
+            }))
+            .expect("task");
+            let mut view = crate::model::DownloadTaskView::local(&dto, None, false);
+            view.queue_position = queue_position;
+            view
+        };
+        let preparing = translator.text("statusPreparing");
+        let pending = translator.text("statusPending");
+
+        let resolving = task(5, 3);
+        assert_eq!(strings.task_state_label(&resolving).as_ref(), preparing);
+        assert_eq!(strings.task_status_text(&resolving).as_ref(), preparing);
+        assert_eq!(strings.status_code_label(5).as_ref(), preparing);
+
+        assert_eq!(strings.task_status_text(&task(0, 0)).as_ref(), pending);
+        assert_eq!(strings.status_code_label(0).as_ref(), pending);
+        assert_eq!(
+            strings.task_status_text(&task(0, 2)).as_ref(),
+            translator.text("subtitleQueued").replace("{pos}", "2")
+        );
+        Ok(())
     }
 }

@@ -5,7 +5,10 @@
 //!   是设备本地偏好；
 //! - `local_only_keys` 设备本地持久化：本机专属键不推送、也不应用云端值；
 //! - 登录后默认开启（除非用户曾显式关闭）；关闭在 SSE 存活期间立即生效；
-//! - `sync_device_limit` / `sync_device_untrusted` → `halted`，停止自动重试；
+//! - `sync_device_untrusted` → `halted`，停止自动重试；`online_device_limit`（在线名额已满）不 halt：
+//!   记录原因、每 30 秒重试，本机任务通道连上时立即恢复；
+//! - 冲突按编辑时间裁决：推送带 `baseVersion` + `editedAt`，云端判负的条目随 `conflicts` 回来，
+//!   按云端拉取值应用；
 //! - 水位与脏键按账号隔离（见 `AgentState::bind_account`）；
 //! - 拉取到的单条毒值只跳过并记录，不阻塞水位前进；
 //! - 首次 / resync 把目录里云端没有的本机值播种上云。
@@ -15,9 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fluxdown_protocol::{
-    AgentEvent, CUSTOM_THEMES_KEY, DaemonConfigPatch, ErrorReason, RpcErrorData, ServiceEvent,
-    SettingSpec, SyncStatusDto, custom_theme_id, daemon_config_default, daemon_config_to_value,
-    normalize_daemon_config_value, sync_scope_key,
+    AgentEvent, CUSTOM_THEMES_KEY, CloudConnectionState, DaemonConfigPatch, ErrorReason,
+    RpcErrorData, ServiceEvent, SettingSpec, SyncStatusDto, custom_theme_id, daemon_config_default,
+    daemon_config_to_value, normalize_daemon_config_value, sync_scope_key,
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -63,6 +66,8 @@ const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 /// 单次推送的条目上限，镜像 FluxCloud `sync::MAX_ITEMS_PER_PUSH`：自定义主题逐个成键，
 /// 首次播种时脏键数可能超出，必须分批。
 const MAX_ITEMS_PER_PUSH: usize = 128;
+/// 在线设备名额已满后的固定重试间隔（不走指数退避）。
+const ONLINE_LIMIT_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,6 +90,9 @@ struct SyncItem {
     version: u64,
     #[serde(default)]
     device_id: String,
+    /// 云端记录该值的编辑时刻（unix 毫秒）；旧云端不带。
+    #[serde(default)]
+    edited_at: Option<i64>,
 }
 
 /// 一次 SSE 会话的结束原因。
@@ -270,18 +278,25 @@ impl SyncService {
                 if error.halts() {
                     continue;
                 }
-                let delay = RETRY_DELAYS[retry_attempt.min(RETRY_DELAYS.len() - 1)];
-                retry_attempt = retry_attempt.saturating_add(1);
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = self.wake.notified() => {},
-                    _ = tokio::time::sleep(delay) => {},
+                let limited = error.is_online_limit();
+                let delay = if limited {
+                    ONLINE_LIMIT_RETRY
+                } else {
+                    let delay = RETRY_DELAYS[retry_attempt.min(RETRY_DELAYS.len() - 1)];
+                    retry_attempt = retry_attempt.saturating_add(1);
+                    delay
+                };
+                if self
+                    .wait_retry(&cancel, &mut session_events, delay, limited)
+                    .await
+                {
+                    return;
                 }
                 continue;
             }
             let sync_started = std::time::Instant::now();
             let device_id = self.state.lock().await.device_id.clone();
-            match self.cloud.at_epoch(epoch).sync_events(&device_id).await {
+            let limited = match self.cloud.at_epoch(epoch).sync_events(&device_id).await {
                 Ok(response) => {
                     self.set_connected_epoch(true, epoch).await;
                     let outcome = self
@@ -305,6 +320,7 @@ impl SyncService {
                             if error.halts() {
                                 continue;
                             }
+                            error.is_online_limit()
                         }
                     }
                 }
@@ -314,17 +330,75 @@ impl SyncService {
                     if error.halts() {
                         continue;
                     }
+                    error.is_online_limit()
                 }
-            }
+            };
             if sync_started.elapsed() >= SSE_STABLE {
                 retry_attempt = 0;
             }
-            let delay = RETRY_DELAYS[retry_attempt.min(RETRY_DELAYS.len() - 1)];
-            retry_attempt = retry_attempt.saturating_add(1);
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = self.wake.notified() => {},
-                _ = tokio::time::sleep(delay) => {},
+            let delay = if limited {
+                ONLINE_LIMIT_RETRY
+            } else {
+                let delay = RETRY_DELAYS[retry_attempt.min(RETRY_DELAYS.len() - 1)];
+                retry_attempt = retry_attempt.saturating_add(1);
+                delay
+            };
+            if self
+                .wait_retry(&cancel, &mut session_events, delay, limited)
+                .await
+            {
+                return;
+            }
+        }
+    }
+
+    /// 立即结束当前重试等待并重新同步；在线名额被释放（手动让其它设备下线）后调用。
+    pub fn request_reconnect(&self) {
+        self.wake.notify_one();
+    }
+
+    /// 失败后的重试等待；返回 `true` 表示已取消。到点、本地变更唤醒即返回；在线名额受限时
+    /// 本机任务通道连上（名额已让出）的瞬间也返回，不必等满 30 秒。
+    async fn wait_retry(
+        &self,
+        cancel: &CancellationToken,
+        session_events: &mut broadcast::Receiver<fluxdown_protocol::EventFrame>,
+        delay: Duration,
+        limited: bool,
+    ) -> bool {
+        tokio::select! {
+            _ = cancel.cancelled() => true,
+            _ = self.wake.notified() => false,
+            _ = tokio::time::sleep(delay) => false,
+            _ = self.wait_remote_connected(session_events), if limited => false,
+        }
+    }
+
+    /// 等到本机任务通道变为 `connected`；接收端 lag 时以当前快照为准。
+    async fn wait_remote_connected(
+        &self,
+        events: &mut broadcast::Receiver<fluxdown_protocol::EventFrame>,
+    ) {
+        loop {
+            match events.recv().await {
+                Ok(frame) => {
+                    if matches!(
+                        &frame.event,
+                        ServiceEvent::Agent(AgentEvent::CloudConnectionChanged(connection))
+                            if connection.state == CloudConnectionState::Connected
+                    ) {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let connected = self.events.inspect(|snapshot| {
+                        snapshot.cloud_connection.state == CloudConnectionState::Connected
+                    });
+                    if connected {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => std::future::pending::<()>().await,
             }
         }
     }
@@ -585,20 +659,10 @@ impl SyncService {
         let pull = serde_json::from_value::<PullResult>(pull_value)
             .map_err(|error| SyncError::Protocol(format!("sync pull response: {error}")))?;
         let no_pulled_items = pull.items.is_empty();
-        let items = pull
-            .items
-            .into_iter()
-            .filter_map(|value| match serde_json::from_value::<SyncItem>(value.clone()) {
-                Ok(item) => Some(item),
-                Err(error) => {
-                    tracing::warn!(error = %error, item = %value, "skipping malformed sync item");
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let items = parse_items(pull.items);
 
         let current_daemon = daemon_config_values(&self.events);
-        let (daemon_changes, prefs_changed, sent_entries) = {
+        let (daemon_changes, mut prefs_changed, sent_entries) = {
             let mut state = self.cloud.lock_epoch(epoch).await?;
             if state.account_uid.as_deref() != Some(uid.as_str()) {
                 return Err(SyncError::AccountChanged);
@@ -627,14 +691,7 @@ impl SyncService {
             for batch in sent_entries.chunks(MAX_ITEMS_PER_PUSH) {
                 let payload = batch
                     .iter()
-                    .map(|(key, entry)| {
-                        serde_json::json!({
-                            "key": key,
-                            "value": entry.value,
-                            "deleted": entry.deleted,
-                            "version": entry.version,
-                        })
-                    })
+                    .map(|(key, entry)| push_item(key, entry))
                     .collect::<Vec<_>>();
                 let response = self
                     .cloud
@@ -650,18 +707,44 @@ impl SyncService {
                     .ok_or_else(|| {
                         SyncError::Protocol("sync push returned no revision".to_owned())
                     })?;
-                let mut state = self.cloud.lock_epoch(epoch).await?;
-                if state.account_uid.as_deref() != Some(uid.as_str()) {
-                    return Err(SyncError::AccountChanged);
-                }
-                for (key, sent) in batch {
-                    if let Some(entry) = state.sync_entries.get_mut(key)
-                        && entry.value == sent.value
-                        && entry.deleted == sent.deleted
-                        && entry.version == sent.version
-                    {
-                        entry.dirty = false;
+                let conflicts = parse_items(
+                    response
+                        .get("conflicts")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                let conflict_daemon_changes = {
+                    let mut state = self.cloud.lock_epoch(epoch).await?;
+                    if state.account_uid.as_deref() != Some(uid.as_str()) {
+                        return Err(SyncError::AccountChanged);
                     }
+                    // 这一批已被云端处理：被采纳的与被判负的都不再脏（判负的下面按云端值覆盖）。
+                    for (key, sent) in batch {
+                        if let Some(entry) = state.sync_entries.get_mut(key)
+                            && entry.value == sent.value
+                            && entry.deleted == sent.deleted
+                            && entry.version == sent.version
+                        {
+                            entry.dirty = false;
+                        }
+                    }
+                    if conflicts.is_empty() {
+                        BTreeMap::new()
+                    } else {
+                        // 云端判负的条目：返回的是云端胜出的现值，按拉取值应用（非脏）。
+                        let report = apply_pull(
+                            &mut state,
+                            &device_id,
+                            conflicts,
+                            &daemon_config_values(&self.events),
+                        );
+                        prefs_changed |= report.prefs_changed;
+                        report.daemon_changes
+                    }
+                };
+                if !conflict_daemon_changes.is_empty() {
+                    self.patch_daemon(conflict_daemon_changes, epoch).await?;
                 }
                 watermark = watermark
                     .filter(|current| revision == *current || revision == current.saturating_add(1))
@@ -785,6 +868,7 @@ impl SyncService {
             )
             .await?;
         }
+        let edited_at = self.cloud.server_now_ms();
         let revision = {
             let mut state = self.cloud.lock_epoch(epoch).await?;
             if matches!(spec.owner, SyncOwner::Agent | SyncOwner::Preferences) {
@@ -800,6 +884,7 @@ impl SyncService {
                 entry.value = wire;
                 entry.deleted = deleted;
                 entry.dirty = true;
+                entry.edited_at_ms = Some(edited_at);
             }
             state.refresh_sync_projection();
             self.events
@@ -836,6 +921,36 @@ impl SyncService {
             .publish(AgentEvent::PreferencesChanged(preferences));
         Ok(revision)
     }
+}
+
+/// 解析云端条目（拉取项 / 推送冲突项）：坏条目只记录并跳过。
+fn parse_items(values: Vec<Value>) -> Vec<SyncItem> {
+    values
+        .into_iter()
+        .filter_map(
+            |value| match serde_json::from_value::<SyncItem>(value.clone()) {
+                Ok(item) => Some(item),
+                Err(error) => {
+                    tracing::warn!(error = %error, item = %value, "skipping malformed sync item");
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+/// 推送线上形态：`baseVersion` 是本机编辑所基于的云端版本（脏键拉取期间不上浮），
+/// `editedAt` 是本机编辑时刻（毫秒）；没有真实编辑时刻（播种）时省略，由云端取当前时间。
+fn push_item(key: &str, entry: &PersistedSyncEntry) -> Value {
+    let mut item = serde_json::Map::new();
+    item.insert("key".to_owned(), Value::from(key));
+    item.insert("value".to_owned(), entry.value.clone());
+    item.insert("deleted".to_owned(), Value::from(entry.deleted));
+    item.insert("baseVersion".to_owned(), Value::from(entry.version));
+    if let Some(edited_at) = entry.edited_at_ms {
+        item.insert("editedAt".to_owned(), Value::from(edited_at));
+    }
+    Value::Object(item)
 }
 
 fn now_unix_ms() -> i64 {
@@ -903,9 +1018,8 @@ fn apply_pull(
             .get(&item.key)
             .is_some_and(|entry| entry.dirty)
         {
-            if let Some(entry) = state.sync_entries.get_mut(&item.key) {
-                entry.version = entry.version.max(item.version);
-            }
+            // 本机有未推送编辑：保持其 `version`（= 编辑所基于的云端版本），推送时云端按编辑时间裁决；
+            // 不能在这里把版本抬到云端最新值，否则冲突永远被当成「已看到」而盲写覆盖。
             continue;
         }
         let applied = match prepare_remote_value(spec, &item, state) {
@@ -949,6 +1063,7 @@ fn apply_pull(
         entry.value = item.value;
         entry.deleted = item.deleted;
         entry.version = item.version;
+        entry.edited_at_ms = item.edited_at;
         entry.dirty = false;
     }
     report
@@ -1070,6 +1185,7 @@ fn seed_local_values(
                 version: 0,
                 dirty: true,
                 deleted: false,
+                edited_at_ms: None,
             },
         );
     }
@@ -1218,13 +1334,16 @@ impl SyncError {
         }
     }
 
-    /// 不可自动恢复：设备数超限 / 本设备不受信任，需要用户处理。
+    /// 不可自动恢复：本设备不受信任，需要用户重新登录。在线名额已满不属于此类（见 [`Self::is_online_limit`]）。
     #[must_use]
     pub fn halts(&self) -> bool {
-        matches!(
-            self.reason(),
-            Some(ErrorReason::SyncDeviceLimit | ErrorReason::DeviceUntrusted)
-        )
+        self.reason() == Some(ErrorReason::DeviceUntrusted)
+    }
+
+    /// 在线设备名额已满：本设备保持登录，固定间隔重试，不 halt。
+    #[must_use]
+    pub fn is_online_limit(&self) -> bool {
+        self.reason() == Some(ErrorReason::OnlineDeviceLimit)
     }
 }
 
@@ -1239,7 +1358,7 @@ mod tests {
     use axum::http::{HeaderMap, StatusCode, header};
     use axum::response::IntoResponse;
     use axum::routing::get;
-    use fluxdown_protocol::ErrorReason;
+    use fluxdown_protocol::{AgentEvent, CloudConnectionDto, CloudConnectionState, ErrorReason};
     use futures_util::StreamExt;
     use serde_json::{Value, json};
     use tokio::sync::Mutex;
@@ -1258,6 +1377,7 @@ mod tests {
             deleted: false,
             version,
             device_id: device.to_owned(),
+            edited_at: None,
         }
     }
 
@@ -1267,6 +1387,7 @@ mod tests {
             version: 1,
             dirty: true,
             deleted: false,
+            edited_at_ms: None,
         }
     }
 
@@ -1493,6 +1614,7 @@ mod tests {
                 version: 3,
                 dirty: false,
                 deleted: false,
+                edited_at_ms: None,
             },
         );
         seed_local_values(&mut state, &Default::default(), &BTreeMap::new(), true);
@@ -1628,6 +1750,8 @@ mod tests {
         events: AtomicUsize,
         push_revision: AtomicUsize,
         pushes: Mutex<Vec<Value>>,
+        /// 推送响应里的 `conflicts`（云端判负、返回胜出现值的条目）。
+        push_conflicts: Mutex<Vec<Value>>,
         pull_status: Mutex<Option<(StatusCode, Value)>>,
         pull_items: Mutex<Vec<Value>>,
         pull_barrier: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
@@ -1658,7 +1782,8 @@ mod tests {
             0 => 9,
             value => value,
         };
-        axum::Json(json!({"revision": revision}))
+        let conflicts = state.push_conflicts.lock().await.clone();
+        axum::Json(json!({"revision": revision, "conflicts": conflicts}))
     }
 
     async fn mock_events(
@@ -1952,11 +2077,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_device_limit_halts_automatic_retries_and_reports_the_reason() {
+    async fn untrusted_device_halts_automatic_retries_and_reports_the_reason() {
         let harness = Harness::new("halt", |state| state.sync.enabled = true).await;
         *harness.mock.pull_status.lock().await = Some((
             StatusCode::FORBIDDEN,
-            json!({"code": "sync_device_limit", "message": "too many sync devices"}),
+            json!({"code": "sync_device_untrusted", "message": "device is not trusted"}),
         ));
         let cancel = CancellationToken::new();
         let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
@@ -1967,7 +2092,7 @@ mod tests {
             let state = harness.state.lock().await;
             assert_eq!(
                 state.sync.last_error_reason,
-                Some(ErrorReason::SyncDeviceLimit)
+                Some(ErrorReason::DeviceUntrusted)
             );
             assert!(!state.sync.connected);
         }
@@ -1992,6 +2117,233 @@ mod tests {
         cancel.cancel();
         worker.await.expect("join worker");
         harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn online_device_limit_never_halts_and_resumes_when_the_remote_channel_connects() {
+        let harness = Harness::new("online_limit", |state| state.sync.enabled = true).await;
+        *harness.mock.pull_status.lock().await = Some((
+            StatusCode::FORBIDDEN,
+            json!({"code": "online_device_limit", "message": "too many online devices"}),
+        ));
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        harness
+            .wait_until("limit recorded", |state, _| {
+                state.sync.last_error_reason == Some(ErrorReason::OnlineDeviceLimit)
+            })
+            .await;
+        {
+            let state = harness.state.lock().await;
+            assert!(!state.sync.halted, "the online limit must not halt sync");
+            assert!(!state.sync.connected);
+        }
+        let pulls = harness.mock.pulls.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            harness.mock.pulls.load(Ordering::SeqCst),
+            pulls,
+            "retries wait a fixed 30s instead of escalating or spinning"
+        );
+
+        // 名额让出：本机任务通道连上的瞬间立即恢复，不必等满 30 秒。
+        harness.mock.hold_open.store(true, Ordering::SeqCst);
+        *harness.mock.pull_status.lock().await = None;
+        harness
+            .service
+            .events
+            .publish(AgentEvent::CloudConnectionChanged(CloudConnectionDto {
+                state: CloudConnectionState::Connected,
+                last_error: None,
+                last_error_reason: None,
+            }));
+        harness
+            .wait_until("recovered", |state, _| {
+                state.sync.connected && state.sync.last_error_reason.is_none()
+            })
+            .await;
+        cancel.cancel();
+        worker.await.expect("join worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn manual_reconnect_request_ends_the_online_limit_wait() {
+        let harness = Harness::new("online_limit_kick", |state| state.sync.enabled = true).await;
+        *harness.mock.pull_status.lock().await = Some((
+            StatusCode::FORBIDDEN,
+            json!({"code": "online_device_limit", "message": "too many online devices"}),
+        ));
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        harness
+            .wait_until("limit recorded", |state, _| {
+                state.sync.last_error_reason == Some(ErrorReason::OnlineDeviceLimit)
+            })
+            .await;
+        harness.mock.hold_open.store(true, Ordering::SeqCst);
+        *harness.mock.pull_status.lock().await = None;
+        harness.service.request_reconnect();
+        harness
+            .wait_until("recovered", |state, _| state.sync.connected)
+            .await;
+        cancel.cancel();
+        worker.await.expect("join worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn push_carries_base_version_and_edit_time_and_conflicts_are_applied_clean() {
+        let harness = Harness::new("push_conflicts", |state| {
+            state.sync.enabled = true;
+            state.sync.revision = 5;
+            state.sync_pulled = true;
+            state
+                .preferences
+                .values
+                .insert("appearance.theme_mode".to_owned(), json!("dark"));
+            state.sync_entries.insert(
+                "appearance.theme_mode".to_owned(),
+                PersistedSyncEntry {
+                    value: json!("dark"),
+                    version: 3,
+                    dirty: true,
+                    deleted: false,
+                    edited_at_ms: Some(1_000),
+                },
+            );
+            state.sync_entries.insert(
+                "general.locale".to_owned(),
+                PersistedSyncEntry {
+                    value: json!("zh"),
+                    version: 0,
+                    dirty: true,
+                    deleted: false,
+                    edited_at_ms: None,
+                },
+            );
+        })
+        .await;
+        *harness.mock.push_conflicts.lock().await = vec![json!({
+            "key": "appearance.theme_mode",
+            "value": "light",
+            "deleted": false,
+            "version": 5,
+            "deviceId": "device-2",
+            "editedAt": 2_000
+        })];
+        harness.service.sync_now().await.expect("sync now");
+
+        let pushes = harness.mock.pushes.lock().await.clone();
+        assert_eq!(pushes.len(), 1);
+        let items = pushes[0]["items"].as_array().expect("items");
+        let find = |key: &str| {
+            items
+                .iter()
+                .find(|item| item["key"] == key)
+                .unwrap_or_else(|| panic!("{key} pushed"))
+        };
+        let theme = find("appearance.theme_mode");
+        assert_eq!(theme["baseVersion"], 3);
+        assert_eq!(theme["editedAt"], 1_000);
+        assert_eq!(theme["deleted"], false);
+        assert!(
+            theme.get("version").is_none(),
+            "legacy `version` is not sent"
+        );
+        let locale = find("general.locale");
+        assert_eq!(locale["baseVersion"], 0);
+        assert!(
+            locale.get("editedAt").is_none(),
+            "seeded entries have no real edit time"
+        );
+
+        let state = harness.state.lock().await;
+        let theme = &state.sync_entries["appearance.theme_mode"];
+        assert_eq!(theme.value, json!("light"));
+        assert!(!theme.dirty);
+        assert_eq!(theme.version, 5);
+        assert_eq!(theme.edited_at_ms, Some(2_000));
+        assert_eq!(
+            state.preferences.values["appearance.theme_mode"],
+            json!("light"),
+            "the winning cloud value replaces the rejected local edit"
+        );
+        assert!(!state.sync_entries["general.locale"].dirty);
+        assert!(state.sync.dirty_keys.is_empty());
+        drop(state);
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn local_edits_record_an_edit_time_and_keep_the_base_version() {
+        let harness = Harness::new("edit_time", |state| {
+            state.sync.enabled = true;
+            state.sync_entries.insert(
+                "appearance.theme_mode".to_owned(),
+                PersistedSyncEntry {
+                    value: json!("light"),
+                    version: 4,
+                    dirty: false,
+                    deleted: false,
+                    edited_at_ms: Some(10),
+                },
+            );
+        })
+        .await;
+        let before = super::now_unix_ms();
+        harness
+            .service
+            .mark_local("appearance.theme_mode".to_owned(), json!("dark"), false)
+            .await
+            .expect("mark local");
+        let after = super::now_unix_ms();
+        let state = harness.state.lock().await;
+        let entry = &state.sync_entries["appearance.theme_mode"];
+        assert!(entry.dirty);
+        assert_eq!(
+            entry.version, 4,
+            "the base version is the last cloud version seen"
+        );
+        let edited_at = entry.edited_at_ms.expect("edit time recorded");
+        assert!((before..=after).contains(&edited_at));
+        drop(state);
+        harness.finish().await;
+    }
+
+    #[test]
+    fn pull_keeps_the_base_version_of_dirty_entries_and_records_remote_edit_time() {
+        let mut state = AgentState::default();
+        state
+            .sync_entries
+            .insert("appearance.theme_mode".to_owned(), dirty(json!("dark")));
+        apply_pull(
+            &mut state,
+            "device-1",
+            vec![item("appearance.theme_mode", json!("light"), 7, "device-2")],
+            &BTreeMap::new(),
+        );
+        let theme = &state.sync_entries["appearance.theme_mode"];
+        assert!(theme.dirty);
+        assert_eq!(
+            theme.version, 1,
+            "base version must not jump past unseen cloud edits"
+        );
+
+        let mut locale = item("general.locale", json!("zh"), 2, "device-2");
+        locale.edited_at = Some(42);
+        apply_pull(&mut state, "device-1", vec![locale], &BTreeMap::new());
+        assert_eq!(state.sync_entries["general.locale"].edited_at_ms, Some(42));
+    }
+
+    #[test]
+    fn legacy_persisted_entries_without_an_edit_time_still_load() {
+        let entry = serde_json::from_value::<PersistedSyncEntry>(
+            json!({"value": "x", "version": 2, "dirty": true, "deleted": false}),
+        )
+        .expect("legacy entry");
+        assert_eq!(entry.edited_at_ms, None);
+        assert_eq!(entry.version, 2);
     }
 
     #[tokio::test]

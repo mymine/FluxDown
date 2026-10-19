@@ -55,6 +55,9 @@ const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
 const SSE_QUEUE_CAPACITY: usize = 16;
 /// 失败上报里的错误文本上限。
 const MAX_REPORTED_ERROR_CHARS: usize = 512;
+/// 在线设备名额已满（或本机被另一台设备踢下线）后的固定重试间隔；不走指数退避，
+/// 用户手动让别的设备下线后可由 `request_reconnect` 立即重试。
+const ONLINE_LIMIT_RETRY: Duration = Duration::from_secs(30);
 
 /// 一次 SSE 会话结束的原因。
 #[derive(Debug, Eq, PartialEq)]
@@ -66,6 +69,8 @@ enum SseEnd {
     Resync,
     /// 登录会话已结束（登出 / 撤销）。
     SessionEnded,
+    /// 本机被同账号的另一台设备手动下线（`presence.kicked`）：断开 SSE，进入在线名额受限的等待。
+    Kicked,
 }
 
 /// 有界 FIFO 去重集合。
@@ -155,10 +160,13 @@ impl RemoteTaskService {
 
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
         let mut retry_attempt = 0_usize;
+        // 上一轮因在线名额受限而等待：下一轮保留 `Reconnecting + OnlineDeviceLimit` 展示，不闪回空原因。
+        let mut limit_shown = false;
         let (mut session_events, _) = self.events.subscribe_and_snapshot();
         let mut session_changes = self.cloud.session_changes();
         loop {
             session_changes.borrow_and_update();
+            let keep_limit_state = std::mem::take(&mut limit_shown);
             if cancel.is_cancelled() {
                 break;
             }
@@ -191,14 +199,16 @@ impl RemoteTaskService {
                 }
                 continue;
             }
-            self.connection(
-                if retry_attempt == 0 {
-                    CloudConnectionState::Connecting
-                } else {
-                    CloudConnectionState::Reconnecting
-                },
-                None,
-            );
+            if !keep_limit_state {
+                self.connection(
+                    if retry_attempt == 0 {
+                        CloudConnectionState::Connecting
+                    } else {
+                        CloudConnectionState::Reconnecting
+                    },
+                    None,
+                );
+            }
             drop(state);
             let connected_at = Instant::now();
             // 外层监督覆盖请求响应头、业务 await 与退避；退出即丢弃所有借用 future，
@@ -256,13 +266,29 @@ impl RemoteTaskService {
                     self.connection(CloudConnectionState::Reconnecting, None);
                     RESYNC_PAUSE
                 }
+                Ok(SseEnd::Kicked) => {
+                    tracing::warn!("this device was taken offline by another device");
+                    self.connection(
+                        CloudConnectionState::Reconnecting,
+                        Some(&RemoteError::Kicked),
+                    );
+                    limit_shown = true;
+                    retry_attempt = 0;
+                    ONLINE_LIMIT_RETRY
+                }
                 Err(error) => {
                     tracing::warn!(error = %format!("{error:#}"), "remote task connection failed");
                     self.connection(CloudConnectionState::Reconnecting, Some(&error));
-                    if connected_at.elapsed() >= SSE_STABLE {
+                    if error.is_online_limit() {
+                        limit_shown = true;
                         retry_attempt = 0;
+                        ONLINE_LIMIT_RETRY
+                    } else {
+                        if connected_at.elapsed() >= SSE_STABLE {
+                            retry_attempt = 0;
+                        }
+                        RETRY_DELAYS[retry_attempt.min(RETRY_DELAYS.len() - 1)]
                     }
-                    RETRY_DELAYS[retry_attempt.min(RETRY_DELAYS.len() - 1)]
                 }
             };
             drop(state);
@@ -297,6 +323,7 @@ impl RemoteTaskService {
                 RemoteError::Cloud(error) => {
                     error.reason().unwrap_or(ErrorReason::CloudUnreachable)
                 }
+                RemoteError::Kicked => ErrorReason::OnlineDeviceLimit,
                 _ => ErrorReason::CloudUnreachable,
             }),
         };
@@ -412,10 +439,13 @@ impl RemoteTaskService {
         transport_alive.store(false, Ordering::Relaxed);
         {
             let _state = self.cloud.lock_epoch(epoch).await?;
-            self.connection(
-                CloudConnectionState::Reconnecting,
-                transport_result.as_ref().err(),
-            );
+            let kicked = RemoteError::Kicked;
+            let error = match &transport_result {
+                Err(error) => Some(error),
+                Ok(SseEnd::Kicked) => Some(&kicked),
+                Ok(_) => None,
+            };
+            self.connection(CloudConnectionState::Reconnecting, error);
         }
         // Transport dropped its sender. Drain accepted commands in FIFO order;
         // unlike task state, pause/resume and deleteFiles cannot be replayed by a snapshot.
@@ -584,7 +614,7 @@ impl RemoteTaskService {
                         }
                         if let Some(payload) = line.strip_prefix(b"data:")
                             && let Ok(event) = serde_json::from_slice::<Value>(payload)
-                            && matches!(event.get("type").and_then(Value::as_str), Some("session.revoked"))
+                            && matches!(event.get("type").and_then(Value::as_str), Some("session.revoked" | "presence.kicked"))
                             && let Some(end) = self.apply_remote_event_epoch(event, epoch).await?
                         {
                             return Ok(end);
@@ -751,6 +781,14 @@ impl RemoteTaskService {
                         self.replace_tasks(tasks, true, epoch).await?;
                     }
                     self.discard_local_task_epoch(id, epoch).await;
+                }
+            }
+            "presence.kicked" => {
+                // 同账号的另一台设备手动让某设备下线；只有指向本机时才结束 SSE，
+                // 其余设备的下线由随后的 `presence` 事件刷新名册。
+                let target = event.get("deviceId").and_then(Value::as_str);
+                if target == Some(self.local_device_id().await.as_str()) {
+                    return Ok(Some(SseEnd::Kicked));
                 }
             }
             "presence" | "device.updated" => {
@@ -2123,6 +2161,9 @@ pub enum RemoteError {
     Cloud(#[from] CloudError),
     #[error("daemon remote command failed: {0:?}")]
     Daemon(RpcErrorData),
+    /// 本机被同账号的另一台设备手动下线（`presence.kicked`）。
+    #[error("this device was taken offline by another device")]
+    Kicked,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -2142,6 +2183,17 @@ pub enum RemoteError {
         reason: Option<ErrorReason>,
         message: String,
     },
+}
+
+impl RemoteError {
+    /// 云端以 `online_device_limit` 拒绝（名额已满），或本机被手动下线：不是故障，30 秒后重试即可。
+    fn is_online_limit(&self) -> bool {
+        match self {
+            Self::Kicked => true,
+            Self::Cloud(error) => error.reason() == Some(ErrorReason::OnlineDeviceLimit),
+            _ => false,
+        }
+    }
 }
 
 /// 等到下一条 `SessionChanged(Some)`；接收端 lag 时也返回，由调用方重新检查登录态。
@@ -3131,6 +3183,116 @@ mod tests {
         );
         cancel.cancel();
         worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn online_device_limit_waits_without_error_escalation_and_retries_on_request() {
+        async fn full(State(state): State<Arc<RemoteMockState>>) -> impl IntoResponse {
+            state.events.fetch_add(1, Ordering::SeqCst);
+            (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({
+                    "code": "online_device_limit",
+                    "message": "too many online devices"
+                })),
+            )
+        }
+        let harness = Harness::new("online_limit", |router| {
+            router.route("/api/v1/tasks/events", get(full))
+        })
+        .await;
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        wait_until(|| {
+            connection_state(&harness.service).last_error_reason
+                == Some(fluxdown_protocol::ErrorReason::OnlineDeviceLimit)
+        })
+        .await;
+        assert_eq!(
+            connection_state(&harness.service).state,
+            fluxdown_protocol::CloudConnectionState::Reconnecting
+        );
+        assert_eq!(harness.mock.events.load(Ordering::SeqCst), 1);
+        // 受限等待是固定 30 秒；手动重连立即再试一次，且重试期间不闪回空原因。
+        harness.service.request_reconnect();
+        wait_until(|| harness.mock.events.load(Ordering::SeqCst) >= 2).await;
+        wait_until(|| {
+            connection_state(&harness.service).last_error_reason
+                == Some(fluxdown_protocol::ErrorReason::OnlineDeviceLimit)
+        })
+        .await;
+        assert_eq!(
+            connection_state(&harness.service).state,
+            fluxdown_protocol::CloudConnectionState::Reconnecting
+        );
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn presence_kicked_for_this_device_drops_the_stream_and_waits_for_a_free_slot() {
+        async fn kicked_events(State(state): State<Arc<RemoteMockState>>) -> impl IntoResponse {
+            state.events.fetch_add(1, Ordering::SeqCst);
+            let first =
+                futures_util::stream::once(std::future::ready(Ok::<_, std::convert::Infallible>(
+                    axum::body::Bytes::from_static(
+                        b"data: {\"type\":\"presence.kicked\",\"deviceId\":\"device-1\"}\n\n",
+                    ),
+                )));
+            let body = Body::from_stream(futures_util::StreamExt::chain(
+                first,
+                futures_util::stream::pending(),
+            ));
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                body,
+            )
+        }
+        let harness = Harness::new("kicked", |router| {
+            router
+                .route("/api/v1/tasks/events", get(kicked_events))
+                .route("/api/v1/tasks/presence", post(mock_presence))
+                .route("/api/v1/tasks/remote", get(mock_remote_snapshot))
+                .route("/api/v1/devices", get(online_roster))
+        })
+        .await;
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        wait_until(|| {
+            connection_state(&harness.service).last_error_reason
+                == Some(fluxdown_protocol::ErrorReason::OnlineDeviceLimit)
+        })
+        .await;
+        assert_eq!(
+            connection_state(&harness.service).state,
+            fluxdown_protocol::CloudConnectionState::Reconnecting
+        );
+        // 被踢后不立刻抢回名额：进入 30 秒等待，只有手动重连才提前重试。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(harness.mock.events.load(Ordering::SeqCst), 1);
+        harness.service.request_reconnect();
+        wait_until(|| harness.mock.events.load(Ordering::SeqCst) >= 2).await;
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn presence_kicked_event_only_ends_the_stream_for_the_targeted_device() {
+        let harness = Harness::new("kicked_target", command_mock).await;
+        let other = harness
+            .service
+            .apply_remote_event(json!({"type": "presence.kicked", "deviceId": "device-2"}))
+            .await;
+        assert!(matches!(other, Ok(None)));
+        let own = harness
+            .service
+            .apply_remote_event(json!({"type": "presence.kicked", "deviceId": "device-1"}))
+            .await;
+        assert!(matches!(own, Ok(Some(SseEnd::Kicked))));
         harness.finish().await;
     }
 

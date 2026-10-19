@@ -8,13 +8,15 @@ import { useT } from '../../i18n'
 import { cn } from '../../lib/cn'
 import { TitleBarSlot } from '../../shell'
 import { Button, Icon, useIsMobile } from '../../ui'
-import { SETTINGS_CATEGORIES, findSettingsCategory } from './categories'
+import { findSettingsCategory } from './categories'
+import { useVisibleCategories } from './useVisibleCategories'
 
 function CategoryList({ activeId }: { activeId: string | null }) {
   const t = useT()
+  const { categories } = useVisibleCategories()
   return (
     <ul className="flex flex-col gap-0.5 p-2">
-      {SETTINGS_CATEGORIES.map((category) => {
+      {categories.map((category) => {
         const active = category.id === activeId
         return (
           <li key={category.id}>
@@ -41,7 +43,8 @@ function CategoryList({ activeId }: { activeId: string | null }) {
 /** `/settings` 索引：桌面跳到第一个分类，移动端显示分类列表。 */
 export function SettingsIndex() {
   const mobile = useIsMobile()
-  if (!mobile) return <Navigate to="/settings/$category" params={{ category: SETTINGS_CATEGORIES[0]?.id ?? 'general' }} replace />
+  const { categories } = useVisibleCategories()
+  if (!mobile) return <Navigate to="/settings/$category" params={{ category: categories[0]?.id ?? 'general' }} replace />
   return (
     <div className="h-full overflow-y-auto">
       <CategoryList activeId={null} />
@@ -83,11 +86,13 @@ export function SettingsLayout() {
   )
 }
 
-/** `/settings/$category`：渲染注册表里对应分类的组件。 */
+/** `/settings/$category`：渲染注册表里对应分类的组件；条件分类不满足时（含当前就在该页而条件失效）退回账户页。 */
 export function SettingsCategoryRoute() {
   const { category = '' } = useParams({ strict: false })
+  const { ready, categories } = useVisibleCategories()
   const entry = findSettingsCategory(category)
   if (!entry) return <Navigate to="/settings" replace />
+  if (!categories.includes(entry)) return ready ? <Navigate to="/settings/$category" params={{ category: 'account' }} replace /> : null
   const Content = entry.Component
   return <Content />
 }

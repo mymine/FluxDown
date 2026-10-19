@@ -11,6 +11,7 @@ export const themeBuilder = defineMessages({
     lede:
       "Edit every color and metric token and watch a mock of the native desktop client update as you type. Right-click any part of the preview to see which tokens paint it.",
     browseThemes: "Browse themes",
+    submitTheme: "Share it in the market",
     tb: {
       rightClickHint: "Right-click any UI block to inspect its tokens",
       client: {
@@ -301,6 +302,7 @@ export const themeBuilder = defineMessages({
     title: "<em>实时</em>设计你的主题",
     lede: "编辑每一个颜色与尺寸 token，桌面客户端的模拟界面随输入即时更新。右键预览中的任意区块，即可查看它由哪些 token 绘制。",
     browseThemes: "浏览主题",
+    submitTheme: "分享到主题市场",
     tb: {
       rightClickHint: "右键任意 UI 区块查看 token",
       client: {

@@ -33,6 +33,12 @@ impl CompletedTasks {
         self.ids.get(self.selected).map(String::as_str)
     }
 
+    /// 处理完 `task_id` 后集合里仍有任务（窗口保留并切到下一项），与 [`Self::remove`] 后
+    /// [`Self::current`] 是否为 `Some` 一致。
+    fn keeps_after(&self, task_id: &str) -> bool {
+        self.ids.iter().any(|id| id != task_id)
+    }
+
     fn append(&mut self, ids: Vec<String>, total: usize, controller: &DownloadsController) {
         self.total = self.total.saturating_add(total);
         for id in ids {
@@ -126,6 +132,13 @@ impl ProgressWindowView {
             self.last_error = None;
         }
         true
+    }
+
+    /// 处理完 `task_id` 后窗口保留（完成集合里还有其它任务）；单任务窗口恒为 `false`。
+    pub(super) fn keeps_window_after(&self, task_id: &str) -> bool {
+        self.completed
+            .as_ref()
+            .is_some_and(|tasks| tasks.keeps_after(task_id))
     }
 
     /// 删除/打开的回调必须针对发起操作的 ID，不能针对回调时的新选择。
@@ -344,5 +357,23 @@ mod tests {
         assert_eq!(tasks.current(), Some("c"));
         assert_eq!(tasks.ids, ["b", "c"]);
         assert_eq!(tasks.total, 2);
+    }
+
+    #[test]
+    fn keeping_the_window_is_predicted_exactly_as_finishing_decides() {
+        let controller = controller(&["a", "b"]);
+        for (ids, target) in [
+            (&["a"][..], "a"),
+            (&["a", "b"][..], "a"),
+            (&["a", "b"][..], "b"),
+            (&["a"][..], "b"),
+            (&[][..], "a"),
+        ] {
+            let mut tasks = CompletedTasks::default();
+            append(&mut tasks, ids, &controller);
+            let predicted = tasks.keeps_after(target);
+            tasks.remove(target);
+            assert_eq!(predicted, tasks.current().is_some(), "{ids:?} - {target}");
+        }
     }
 }

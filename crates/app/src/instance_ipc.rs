@@ -38,6 +38,9 @@ pub struct ActivateMessage {
     pub activate: bool,
     #[serde(default)]
     pub settings: bool,
+    /// 打开新建下载窗口（`--new-download`）。
+    #[serde(default)]
+    pub new_download: bool,
     /// agent 为静默建成的任务拉起界面时携带（`--progress-task`）：主实例按用户开始处理该任务。
     #[serde(default)]
     pub progress_task: Option<String>,
@@ -447,6 +450,7 @@ mod tests {
             files: vec!["/tmp/x.torrent".into()],
             activate: true,
             settings: true,
+            new_download: true,
             progress_task: Some("task-1".to_owned()),
         };
         let json = serde_json::to_string(&message).expect("serialize");
@@ -472,6 +476,7 @@ mod tests {
             files: Vec::new(),
             activate: true,
             settings: true,
+            new_download: false,
             progress_task: None,
         };
         let sender_endpoint = endpoint.clone();

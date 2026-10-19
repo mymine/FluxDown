@@ -25,6 +25,8 @@ struct EventState {
 pub struct DaemonEventHub {
     state: Arc<Mutex<EventState>>,
     events: broadcast::Sender<EventFrame>,
+    /// 可移植视图会话存储：事件映射（渲染 → 帧）与 RPC（open / snapshot / close）共享。
+    plugin_views: Arc<crate::plugin_views::PluginViewStore>,
 }
 
 impl DaemonEventHub {
@@ -43,7 +45,14 @@ impl DaemonEventHub {
         Self {
             state: Arc::new(Mutex::new(state)),
             events,
+            plugin_views: Arc::default(),
         }
+    }
+
+    /// 可移植视图会话存储（与 [`DaemonEngineEventSink`] 共享同一份）。
+    #[must_use]
+    pub fn plugin_views(&self) -> &Arc<crate::plugin_views::PluginViewStore> {
+        &self.plugin_views
     }
 
     /// 只订阅增量广播（不克隆快照）；滞后时接收者自行按 [`Self::snapshot`] 复核。
@@ -177,6 +186,7 @@ impl DaemonEventHub {
         state.expiry_running = true;
         let weak = Arc::downgrade(&self.state);
         let events = self.events.clone();
+        let plugin_views = self.plugin_views.clone();
         runtime.spawn(async move {
             loop {
                 tokio::time::sleep(TRAFFIC_BUCKET).await;
@@ -186,6 +196,7 @@ impl DaemonEventHub {
                 let hub = Self {
                     state: shared,
                     events: events.clone(),
+                    plugin_views: plugin_views.clone(),
                 };
                 let mut state = lock_or_recover(&hub.state);
                 hub.expire_locked_at(&mut state, Instant::now());
@@ -253,6 +264,11 @@ struct TaskSample {
     downloaded: i64,
     uploaded: i64,
     explicit_baseline: bool,
+    /// The engine reports received body bytes for this transfer interval
+    /// (`EngineEvent::TaskTransferred`): they are the traffic, and progress
+    /// deltas only move the high-water mark. Cleared when the task leaves the
+    /// active states or gets a new explicit baseline.
+    transfer_measured: bool,
     /// When this task's bytes were last accounted (or it became active):
     /// the start of the interval the next delta is spread over.
     last_at: Option<Instant>,
@@ -312,15 +328,30 @@ impl RuntimeAccounting {
         if let Some(sample) = self.tasks.get_mut(task_id) {
             sample.downloaded = downloaded_bytes.max(0);
             sample.explicit_baseline = true;
+            sample.transfer_measured = false;
         }
     }
 
     fn settle_download(&mut self, task_id: &str, downloaded_bytes: i64, now: Instant) {
         if let Some(sample) = self.tasks.get_mut(task_id) {
-            let delta = downloaded_bytes.saturating_sub(sample.downloaded).max(0);
+            let delta = if sample.transfer_measured {
+                0
+            } else {
+                downloaded_bytes.saturating_sub(sample.downloaded).max(0)
+            };
             sample.downloaded = sample.downloaded.max(downloaded_bytes);
             let since = sample.last_at.replace(now);
             self.record_traffic(delta, 0, since, now);
+        }
+    }
+
+    /// Received body bytes since the task's previous frame. Marks the task as
+    /// transfer-measured so its progress deltas are not counted twice.
+    fn record_transfer(&mut self, task_id: &str, bytes: i64, now: Instant) {
+        if let Some(sample) = self.tasks.get_mut(task_id) {
+            sample.transfer_measured = true;
+            let since = sample.last_at.replace(now);
+            self.record_traffic(bytes.max(0), 0, since, now);
         }
     }
 
@@ -414,6 +445,9 @@ impl RuntimeAccounting {
             if is_active(task.status) && !is_active(previous) {
                 sample.last_at = Some(now);
             }
+            if !is_active(task.status) {
+                sample.transfer_measured = false;
+            }
             Some(previous)
         } else {
             self.tasks.insert(
@@ -423,6 +457,7 @@ impl RuntimeAccounting {
                     downloaded: task.downloaded_bytes.max(0),
                     uploaded: task.uploaded_bytes.max(0),
                     explicit_baseline: false,
+                    transfer_measured: false,
                     last_at: is_active(task.status).then_some(now),
                 },
             );
@@ -448,6 +483,9 @@ impl RuntimeAccounting {
                     sample.downloaded = sample.downloaded.max(task.downloaded_bytes);
                 }
                 sample.uploaded = sample.uploaded.max(task.uploaded_bytes);
+                if !is_active(task.status) {
+                    sample.transfer_measured = false;
+                }
             } else {
                 self.tasks.insert(
                     task.task_id.clone(),
@@ -456,6 +494,7 @@ impl RuntimeAccounting {
                         downloaded: task.downloaded_bytes.max(0),
                         uploaded: task.uploaded_bytes.max(0),
                         explicit_baseline: false,
+                        transfer_measured: false,
                         last_at: None,
                     },
                 );
@@ -506,13 +545,22 @@ impl RuntimeAccounting {
                 };
                 let old_status = sample.status;
                 sample.status = *status;
-                let downloaded = downloaded_bytes.saturating_sub(sample.downloaded).max(0);
+                // Transfer-measured tasks already accounted their received
+                // bytes; their progress is written bytes (or a final size).
+                let downloaded = if sample.transfer_measured {
+                    0
+                } else {
+                    downloaded_bytes.saturating_sub(sample.downloaded).max(0)
+                };
                 let uploaded = uploaded_bytes.saturating_sub(sample.uploaded).max(0);
                 // Keep high water marks within a transfer interval. Only the
                 // engine's ordered, explicit baseline can reset that interval;
                 // arbitrary regressing samples and snapshots cannot.
                 sample.downloaded = sample.downloaded.max(*downloaded_bytes);
                 sample.uploaded = sample.uploaded.max(*uploaded_bytes);
+                if !is_active(*status) {
+                    sample.transfer_measured = false;
+                }
                 let since = sample.last_at.replace(now);
                 self.remove_status(old_status);
                 self.add_status(*status);
@@ -612,6 +660,16 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
     fn emit(&self, event: fluxdown_engine::events::EngineEvent) {
         use fluxdown_engine::events::EngineEvent;
         match event {
+            EngineEvent::TaskTransferred { task_id, bytes } => {
+                // Host-local like the baseline: the progress frame that follows
+                // publishes the updated runtime stats.
+                lock_or_recover(&self.0.state).accounting.record_transfer(
+                    &task_id,
+                    bytes,
+                    Instant::now(),
+                );
+                return;
+            }
             EngineEvent::TaskTransferBaseline {
                 task_id,
                 downloaded_bytes,
@@ -806,6 +864,36 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
                 auto_cap,
             },
             EngineEvent::BtDataFinished { .. } => return,
+            EngineEvent::PluginViewRendered { session, tree } => {
+                if let Some(frame) = self.0.plugin_views.rendered(&session, &tree) {
+                    self.0.publish(DaemonEvent::PluginViewFrame(frame));
+                }
+                return;
+            }
+            EngineEvent::PluginViewFailed { session, message } => {
+                if let Some(frame) = self.0.plugin_views.failed(&session, &message) {
+                    self.0.publish(DaemonEvent::PluginViewFrame(frame));
+                }
+                return;
+            }
+            EngineEvent::PluginViewClosed { session, reason } => {
+                self.0.plugin_views.close(&session);
+                self.0
+                    .publish(DaemonEvent::PluginViewClosed { session, reason });
+                return;
+            }
+            EngineEvent::PluginToast {
+                identity,
+                level,
+                text,
+            } => {
+                self.0.publish(DaemonEvent::PluginToast {
+                    identity,
+                    level,
+                    text,
+                });
+                return;
+            }
             EngineEvent::PluginAutoDisabled { identity, reason } => {
                 WsServerMsg::PluginAutoDisabled { identity, reason }
             }
@@ -1453,6 +1541,31 @@ mod tests {
             now,
         );
         assert_eq!(state.accounting.window_bytes().0, 128 * 1024);
+    }
+
+    /// Tasks that buffer bodies before an ordered write (HLS) report received
+    /// bytes: those are the traffic, while segment-sized write jumps and the
+    /// final (remuxed) size are not. Leaving the active states restores
+    /// ordinary progress accounting for the same task id.
+    #[test]
+    fn transfer_measured_tasks_count_received_bytes_not_progress_jumps() {
+        const MIB: i64 = 1024 * 1024;
+        let start = std::time::Instant::now();
+        let mut accounting = super::RuntimeAccounting::new(&[traffic_task("hls", 1, 0, 0)], start);
+        accounting.record_transfer("hls", MIB, start);
+        accounting.apply(&traffic_progress("hls", 1, 0, 0), start);
+        assert_eq!(accounting.window_bytes().0, MIB);
+        accounting.record_transfer("hls", MIB, start);
+        accounting.apply(&traffic_progress("hls", 1, 2 * MIB, 0), start);
+        assert_eq!(accounting.window_bytes().0, 2 * MIB);
+        accounting.apply(&traffic_progress("hls", 3, 5 * MIB, 0), start);
+        assert_eq!(accounting.window_bytes().0, 2 * MIB);
+        accounting.apply(
+            &DaemonEvent::TaskChanged(traffic_task("hls", 1, 5 * MIB, 0)),
+            start,
+        );
+        accounting.apply(&traffic_progress("hls", 1, 6 * MIB, 0), start);
+        assert_eq!(accounting.window_bytes().0, 3 * MIB);
     }
 
     #[test]

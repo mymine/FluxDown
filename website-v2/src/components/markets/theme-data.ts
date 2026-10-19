@@ -7,10 +7,6 @@ import { href } from "@/i18n/routing";
 import { normalizeFluxThemeJson, type FluxThemeJson } from "@/lib/theme-builder";
 import { withBase } from "@/lib/base";
 
-export const THEMES_REPO = "zerx-lab/fluxdown-themes";
-export const THEMES_REPO_URL = `https://github.com/${THEMES_REPO}`;
-export const THEMES_GUIDE_URL = `${THEMES_REPO_URL}?tab=contributing-ov-file`;
-
 export interface VariantAsset {
   /** 仓库相对路径,如 themes/<id>/theme.dark.json */
   theme: string;

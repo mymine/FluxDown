@@ -81,7 +81,8 @@ jobs:
   #   native/mobile/**、mobile/Android/** → 原生 Android 移动端资产
   #   docker/**              → 服务器（部署文件变更需重发镜像）
   #   mobile/FluxDown/**     → 原生 iOS（独立走 ios-testflight.yml）
-  #   website/**             → 官网（独立走 deploy-website.yml 部署，不发 release）
+  #   website-v2/**          → 官网（独立走 deploy-website-v2.yml 部署，不发 release）；其中 src/lib/gpui-theme/** 被 Web SPA 构建引用 → 服务器（server）
+  #   website/**             → 已删除的 v1 旧站：删除提交与历史 tag 区间的 diff 仍会列出它，不触发任何构建
   #   docs/**、*.md          → 纯文档，不触发任何构建
   #   其余任何路径            → 桌面客户端（app）
   # 浏览器扩展与其他组件同一套判定：预览版有变动只打包附到 release、不推送各浏览器商店
@@ -301,7 +302,12 @@ jobs:
                 assets/i18n/*)       APP=true; MOBILE=true; SERVER=true ;;
                 website-v2/src/lib/gpui-theme/*) SERVER=true ;;
                 assets/icon-packs/*) APP=true; SERVER=true ;;
-                website/*)  ;;
+                # 官网独立部署（deploy-website-v2.yml），不发 release；gpui-theme 例外已在上方先匹配。
+                # website/ 是已删除的 v1 旧站：删除提交与历史 tag 区间的 diff 仍会列出它，同样不触发构建
+                website-v2/*|website/*) ;;
+                # 插件 SDK 走独立的 plugin-sdk-release.yml，不触发桌面/服务器重建
+                packages/*) ;;
+                .github/workflows/plugin-sdk-release.yml) ;;
                 docs/*|*.md) ;;
                 *)          APP=true ;;
               esac
@@ -402,6 +408,7 @@ jobs:
         run: |
           cargo check --locked -p fluxdown_engine
           cargo test --locked -p fluxdown_engine
+          cargo test --locked -p fluxdown_engine --features plugins,components plugin
           cargo fmt --check
 
   # ── 并行 Job 1: GPUI 桌面客户端 Windows（x64 + ARM64）：Inno 安装器 + 便携 zip ──
@@ -575,13 +582,18 @@ jobs:
         run: npm ci
         working-directory: fluxDown
 
+      # 发布包不展示内置嗅探规则原文（见 fluxDown RuleTable 的 BUILTIN_RULE_PREVIEW）
       - name: Build Chrome extension
         run: npm run build
         working-directory: fluxDown
+        env:
+          WXT_HIDE_BUILTIN_RULES: '1'
 
       - name: Build Firefox extension
         run: npm run build:firefox
         working-directory: fluxDown
+        env:
+          WXT_HIDE_BUILTIN_RULES: '1'
 
       - name: Package Chrome extension
         run: |
@@ -1330,15 +1342,16 @@ jobs:
           name: server-bin-${{ matrix.platform }}
           path: release-assets/*
 
-  # ── 并行 Job 5c': NAS/软路由包（OpenWrt ipk + QNAP qpkg + 群晖 spk，复用 linux musl 静态产物）──
+  # ── 并行 Job 5c': NAS/软路由包（OpenWrt ipk + QNAP qpkg + 群晖 spk + 飞牛 fpk，复用 linux musl 静态产物）──
   # ipk 纯脚本手打（packaging/openwrt/build_ipk.sh，无需 OpenWrt SDK）；
   # qpkg 用官方 QDK qbuild（packaging/qnap/build_qpkg.sh）。
   # 不跑 InstallToUbuntu.sh（其 apt 依赖列表含 ubuntu 24.04 已不存在的 `python` 包），手动装 QDK。
   # spk 纯脚本手打（packaging/synology/build_spk.sh，做法同 SynoCommunity spksrc，无需群晖 toolkit）；
   # DSM 6 / DSM 7 × x86_64 / armv8 共 4 包（DSM 7 强制套件用户运行，DSM 6 root）。
+  # fpk 由 packaging/fnos/build_fpk.sh 拼装后交官方 fnpack（钉版本 + sha256）打包，x86 / arm 各 1 包。
   # 产物名带 server-bin- 前缀 → upload-server 的 download pattern 自动收集附到统一 release。
   build-server-nas-packages:
-    name: Build Server (OpenWrt/QNAP/Synology packages)
+    name: Build Server (OpenWrt/QNAP/Synology/fnOS packages)
     needs: [changes, build-server-binaries]
     if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-latest
@@ -1412,6 +1425,26 @@ jobs:
             ./packaging/synology/build_spk.sh "$VERSION" "$dsm" armv8 "$A64" \
               "release-assets/FluxDown-Server-${VERSION}-synology-${dsm}-arm64.spk"
           done
+
+      - name: Install fnpack
+        env:
+          FNPACK_VERSION: 1.2.3
+          FNPACK_SHA256: 54b97fa7b70968c4d05c79840f5daeff508957d0bb2062fdb0376d00d9615c93
+        run: |
+          curl -fsSL --retry 3 -o /tmp/fnpack \
+            "https://static2.fnnas.com/fnpack/fnpack-${FNPACK_VERSION}-linux-amd64"
+          echo "${FNPACK_SHA256}  /tmp/fnpack" | sha256sum -c -
+          sudo install -m 755 /tmp/fnpack /usr/local/bin/fnpack
+
+      - name: Build fnOS fpk
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          X64="extracted/fluxdown-server-${VERSION}-linux-x64"
+          A64="extracted/fluxdown-server-${VERSION}-linux-arm64"
+          ./packaging/fnos/build_fpk.sh "$VERSION" x86 "$X64" \
+            "release-assets/FluxDown-Server-${VERSION}-fnos-x64.fpk"
+          ./packaging/fnos/build_fpk.sh "$VERSION" arm "$A64" \
+            "release-assets/FluxDown-Server-${VERSION}-fnos-arm64.fpk"
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
@@ -1967,6 +2000,8 @@ jobs:
         upload-mobile,
       ]
     if: ${{ always() && !cancelled() && needs.prepare-release.result == 'success' }}
+    outputs:
+      was_draft: ${{ steps.before.outputs.was_draft }}
 
     steps:
       - name: Checkout repository
@@ -1982,6 +2017,17 @@ jobs:
           pattern: rehearsal-*
           path: rehearsal/
           merge-multiple: true
+
+      # 记录发布前的草稿状态：只有本次把草稿转正时 notify-telegram 才发公告，
+      # 补发 / Re-run 遇到已发布的 release 不会重复推送。
+      - name: Record draft state before publishing
+        id: before
+        if: needs.changes.outputs.rehearsal == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.changes.outputs.tag }}
+        run: echo "was_draft=$(gh release view "$TAG" --json isDraft -q .isDraft)" >> "$GITHUB_OUTPUT"
 
       - name: Publish unified release
         env:
@@ -2016,6 +2062,98 @@ jobs:
             rehearsal/SHA256SUMS.txt
             rehearsal/release-body.md
           if-no-files-found: warn
+
+  # ── 发布公告：草稿转正后推送到 Telegram 频道（t.me/fluxdown）──
+  # release 由 GITHUB_TOKEN 发布，不会触发 on: release 事件，所以公告在本流水线内发送。
+  # 部分组件失败时 publish-release 以非零退出但 release 已转正，照常公告；仍为草稿则跳过。
+  # 公告失败不影响发布结果。
+  notify-telegram:
+    name: Notify Telegram Channel
+    runs-on: ubuntu-latest
+    needs: [changes, publish-release]
+    if: ${{ always() && !cancelled() && needs.changes.outputs.rehearsal == 'false' && needs.publish-release.outputs.was_draft == 'true' }}
+    continue-on-error: true
+
+    steps:
+      - name: Send release announcement
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.changes.outputs.tag }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          gh release view "$TAG" --json isDraft,isPrerelease,name,url,body > "$RUNNER_TEMP/release.json"
+          python3 - "$RUNNER_TEMP/release.json" <<'EOF'
+          import html, json, os, re, sys, urllib.request
+          r = json.load(open(sys.argv[1]))
+          if r["isDraft"]:
+              print("Release is still a draft; skipping announcement")
+              sys.exit(0)
+          e = os.environ
+          body = r.get("body") or ""
+          # 只取中文更新日志：<!-- fluxdown:lang:zh --> 到下一个语言标记；
+          # 没有标记时去掉下载说明块（release:begin..end）与其余 HTML 注释。
+          m = re.search(r"<!-- fluxdown:lang:zh -->(.*?)(?=<!-- fluxdown:lang:|\Z)", body, re.S)
+          if m:
+              body = m.group(1)
+          else:
+              body = re.sub(r"<!-- fluxdown:release:begin.*?<!-- fluxdown:release:end -->", "", body, flags=re.S)
+              body = re.sub(r"<!--.*?-->", "", body, flags=re.S)
+
+          def inline(s):  # Markdown 行内 → Telegram HTML
+              parts = re.split(r"(`[^`]+`)", s)
+              out = []
+              for p in parts:
+                  if len(p) > 1 and p.startswith("`") and p.endswith("`"):
+                      out.append(f"<code>{html.escape(p[1:-1])}</code>")
+                  else:
+                      out.append(re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", html.escape(p)))
+              return "".join(out)
+
+          lines, size, truncated = [], 0, False
+          for raw in body.strip().splitlines():
+              line = raw.rstrip()
+              if re.match(r"^## \d", line):  # 版本号标题与公告标题重复
+                  continue
+              h = re.match(r"^#{1,6}\s+(.*)", line)
+              li = re.match(r"^\s*[-*]\s+(.*)", line)
+              if h:
+                  out = f"\n<b>{inline(h.group(1))}</b>"
+              elif li:
+                  out = f"• {inline(li.group(1))}"
+              else:
+                  out = inline(line)
+              # 按整行截断，避免切断 HTML 标签；Telegram 单条消息上限 4096 字符
+              if size + len(out) > 3500:
+                  truncated = True
+                  break
+              lines.append(out)
+              size += len(out) + 1
+          notes = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+          if truncated:
+              notes += "\n…"
+          title = "🧪 FluxDown 预览版" if r["isPrerelease"] else "🚀 FluxDown 新版本"
+          name = r.get("name") or ""
+          text = f"<b>{title} {html.escape(e['TAG'])}</b>\n"
+          if name and name != e["TAG"]:
+              text += f"{html.escape(name)}\n"
+          text += f"\n{notes}\n\n" if notes else "\n"
+          text += f'<a href="{html.escape(r["url"])}">查看 Release / 下载</a>'
+          payload = {
+              "chat_id": e["TG_CHAT"],
+              "text": text,
+              "parse_mode": "HTML",
+              "link_preview_options": {"is_disabled": True},
+          }
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{e['TG_TOKEN']}/sendMessage",
+              data=json.dumps(payload).encode(),
+              headers={"Content-Type": "application/json"},
+          )
+          resp = json.load(urllib.request.urlopen(req))
+          print(f"Telegram message_id={resp['result']['message_id']}")
+          EOF
 
   # ── 最终 Job: 清理 GitHub Actions Artifact，仅保留当前 tag 这一组 ──
   # 原因：Free 账号 artifact 配额仅 500MB，每次 release 会上传 ~400MB

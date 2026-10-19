@@ -1,19 +1,25 @@
 // 插件子页：已安装插件管理（启用 / 设置 / 登录 / 卸载）+ 安装区（zip 上传 / 服务端开发目录）+ 插件市场。
 
-import { FolderOpen, Info, Package, RotateCw, Settings, Trash2 } from 'lucide-react'
+import { FolderOpen, Info, Package, RotateCw, ScrollText, Settings, Trash2 } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { useT } from '../../../../i18n'
 import { METHOD, call, rpc, uploadBlob, useDaemon } from '../../../../lib/rpc'
 import type { DaemonSnapshot, InstalledPlugin, PluginDto } from '../../../../lib/rpc'
 import { Badge, Button, Card, ConfirmFooter, Dialog, EmptyState, FormField, Input, InputWithAction, Switch, confirmDialog, toast } from '../../../../ui'
+import { hasPluginSettings } from '../../../plugins/contributions'
 import { BlockTitle, ExtLink, IconButton, ListCard, ListRow } from './common'
 import { detailFromPlugin } from './detail'
 import type { PluginDetail } from './detail'
 import { extensionErrorText } from './errors'
 import { MarketSection } from './MarketSection'
+import { PluginAuditDialog } from './PluginAuditDialog'
 import { PluginAuthDialog } from './PluginAuthDialog'
+import { GrantConsentDialog, RiskBadge } from './PluginConsentDialog'
 import { PluginDetailDialog } from './PluginDetailDialog'
 import { PluginSettingsDialog } from './PluginSettingsDialog'
+import { SiteDefaultsCard } from './SiteDefaultsCard'
+import { postInstallConsent } from './logic'
+import type { ConsentSet } from './logic'
 
 const EMPTY_PLUGINS: PluginDto[] = []
 const selectPlugins = (daemon: DaemonSnapshot) => daemon.plugins
@@ -41,11 +47,36 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
   const [settingsPlugin, setSettingsPlugin] = useState<PluginDto | null>(null)
   const [authPlugin, setAuthPlugin] = useState<PluginDto | null>(null)
   const [missing, setMissing] = useState<string[] | null>(null)
+  const [consentPlugin, setConsentPlugin] = useState<PluginDto | null>(null)
+  const [audit, setAudit] = useState<{ identity: string | null } | null>(null)
   const fileInput = useRef<HTMLInputElement>(null)
 
-  const onInstalled = (result: InstalledPlugin) => {
+  /**
+   * 安装 / 更新成功后的统一授权流程：待授权集合与用户安装前确认的集合吻合 → 直接授权，否则弹授权对话框。
+   * `confirmed` 仅市场路径提供。
+   */
+  const onInstalled = async (result: InstalledPlugin, confirmed: ConsentSet | null = null) => {
     toast.success(t('pluginOpInstallSuccess'))
     if (result.missingComponents?.length) setMissing(result.missingComponents)
+    let plugin: PluginDto | undefined
+    try {
+      plugin = (await rpc.daemon.plugin.list()).find((item) => item.identity === result.identity)
+    } catch (error) {
+      toast.error(t('pluginConsentFailed', { message: extensionErrorText(t, error) }))
+      return
+    }
+    if (plugin === undefined) return
+    const action = postInstallConsent(plugin, confirmed)
+    if (action === 'dialog') {
+      setConsentPlugin(plugin)
+    } else if (action === 'grant') {
+      try {
+        await rpc.daemon.plugin.consent({ identity: plugin.identity, permissions: plugin.permissions, networkHosts: plugin.networkHosts })
+      } catch (error) {
+        toast.error(t('pluginConsentFailed', { message: extensionErrorText(t, error) }))
+        setConsentPlugin(plugin)
+      }
+    }
   }
   const onInstallFailed = (error: unknown) => {
     toast.error(t('pluginOpInstallFailed', { message: extensionErrorText(t, error) }))
@@ -112,7 +143,7 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
         onProgress: (fraction) => setZipPhase({ kind: 'uploading', fraction }),
       })
       setZipPhase({ kind: 'installing' })
-      onInstalled(await call<InstalledPlugin>(METHOD.DAEMON_PLUGIN_INSTALL, { blobId }, { timeoutMs: INSTALL_TIMEOUT_MS }))
+      await onInstalled(await call<InstalledPlugin>(METHOD.DAEMON_PLUGIN_INSTALL, { blobId }, { timeoutMs: INSTALL_TIMEOUT_MS }))
     } catch (error) {
       onInstallFailed(error)
     } finally {
@@ -125,7 +156,7 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
     if (dirPath === '' || installingDir) return
     setInstallingDir(true)
     try {
-      onInstalled(await rpc.daemon.plugin.installDev({ dirPath }))
+      await onInstalled(await rpc.daemon.plugin.installDev({ dirPath }))
       setDevDir('')
     } catch (error) {
       onInstallFailed(error)
@@ -146,10 +177,15 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
       <BlockTitle
         title={t('pluginsSectionTitle')}
         trailing={
-          <label className="flex items-center gap-2 text-xs text-muted-foreground">
-            {t('pluginDevModeSwitch')}
-            <Switch checked={devMode} onCheckedChange={setDevMode} aria-label={t('pluginDevModeSwitch')} />
-          </label>
+          <div className="flex items-center gap-3">
+            <Button variant="outline" icon={ScrollText} onClick={() => setAudit({ identity: null })}>
+              {t('pluginAuditOpenAll')}
+            </Button>
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              {t('pluginDevModeSwitch')}
+              <Switch checked={devMode} onCheckedChange={setDevMode} aria-label={t('pluginDevModeSwitch')} />
+            </label>
+          </div>
         }
       />
 
@@ -210,6 +246,7 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
               onDetail={() => setDetail(detailFromPlugin(plugin))}
               onSettings={() => setSettingsPlugin(plugin)}
               onAuth={() => setAuthPlugin(plugin)}
+              onConsent={() => setConsentPlugin(plugin)}
               onUninstall={() => void uninstall(plugin)}
               onReload={() => void reload(plugin)}
               onToggle={(enabled) => void setEnabled(plugin, enabled)}
@@ -218,11 +255,19 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
         </ListCard>
       )}
 
+      <SiteDefaultsCard plugins={plugins} stale={stale} />
+
       <MarketSection stale={stale} plugins={plugins} onInstalled={onInstalled} onInstallFailed={onInstallFailed} onShowDetail={setDetail} />
 
-      <PluginDetailDialog detail={detail} onClose={() => setDetail(null)} />
+      <PluginDetailDialog
+        detail={detail}
+        onClose={() => setDetail(null)}
+        onAudit={detail && plugins.some((item) => item.identity === detail.identity) ? (identity) => setAudit({ identity }) : undefined}
+      />
       <PluginSettingsDialog plugin={settingsPlugin} onClose={() => setSettingsPlugin(null)} />
       <PluginAuthDialog plugin={authPlugin} onClose={() => setAuthPlugin(null)} />
+      <GrantConsentDialog plugin={consentPlugin} onClose={() => setConsentPlugin(null)} />
+      <PluginAuditDialog open={audit !== null} initialIdentity={audit?.identity ?? null} onClose={() => setAudit(null)} />
       <Dialog
         open={missing !== null}
         onOpenChange={(open) => !open && setMissing(null)}
@@ -257,6 +302,7 @@ function PluginRow({
   onDetail,
   onSettings,
   onAuth,
+  onConsent,
   onUninstall,
   onReload,
   onToggle,
@@ -266,6 +312,7 @@ function PluginRow({
   onDetail: () => void
   onSettings: () => void
   onAuth: () => void
+  onConsent: () => void
   onUninstall: () => void
   onReload: () => void
   onToggle: (enabled: boolean) => void
@@ -282,8 +329,11 @@ function PluginRow({
             {plugin.devMode ? <Badge>{t('pluginDevModeBadge')}</Badge> : null}
             {/* 颜色是信号：只有加载失败 / 熔断停用着 destructive，其余中性。 */}
             {loadFailed ? <Badge tone="destructive">{t('pluginLoadStatusFailed')}</Badge> : <Badge>{t('pluginLoadStatusLoaded')}</Badge>}
+            <RiskBadge risk={plugin.risk} />
             {plugin.disabledReason === 'Manual' ? <Badge>{t('pluginDisabledManual')}</Badge> : null}
             {plugin.disabledReason === 'CircuitBreaker' ? <Badge tone="destructive">{t('pluginDisabledCircuitBreaker')}</Badge> : null}
+            {plugin.disabledReason === 'Revoked' ? <Badge tone="destructive">{t('pluginDisabledRevoked')}</Badge> : null}
+            {plugin.disabledReason === 'ConsentRequired' ? <Badge tone="warning">{t('pluginDisabledConsentRequired')}</Badge> : null}
           </div>
           {plugin.homepage ? <ExtLink href={plugin.homepage} /> : null}
           {plugin.description ? <div className="line-clamp-2 break-words text-xs text-muted-foreground">{plugin.description}</div> : null}
@@ -294,7 +344,12 @@ function PluginRow({
         <>
           {plugin.devMode ? <IconButton icon={RotateCw} label={t('pluginReloadTooltip')} onClick={onReload} disabled={disabled} /> : null}
           <IconButton icon={Info} label={t('pluginDetailDescription')} onClick={onDetail} />
-          {!loadFailed && plugin.settings.length > 0 ? (
+          {plugin.disabledReason === 'ConsentRequired' ? (
+            <Button variant="outline" onClick={onConsent} disabled={disabled}>
+              {t('pluginConsentButton')}
+            </Button>
+          ) : null}
+          {!loadFailed && hasPluginSettings(plugin) ? (
             <IconButton icon={Settings} label={t('pluginSettingsTooltip')} onClick={onSettings} disabled={disabled} />
           ) : null}
           {!loadFailed && plugin.authSupported ? (

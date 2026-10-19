@@ -19,8 +19,8 @@ use crate::{BuiltinThemeId, flutter, migrate};
 pub const THEME_FORMAT: &str = "fluxdown.gpui-theme";
 /// 当前 schema 版本。
 pub const THEME_SCHEMA_VERSION: u32 = 2;
-/// 导出时写入的 `$schema`。
-pub const THEME_SCHEMA_URL: &str = "https://fluxdown.zerx.dev/schemas/gpui-theme.v2.json";
+/// 导出时写入的 `$schema`。解析不校验该值：旧域名（fluxdown.zerx.dev）导出的主题照常读取。
+pub const THEME_SCHEMA_URL: &str = "https://fluxdown.com/schemas/gpui-theme.v2.json";
 
 /// 诊断类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

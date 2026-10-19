@@ -17,6 +17,8 @@ mod autostart;
 mod clipboard_seq;
 mod file_association;
 mod file_icon;
+#[cfg(feature = "desktop")]
+pub(crate) mod hotkey;
 #[cfg(target_os = "macos")]
 mod macos_cf;
 mod protocol_registry;

@@ -87,7 +87,7 @@
 
 | # | 阻塞项 | 影响面 | 处理 |
 |---|---|---|---|
-| **A** | 仓库 Homepage 字段是 `https://www.fluxdown.com`，README 全用 `https://fluxdown.zerx.dev` | **全部清单**。维护者点 homepage 核对时视为可疑条目 | 二选一统一（改仓库 Settings 或改 README） |
+| **A** | 仓库 Homepage 字段是 `https://www.fluxdown.com`，README 全用 `https://fluxdown.com` | **全部清单**。维护者点 homepage 核对时视为可疑条目 | 二选一统一（改仓库 Settings 或改 README） |
 | **B** | 最早 GitHub **Release** 2026-07-03 | `awesome-selfhosted`：PR #2675 已于 2026-07-05 被驳回（"Initial release 2 days ago"）。**补发 v0.0.1 Release 无效**——维护者看 Release 实际发布时间而非 tag 日期 | 冷却到 **2026-11-03** 后重提 |
 | **C** | CasaOS 源缺 `supported-languages.json`（v2 协议必需） | CasaOS/ZimaOS 自建源构建 | 补文件后再跑 `build_appstore.py` |
 

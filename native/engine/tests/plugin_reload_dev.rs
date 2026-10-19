@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_config::BtConfig;
 use fluxdown_engine::plugin::PluginError;
 use fluxdown_engine::proxy_config::ProxyConfig;
 use fluxdown_engine::{Engine, EngineConfig, NoopSelection, NoopSink};
@@ -120,6 +120,54 @@ async fn reload_dev_applies_manifest_edits_and_keeps_registration_on_failure() {
     // 非 dev 标识拒绝。
     let err = pm.reload_dev("nobody@none").await.expect_err("not dev");
     assert!(matches!(err, PluginError::NotDevPlugin(_)), "got {err:?}");
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
+}
+
+/// 声明的入口脚本缺失（如 `dist/` 被清空）：install_dev / reload_dev 在加载期就报错
+/// 并点名文件，而不是等到调用时才报「未提供 resolver」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dev_plugin_with_missing_entry_fails_to_load_naming_the_file() {
+    let work = std::env::temp_dir().join(format!("fluxdown-reload-dev-{}", uniq()));
+    let src = work.join("dev-src");
+    tokio::fs::create_dir_all(&src).await.expect("mkdir");
+    write_manifest(&src, "1.0.0").await;
+
+    let engine = make_engine(&work).await;
+    let pm = engine.manager.plugin_manager().expect("pm installed");
+
+    // 安装时入口缺失：安装失败，错误点名文件，dev 登记被回退。
+    let err = pm.install_dev(&src).await.expect_err("entry missing");
+    assert!(
+        matches!(&err, PluginError::LoadFailed(message) if message.contains("auth.js")),
+        "got {err:?}"
+    );
+
+    // 装好后入口被删：重载报错并点名文件，插件列为加载失败；补回后恢复。
+    write_script(&src, VALID_SCRIPT).await;
+    pm.install_dev(&src).await.expect("install dev plugin");
+    tokio::fs::remove_file(src.join("auth.js"))
+        .await
+        .expect("remove entry");
+    let err = pm.reload_dev(IDENTITY).await.expect_err("entry removed");
+    assert!(
+        matches!(&err, PluginError::LoadFailed(message) if message.contains("auth.js")),
+        "got {err:?}"
+    );
+    let status = pm
+        .list()
+        .await
+        .into_iter()
+        .find(|p| p.identity == IDENTITY)
+        .map(|p| p.load_status);
+    assert_eq!(status.as_deref(), Some("Failed"));
+
+    write_script(&src, VALID_SCRIPT).await;
+    pm.reload_dev(IDENTITY).await.expect("reload after fix");
 
     if let Err(error) = tokio::fs::remove_dir_all(&work).await
         && error.kind() != std::io::ErrorKind::NotFound

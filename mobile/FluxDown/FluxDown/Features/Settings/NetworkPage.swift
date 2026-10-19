@@ -38,7 +38,9 @@ struct NetworkPage: View {
                 Section {
                     modeRow(mode)
                 } footer: {
+                    #if FULL_P2P
                     Text(L("proxyBtNote"))
+                    #endif
                 }
                 .disabled(readOnly)
 

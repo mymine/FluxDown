@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use fluxdown_cli::client::ClientError;
 use fluxdown_cli::exit::ExitCode;
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_config::BtConfig;
 use fluxdown_engine::data_dir::resolve_data_dir;
 use fluxdown_engine::db::{Db, DbError};
 use fluxdown_engine::download_manager::{NewTaskSpec, progress_reporter};

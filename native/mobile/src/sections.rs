@@ -212,6 +212,10 @@ pub(crate) fn affected(event: &AgentEvent) -> &'static [Section] {
             | DaemonEvent::TaskActivityAdded(_)
             // 云端推送事件只由 agent 消费，不应到达投影；到达也不改变任何分区。
             | DaemonEvent::TaskNotice(_)
+            // 插件可移植视图事件：移动端 v1 不渲染，不改变任何分区。
+            | DaemonEvent::PluginViewFrame(_)
+            | DaemonEvent::PluginViewClosed { .. }
+            | DaemonEvent::PluginToast { .. }
             | DaemonEvent::SnapshotReplaced(_)
             | DaemonEvent::TaskChanged(_)
             | DaemonEvent::TasksChanged(_)

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { WEBHOOK_DELIVERY_LIMIT, applyAgentEvent, applyDaemonEvent } from './apply'
-import type { AgentSnapshot, DaemonSnapshot, TaskDto, TaskRuntimeDto, WebhookDeliveryDto } from './protocol'
+import type { AgentSnapshot, DaemonEvent, DaemonSnapshot, TaskDto, TaskRuntimeDto, WebhookDeliveryDto } from './protocol'
 
 test('cloud connection is independent of sync, clears stale self presence and resets on logout', () => {
   const initial = {
@@ -198,6 +198,18 @@ describe('apply cloud notify', () => {
       data: { type: 'taskNotice', data: { deliveryId: 'd', event: 'task.completed', timestampMs: 1, queueId: 'q', queueName: 'Q' } },
     })
     expect(notice).toBe(next)
+  })
+
+  test('plugin view events never change the snapshot', () => {
+    const snapshot = { cloudNotify: undefined, daemon: daemon([]) } as unknown as AgentSnapshot
+    const events: DaemonEvent[] = [
+      { type: 'pluginViewFrame', data: { session: 's', seq: 1, ops: [{ op: 'error', message: 'x' }] } },
+      { type: 'pluginViewClosed', data: { session: 's', reason: 'closed' } },
+      { type: 'pluginToast', data: { identity: 'a@b', level: 'info', text: 'hi' } },
+    ]
+    for (const data of events) {
+      expect(applyAgentEvent(snapshot, { type: 'daemon', data })).toBe(snapshot)
+    }
   })
 
   test('session end clears overview, loading and error but keeps local preferences and the public catalog', () => {

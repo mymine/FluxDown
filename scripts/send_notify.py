@@ -85,8 +85,8 @@ def build_text(
 立即下载：{download_url}
 
 ---
-© 2025 FluxDown · zerx-lab · https://fluxdown.zerx.dev
-如有问题或建议：https://fluxdown.zerx.dev/feedback
+© 2025 FluxDown · zerx-lab · https://fluxdown.com
+如有问题或建议：https://fluxdown.com/feedback
 """
 
 

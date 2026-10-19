@@ -40,13 +40,13 @@ After editing running code, exit the affected processes before launching again; 
 
 ## 反馈问题 / Reporting Issues
 
-请通过 [GitHub Issues](https://github.com/zerx-lab/FluxDown/issues) 或官网 [反馈页面](https://fluxdown.zerx.dev/feedback) 提交问题。
-Please report problems via [GitHub Issues](https://github.com/zerx-lab/FluxDown/issues) or the [feedback page](https://fluxdown.zerx.dev/feedback) on the official site.
+请通过 [GitHub Issues](https://github.com/zerx-lab/FluxDown/issues) 或官网 [反馈页面](https://fluxdown.com/feedback) 提交问题。
+Please report problems via [GitHub Issues](https://github.com/zerx-lab/FluxDown/issues) or the [feedback page](https://fluxdown.com/feedback) on the official site.
 
 ## 文档贡献 / Documentation Contributions
 
-FluxDown 官网文档（<https://fluxdown.zerx.dev/docs/>）与源码同仓库维护，欢迎通过 Pull Request 贡献或翻译。
-The FluxDown documentation site (<https://fluxdown.zerx.dev/docs/>) is maintained in this repository — contributions and translations via Pull Request are welcome.
+FluxDown 官网文档（<https://fluxdown.com/docs/>）与源码同仓库维护，欢迎通过 Pull Request 贡献或翻译。
+The FluxDown documentation site (<https://fluxdown.com/docs/>) is maintained in this repository — contributions and translations via Pull Request are welcome.
 
 ### 快速编辑 / Quick Edit
 
@@ -55,8 +55,8 @@ Every documentation page has an "Edit this page" link that opens the GitHub web 
 
 ### 目录结构 / Directory Layout
 
-文档源文件位于 `website-v2/src/content/docs/{en,zh}/`，按语言分目录，子目录与文件名一一对应（`website/` 是 `/v1` 旧站存档，不再接收文档改动）：
-Documentation source files live under `website-v2/src/content/docs/{en,zh}/`, one directory per language, with matching subdirectory/filename structure across languages (`website/` is the archived `/v1` site and no longer accepts doc changes):
+文档源文件位于 `website-v2/src/content/docs/{en,zh}/`，按语言分目录，子目录与文件名一一对应：
+Documentation source files live under `website-v2/src/content/docs/{en,zh}/`, one directory per language, with matching subdirectory/filename structure across languages:
 
 ```text
 website-v2/src/content/docs/

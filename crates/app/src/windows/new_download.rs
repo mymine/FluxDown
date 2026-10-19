@@ -499,6 +499,10 @@ fn submit(submission: NewDownloadSubmission, port: &Arc<AgentDownloadsPort>, cx:
     };
     let task = cx.spawn(async move |cx| {
         let SubmitNotice { ok, message } = notice.await;
+        // 全部新建成功不提示：任务已在列表中，toast 只会遮挡列表顶部（#884）。
+        if ok && message.is_empty() {
+            return;
+        }
         cx.update(|cx| {
             let main = match WindowRegistry::handle(cx, &WindowKey::Main) {
                 Some(main) => main,
@@ -512,14 +516,10 @@ fn submit(submission: NewDownloadSubmission, port: &Arc<AgentDownloadsPort>, cx:
                     main
                 }
             };
-            let translator = translator.read(cx);
             let message = if message.is_empty() {
                 translator
-                    .text(if ok {
-                        "taskCreatedToast"
-                    } else {
-                        "localServiceActionFailed"
-                    })
+                    .read(cx)
+                    .text("localServiceActionFailed")
                     .to_owned()
             } else {
                 message

@@ -3,6 +3,7 @@
 mod assets;
 mod controller;
 mod editor;
+mod provider;
 mod view;
 
 pub use assets::{RSS_ICON_PATH, RssAssets};

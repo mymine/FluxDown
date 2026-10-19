@@ -32,6 +32,7 @@ jobs:
       website: ${{ steps.f.outputs.website }}
       extension: ${{ steps.f.outputs.extension }}
       android: ${{ steps.f.outputs.android }}
+      sdk: ${{ steps.f.outputs.sdk }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -46,6 +47,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
+              - 'packages/plugin-sdk/types/**'
               - '.github/workflows/ci.yml'
             web:
               - 'web/**'
@@ -53,6 +55,9 @@ jobs:
               - 'website-v2/src/lib/gpui-theme/**'
               - 'assets/icon-packs/**'
               - 'crates/icon_pack/tests/fixtures/**'
+              - 'native/protocol/tests/fixtures/plugin_view_apply.json'
+              - 'native/protocol/src/plugin_view_tones.json'
+              - 'crates/extensions/tests/fixtures/consent_cases.json'
               - '.github/workflows/ci.yml'
             website:
               - 'website-v2/**'
@@ -60,6 +65,7 @@ jobs:
               - '.github/workflows/ci.yml'
             extension:
               - 'fluxDown/**'
+              - 'scripts/sniff-rules/**'
               - '.github/workflows/ci.yml'
             android:
               - 'mobile/Android/**'
@@ -67,6 +73,12 @@ jobs:
               - 'assets/i18n/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            sdk:
+              - 'packages/plugin-sdk/**'
+              - 'native/engine/src/plugin/fixtures/**'
+              - 'native/protocol/src/plugin_view_schema.json'
+              - 'website-v2/src/lib/gpui-theme/registry.json'
               - '.github/workflows/ci.yml'
 
   rust-lint:
@@ -104,6 +116,10 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --exclude fluxdown_server --all-targets -- -D warnings
 
+      # 插件桌面类型由 gpui-shell 组件目录 + fluxdown 宿主模块生成，入库副本必须与生成结果一致。
+      - name: plugin desktop typings drift
+        run: cargo run --locked -p fluxdown_ui_plugin_ui --example gen_plugin_typings -- --check packages/plugin-sdk/types/desktop.d.ts
+
   rust-test:
     name: Test (${{ matrix.name }})
     needs: changes
@@ -115,6 +131,9 @@ jobs:
         include:
           - name: engine
             packages: "-p fluxdown_engine"
+          # 插件运行时（quickjs-jit）与常驻宿主只在 feature 下编译，单独成组。
+          - name: engine-plugins
+            packages: "-p fluxdown_engine --features plugins,components"
           - name: core
             packages: "-p fluxdown_api -p fluxdown_protocol -p fluxdown_daemon -p fluxdown_engine_protocol -p fluxdown_link -p fluxdown_logfile -p fluxdown_cli"
           - name: agent
@@ -122,7 +141,7 @@ jobs:
           - name: mobile
             packages: "-p fluxdown_mobile"
           - name: gpui
-            packages: "-p fluxdown_ui_account -p fluxdown_ui_app -p fluxdown_ui_command_palette -p fluxdown_ui_components -p fluxdown_ui_downloads -p fluxdown_ui_extensions -p fluxdown_ui_i18n -p fluxdown_ui_rss -p fluxdown_ui_settings -p fluxdown_ui_shell -p fluxdown_ui_theme"
+            packages: "-p fluxdown_ui_account -p fluxdown_ui_app -p fluxdown_ui_command_palette -p fluxdown_ui_components -p fluxdown_ui_downloads -p fluxdown_ui_extensions -p fluxdown_ui_i18n -p fluxdown_ui_plugin_ui -p fluxdown_ui_rss -p fluxdown_ui_settings -p fluxdown_ui_shell -p fluxdown_ui_theme"
     steps:
       - uses: actions/checkout@v4
 
@@ -179,6 +198,24 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run test
 
+  plugin-sdk:
+    name: Plugin SDK (gen + typecheck + test + build)
+    needs: changes
+    if: needs.changes.outputs.sdk == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/plugin-sdk
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      # 重新生成 view / theme 类型并与入库文件逐字比较（脚本内比较，不依赖 git）。
+      - run: bun run gen:check
+      - run: bun run typecheck
+      - run: bun run test
+      - run: bun run build
+
   extension:
     name: Browser extension build
     needs: changes
@@ -193,8 +230,23 @@ jobs:
         with:
           node-version: "22"
       - run: npm ci
+      - uses: oven-sh/setup-bun@v2
+      - run: bun test
+      - run: npm run typecheck
       - run: npm run build
       - run: npm run build:firefox
+      # 规则仓与扩展不漂移：vendor 的校验器 / 求值器打包物、内置官方规则种子都必须与规则仓 main 一致。
+      - uses: actions/checkout@v4
+        with:
+          repository: zerx-lab/fluxdown-sniff-rules
+          ref: main
+          path: sniff-rules-repo
+          persist-credentials: false
+      - name: Sniff rules repo drift check
+        working-directory: .
+        run: |
+          bun scripts/sniff-rules/sync-repo.ts vendor --check --repo sniff-rules-repo
+          bun scripts/sniff-rules/sync-repo.ts seed --check --repo sniff-rules-repo
 
   # 原生 Android：Kotlin 单测（含经 UniFFI 生成绑定的本机主机端到端冒烟）+ 组装 APK + lint。
   # :bridge 经 cargo-ndk 交叉编译 fluxdown_mobile；门禁只编 arm64-v8a 以控制时长。

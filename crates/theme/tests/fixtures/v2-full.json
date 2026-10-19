@@ -1,5 +1,5 @@
 {
-  "$schema": "https://fluxdown.zerx.dev/schemas/gpui-theme.v2.json",
+  "$schema": "https://fluxdown.com/schemas/gpui-theme.v2.json",
   "format": "fluxdown.gpui-theme",
   "schemaVersion": 2,
   "meta": {

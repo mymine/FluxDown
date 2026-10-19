@@ -179,12 +179,11 @@ async fn fs_rejects_unsafe_names() {
 async fn ytdlp_install_smoke() {
     let data_dir = unique_dir("data_install_smoke");
     let db = Db::open(&data_dir).await.expect("open db");
-    let client = fluxdown_engine::downloader::build_client(&ProxyConfig::default(), "")
-        .expect("build client");
+    let egress = fluxdown_engine::egress::Egress::new(db.clone());
     let progress = |d: u64, t: u64| eprintln!("[install] {d}/{t}");
 
     let status =
-        fluxdown_engine::components::install_ytdlp(&db, &data_dir, &client, None, &progress)
+        fluxdown_engine::components::install_ytdlp(&db, &data_dir, &egress, None, &progress)
             .await
             .expect("install yt-dlp");
     assert_eq!(status.source.as_str(), "managed");
@@ -225,9 +224,8 @@ async fn ytdlp_install_smoke() {
 async fn ytdlp_list_versions_smoke() {
     let data_dir = unique_dir("data_list_versions_smoke");
     let db = Db::open(&data_dir).await.expect("open db");
-    let client = fluxdown_engine::downloader::build_client(&ProxyConfig::default(), "")
-        .expect("build client");
-    let v = fluxdown_engine::components::list_ytdlp_versions(&db, &client)
+    let egress = fluxdown_engine::egress::Egress::new(db.clone());
+    let v = fluxdown_engine::components::list_ytdlp_versions(&db, &egress)
         .await
         .expect("list yt-dlp versions");
     assert!(!v.versions.is_empty(), "at least one version tag");

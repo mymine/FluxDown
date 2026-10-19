@@ -14,6 +14,8 @@ import com.fluxdown.app.data.SecretBox
 import com.fluxdown.app.data.ViewPrefsRepo
 import com.fluxdown.app.feature.newtask.ImportCenter
 import com.fluxdown.app.service.LocalActivity
+import com.fluxdown.app.diag.AppDiagnostics
+import com.fluxdown.app.service.DownloadServiceController
 import com.fluxdown.bridge.FluxBridge
 import com.fluxdown.core.host.CreateTaskRequest
 import com.fluxdown.core.host.HostErrorCode
@@ -64,7 +66,12 @@ class FluxApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        AppDiagnostics.install(this)
         container = AppContainer(this)
+        // 本机出现下载活动时就尝试拉起前台服务——不限于界面在前台：RSS 自动下载、云端 / 局域网下发、
+        // 队列调度都可能在后台产生任务。Android 12+ 后台启动多数会被拒（已在电池优化白名单时豁免），
+        // 被拒记入诊断，回到前台由 DownloadServiceEffect 补拉。
+        DownloadServiceController.keepAliveWhileBusy(this, container)
         // 周期后台检查按「自动检查」开关登记 / 取消（幂等；不持久化，每次冷启动重登）。
         // 偏好读取与 JobScheduler binder 调用放 IO，不占冷启动主线程。
         container.appScope.launch(Dispatchers.IO) {

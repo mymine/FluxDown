@@ -18,6 +18,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -37,6 +38,7 @@ import androidx.compose.ui.unit.dp
 import com.fluxdown.app.R
 import com.fluxdown.app.actions.LocalTaskActions
 import com.fluxdown.app.i18n.str
+import com.fluxdown.app.shell.LocalAppContainer
 import com.fluxdown.app.shell.hostState
 import com.fluxdown.app.ui.TaskVisualState
 import com.fluxdown.app.ui.label
@@ -58,6 +60,8 @@ import com.fluxdown.fluxui.controls.StatItem
 import com.fluxdown.fluxui.controls.Tone
 import com.fluxdown.fluxui.data.Donut
 import com.fluxdown.fluxui.data.DonutSlice
+import com.fluxdown.fluxui.data.WaveChart
+import com.fluxdown.fluxui.data.WaveTick
 import com.fluxdown.fluxui.data.WaveSeries
 import com.fluxdown.fluxui.data.Waveform
 import com.fluxdown.fluxui.icons.FluxIcons
@@ -67,6 +71,12 @@ import com.fluxdown.fluxui.overlay.FluxToastKind
 import com.fluxdown.fluxui.overlay.LocalFluxOverlays
 import com.fluxdown.fluxui.theme.FluxText
 import com.fluxdown.fluxui.theme.FluxTheme
+import com.fluxdown.core.protocol.HostMethod
+import com.fluxdown.core.protocol.TaskSpeedHistory
+import com.fluxdown.core.protocol.TaskSpeedHistoryQuery
+import com.fluxdown.core.protocol.callJson
+import com.fluxdown.core.host.HostException
+import kotlinx.coroutines.delay
 import java.util.Locale
 import kotlin.math.max
 import kotlin.math.roundToInt
@@ -212,50 +222,74 @@ private fun SourcesCard(task: Task, modifier: Modifier) {
 
 // ── 速度 ──────────────────────────────────────────────────────────────────
 
-private data class SpeedStats(val samples: Int, val avg: Long, val peak: Long)
+private const val SPEED_REFRESH_MS = 2_000L
 
-private fun SpeedHistory?.stats(): SpeedStats {
-    if (this == null || size == 0) return SpeedStats(0, 0, 0)
-    var sum = 0L
-    var peak = 0L
-    for (i in 0 until size) {
-        val v = downAt(i)
-        sum += v
-        peak = max(peak, v)
+/**
+ * 任务自身的全生命周期速度曲线（`daemon.task.speedHistory`）。
+ * 进入速度页 / 任务变化时拉取；下载中每 2 s 重拉（串行，不重叠）；离开下载态时 effect 重启再拉一次取终态。
+ * 失败（含旧主机无此方法）保留上一份有效数据；effect 按 taskId 重启，迟到响应随取消丢弃。
+ */
+@Composable
+private fun rememberTaskSpeedHistory(taskId: String, downloading: Boolean): TaskSpeedHistory? {
+    val container = LocalAppContainer.current
+    var history by remember(taskId) { mutableStateOf<TaskSpeedHistory?>(null) }
+    LaunchedEffect(taskId, downloading) {
+        while (true) {
+            try {
+                val fetched = TaskSpeedHistory.fromJson(
+                    container.session.callJson(HostMethod.daemonTaskSpeedHistory, TaskSpeedHistoryQuery(taskId).toJson()),
+                )
+                if (fetched == null) {
+                    // 无记录：仅在尚无数据时有意义（重新下载后清空由 null 体现）
+                    history = null
+                } else if (fetched.taskId == taskId) {
+                    history = fetched
+                }
+            } catch (_: HostException) {
+                // 保留上一份数据
+            }
+            if (!downloading) break
+            delay(SPEED_REFRESH_MS)
+        }
     }
-    return SpeedStats(size, sum / size, peak)
+    return history
 }
+
+/** 时长：<60s 用秒，其余同做种时长（d h m）。 */
+@Composable
+private fun activeTimeText(seconds: Long): String = if (seconds < 60) etaText(seconds.coerceAtLeast(0)) else durationText(seconds)
 
 @Composable
 internal fun SpeedTab(taskId: String, modelOf: () -> DetailModel?) {
     val model = modelOf() ?: return
     val task = model.task
-    val host = hostState()
     val c = FluxTheme.colors
     val type = FluxTheme.type
-    val stats by remember(taskId) { derivedStateOf { host.value.taskSpeedHistory[taskId].stats() } }
+    val history = rememberTaskSpeedHistory(taskId, model.isTransferring)
 
-    val cur = Format.speedOrZero(model.speedDown)
-    val avg = Format.speedOrZero(stats.avg)
-    val peak = Format.speedOrZero(stats.peak)
+    val cur = Format.speedOrZero(if (model.isTransferring) model.speedDown else 0)
+    val avg = Format.speedOrZero(history?.averageBps ?: 0)
+    val peak = Format.speedOrZero(history?.peakBps ?: 0)
+    val active = history?.activeSecs ?: 0
+    val activeText = activeTimeText(active)
     GlassSection(Modifier.fluxFlowIn(0)) {
         custom {
             FluxStatRow(
                 listOf(
                     StatItem(cur.value, str(R.string.infoSpeed), cur.unit, if (model.isTransferring) Tone.Accent else Tone.Neutral),
-                    StatItem(avg.value, str(R.string.mobileSpeedAvgRecent), avg.unit),
-                    StatItem(peak.value, str(R.string.mobileSpeedPeakRecent), peak.unit),
+                    StatItem(avg.value, str(R.string.speedAverage), avg.unit),
+                    StatItem(peak.value, str(R.string.speedPeak), peak.unit),
+                    StatItem(activeText, str(R.string.speedActiveTime)),
                 ),
             )
         }
     }
 
-    // 实时曲线：采样读取放在绘制阶段，主机每次发布只重绘、不重组
-    val buffer = remember { FloatArray(SpeedHistory.CAPACITY) }
+    // 整段历史曲线：横向铺满，不做固定容量右对齐
     GlassSection(Modifier.fluxFlowIn(1)) {
         custom {
             Column(Modifier.padding(vertical = 12.dp)) {
-                if (stats.samples < 2) {
+                if (history == null || !history.hasChart) {
                     FluxText(
                         str(R.string.speedChartEmpty),
                         style = type.sm,
@@ -263,21 +297,28 @@ internal fun SpeedTab(taskId: String, modelOf: () -> DetailModel?) {
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 28.dp).fillMaxWidth(),
                     )
                 } else {
-                    Waveform(
-                        samples = {
-                            val h = host.value.taskSpeedHistory[taskId]
-                            if (h == null || h.size < 2) {
-                                WaveSeries.Idle
-                            } else {
-                                for (i in 0 until h.size) buffer[i] = h.downAt(i).toFloat()
-                                WaveSeries(buffer, WaveSeries.EMPTY, h.size)
-                            }
+                    val series = remember(history) {
+                        WaveSeries(
+                            FloatArray(history.samples.size) { history.samples[it].toFloat() },
+                            maxValue = history.chartMaxBps.toFloat(),
+                        )
+                    }
+                    val elapsed = remember(history) { history.elapsedSecs() }
+                    val ticks = remember(history) {
+                        history.axisTicksBps.map { WaveTick(it.toFloat(), Format.speedOrZero(it).toString()) }
+                    }
+                    WaveChart(
+                        samples = { series },
+                        ticks = ticks,
+                        readout = { i ->
+                            val t = elapsed.getOrNull(i)?.let { TaskSpeedHistory.formatElapsed(it) }.orEmpty()
+                            "$t · ${Format.speedOrZero(history.samples.getOrNull(i) ?: 0)}"
                         },
-                        modifier = Modifier.height(120.dp),
+                        fadeStart = false,
                     )
                     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                        FluxText(str(R.string.mobileSpeedAxisStart), style = type.monoS, color = c.inkFaint, maxLines = 1)
-                        FluxText(str(R.string.mobileSpeedAxisNow), style = type.monoS, color = c.inkFaint, maxLines = 1)
+                        FluxText(str(R.string.speedAxisStart), style = type.monoS, color = c.inkFaint, maxLines = 1)
+                        FluxText(activeText, style = type.monoS, color = c.inkFaint, maxLines = 1)
                     }
                 }
             }

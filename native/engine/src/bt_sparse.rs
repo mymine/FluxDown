@@ -21,15 +21,23 @@
 //! 任务进错误态可重试）与簇的连续性（NTFS 按写入顺序分配，BT 随机写
 //! 本就难以连续）。换来的是即点即下、零预留等待、零 VDL 写放大。
 
+#[cfg(feature = "bt")]
 use std::any::TypeId;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "bt")]
+use std::path::PathBuf;
 
+#[cfg(feature = "bt")]
 use librqbit::storage::filesystem::{FilesystemStorage, FilesystemStorageFactory};
+#[cfg(feature = "bt")]
 use librqbit::storage::{BoxStorageFactory, StorageFactory, TorrentStorage};
+#[cfg(feature = "bt")]
 use librqbit::{ManagedTorrentShared, TorrentMetadata};
 
+#[cfg(feature = "bt")]
 use crate::logger::log_info;
 
+#[cfg(feature = "bt")]
 /// 构造注入 `AddTorrentOptions.storage_factory` 的 sparse 包装工厂。
 ///
 /// `output_folder` 与 `AddTorrentOptions.output_folder` 同值（本任务的
@@ -41,11 +49,13 @@ pub fn sparse_fs_factory(output_folder: PathBuf) -> BoxStorageFactory {
     })
 }
 
+#[cfg(feature = "bt")]
 struct SparseFsFactory {
     inner: FilesystemStorageFactory,
     output_folder: PathBuf,
 }
 
+#[cfg(feature = "bt")]
 impl StorageFactory for SparseFsFactory {
     // `BoxStorageFactory` 要求关联 Storage 为 `Box<dyn TorrentStorage>`。
     type Storage = Box<dyn TorrentStorage>;
@@ -79,12 +89,14 @@ impl StorageFactory for SparseFsFactory {
     }
 }
 
+#[cfg(feature = "bt")]
 /// 委托 `FilesystemStorage` 的存储实现，仅在 `init` 后追加 sparse 标记。
 pub struct SparseFsStorage {
     inner: FilesystemStorage,
     output_folder: PathBuf,
 }
 
+#[cfg(feature = "bt")]
 impl TorrentStorage for SparseFsStorage {
     fn init(
         &mut self,
@@ -174,6 +186,7 @@ pub(crate) fn mark_sparse(path: &Path) -> std::io::Result<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
 

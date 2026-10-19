@@ -49,20 +49,24 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use rand::{Rng, RngCore};
 use tokio::sync::Notify;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use super::address::PeerAddress;
 use super::crypto::{
     derive_link_key, derive_sas, eph_commitment, fingerprint, hash_transcript,
     verify_eph_commitment,
 };
 use super::error::{LinkError, LinkResult};
 use super::identity::LinkIdentity;
-use super::types::{PeerCandidate, PeerInfo, PeerRecord, TransportKind};
+use super::text::{
+    MAX_NAME_CHARS, MAX_PLATFORM_CHARS, MAX_VERSION_CHARS, sanitize_optional, sanitize_text,
+};
+use super::types::{MAX_DIRECT_CANDIDATES, PeerCandidate, PeerRecord, TransportKind};
 
 /// 配对协议版本。`hello` 与其回复都携带它，两端必须逐字相等，否则一律
 /// [`LinkError::UnsupportedVersion`]——不提供向下兼容的握手形态。
@@ -109,6 +113,8 @@ const MAX_FAILURE_BUCKETS: usize = 256;
 /// 让「拿不到来源地址」变成绕过节流的手段；桶表满员后的溢出来源也并入
 /// 这个桶（见 `MAX_FAILURE_BUCKETS`）。
 const UNKNOWN_SOURCE_KEY: &str = "unknown";
+/// hello 自报的单条回连地址的长度上限（字节）。
+const MAX_ADDRESS_LEN: usize = 256;
 /// 等待响应方本机用户核验 SAS 并做出批准/拒绝决策的超时时长。
 ///
 /// 不变量：锚点是揭示被受理的时刻（即 `IncomingPairing` 广播给本机 UI 的时刻），与
@@ -241,12 +247,16 @@ impl Transcript {
     }
 }
 
-/// 本机在配对响应中呈现的自身信息。
-#[derive(Debug, Clone)]
+/// 本机在配对响应与数据面信息交换中呈现的自身信息。设备名与云设备 ID 在运行期可变（改名、
+/// 云账号登录 / 登出），宿主经 `LinkManager::update_self` 更新。
+#[derive(Debug, Clone, Default)]
 pub struct SelfInfo {
     pub name: String,
     pub platform: Option<String>,
     pub app_version: Option<String>,
+    /// 本机已登录云账号时的云设备 ID（`state.device_id`），未登录为 `None`。**只经已认证的
+    /// 数据面信息交换告知已配对对端**：绝不进 mDNS、`/ping`、配对 hello。
+    pub cloud_device_id: Option<String>,
 }
 
 /// 发起方 `hello` 请求（byte-oriented；wire 层负责 base64 编解码）。
@@ -314,6 +324,9 @@ enum SessionStage {
         eph_secret: StaticSecret,
         nonce: [u8; 32],
         hello_digest: [u8; 32],
+        /// hello 回复里出示的响应方自报信息的摘要（hello 当刻定格）：reveal 时的转录必须
+        /// 与发起方据 hello 回复算出的一致，即使本机在两步之间改了设备名。
+        responder_info_digest: [u8; 32],
     },
     /// 承诺已核对、SAS 已展示给本机用户，等待双方 confirm 与本机用户表态。
     Revealed {
@@ -331,8 +344,11 @@ enum SessionStage {
 /// 一条入站会话（hello 已完成，等待揭示 → SAS 核对 + confirm）。
 struct ConfirmEntry {
     initiator_id_pub: [u8; 32],
+    /// 已清洗的发起方自报名 / 平台 / 版本（签名覆盖的是原始值，入册与展示用清洗后的值）。
     name: String,
     platform: Option<String>,
+    app_version: Option<String>,
+    /// 已校验并规范化的回连地址（至多 [`MAX_DIRECT_CANDIDATES`] 条）。
     initiator_addrs: Vec<String>,
     /// hello 抵达时刻，会话总寿命（`SESSION_TTL`）与揭示时限（`REVEAL_TIMEOUT`）的锚点。
     created: Instant,
@@ -361,10 +377,50 @@ fn prune_sessions(sessions: &mut HashMap<String, ConfirmEntry>) {
 /// 把请求来源标准化为失败 hello 的节流分桶键。`None`（宿主层拿不到来源
 /// 地址，如某些部署形态取不到连接对端 IP）统一归入固定的
 /// `UNKNOWN_SOURCE_KEY` 桶——不能因为拿不到地址就放弃对这类请求节流。
+///
+/// IPv4-mapped IPv6（`::ffff:a.b.c.d`）与对应的 IPv4 是同一来源；IPv6 按 /64 归一——
+/// 一个 /64 前缀内的隐私地址可以任意轮换，按 /128 分桶等于没有单来源限额。
 fn failure_bucket_key(source: Option<IpAddr>) -> String {
-    source
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| UNKNOWN_SOURCE_KEY.to_string())
+    let Some(ip) = source else {
+        return UNKNOWN_SOURCE_KEY.to_string();
+    };
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
+        v4 @ IpAddr::V4(_) => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+    }
+}
+
+/// 校验 hello 自报的回连地址：至多 [`MAX_DIRECT_CANDIDATES`] 条，且每条都能被
+/// [`PeerAddress::parse`] 解析；返回规范化（去重）后的候选形态。这些地址会被写进名册、此后
+/// 周期性被本机探测，来源虽经签名覆盖，但发起方是任何持有配对码的人，必须当作不可信输入。
+fn validate_initiator_addrs(addrs: &[String]) -> LinkResult<Vec<String>> {
+    if addrs.len() > MAX_DIRECT_CANDIDATES {
+        return Err(LinkError::BadPayload(
+            "too many initiator addresses".to_owned(),
+        ));
+    }
+    let mut canonical: Vec<String> = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        if addr.len() > MAX_ADDRESS_LEN {
+            return Err(LinkError::BadPayload(
+                "initiator address too long".to_owned(),
+            ));
+        }
+        let parsed = PeerAddress::parse(addr)
+            .map_err(|_| LinkError::BadPayload("invalid initiator address".to_owned()))?;
+        let candidate = parsed.to_candidate();
+        if !canonical.contains(&candidate) {
+            canonical.push(candidate);
+        }
+    }
+    Ok(canonical)
 }
 
 /// 剪枝失败 hello 分桶表：每个来源桶按 `FAILED_HELLO_WINDOW` 剪掉过期
@@ -390,7 +446,8 @@ fn is_all_zero(bytes: &[u8]) -> bool {
 /// 配对**响应方**（被添加的设备侧）。持有一次性配对码与待确认会话表。
 pub struct PairingResponder {
     identity: LinkIdentity,
-    self_info: SelfInfo,
+    /// 本机自报信息：设备名可在运行期更新（改名 / 云登录后同步），所以放在锁里。
+    self_info: RwLock<SelfInfo>,
     codes: Mutex<Vec<CodeEntry>>,
     sessions: Mutex<HashMap<String, ConfirmEntry>>,
     /// 失败 hello（猜码）时间戳，按 [`failure_bucket_key`] 分桶——与配对码
@@ -407,11 +464,29 @@ impl PairingResponder {
     pub fn new(identity: LinkIdentity, self_info: SelfInfo) -> Self {
         Self {
             identity,
-            self_info,
+            self_info: RwLock::new(self_info),
             codes: Mutex::new(Vec::new()),
             sessions: Mutex::new(HashMap::new()),
             failures: Mutex::new(HashMap::new()),
             decision_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// 本机当前自报信息（快照）。
+    #[must_use]
+    pub fn self_info(&self) -> SelfInfo {
+        match self.self_info.read() {
+            Ok(info) => info.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// 更新本机自报信息（设备名改变后调用）；只影响之后的新会话，进行中的会话沿用 hello 当刻
+    /// 定格的自报信息。
+    pub fn set_self_info(&self, info: SelfInfo) {
+        match self.self_info.write() {
+            Ok(mut current) => *current = info,
+            Err(poisoned) => *poisoned.into_inner() = info,
         }
     }
 
@@ -484,9 +559,9 @@ impl PairingResponder {
         }
     }
 
-    /// 处理 `hello`：版本 → 节流 → 自配对 → 校验码 → 验发起方签名 → 建会话并回出本次
-    /// 会话全新的临时公钥与随机数。此刻只有发起方临时公钥的承诺，没有 ECDH、没有
-    /// SAS——它们在 [`Self::handle_reveal`] 里产生。
+    /// 处理 `hello`：版本 → 输入校验 → 节流 → 自配对 → 查码 → 验发起方签名 → **签名通过后才
+    /// 消费配对码** → 建会话并回出本次会话全新的临时公钥与随机数。此刻只有发起方临时公钥的
+    /// 承诺，没有 ECDH、没有 SAS——它们在 [`Self::handle_reveal`] 里产生。
     /// `source`：请求来源地址，用于按来源分桶节流（见 [`failure_bucket_key`]）；
     /// 宿主层拿不到时传 `None`，仍会计入固定的 `UNKNOWN_SOURCE_KEY` 桶。
     pub fn handle_hello(
@@ -499,6 +574,9 @@ impl PairingResponder {
         if req.protocol_version != PAIRING_PROTOCOL_VERSION {
             return Err(LinkError::UnsupportedVersion);
         }
+        // 结构性输入校验（廉价、不碰任何状态）：回连地址条数 / 可解析性。自报的 name /
+        // platform / app_version 不拒绝，而是在通过验签后清洗（签名覆盖的是原始值）。
+        let initiator_addrs = validate_initiator_addrs(&req.initiator_addrs)?;
         // 节流检查放在查码与验签之前：命中时立即返回，既不消费任何
         // 配对码也不做任何签名验证运算。`Throttled` 与 `InvalidCode` 各自
         // 持有独立错误信息——这个区别是**故意**向对端暴露的：区分信息本身
@@ -512,24 +590,17 @@ impl PairingResponder {
         if req.initiator_id_pub == self.identity.public_bytes() {
             return Err(LinkError::SelfPairing);
         }
-        // 取出并消费匹配的有效码（消费即移除，杜绝重放）。
-        //
-        // 残余风险（评估为可接受，不做额外处理）：hello 请求本身明文传输，
-        // 若攻击者已具备局域网内的流量可见性（中间人位置），可以原样重放
-        // 抓到的 hello 抢先消费掉这个一次性码，导致真正的发起方随后收到
-        // InvalidCode——效果仅是一次性拒绝服务式骚扰，用户重新生成码即可。
-        // 攻击者拿不到发起方的临时私钥（hello 里只有承诺，临时公钥直到
-        // reveal 才出现），推不出共享密钥 z / link_secret。
+        // 先只**查**码、不消费：码匹配只说明对方知道码，还不能证明 hello 是完整、未被篡改的。
+        // 若此时就消费，持码（或窥屏到码）的人发一个签名错误的 hello 就能烧掉合法用户的码。
         {
             let mut codes = self.codes.lock().map_err(|_| LinkError::Unavailable)?;
             prune_codes(&mut codes);
-            let Some(pos) = codes.iter().position(|c| c.code == req.code) else {
+            if !codes.iter().any(|c| c.code == req.code) {
                 // 无匹配：仅记一次失败到解耦的全局节流器，**绝不**作废有效码（修复猜码 DoS）。
                 drop(codes);
                 self.record_failed_hello(source);
                 return Err(LinkError::InvalidCode);
-            };
-            codes.remove(pos);
+            }
         }
 
         // 验发起方身份签名：绑定其长期身份、临时公钥承诺，以及自报的
@@ -544,8 +615,43 @@ impl PairingResponder {
             &req.initiator_addrs,
         );
         if !LinkIdentity::verify(&req.initiator_id_pub, &message, &req.initiator_sig) {
+            // 签名错误的 hello 不消费码，但同样计入节流：否则持码者可以无限次地用错误签名试探。
+            self.record_failed_hello(source);
             return Err(LinkError::BadSignature);
         }
+
+        // 签名通过 → 消费匹配的有效码（消费即移除，杜绝重放）。两个并发的有效 hello 抢同一张码时
+        // 只有先到者成功。
+        //
+        // 残余风险（评估为可接受，不做额外处理）：hello 请求本身明文传输，
+        // 若攻击者已具备局域网内的流量可见性（中间人位置），可以原样重放
+        // 抓到的 hello 抢先消费掉这个一次性码，导致真正的发起方随后收到
+        // InvalidCode——效果仅是一次性拒绝服务式骚扰，用户重新生成码即可。
+        // 攻击者拿不到发起方的临时私钥（hello 里只有承诺，临时公钥直到
+        // reveal 才出现），推不出共享密钥 z / link_secret。
+        {
+            let mut codes = self.codes.lock().map_err(|_| LinkError::Unavailable)?;
+            prune_codes(&mut codes);
+            let Some(pos) = codes.iter().position(|c| c.code == req.code) else {
+                return Err(LinkError::InvalidCode);
+            };
+            codes.remove(pos);
+        }
+
+        // 通过验签后才清洗自报文本：入册与展示用清洗后的值，转录仍按签名覆盖的原始值。
+        let peer_name = {
+            let cleaned = sanitize_text(&req.name, MAX_NAME_CHARS);
+            if cleaned.is_empty() {
+                fingerprint(&req.initiator_id_pub)
+                    .chars()
+                    .take(12)
+                    .collect()
+            } else {
+                cleaned
+            }
+        };
+        let peer_platform = sanitize_optional(req.platform.as_deref(), MAX_PLATFORM_CHARS);
+        let peer_version = sanitize_optional(req.app_version.as_deref(), MAX_VERSION_CHARS);
 
         // 临时密钥与随机数在 hello 被验证之后、针对这一次会话全新生成——不随配对码
         // 复用，也先于揭示。
@@ -556,6 +662,9 @@ impl PairingResponder {
         let mut nonce = [0u8; 32];
         rand::rng().fill_bytes(&mut nonce);
         let session_id = uuid::Uuid::new_v4().simple().to_string();
+        let me = self.self_info();
+        let info_digest =
+            responder_info_digest(&me.name, me.platform.as_deref(), me.app_version.as_deref());
 
         {
             let mut sessions = self.sessions.lock().map_err(|_| LinkError::Unavailable)?;
@@ -564,15 +673,17 @@ impl PairingResponder {
                 session_id.clone(),
                 ConfirmEntry {
                     initiator_id_pub: req.initiator_id_pub,
-                    name: req.name.clone(),
-                    platform: req.platform.clone(),
-                    initiator_addrs: req.initiator_addrs.clone(),
+                    name: peer_name,
+                    platform: peer_platform,
+                    app_version: peer_version,
+                    initiator_addrs,
                     created: Instant::now(),
                     stage: SessionStage::AwaitingReveal {
                         commit: req.initiator_commit,
                         eph_secret,
                         nonce,
                         hello_digest: hash_transcript(&message),
+                        responder_info_digest: info_digest,
                     },
                 },
             );
@@ -584,9 +695,9 @@ impl PairingResponder {
             responder_eph_pub,
             responder_nonce: nonce,
             responder_id_pub: self.identity.public_bytes(),
-            name: self.self_info.name.clone(),
-            platform: self.self_info.platform.clone(),
-            app_version: self.self_info.app_version.clone(),
+            name: me.name,
+            platform: me.platform,
+            app_version: me.app_version,
         })
     }
 
@@ -612,6 +723,7 @@ impl PairingResponder {
             initiator_id_pub,
             name,
             platform,
+            app_version,
             initiator_addrs,
             created,
             stage:
@@ -620,6 +732,7 @@ impl PairingResponder {
                     eph_secret,
                     nonce,
                     hello_digest,
+                    responder_info_digest,
                 },
         }) = entry
         else {
@@ -649,11 +762,7 @@ impl PairingResponder {
             responder_eph_pub: PublicKey::from(&eph_secret).to_bytes(),
             initiator_nonce: req.initiator_nonce,
             responder_nonce: nonce,
-            responder_info_digest: responder_info_digest(
-                &self.self_info.name,
-                self.self_info.platform.as_deref(),
-                self.self_info.app_version.as_deref(),
-            ),
+            responder_info_digest,
         };
         let transcript_hash = transcript.hash();
         let sas = derive_sas(&z, &transcript_hash);
@@ -667,6 +776,7 @@ impl PairingResponder {
                     initiator_id_pub,
                     name: name.clone(),
                     platform: platform.clone(),
+                    app_version,
                     initiator_addrs,
                     created,
                     stage: SessionStage::Revealed {
@@ -707,20 +817,25 @@ impl PairingResponder {
         Ok(())
     }
 
-    /// 从会话表中移除一条会话——超时/拒绝/confirm 完成后清理，避免残留占用。
+    /// 从会话表中移除一条会话——超时/拒绝/confirm 完成后清理，避免残留占用。移除后唤醒所有
+    /// 等待决策的 `handle_confirm`：它们会发现会话已不在并立即返回，不必睡到各自的截止时间。
     fn remove_session(&self, session_id: &str) {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.remove(session_id);
         }
+        self.decision_notify.notify_waiters();
     }
 
     /// 处理 `confirm`：SAS 核对现在是**双向**的。`confirm=false`（发起方一侧
-    /// 用户发现 SAS 不符或主动取消）→ 直接丢弃会话，返回 `None`。
+    /// 用户发现 SAS 不符或主动取消）→ 直接丢弃会话（并立即唤醒仍在等待本机决策的
+    /// `confirm=true` 请求），返回 `None`。
     /// `confirm=true` 时不会立即放行：还必须等待响应方本机用户通过
     /// `Self::set_local_decision` 核对 SAS 并明确批准——响应方是这场配对能否
     /// 成立的最终把关人，而非一次性码验证通过就自动登记对端。最多等待
     /// `LOCAL_DECISION_TIMEOUT`（60 秒）：超时 → `Err(PairingTimeout)`；本机
     /// 用户拒绝 → `Err(RejectedByPeer)`；批准 → 登记并返回发起方设备记录。
+    /// 本机用户**已经表态**的会话不再受 60 秒核验窗口约束（窗口只约束「等待用户表态」）：
+    /// 用户及时批准、发起方的 confirm 稍后才到，配对仍然成立（会话总寿命 `SESSION_TTL` 兜底）。
     /// 尚未揭示就 `confirm=true` 是协议违规：会话作废并返回 `BadPayload`。
     pub async fn handle_confirm(
         &self,
@@ -733,6 +848,7 @@ impl PairingResponder {
                 prune_sessions(&mut sessions);
                 sessions.remove(session_id).is_some()
             };
+            self.decision_notify.notify_waiters();
             return if existed {
                 Ok(None)
             } else {
@@ -746,32 +862,93 @@ impl PairingResponder {
         // 发起方核对 SAS 到点 confirm 之间可能耗费任意时长：若仍从本次 confirm 抵达
         // 时刻重新起算，响应方 UI 弹窗早已按自己的倒计时自动关闭，backend 却还在
         // 傻等另一个 60s，用户在场也点不到已经消失的弹窗。
-        let deadline = {
+        let (existing_decision, deadline) = {
             let mut sessions = self.sessions.lock().map_err(|_| LinkError::Unavailable)?;
             prune_sessions(&mut sessions);
             let entry = sessions.get(session_id).ok_or(LinkError::SessionExpired)?;
-            let announced = match &entry.stage {
-                SessionStage::Revealed { announced, .. } => Some(*announced),
+            let revealed = match &entry.stage {
+                SessionStage::Revealed {
+                    announced,
+                    decision,
+                    ..
+                } => Some((*decision, *announced + LOCAL_DECISION_TIMEOUT)),
                 SessionStage::AwaitingReveal { .. } => None,
             };
-            let Some(announced) = announced else {
+            let Some(revealed) = revealed else {
                 sessions.remove(session_id);
                 return Err(LinkError::BadPayload(
                     "pairing confirm received before reveal".into(),
                 ));
             };
-            announced + LOCAL_DECISION_TIMEOUT
+            revealed
             // MutexGuard 在此作用域结束时 drop。
         };
-        // 窗口已过：两端客户端此刻也早已按同源倒计时自动关闭了 UI，不必再
-        // 进入下面的等待循环——立即清理会话并返回超时，而不是傻等一个不
-        // 可能再来的决策。
-        if deadline.checked_duration_since(Instant::now()).is_none() {
-            self.remove_session(session_id);
-            return Err(LinkError::PairingTimeout);
+        let decision = match existing_decision {
+            // 已经表态（批准或拒绝）：直接采用，不再检查核验窗口。
+            Some(decision) => decision,
+            None => {
+                // 窗口已过：两端客户端此刻也早已按同源倒计时自动关闭了 UI，不必再
+                // 进入下面的等待循环——立即清理会话并返回超时，而不是傻等一个不
+                // 可能再来的决策。
+                if deadline.checked_duration_since(Instant::now()).is_none() {
+                    self.remove_session(session_id);
+                    return Err(LinkError::PairingTimeout);
+                }
+                self.await_decision(session_id, deadline).await?
+            }
+        };
+
+        let entry = {
+            let mut sessions = self.sessions.lock().map_err(|_| LinkError::Unavailable)?;
+            sessions.remove(session_id)
+        };
+        let Some(ConfirmEntry {
+            initiator_id_pub,
+            name,
+            platform,
+            app_version,
+            initiator_addrs,
+            stage: SessionStage::Revealed {
+                z, transcript_hash, ..
+            },
+            ..
+        }) = entry
+        else {
+            return Err(LinkError::SessionExpired);
+        };
+        if !decision {
+            return Err(LinkError::RejectedByPeer);
         }
 
-        let decision = loop {
+        let now = now_unix();
+        // 入册前再截断一次：地址已在 hello 里校验过，这里只是确保候选表有界。
+        let candidates = initiator_addrs
+            .iter()
+            .take(MAX_DIRECT_CANDIDATES)
+            .map(|a| PeerCandidate {
+                kind: TransportKind::Direct,
+                address: a.clone(),
+            })
+            .collect();
+        Ok(Some(PeerRecord {
+            fingerprint: fingerprint(&initiator_id_pub),
+            identity_pub: initiator_id_pub.to_vec(),
+            name,
+            platform,
+            link_secret: derive_link_key(&z, &transcript_hash),
+            candidates,
+            paired_at: now,
+            last_seen_at: now,
+            app_version,
+            ..PeerRecord::default()
+        }))
+    }
+
+    /// 等待本机用户对 `session_id` 表态（批准 / 拒绝）。会话被移除（超时清理 / 发起方
+    /// `confirm=false` / 本机拒绝后被收走）→ `SessionExpired`；超过 `deadline` →
+    /// `PairingTimeout` 并清理会话。
+    async fn await_decision(&self, session_id: &str, deadline: Instant) -> LinkResult<bool> {
+        loop {
             // 先构造等待 future 再检查状态：只要 set_local_decision 的
             // notify_waiters() 发生在 `notified()` 构造之后（无论早于还是晚于
             // 随后的 await），该唤醒都不会丢失——这是 tokio::sync::Notify 对
@@ -791,7 +968,7 @@ impl PairingResponder {
                 // MutexGuard 在此作用域结束时 drop，绝不带着它跨越下面的 await。
             };
             if let Some(decision) = existing {
-                break decision;
+                return Ok(decision);
             }
 
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -804,48 +981,7 @@ impl PairingResponder {
             }
             // 被唤醒：可能是本会话的决策落地，也可能是共享 Notify 上其它会话
             // 触发的假唤醒——回到循环顶部重新加锁读取，确认后再决断。
-        };
-
-        let entry = {
-            let mut sessions = self.sessions.lock().map_err(|_| LinkError::Unavailable)?;
-            sessions.remove(session_id)
-        };
-        let Some(ConfirmEntry {
-            initiator_id_pub,
-            name,
-            platform,
-            initiator_addrs,
-            stage: SessionStage::Revealed {
-                z, transcript_hash, ..
-            },
-            ..
-        }) = entry
-        else {
-            return Err(LinkError::SessionExpired);
-        };
-        if !decision {
-            return Err(LinkError::RejectedByPeer);
         }
-
-        let now = now_unix();
-        let candidates = initiator_addrs
-            .iter()
-            .map(|a| PeerCandidate {
-                kind: TransportKind::Direct,
-                address: a.clone(),
-            })
-            .collect();
-        Ok(Some(PeerRecord {
-            fingerprint: fingerprint(&initiator_id_pub),
-            identity_pub: initiator_id_pub.to_vec(),
-            name,
-            platform,
-            link_secret: derive_link_key(&z, &transcript_hash),
-            candidates,
-            paired_at: now,
-            last_seen_at: now,
-            info: PeerInfo::default(),
-        }))
     }
 
     /// 供后台 GC 定时调用：主动剪枝三张表，清理「半途放弃」的配对——例如
@@ -883,8 +1019,10 @@ pub struct PairingInitiator {
 struct Handshake {
     z: [u8; 32],
     transcript: Transcript,
+    /// 已清洗的响应方自报信息（转录里用的是 hello 回复里的原始值）。
     responder_name: String,
     responder_platform: Option<String>,
+    responder_app_version: Option<String>,
     responder_addr: String,
 }
 
@@ -1002,8 +1140,12 @@ impl PairingInitiator {
         self.pending = Some(Handshake {
             z,
             transcript,
-            responder_name: resp.name.clone(),
-            responder_platform: resp.platform.clone(),
+            responder_name: sanitize_text(&resp.name, MAX_NAME_CHARS),
+            responder_platform: sanitize_optional(resp.platform.as_deref(), MAX_PLATFORM_CHARS),
+            responder_app_version: sanitize_optional(
+                resp.app_version.as_deref(),
+                MAX_VERSION_CHARS,
+            ),
             responder_addr: responder_addr.to_string(),
         });
         Ok(RevealRequest {
@@ -1038,7 +1180,14 @@ impl PairingInitiator {
         Ok(PeerRecord {
             fingerprint: fingerprint(&n.transcript.responder_id_pub),
             identity_pub: n.transcript.responder_id_pub.to_vec(),
-            name: n.responder_name.clone(),
+            name: if n.responder_name.is_empty() {
+                fingerprint(&n.transcript.responder_id_pub)
+                    .chars()
+                    .take(12)
+                    .collect()
+            } else {
+                n.responder_name.clone()
+            },
             platform: n.responder_platform.clone(),
             link_secret: derive_link_key(&n.z, &n.transcript.hash()),
             candidates: vec![PeerCandidate {
@@ -1047,7 +1196,8 @@ impl PairingInitiator {
             }],
             paired_at: now,
             last_seen_at: now,
-            info: PeerInfo::default(),
+            app_version: n.responder_app_version.clone(),
+            ..PeerRecord::default()
         })
     }
 }
@@ -1062,6 +1212,7 @@ mod tests {
             name: name.to_string(),
             platform: Some("linux".to_string()),
             app_version: Some("0.1.0".to_string()),
+            cloud_device_id: None,
         }
     }
 
@@ -1858,5 +2009,253 @@ mod tests {
             initiator.on_hello_response(&hello_resp, "10.0.0.1:1", &[]),
             Err(LinkError::BadPayload(_))
         ));
+    }
+
+    #[test]
+    fn bad_signature_does_not_burn_the_pairing_code() {
+        // 签名验证通过后才消费配对码：持码者发一个签名错误的 hello 不能烧掉合法用户的码。
+        let responder = PairingResponder::new(LinkIdentity::generate(), self_info("NAS"));
+        let mut attacker = PairingInitiator::new(LinkIdentity::generate());
+        let code = responder.generate_code();
+        let mut forged = attacker.build_hello(&code, &self_info("L"), vec![]);
+        forged.initiator_sig[0] ^= 0xff;
+        assert!(matches!(
+            responder.handle_hello(&forged, None),
+            Err(LinkError::BadSignature)
+        ));
+        // 码仍然有效：合法发起方照常完成 hello。
+        let mut honest = PairingInitiator::new(LinkIdentity::generate());
+        let hello = honest.build_hello(&code, &self_info("Laptop"), vec![]);
+        assert!(responder.handle_hello(&hello, None).is_ok());
+    }
+
+    #[test]
+    fn repeated_bad_signatures_are_throttled_per_source() {
+        let responder = PairingResponder::new(LinkIdentity::generate(), self_info("NAS"));
+        let mut attacker = PairingInitiator::new(LinkIdentity::generate());
+        let source: Option<IpAddr> = Some("203.0.113.9".parse().unwrap());
+        let code = responder.generate_code();
+        for _ in 0..MAX_FAILED_HELLOS {
+            let mut forged = attacker.build_hello(&code, &self_info("L"), vec![]);
+            forged.initiator_sig[0] ^= 0xff;
+            assert!(matches!(
+                responder.handle_hello(&forged, source),
+                Err(LinkError::BadSignature)
+            ));
+        }
+        let good = attacker.build_hello(&code, &self_info("L"), vec![]);
+        assert!(matches!(
+            responder.handle_hello(&good, source),
+            Err(LinkError::Throttled)
+        ));
+    }
+
+    #[test]
+    fn hello_inputs_are_validated_and_sanitized() {
+        let responder = PairingResponder::new(LinkIdentity::generate(), self_info("NAS"));
+        let mut initiator = PairingInitiator::new(LinkIdentity::generate());
+        let code = responder.generate_code();
+
+        // 回连地址：超过 4 条 / 不可解析 → BadPayload，且不消费配对码。
+        let many: Vec<String> = (1..=5).map(|i| format!("10.0.0.{i}:17800")).collect();
+        let hello = initiator.build_hello(&code, &self_info("L"), many);
+        assert!(matches!(
+            responder.handle_hello(&hello, None),
+            Err(LinkError::BadPayload(_))
+        ));
+        let hello = initiator.build_hello(&code, &self_info("L"), vec!["ftp://evil".into()]);
+        assert!(matches!(
+            responder.handle_hello(&hello, None),
+            Err(LinkError::BadPayload(_))
+        ));
+
+        // 名称 / 平台 / 版本：通过验签后清洗（控制字符、双向控制字符、超长）而不是原样入册。
+        let dirty = SelfInfo {
+            name: format!("Evil\u{202E}\u{0}{}", "x".repeat(200)),
+            platform: Some("lin\nux".into()),
+            app_version: Some("1.0\u{7}".into()),
+            cloud_device_id: None,
+        };
+        let hello = initiator.build_hello(&code, &dirty, vec!["http://10.0.0.7:17800".into()]);
+        let resp = responder.handle_hello(&hello, None).unwrap();
+        let reveal = initiator
+            .on_hello_response(&resp, "10.0.0.1:17800", &[])
+            .unwrap();
+        let accepted = responder.handle_reveal(&reveal).unwrap();
+        assert!(accepted.peer_name.starts_with("Evilx"));
+        assert_eq!(accepted.peer_name.chars().count(), MAX_NAME_CHARS);
+        assert!(!accepted.peer_name.contains(['\u{202E}', '\u{0}']));
+        assert_eq!(accepted.peer_platform.as_deref(), Some("linux"));
+    }
+
+    #[tokio::test]
+    async fn confirmed_record_carries_sanitized_fields_and_canonical_candidates() {
+        let responder = PairingResponder::new(LinkIdentity::generate(), self_info("NAS"));
+        let mut initiator = PairingInitiator::new(LinkIdentity::generate());
+        let code = responder.generate_code();
+        let dirty = SelfInfo {
+            name: "Lap\u{0}top".into(),
+            platform: Some("macos".into()),
+            app_version: Some("2.0.1".into()),
+            cloud_device_id: None,
+        };
+        let hello = initiator.build_hello(
+            &code,
+            &dirty,
+            vec!["http://10.0.0.7:17800".into(), "10.0.0.7:17800".into()],
+        );
+        let resp = responder.handle_hello(&hello, None).unwrap();
+        let reveal = initiator
+            .on_hello_response(&resp, "10.0.0.1:17800", &[])
+            .unwrap();
+        responder.handle_reveal(&reveal).unwrap();
+        responder
+            .set_local_decision(&resp.session_id, true)
+            .unwrap();
+        let record = responder
+            .handle_confirm(&resp.session_id, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.name, "Laptop");
+        assert_eq!(record.app_version.as_deref(), Some("2.0.1"));
+        // 两种写法规范化为同一候选并去重。
+        assert_eq!(record.candidates.len(), 1);
+        assert_eq!(record.candidates[0].address, "10.0.0.7:17800");
+        assert!(!record.revoked);
+    }
+
+    #[tokio::test]
+    async fn approved_session_survives_a_late_confirm() {
+        // 本机用户在 60 秒核验窗口内批准，发起方的 confirm 在窗口之后（但仍在会话 TTL 内）才到：
+        // 配对仍然成立，不能因为 confirm 迟到而把已批准的结果丢掉。
+        let responder = PairingResponder::new(LinkIdentity::generate(), self_info("NAS"));
+        let mut initiator = PairingInitiator::new(LinkIdentity::generate());
+        let run = run_handshake(&responder, &mut initiator, vec![]);
+        let session_id = &run.hello_resp.session_id;
+        responder.set_local_decision(session_id, true).unwrap();
+        {
+            let mut sessions = responder.sessions.lock().unwrap();
+            let entry = sessions.get_mut(session_id).unwrap();
+            let SessionStage::Revealed { announced, .. } = &mut entry.stage else {
+                panic!("session must be revealed");
+            };
+            *announced = Instant::now() - LOCAL_DECISION_TIMEOUT - Duration::from_secs(30);
+        }
+        let record = responder.handle_confirm(session_id, true).await.unwrap();
+        assert!(record.is_some(), "an approved pairing must not time out");
+    }
+
+    #[tokio::test]
+    async fn locally_rejected_session_reports_rejection_even_after_the_window() {
+        let responder = PairingResponder::new(LinkIdentity::generate(), self_info("NAS"));
+        let mut initiator = PairingInitiator::new(LinkIdentity::generate());
+        let run = run_handshake(&responder, &mut initiator, vec![]);
+        let session_id = &run.hello_resp.session_id;
+        responder.set_local_decision(session_id, false).unwrap();
+        {
+            let mut sessions = responder.sessions.lock().unwrap();
+            let entry = sessions.get_mut(session_id).unwrap();
+            let SessionStage::Revealed { announced, .. } = &mut entry.stage else {
+                panic!("session must be revealed");
+            };
+            *announced = Instant::now() - LOCAL_DECISION_TIMEOUT - Duration::from_secs(30);
+        }
+        assert!(matches!(
+            responder.handle_confirm(session_id, true).await,
+            Err(LinkError::RejectedByPeer)
+        ));
+    }
+
+    #[tokio::test]
+    async fn decline_wakes_a_waiting_confirm_immediately() {
+        // confirm=false 到达时，仍在等本机决策的 confirm=true 请求立即醒来，不必睡到核验窗口结束。
+        let responder = Arc::new(PairingResponder::new(
+            LinkIdentity::generate(),
+            self_info("NAS"),
+        ));
+        let mut initiator = PairingInitiator::new(LinkIdentity::generate());
+        let run = run_handshake(&responder, &mut initiator, vec![]);
+        let session_id = run.hello_resp.session_id.clone();
+        let waiter = {
+            let responder = responder.clone();
+            let session_id = session_id.clone();
+            tokio::spawn(async move { responder.handle_confirm(&session_id, true).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            responder
+                .handle_confirm(&session_id, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiting confirm must wake up promptly")
+            .unwrap();
+        assert!(matches!(result, Err(LinkError::SessionExpired)));
+    }
+
+    #[test]
+    fn throttle_buckets_ipv6_by_slash_64_and_normalizes_mapped_ipv4() {
+        let a: IpAddr = "2001:db8:1:2:aaaa:bbbb:cccc:dddd".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:1111:2222:3333:4444".parse().unwrap();
+        let other_net: IpAddr = "2001:db8:1:3:aaaa:bbbb:cccc:dddd".parse().unwrap();
+        // 同一 /64 内轮换隐私地址：同一个桶。
+        assert_eq!(failure_bucket_key(Some(a)), failure_bucket_key(Some(b)));
+        assert_ne!(
+            failure_bucket_key(Some(a)),
+            failure_bucket_key(Some(other_net))
+        );
+        // IPv4-mapped IPv6 与 IPv4 是同一来源。
+        let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        let plain: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(
+            failure_bucket_key(Some(mapped)),
+            failure_bucket_key(Some(plain))
+        );
+        assert_eq!(failure_bucket_key(None), UNKNOWN_SOURCE_KEY);
+
+        // 行为层面：换 /64 内的地址不能绕过单来源限额。
+        let responder = PairingResponder::new(LinkIdentity::generate(), self_info("NAS"));
+        let mut initiator = PairingInitiator::new(LinkIdentity::generate());
+        let real = responder.generate_code();
+        let bad = if real == "999999" { "888888" } else { "999999" };
+        for i in 0..MAX_FAILED_HELLOS {
+            let rotating: IpAddr = format!("2001:db8:1:2::{:x}", i + 1).parse().unwrap();
+            let hello = initiator.build_hello(bad, &self_info("L"), vec![]);
+            assert!(matches!(
+                responder.handle_hello(&hello, Some(rotating)),
+                Err(LinkError::InvalidCode)
+            ));
+        }
+        let fresh: IpAddr = "2001:db8:1:2:dead:beef:0:1".parse().unwrap();
+        let good = initiator.build_hello(&real, &self_info("L"), vec![]);
+        assert!(matches!(
+            responder.handle_hello(&good, Some(fresh)),
+            Err(LinkError::Throttled)
+        ));
+    }
+
+    #[test]
+    fn self_info_rename_applies_to_new_hellos_but_not_to_sessions_in_flight() {
+        let responder = PairingResponder::new(LinkIdentity::generate(), self_info("NAS"));
+        let mut initiator = PairingInitiator::new(LinkIdentity::generate());
+        let (_hello, resp) = hello_only(&responder, &mut initiator);
+        assert_eq!(resp.name, "NAS");
+        // 握手进行中改名：已发出的 hello 回复里的名字是转录的一部分，reveal 仍要验签通过。
+        responder.set_self_info(self_info("NAS-renamed"));
+        let reveal = initiator
+            .on_hello_response(&resp, "10.0.0.1:17800", &[])
+            .unwrap();
+        let accepted = responder.handle_reveal(&reveal).unwrap();
+        initiator.on_reveal_response(&accepted.response).unwrap();
+        // 之后的新会话用新名字。
+        let (_hello, resp2) = hello_only(
+            &responder,
+            &mut PairingInitiator::new(LinkIdentity::generate()),
+        );
+        assert_eq!(resp2.name, "NAS-renamed");
     }
 }

@@ -45,7 +45,7 @@ use crate::{
             DateBucket, SortDir, ViewDensity, ViewGroupBy, ViewPrefs, ViewSortKey, state_group_key,
         },
     },
-    pages::downloads::DownloadView,
+    pages::downloads::{DownloadView, PluginTaskCommand},
     strings::{DownloadStrings, error_text},
 };
 
@@ -419,6 +419,11 @@ impl TaskMenuFacts {
     pub(crate) fn can_change_segments(&self) -> bool {
         self.is_local && !self.is_bt && self.state != TaskState::Completed
     }
+
+    /// 「完整性校验」可用：本地已完成、产物仍在的 BT 任务（按种子 piece 表重哈希）。
+    pub(crate) fn can_verify_integrity(&self) -> bool {
+        self.is_local && self.is_bt && self.state == TaskState::Completed && !self.file_missing
+    }
 }
 
 /// 由任务行计算菜单事实：右键菜单、应用菜单与详情面板按钮共用同一事实源。
@@ -453,6 +458,8 @@ pub(crate) enum MenuEntry {
     ChangeUrl,
     /// 修改线程数（单选；条件见 [`TaskMenuFacts::can_change_segments`]）。
     ChangeSegments,
+    /// 完整性校验（单选；条件见 [`TaskMenuFacts::can_verify_integrity`]）。
+    VerifyIntegrity,
     Redownload,
     CopyUrl,
     MoveToQueue,
@@ -464,6 +471,8 @@ pub(crate) enum MenuEntry {
     DeleteWithFiles,
     /// 在主窗口停靠详情面板中查看（独立窗口经面板头部「在独立窗口打开」）。
     ShowDetail,
+    /// 插件贡献的命令（下标对应 [`DownloadView`] 上的插件命令列表）。
+    Plugin(u16),
 }
 
 /// 纯函数：按选中任务集合的事实计算应显示的右键菜单项。
@@ -519,6 +528,9 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
         if only.can_change_segments() {
             items.push(MenuEntry::ChangeSegments);
         }
+        if only.can_verify_integrity() {
+            items.push(MenuEntry::VerifyIntegrity);
+        }
     }
     if selection.iter().all(|task| {
         task.is_local
@@ -547,15 +559,25 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
 pub(crate) fn task_menu_entries(
     selection: &[TaskMenuFacts],
     in_multi_select: bool,
+    plugin_commands: usize,
 ) -> Vec<MenuEntry> {
     let mut items = context_menu_items(selection);
-    if in_multi_select || items.is_empty() {
+    if items.is_empty() {
         return items;
     }
-    let at = items
-        .iter()
-        .position(|entry| *entry == MenuEntry::Separator)
-        .unwrap_or(items.len());
+    // 插件命令自成一组，位于多选分组与删除分组之间。
+    if plugin_commands > 0 {
+        let at = separator_index(&items);
+        let count = u16::try_from(plugin_commands).unwrap_or(u16::MAX);
+        items.splice(
+            at..at,
+            std::iter::once(MenuEntry::Separator).chain((0..count).map(MenuEntry::Plugin)),
+        );
+    }
+    if in_multi_select {
+        return items;
+    }
+    let at = separator_index(&items);
     items.splice(
         at..at,
         [
@@ -565,6 +587,13 @@ pub(crate) fn task_menu_entries(
         ],
     );
     items
+}
+
+fn separator_index(items: &[MenuEntry]) -> usize {
+    items
+        .iter()
+        .position(|entry| *entry == MenuEntry::Separator)
+        .unwrap_or(items.len())
 }
 
 /// 构造一个分组头右键菜单项：点击时把 `group_id` 回调进 [`DownloadView`] 的方法
@@ -667,6 +696,8 @@ pub(crate) struct DownloadTableDelegate {
     /// 上级页面弱引用：右键菜单需要参数的命令（移动到队列 / 忽略插件重试 /
     /// 任务组操作）经它回调 `DownloadView` 的方法执行；`None` 时这些项不渲染。
     host: Option<WeakEntity<DownloadView>>,
+    /// 插件贡献的任务右键命令。
+    plugin_commands: Vec<PluginTaskCommand>,
     /// 右键菜单动作分派目标；`None` 时菜单项不带 action_context（仍可点击，
     /// 只是动作从菜单自身的焦点路径冒泡）。
     action_context: Option<FocusHandle>,
@@ -712,6 +743,7 @@ impl DownloadTableDelegate {
             text_scale: Cell::new(1.),
             columns_dirty: false,
             host: None,
+            plugin_commands: Vec::new(),
             action_context: None,
         }
     }
@@ -725,6 +757,11 @@ impl DownloadTableDelegate {
     /// [`DownloadView`] 的方法执行。
     pub(crate) fn set_host(&mut self, host: WeakEntity<DownloadView>) {
         self.host = Some(host);
+    }
+
+    /// 插件任务右键命令（下标即 `MenuEntry::Plugin`）。
+    pub(crate) fn set_plugin_commands(&mut self, commands: Vec<PluginTaskCommand>) {
+        self.plugin_commands = commands;
     }
 
     /// 注入右键菜单动作分派目标（根元素的 focus handle）。
@@ -2279,14 +2316,14 @@ impl DownloadTableDelegate {
     }
 
     /// 任务行右键菜单：按 [`task_menu_entries`] 的纯函数结果逐项渲染。
-    fn task_context_menu(&self, menu: PopupMenu) -> PopupMenu {
+    fn task_context_menu(&self, menu: PopupMenu, destructive: Hsla) -> PopupMenu {
         let Some((selected, facts)) = self.selected_menu_facts() else {
             return menu;
         };
-        task_menu_entries(&facts, self.in_multi_select())
+        task_menu_entries(&facts, self.in_multi_select(), self.plugin_commands.len())
             .into_iter()
             .fold(menu, |menu, entry| {
-                self.apply_menu_entry(menu, entry, &selected)
+                self.apply_menu_entry(menu, entry, &selected, destructive)
             })
     }
 
@@ -2295,6 +2332,7 @@ impl DownloadTableDelegate {
         menu: PopupMenu,
         entry: MenuEntry,
         selected: &[RowKey],
+        destructive: Hsla,
     ) -> PopupMenu {
         match entry {
             MenuEntry::Resume => menu.menu_with_icon(
@@ -2366,6 +2404,11 @@ impl DownloadTableDelegate {
                 FluxIcon::Layers,
                 Box::new(crate::actions::ChangeSelectedSegments),
             ),
+            MenuEntry::VerifyIntegrity => menu.menu_with_icon(
+                self.strings.verify_integrity.clone(),
+                FluxIcon::Shield,
+                Box::new(crate::actions::VerifySelected),
+            ),
             MenuEntry::Redownload => menu.menu_with_icon(
                 self.strings.redownload_task.clone(),
                 FluxIcon::RotateCw,
@@ -2378,14 +2421,16 @@ impl DownloadTableDelegate {
             ),
             MenuEntry::MoveToQueue => self.append_move_to_queue(menu),
             MenuEntry::Separator => menu.separator(),
-            MenuEntry::Delete => menu.menu_with_icon(
+            MenuEntry::Delete => destructive_menu_item(
+                menu,
+                destructive,
                 self.strings.delete_task.clone(),
-                FluxIcon::Trash2,
                 Box::new(crate::actions::DeleteSelected),
             ),
-            MenuEntry::DeleteWithFiles => menu.menu_with_icon(
+            MenuEntry::DeleteWithFiles => destructive_menu_item(
+                menu,
+                destructive,
                 self.strings.delete_task_and_file.clone(),
-                FluxIcon::Trash2,
                 Box::new(crate::actions::DeleteSelectedWithFiles),
             ),
             MenuEntry::ShowDetail => menu.menu_with_icon(
@@ -2403,7 +2448,52 @@ impl DownloadTableDelegate {
                 FluxIcon::CheckboxCheck,
                 Box::new(crate::actions::SelectAllTasks),
             ),
+            MenuEntry::Plugin(index) => self.append_plugin_command(menu, index, selected),
         }
+    }
+}
+
+/// 破坏性菜单项：图标与文字取主题 `destructive` 色。
+fn destructive_menu_item(
+    menu: PopupMenu,
+    color: Hsla,
+    label: SharedString,
+    action: Box<dyn gpui::Action>,
+) -> PopupMenu {
+    menu.menu_element_with_icon(
+        Icon::from(FluxIcon::Trash2).text_color(color),
+        action,
+        move |_, _| div().text_color(color).child(label.clone()),
+    )
+}
+
+impl DownloadTableDelegate {
+    /// 插件贡献的任务命令：只把本机 daemon 认识的任务 id 交给宿主回调（远程任务不下发）。
+    fn append_plugin_command(&self, menu: PopupMenu, index: u16, selected: &[RowKey]) -> PopupMenu {
+        let (Some(host), Some(command)) = (
+            self.host.clone(),
+            self.plugin_commands.get(usize::from(index)),
+        ) else {
+            return menu;
+        };
+        let task_ids: Vec<String> = selected
+            .iter()
+            .filter(|key| key.is_local())
+            .map(|key| key.task_id().to_owned())
+            .collect();
+        menu.item(
+            PopupMenuItem::new(command.title.clone())
+                .icon(FluxIcon::Sparkles)
+                .on_click(move |_, window, cx| {
+                    let task_ids = task_ids.clone();
+                    let Ok(()) = host.update(cx, |view, cx| {
+                        view.run_plugin_command(index, task_ids, window, cx);
+                    }) else {
+                        // 视图已释放，结束这次回调。
+                        return;
+                    };
+                }),
+        )
     }
 
     /// 「移动到队列」：固定版 gpui-component 的 `PopupMenu::submenu` 需要
@@ -2992,7 +3082,7 @@ impl TableDelegate for DownloadTableDelegate {
                     self.select_task_for_context_menu(key);
                     cx.notify();
                 }
-                self.task_context_menu(menu)
+                self.task_context_menu(menu, active_theme(cx).tokens().colors.destructive)
             }
             None => menu,
         }
@@ -4889,6 +4979,37 @@ mod context_menu_tests {
     }
 
     #[test]
+    fn verify_integrity_needs_single_local_completed_bt_task_with_files() {
+        let mut bt = task(true, TaskState::Completed);
+        bt.is_bt = true;
+        let items = context_menu_items(&[bt]);
+        let at = items
+            .iter()
+            .position(|entry| *entry == MenuEntry::VerifyIntegrity)
+            .expect("completed BT task offers verification");
+        assert_eq!(items.get(at + 1), Some(&MenuEntry::Redownload));
+
+        let mut missing = bt;
+        missing.file_missing = true;
+        let mut unfinished = bt;
+        unfinished.state = TaskState::Paused;
+        let mut remote = bt;
+        remote.is_local = false;
+        for facts in [
+            missing,
+            unfinished,
+            remote,
+            task(true, TaskState::Completed),
+        ] {
+            assert!(
+                !context_menu_items(&[facts]).contains(&MenuEntry::VerifyIntegrity),
+                "{facts:?}"
+            );
+        }
+        assert!(!context_menu_items(&[bt, bt]).contains(&MenuEntry::VerifyIntegrity));
+    }
+
+    #[test]
     fn failed_local_task_menu_places_edit_entries_between_rename_and_redownload() {
         assert_eq!(
             context_menu_items(&[task(true, TaskState::Failed)]),
@@ -4935,16 +5056,44 @@ mod context_menu_tests {
     #[test]
     fn select_entries_only_outside_multi_select_and_before_delete_group() {
         let selection = [task(true, TaskState::Completed)];
-        let items = task_menu_entries(&selection, false);
+        let items = task_menu_entries(&selection, false, 0);
         let select = items.iter().position(|entry| *entry == MenuEntry::Select);
         let delete = items.iter().position(|entry| *entry == MenuEntry::Delete);
         assert!(matches!((select, delete), (Some(s), Some(d)) if s < d));
         assert!(items.contains(&MenuEntry::SelectAll));
 
-        let in_mode = task_menu_entries(&selection, true);
+        let in_mode = task_menu_entries(&selection, true, 0);
         assert!(!in_mode.contains(&MenuEntry::Select));
         assert!(!in_mode.contains(&MenuEntry::SelectAll));
-        assert!(task_menu_entries(&[], false).is_empty());
+        assert!(task_menu_entries(&[], false, 0).is_empty());
+        assert!(task_menu_entries(&[], false, 3).is_empty());
+    }
+
+    #[test]
+    fn plugin_commands_sit_between_select_group_and_delete_group() {
+        let selection = [task(true, TaskState::Completed)];
+        let items = task_menu_entries(&selection, false, 2);
+        let pos = |entry: MenuEntry| items.iter().position(|e| *e == entry);
+        let (select, p0, p1, delete) = (
+            pos(MenuEntry::Select),
+            pos(MenuEntry::Plugin(0)),
+            pos(MenuEntry::Plugin(1)),
+            pos(MenuEntry::Delete),
+        );
+        let (Some(select), Some(p0), Some(p1), Some(delete)) = (select, p0, p1, delete) else {
+            panic!("missing entries: {items:?}");
+        };
+        assert!(select < p0 && p0 + 1 == p1 && p1 < delete);
+        assert_eq!(items[p0 - 1], MenuEntry::Separator);
+        assert_eq!(items[p1 + 1], MenuEntry::Separator);
+        assert_eq!(items[p1 + 2], MenuEntry::Delete);
+
+        let none = task_menu_entries(&selection, false, 0);
+        assert!(!none.iter().any(|e| matches!(e, MenuEntry::Plugin(_))));
+
+        let in_mode = task_menu_entries(&selection, true, 1);
+        assert!(in_mode.contains(&MenuEntry::Plugin(0)));
+        assert!(!in_mode.contains(&MenuEntry::Select));
     }
 }
 

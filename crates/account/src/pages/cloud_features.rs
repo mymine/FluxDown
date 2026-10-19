@@ -19,15 +19,26 @@ use crate::sync_scope::{SyncPhase, can_sync_now, relative_time, sync_groups, syn
 use crate::view::AccountView;
 use crate::{AccountCommand, t, t_with, ui};
 
+/// 云功能分组的瞬时状态：登录态、断线只读。
+#[derive(Clone, Copy)]
+pub(crate) struct CloudFeaturesState {
+    pub logged_in: bool,
+    pub disabled: bool,
+}
+
 pub(crate) fn render(
     translator: &Translator,
     tokens: &SemanticThemeTokens,
-    logged_in: bool,
+    state: CloudFeaturesState,
     sync: &SyncStatusDto,
     devices: Option<&[CloudDevice]>,
-    disabled: bool,
+    max_online: Option<u64>,
     cx: &mut Context<AccountView>,
 ) -> impl IntoElement {
+    let CloudFeaturesState {
+        logged_in,
+        disabled,
+    } = state;
     let heading = t(translator, "accountGroupCloudFeatures");
     let desc = t(translator, "accountCloudFeaturesDesc");
 
@@ -49,7 +60,9 @@ pub(crate) fn render(
                         .child(scope_block(translator, tokens, sync, disabled, cx))
                 })
                 .child(ui::row_divider(cx))
-                .child(multi_device_row(translator, tokens, logged_in, devices, cx)),
+                .child(multi_device_row(
+                    translator, tokens, logged_in, devices, max_online, cx,
+                )),
         )
 }
 
@@ -294,15 +307,12 @@ fn multi_device_row(
     tokens: &SemanticThemeTokens,
     logged_in: bool,
     devices: Option<&[CloudDevice]>,
+    max_online: Option<u64>,
     cx: &App,
 ) -> impl IntoElement {
     let title = t(translator, "multiDeviceTitle");
     let desc = t(translator, "multiDeviceDesc");
-    let online_count = devices
-        .unwrap_or_default()
-        .iter()
-        .filter(|device| device.is_online && !device.is_current)
-        .count();
+    let online_count = crate::device_list::online_count(devices.unwrap_or_default());
     let caption = active_theme(cx).extended().caption;
 
     h_flex()
@@ -325,11 +335,21 @@ fn multi_device_row(
                     .font_features(tabular_numbers())
                     .text_color(tokens.colors.muted_foreground)
                     .child(if devices.is_some() {
-                        t_with(
-                            translator,
-                            "devicesOnlineCount",
-                            &[("count", &online_count.to_string())],
-                        )
+                        match max_online {
+                            Some(max) => t_with(
+                                translator,
+                                "devicesOnlineCountOf",
+                                &[
+                                    ("count", &online_count.to_string()),
+                                    ("max", &max.to_string()),
+                                ],
+                            ),
+                            None => t_with(
+                                translator,
+                                "devicesOnlineCount",
+                                &[("count", &online_count.to_string())],
+                            ),
+                        }
                     } else {
                         t(translator, "devicePresenceUnknown")
                     }),

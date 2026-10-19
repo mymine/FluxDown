@@ -12,6 +12,7 @@ mod app;
 mod app_icon;
 mod assets;
 mod capability_ports;
+mod chrome_layout;
 mod command_palette;
 mod completion_windows;
 mod downloads_port;
@@ -21,6 +22,7 @@ mod legacy_themes;
 mod lifecycle;
 mod logging;
 mod menus;
+mod plugin_contributions;
 mod plugin_notices;
 mod power;
 mod preference_writes;
@@ -30,6 +32,7 @@ mod session;
 mod settings_port;
 #[cfg(windows)]
 mod shell_open;
+mod shortcuts;
 mod update_notices;
 mod windows;
 

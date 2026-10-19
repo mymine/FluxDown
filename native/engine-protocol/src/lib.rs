@@ -8,11 +8,12 @@ use fluxdown_engine::model::{
     ResolveVariantOption, SegmentDetail, SourceBytes, TaskInfo,
 };
 use fluxdown_engine::rss::model::{RssItemInfo, RssSourceInfo};
+use fluxdown_engine::selection::PluginCandidate;
 use fluxdown_engine::webhook::{PresetInfo, TaskNotice, WebhookDelivery};
 use fluxdown_protocol::daemon::{
-    BtFileDto, CdnNodeDto, GroupDto, HlsQualityOptionDto, QueueDto, QueuePositionDto, RequestBody,
-    ResolveVariantOptionDto, RssItemDto, RssSourceDto, SegmentDetailDto, TaskDto,
-    WebhookDeliveryDto, WebhookPresetDto,
+    BtFileDto, CdnNodeDto, GroupDto, HlsQualityOptionDto, PluginCandidateDto, QueueDto,
+    QueuePositionDto, RequestBody, ResolveVariantOptionDto, RssItemDto, RssSourceDto,
+    SegmentDetailDto, TaskDto, WebhookDeliveryDto, WebhookPresetDto,
 };
 #[cfg(feature = "components")]
 use fluxdown_protocol::daemon::{ComponentFfmpegStatus, ComponentVersions, ComponentYtdlpStatus};
@@ -40,6 +41,31 @@ pub fn source_bytes_to_dto(bytes: SourceBytes) -> fluxdown_protocol::TaskSourceB
         cdn_bytes: bytes.cdn,
         proxy_bytes: bytes.proxy,
         nic_bytes: bytes.nic,
+    }
+}
+
+/// 将宿主自身请求的出口方案转换为 wire DTO（改写地址在前，原地址由调用方兜底）。
+#[must_use]
+pub fn egress_plan_to_dto(
+    plan: fluxdown_engine::egress::EgressPlan,
+) -> fluxdown_protocol::EgressPlanDto {
+    let proxy = plan.proxy.map(|proxy| fluxdown_protocol::EgressProxyDto {
+        url: proxy.url,
+        no_proxy: proxy.no_proxy,
+    });
+    match plan.route.rewrite() {
+        Some(rewrite) => fluxdown_protocol::EgressPlanDto {
+            url: rewrite.url.clone(),
+            headers: rewrite.headers.iter().cloned().collect(),
+            plugin: Some(rewrite.plugin.clone()),
+            proxy,
+        },
+        None => fluxdown_protocol::EgressPlanDto {
+            url: plan.route.source_url().to_owned(),
+            headers: std::collections::BTreeMap::new(),
+            plugin: None,
+            proxy,
+        },
     }
 }
 
@@ -83,6 +109,22 @@ pub fn task_activity_to_dto(
         kind: activity.kind,
         message: activity.message,
         status: activity.status,
+    }
+}
+
+/// 将任务速度历史转换成 wire DTO（未满桶的当前均值作为末点）。
+#[must_use]
+pub fn task_speed_history_to_dto(
+    task_id: String,
+    history: fluxdown_engine::speed_history::SpeedHistory,
+) -> fluxdown_protocol::TaskSpeedHistoryDto {
+    fluxdown_protocol::TaskSpeedHistoryDto {
+        task_id,
+        bucket_secs: history.bucket_secs,
+        samples: history.points(),
+        active_secs: history.active_secs,
+        transferred_bytes: history.transferred_bytes,
+        peak_bps: history.peak_bps,
     }
 }
 
@@ -324,6 +366,17 @@ pub fn resolve_variant_option_to_dto(option: ResolveVariantOption) -> ResolveVar
     }
 }
 
+/// 将多插件选择的候选插件转换为 wire DTO。
+#[must_use]
+pub fn plugin_candidate_to_dto(candidate: PluginCandidate) -> PluginCandidateDto {
+    PluginCandidateDto {
+        identity: candidate.identity,
+        name: candidate.name,
+        version: candidate.version,
+        description: candidate.description,
+    }
+}
+
 /// 将 Webhook 投递记录转换为 wire DTO。
 #[must_use]
 pub fn webhook_delivery_to_dto(delivery: WebhookDelivery) -> WebhookDeliveryDto {
@@ -453,8 +506,53 @@ pub fn plugin_info_to_dto(
         permissions: plugin.permissions,
         auth_supported: plugin.auth_supported,
         subscription_provider_ids: plugin.subscription_provider_ids,
+        resolver_urls: plugin.resolver_urls,
         load_status: plugin.load_status,
         load_error: plugin.load_error,
+        contributions: plugin_contributions_to_dto(&plugin.contributions),
+        risk: plugin.risk.as_str().to_owned(),
+        consent_pending: plugin.consent_pending,
+        consent_pending_hosts: plugin.consent_pending_hosts,
+        network_hosts: plugin.network_hosts,
+        package_dir: plugin.package_dir,
+    }
+}
+
+#[cfg(feature = "plugins")]
+fn plugin_contributions_to_dto(
+    contributes: &fluxdown_engine::plugin::manifest::ContributesDecl,
+) -> fluxdown_protocol::daemon::PluginContributionsDto {
+    use fluxdown_protocol::daemon::{
+        PluginCommandDeclDto, PluginContributionsDto, PluginDesktopEntryDto, PluginViewDeclDto,
+    };
+    PluginContributionsDto {
+        views: contributes
+            .views
+            .iter()
+            .map(|view| PluginViewDeclDto {
+                id: view.id.clone(),
+                title: view.title.clone(),
+                location: view.location.as_str().to_owned(),
+                portable: view.is_portable(),
+                desktop: view.desktop.as_ref().map(|d| PluginDesktopEntryDto {
+                    entry: d.entry.clone(),
+                    width: d.width,
+                    height: d.height,
+                    network_hosts: d.network_hosts.clone(),
+                }),
+            })
+            .collect(),
+        commands: contributes
+            .commands
+            .iter()
+            .map(|cmd| PluginCommandDeclDto {
+                id: cmd.id.clone(),
+                title: cmd.title.clone(),
+                palette: cmd.palette,
+                task_menu: cmd.task_menu,
+            })
+            .collect(),
+        sniff_rules: contributes.sniff_rules.is_some(),
     }
 }
 
@@ -479,6 +577,7 @@ pub fn market_entry_to_dto(
         yanked: entry.yanked,
         tags: entry.tags,
         permissions: entry.permissions,
+        network_hosts: entry.network_hosts,
     }
 }
 

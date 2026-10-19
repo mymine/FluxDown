@@ -11,7 +11,7 @@
 
 #define MyAppName "FluxDown"
 #define MyAppPublisher "FluxDown"
-#define MyAppURL "https://fluxdown.zerx.dev"
+#define MyAppURL "https://fluxdown.com"
 #define MyAppExeName "fluxdown-desktop.exe"
 #define MyAgentExeName "fluxdown-agent.exe"
 ; Former Flutter executable, removed on upgrade

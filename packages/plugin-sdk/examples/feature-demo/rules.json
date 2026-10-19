@@ -1,0 +1,25 @@
+{
+  "format": "fluxdown-sniff-pack",
+  "packId": "feature-demo",
+  "sequence": 1,
+  "engine": 1,
+  "issuedAt": "2026-10-17T00:00:00Z",
+  "rules": [
+    {
+      "id": "demo-ext",
+      "version": 1,
+      "tier": "plugin",
+      "stage": "response",
+      "match": { "host": ["httpbin.org"], "ext": ["fdemo"] },
+      "action": { "kind": "resource", "type": "other" }
+    },
+    {
+      "id": "demo-headers-rejected",
+      "version": 1,
+      "tier": "plugin",
+      "stage": "request",
+      "match": { "host": ["httpbin.org"] },
+      "action": { "kind": "headers", "set": { "X-Demo": "1" } }
+    }
+  ]
+}

@@ -5,10 +5,10 @@
 
 ## 0. 提交前必须先修的一处硬伤
 
-`zerx-lab/FluxDown` 仓库的 **Homepage 字段填的是 `https://www.fluxdown.com`**，而 README.md:19 / README.zh-CN.md:19 里的官网全是 `https://fluxdown.zerx.dev`。
-多数清单维护者会点仓库右上角的 Homepage 做核对，两个域名不一致会被当成可疑条目。**提交任何清单前先把 Homepage 统一成 `https://fluxdown.zerx.dev`**（或反过来，取一个作为唯一官网）。
+`zerx-lab/FluxDown` 仓库的 **Homepage 字段填的是 `https://www.fluxdown.com`**，而 README.md:19 / README.zh-CN.md:19 里的官网全是 `https://fluxdown.com`。
+多数清单维护者会点仓库右上角的 Homepage 做核对，两个域名不一致会被当成可疑条目。**提交任何清单前先把 Homepage 统一成 `https://fluxdown.com`**（或反过来，取一个作为唯一官网）。
 
-本文件所有条目文本统一使用 `https://fluxdown.zerx.dev`。
+本文件所有条目文本统一使用 `https://fluxdown.com`。
 
 ---
 
@@ -133,7 +133,7 @@ aria2.onDownloadComplete aria2.onDownloadError    aria2.onBtDownloadComplete
 ### 2026 年 7 月 27 号添加
 
 #### zerx-lab - [Github](https://github.com/zerx-lab)
-* :white_check_mark: [FluxDown](https://fluxdown.zerx.dev)：多协议下载管理器，Rust 引擎 + IDM 式动态分段，支持 HTTP/FTP/BT 磁力/eD2K/HLS/DASH，浏览器扩展自动接管下载，Win/macOS/Linux/Android 全平台开源免费
+* :white_check_mark: [FluxDown](https://fluxdown.com)：多协议下载管理器，Rust 引擎 + IDM 式动态分段，支持 HTTP/FTP/BT 磁力/eD2K/HLS/DASH，浏览器扩展自动接管下载，Win/macOS/Linux/Android 全平台开源免费
 ```
 
 > 日期小节按实际提交日改。若当天已存在同日期 `###` 小节，则**不新建小节**，直接在该小节末尾追加 `####` 作者块。
@@ -212,7 +212,7 @@ FluxDown 用 Rust + Tokio 写下载引擎，PC 使用 GPUI，Android/iOS 使用 
 
 ```markdown
 仓库：https://github.com/zerx-lab/FluxDown
-官网：https://fluxdown.zerx.dev
+官网：https://fluxdown.com
 协议：AGPL-3.0
 
 FluxDown 是一个多协议下载管理器，Rust + Tokio 写引擎，PC 用 GPUI、Android/iOS 用 Kotlin Compose / SwiftUI，目标是做 IDM 的开源替代。
@@ -246,13 +246,13 @@ FluxDown 是一个多协议下载管理器，Rust + Tokio 写引擎，PC 用 GPU
 - **README.md 可直接复制粘贴的条目文本**：
 
 ```markdown
-- [FluxDown](https://fluxdown.zerx.dev) - Multi-protocol download manager with IDM-style dynamic segmentation, supporting HTTP, FTP, BitTorrent, eD2K, HLS and DASH. 🪟 🍎 🐧 [🟢](https://github.com/zerx-lab/FluxDown)
+- [FluxDown](https://fluxdown.com) - Multi-protocol download manager with IDM-style dynamic segmentation, supporting HTTP, FTP, BitTorrent, eD2K, HLS and DASH. 🪟 🍎 🐧 [🟢](https://github.com/zerx-lab/FluxDown)
 ```
 
 - **MOBILE.md 可直接复制粘贴的条目文本**（目标章节 `## Download Managers`，MOBILE.md:258；插入位置为该分类最底部，当前最后一条是 `MyJDownloader`，MOBILE.md:264。MOBILE.md 图标体系已实测：🤖 Android / 🍎 iOS / 🟢 开源 / ⭐ 推荐，且 `[🟢](repo)` 的链接写法在该文件中确有使用，见 MOBILE.md:244–245、:347）：
 
 ```markdown
-- [FluxDown](https://fluxdown.zerx.dev) - Multi-protocol download manager with IDM-style dynamic segmentation. 🤖 [🟢](https://github.com/zerx-lab/FluxDown)
+- [FluxDown](https://fluxdown.com) - Multi-protocol download manager with IDM-style dynamic segmentation. 🤖 [🟢](https://github.com/zerx-lab/FluxDown)
 ```
 
 ---
@@ -273,7 +273,7 @@ FluxDown 是一个多协议下载管理器，Rust + Tokio 写引擎，PC 用 GPU
 - **可直接复制粘贴的条目文本**（严格照抄同分区非星标条目的 `名称 - 类型 / 平台 / 链接 / GitHub` 排版）：
 
 ```markdown
-* [FluxDown](https://fluxdown.zerx.dev/) - Download Manager / [Firefox](https://addons.mozilla.org/firefox/addon/fluxdown) / [Chrome](https://chromewebstore.google.com/detail/fluxdown/meleenglfggcmcajknpeeeiobnpfmahc) / [Edge](https://microsoftedge.microsoft.com/addons/detail/fluxdown/nglkkjbogjghekbhhcnccnpfedjbdhhd) / Windows, macOS, Linux, Android / [GitHub](https://github.com/zerx-lab/FluxDown)
+* [FluxDown](https://fluxdown.com/) - Download Manager / [Firefox](https://addons.mozilla.org/firefox/addon/fluxdown) / [Chrome](https://chromewebstore.google.com/detail/fluxdown/meleenglfggcmcajknpeeeiobnpfmahc) / [Edge](https://microsoftedge.microsoft.com/addons/detail/fluxdown/nglkkjbogjghekbhhcnccnpfedjbdhhd) / Windows, macOS, Linux, Android / [GitHub](https://github.com/zerx-lab/FluxDown)
 ```
 
 ---
@@ -378,7 +378,7 @@ FluxDown 是一个多协议下载管理器，Rust + Tokio 写引擎，PC 用 GPU
 
 - 统一写「兼容 aria2 JSON-RPC，可直连 AriaNg」+「36 个方法全集 / 27 个真实实现」，**未出现「完全兼容」**。
 - MCP 工具数按 `native/api/src/mcp.rs` 测试 `tools_list_returns_every_tool`（`assert_eq!(tools.len(), 12)`）写作 **12 个**。
-- 链接统一 `https://fluxdown.zerx.dev`。
+- 链接统一 `https://fluxdown.com`。
 - 中文清单用中文正文，英文清单用英文正文；无 AI 署名、无 Co-authored-by。
 - Axorax 的 commit message 严格用 `Add: FluxDown`；两条目均追加在各自分类底部，未重排、未动 TOC 与 `filter/`。
 - fmhy 按其 CONTRIBUTING 走 issue（`wiki.yml` 模板，Type = Site suggestion），并在正文声明了开发者身份、请其自行测试。
@@ -392,5 +392,5 @@ FluxDown 是一个多协议下载管理器，Rust + Tokio 写引擎，PC 用 GPU
 
 ### 待办
 
-- **§0 的 Homepage 不一致仍未修**：仓库 Homepage 字段还是 `https://www.fluxdown.com`，而所有提交出去的物料写的都是 `https://fluxdown.zerx.dev`。维护者核对时会看到两个域名，**应尽快统一**。
+- **§0 的 Homepage 不一致仍未修**：仓库 Homepage 字段还是 `https://www.fluxdown.com`，而所有提交出去的物料写的都是 `https://fluxdown.com`。维护者核对时会看到两个域名，**应尽快统一**。
 - 关注 6 条的回复；HelloGitHub 月刊 28 号发布，本次赶在发布前一天投递，可能落到下一期。

@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use fluxdown_ui_account::AccountView;
-use fluxdown_ui_extensions::ExtensionsView;
+use fluxdown_ui_account::{AccountView, ReferralView};
+use fluxdown_ui_extensions::{ExtensionsEvent, ExtensionsView};
 use fluxdown_ui_i18n::keys;
-use fluxdown_ui_settings::{SettingsContentSlots, SettingsTarget, SettingsView};
+use fluxdown_ui_settings::{SettingsContentSlots, SettingsTarget, SettingsView, VisibleSlot};
 use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_window_options};
 use gpui::{App, AppContext as _, px, size};
 use gpui_component::Root;
@@ -26,6 +26,7 @@ pub fn open(cx: &mut App) {
     let client = desktop.client.clone();
     let settings_store = desktop.settings_store.clone();
     let account_host = desktop.account_host.clone();
+    let referral_visibility = desktop.referral_visibility.clone();
     let title = translator.read(cx).text(keys::SETTINGS).to_owned();
     let mut options = auxiliary_window_options(title);
     options.window_min_size = Some(size(px(1000.), px(600.)));
@@ -41,6 +42,7 @@ pub fn open(cx: &mut App) {
         let account =
             cx.new(|cx| AccountView::new(translator.clone(), account_host.clone(), window, cx));
         let extensions = cx.new(|cx| ExtensionsView::new(translator.clone(), extensions_port, cx));
+        let referral = cx.new(|cx| ReferralView::new(account_host.clone(), window, cx));
         let settings = cx.new(|cx| {
             SettingsView::new(
                 translator.clone(),
@@ -48,6 +50,10 @@ pub fn open(cx: &mut App) {
                 SettingsContentSlots {
                     account: Some(account.clone().into()),
                     extensions: Some(extensions.clone().into()),
+                    referral: Some(VisibleSlot {
+                        view: referral.clone().into(),
+                        visible: referral_visibility,
+                    }),
                     activity_bar: crate::activity::toggles(),
                 },
                 window,
@@ -56,6 +62,19 @@ pub fn open(cx: &mut App) {
         });
         Desktop::global_mut(cx).settings_view = Some(settings.downgrade());
         attach(&session, &extensions, cx);
+        extensions.update(cx, |extensions, cx| {
+            extensions
+                .set_plugin_view_factory(crate::plugin_contributions::settings_view_factory(), cx);
+        });
+        cx.subscribe(&extensions, |_, event, cx| match event {
+            ExtensionsEvent::OpenPluginView { plugin, view } => {
+                let plugin = plugin.clone();
+                let view = view.clone();
+                // 事件在设置窗口的 update 栈内分发；开新窗口延后到栈外。
+                cx.defer(move |cx| crate::windows::plugin::open(cx, &plugin, &view));
+            }
+        })
+        .detach();
         let window_view =
             cx.new(|cx| AuxiliaryWindowView::new(translator, keys::SETTINGS, settings.into(), cx));
         let root = cx.new(|cx| Root::new(window_view, window, cx));

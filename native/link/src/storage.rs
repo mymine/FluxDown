@@ -6,7 +6,10 @@
 use async_trait::async_trait;
 
 use super::error::LinkResult;
-use super::types::{PeerCandidate, PeerInfo, PeerRecord};
+use super::types::{PeerCandidate, PeerRecord};
+
+/// [`LinkStorage::update_record`] 的原地修改闭包：返回 `true` = 记录有改动，需要写回。
+pub type RecordUpdate<'a> = Box<dyn FnOnce(&mut PeerRecord) -> bool + Send + 'a>;
 
 /// 设备互联持久化后端。
 ///
@@ -41,11 +44,25 @@ pub trait LinkStorage: Send + Sync + 'static {
         candidates: &[PeerCandidate],
     ) -> LinkResult<bool>;
 
-    /// 记录对端经已认证链路自报的信息。默认实现丢弃（没有对应存储列的后端，
-    /// 如引擎 `link_devices` 表——对端信息只在本次运行内有意义）。
-    async fn set_peer_info(&self, fingerprint: &str, info: &PeerInfo) -> LinkResult<bool> {
-        let _ = (fingerprint, info);
-        Ok(false)
+    /// 读-改-写一条已配对设备记录：`update` 就地修改记录并返回是否真的有改动，**只有改动时
+    /// 才写回 / 落盘**（空闲时的对端信息交换因此零写入）。返回 `None` = 设备不存在；
+    /// `Some(changed)` = 设备存在，`changed` 即闭包的返回值。
+    ///
+    /// 默认实现是 `get` + `upsert`（非原子）；有共享状态锁的后端（agent）应覆盖成锁内原子
+    /// 读改写。
+    async fn update_record(
+        &self,
+        fingerprint: &str,
+        update: RecordUpdate<'_>,
+    ) -> LinkResult<Option<bool>> {
+        let Some(mut record) = self.get(fingerprint).await? else {
+            return Ok(None);
+        };
+        if !update(&mut record) {
+            return Ok(Some(false));
+        }
+        self.upsert(&record).await?;
+        Ok(Some(true))
     }
 }
 
@@ -57,15 +74,30 @@ pub(crate) mod memory {
 
     use async_trait::async_trait;
 
-    use super::LinkStorage;
+    use super::{LinkStorage, RecordUpdate};
     use crate::error::{LinkError, LinkResult};
-    use crate::types::{PeerCandidate, PeerInfo, PeerRecord};
+    use crate::types::{PeerCandidate, PeerRecord};
 
     #[derive(Default)]
     pub(crate) struct MemoryLinkStorage {
         seed: Mutex<Option<[u8; 32]>>,
         peers: Mutex<HashMap<String, PeerRecord>>,
         pub(crate) fail_metadata_writes: std::sync::atomic::AtomicBool,
+        /// 身份种子「存在但无法解析」：`load_identity_seed` 报错（而不是当作不存在）。
+        pub(crate) seed_unreadable: std::sync::atomic::AtomicBool,
+        /// 名册写入次数（upsert / 候选 / 记录更新）：验证「空闲时零写入」。
+        pub(crate) writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MemoryLinkStorage {
+        /// 直接读种子（不经 trait，绕过 `seed_unreadable`）。
+        pub(crate) fn raw_seed(&self) -> Option<[u8; 32]> {
+            self.seed.lock().ok().and_then(|seed| *seed)
+        }
+
+        pub(crate) fn write_count(&self) -> usize {
+            self.writes.load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     fn poisoned<T>(_: std::sync::PoisonError<T>) -> LinkError {
@@ -75,6 +107,12 @@ pub(crate) mod memory {
     #[async_trait]
     impl LinkStorage for MemoryLinkStorage {
         async fn load_identity_seed(&self) -> LinkResult<Option<[u8; 32]>> {
+            if self
+                .seed_unreadable
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(LinkError::Store("identity seed is unreadable".into()));
+            }
             Ok(*self.seed.lock().map_err(poisoned)?)
         }
 
@@ -88,6 +126,8 @@ pub(crate) mod memory {
                 .lock()
                 .map_err(poisoned)?
                 .insert(record.fingerprint.clone(), record.clone());
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         }
 
@@ -143,27 +183,38 @@ pub(crate) mod memory {
             match peers.get_mut(fingerprint) {
                 Some(record) => {
                     record.candidates = candidates.to_vec();
+                    self.writes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Ok(true)
                 }
                 None => Ok(false),
             }
         }
 
-        async fn set_peer_info(&self, fingerprint: &str, info: &PeerInfo) -> LinkResult<bool> {
+        async fn update_record(
+            &self,
+            fingerprint: &str,
+            update: RecordUpdate<'_>,
+        ) -> LinkResult<Option<bool>> {
+            let mut peers = self.peers.lock().map_err(poisoned)?;
+            let Some(record) = peers.get_mut(fingerprint) else {
+                return Ok(None);
+            };
+            // 先在副本上试改：写失败注入只在「确有改动」时触发，与真实后端的落盘语义一致。
+            let mut edited = record.clone();
+            if !update(&mut edited) {
+                return Ok(Some(false));
+            }
             if self
                 .fail_metadata_writes
                 .load(std::sync::atomic::Ordering::Relaxed)
             {
                 return Err(LinkError::Store("metadata write rejected".into()));
             }
-            let mut peers = self.peers.lock().map_err(poisoned)?;
-            match peers.get_mut(fingerprint) {
-                Some(record) => {
-                    record.info = info.clone();
-                    Ok(true)
-                }
-                None => Ok(false),
-            }
+            *record = edited;
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(Some(true))
         }
     }
 }

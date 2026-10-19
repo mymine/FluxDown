@@ -4,6 +4,7 @@
 import { useT } from '../../../../i18n'
 import { useAgent } from '../../../../lib/rpc'
 import { Switch } from '../../../../ui'
+import { mergeDevices, sidebarDevices } from '../../../downloads/model/devices'
 import { PrefSwitchRow, SettingsPage, SettingsRow, SettingsSection, setPref, usePrefRaw, useSettingsReadOnly } from '../../kit'
 import { CategoriesGroup } from './CategoriesGroup'
 
@@ -12,7 +13,10 @@ function SidebarDevicesRow() {
   const t = useT()
   const raw = usePrefRaw('ui.show_sidebar_devices')
   const loggedIn = useAgent((snapshot) => snapshot.session !== null && snapshot.session !== undefined, false)
-  const hasLinked = useAgent((snapshot) => snapshot.linkedDevices.length > 0, false)
+  const hasLinked = useAgent(
+    (snapshot) => sidebarDevices(mergeDevices(snapshot.cloudDevices, snapshot.linkedDevices, { cloud: true, local: true })).length > 0,
+    false,
+  )
   const checked = typeof raw === 'boolean' ? raw : loggedIn || hasLinked
   return (
     <SettingsRow title={t('showSidebarDevice')} description={t('showSidebarDeviceDesc')} compact>

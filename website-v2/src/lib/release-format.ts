@@ -53,6 +53,8 @@ export interface ReleaseInfo {
       | "synology_dsm7_arm64"
       | "synology_dsm6_x64"
       | "synology_dsm6_arm64"
+      | "fnos_x64"
+      | "fnos_arm64"
     >;
   } | null;
   cli: {

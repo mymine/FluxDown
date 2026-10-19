@@ -1,0 +1,164 @@
+{
+  "format": "fluxdown-sniff-pack",
+  "packId": "official",
+  "sequence": 1792374964,
+  "engine": 1,
+  "issuedAt": "2026-10-19T01:56:04.962Z",
+  "rules": [
+    {
+      "id": "official.bilibili.track",
+      "version": 1,
+      "tier": "official",
+      "title": "哔哩哔哩：按 m4s 分片编号区分音轨 / 视频轨（CDN 域名）",
+      "stage": "track",
+      "match": {
+        "host": [
+          "bilibili.com",
+          "bilivideo.com",
+          "bilivideo.cn",
+          "acgvideo.com"
+        ]
+      },
+      "action": {
+        "kind": "track",
+        "source": "filenameOrUrl",
+        "pattern": "[-_](\\d{4,6})\\.m4s(?:[?#]|$)",
+        "group": 1,
+        "audio": [
+          "30216",
+          "30232",
+          "30280",
+          "30250",
+          "30251"
+        ],
+        "fallback": "video"
+      }
+    },
+    {
+      "id": "official.bilibili.track-page",
+      "version": 1,
+      "tier": "official",
+      "title": "哔哩哔哩：按 m4s 分片编号区分音轨 / 视频轨（站内页面）",
+      "stage": "track",
+      "match": {
+        "pageHost": [
+          "bilibili.com",
+          "bilivideo.com",
+          "bilivideo.cn",
+          "acgvideo.com"
+        ]
+      },
+      "action": {
+        "kind": "track",
+        "source": "filenameOrUrl",
+        "pattern": "[-_](\\d{4,6})\\.m4s(?:[?#]|$)",
+        "group": 1,
+        "audio": [
+          "30216",
+          "30232",
+          "30280",
+          "30250",
+          "30251"
+        ],
+        "fallback": "video"
+      }
+    },
+    {
+      "id": "official.douyin.title",
+      "version": 1,
+      "tier": "official",
+      "title": "抖音：视频描述作为文件名",
+      "stage": "page",
+      "match": {
+        "pageHost": [
+          "douyin.com"
+        ]
+      },
+      "action": {
+        "kind": "title",
+        "selector": "[data-e2e=\"video-desc\"]"
+      }
+    },
+    {
+      "id": "official.douyin.track",
+      "version": 1,
+      "tier": "official",
+      "title": "抖音：按 media-audio / media-video 路径区分分离的音轨 / 视频轨（CDN 域名）",
+      "stage": "track",
+      "match": {
+        "host": [
+          "douyinvod.com"
+        ]
+      },
+      "action": {
+        "kind": "track",
+        "source": "filenameOrUrl",
+        "pattern": "media-(audio|video)-",
+        "group": 1,
+        "audio": [
+          "audio"
+        ],
+        "fallback": "video"
+      }
+    },
+    {
+      "id": "official.douyin.track-page",
+      "version": 1,
+      "tier": "official",
+      "title": "抖音：按 media-audio / media-video 路径区分分离的音轨 / 视频轨（站内页面）",
+      "stage": "track",
+      "match": {
+        "pageHost": [
+          "douyin.com"
+        ]
+      },
+      "action": {
+        "kind": "track",
+        "source": "filenameOrUrl",
+        "pattern": "media-(audio|video)-",
+        "group": 1,
+        "audio": [
+          "audio"
+        ],
+        "fallback": "video"
+      }
+    },
+    {
+      "id": "official.lanzou.extract",
+      "version": 1,
+      "tier": "official",
+      "title": "蓝奏云：从 ajaxm.php 响应提取直链",
+      "stage": "body",
+      "match": {
+        "url": [
+          "*/ajaxm.php*"
+        ]
+      },
+      "action": {
+        "kind": "extract",
+        "when": [
+          {
+            "path": "zt",
+            "equals": 1
+          }
+        ],
+        "fields": {
+          "dom": "dom",
+          "url": "url",
+          "name": "inf"
+        },
+        "emit": {
+          "mode": "preempt",
+          "url": {
+            "resolve": {
+              "base": "${dom}",
+              "ref": "${url}",
+              "bareQueryPrefix": "/file/"
+            }
+          },
+          "filename": "${name}"
+        }
+      }
+    }
+  ]
+}

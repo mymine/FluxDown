@@ -133,7 +133,11 @@ private struct CloudDeviceDetail: View {
             }
         }
         .sheet(isPresented: $showDispatch) {
-            DispatchSheet(target: DispatchTarget(cloud: record, presenceKnown: presenceKnown))
+            // 同一台机器同时是直连设备时合并：直连在线走局域网，否则走云。
+            let attached = state.linkDevices.first {
+                !$0.revoked && !$0.fingerprint.isEmpty && $0.cloudDeviceId == record.deviceId
+            }.flatMap { model.linkInfo($0.fingerprint, state: container.store.state) }
+            DispatchSheet(target: DispatchTarget(cloud: record, presenceKnown: presenceKnown, link: attached))
         }
     }
 
@@ -179,6 +183,7 @@ private struct LinkDeviceDetail: View {
 
     let fingerprint: String
     @State private var showDispatch = false
+    @State private var renamingLink: LinkRenameTarget?
     @State private var confirmingUnpair = false
     @State private var unpairing = false
     @State private var leaving = false
@@ -208,21 +213,36 @@ private struct LinkDeviceDetail: View {
 
     private func detailList(_ info: LinkDeviceInfo, state: HostState) -> some View {
         let readOnly = state.isReadOnly
-        let statusText = L(info.online ? "deviceOnline" : "deviceOffline")
+        let revoked = info.revoked
+        let online = info.online && !revoked
+        let statusText = L(online ? "deviceOnline" : "deviceOffline")
+        let sameAccount = DevicePresentation.isSameAccount(
+            LinkDevice(
+                fingerprint: info.fingerprint, name: info.name, platform: info.platform, online: info.online,
+                cloudDeviceId: info.cloudDeviceId, revoked: revoked
+            ),
+            cloud: state.cloudDevices
+        )
         return List {
             Section {
                 DeviceHeader(
                     platform: info.platform,
                     name: info.name,
-                    online: info.online,
+                    online: online,
                     status: statusText,
                     isCurrent: false
                 )
+                if revoked {
+                    StatusBadge(text: L("linkedDeviceRevokedTag"), tone: .warning)
+                } else if sameAccount {
+                    StatusBadge(text: L("linkedDeviceSameAccountTag"), tone: .neutral)
+                }
             }
 
             Section {
-                DeviceInfoRow(key: L("accountDeviceFieldOnline"), value: statusText, tone: info.online ? .success : nil)
+                DeviceInfoRow(key: L("accountDeviceFieldOnline"), value: statusText, tone: online ? .success : nil)
                 DeviceInfoRow(key: L("accountDeviceFieldPlatform"), value: DevicePresentation.label(platform: info.platform))
+                DeviceInfoRow(key: L("accountDeviceFieldAppVersion"), value: info.appVersion)
                 DeviceInfoRow(key: L("mobileDeviceFieldPairedAt"), value: AccountText.dateTime(unix: info.pairedAt))
                 DeviceInfoRow(key: L("accountDeviceFieldLastSeenAt"), value: AccountText.dateTime(unix: info.lastSeenAt))
                 DeviceInfoRow(key: L("accountDeviceFieldSaveDir"), value: info.defaultSaveDir, monospaced: true, copyable: true)
@@ -231,12 +251,20 @@ private struct LinkDeviceDetail: View {
             }
 
             Section {
-                Button {
-                    showDispatch = true
-                } label: {
-                    Label(L("mobileDeviceDispatchAction"), systemImage: "arrow.down.circle")
+                if !revoked {
+                    Button {
+                        showDispatch = true
+                    } label: {
+                        Label(L("mobileDeviceDispatchAction"), systemImage: "arrow.down.circle")
+                    }
+                    .disabled(readOnly)
+                    Button {
+                        renamingLink = LinkRenameTarget(fingerprint: info.fingerprint, customName: info.customName ?? "")
+                    } label: {
+                        Label(L("linkedDeviceRename"), systemImage: FluxSymbol.edit)
+                    }
+                    .disabled(readOnly)
                 }
-                .disabled(readOnly)
                 Button(role: .destructive) {
                     confirmingUnpair = true
                 } label: {
@@ -261,6 +289,8 @@ private struct LinkDeviceDetail: View {
             } footer: {
                 if readOnly {
                     Text(L("localServiceDisconnected"))
+                } else if revoked {
+                    Text(L("linkedDeviceRevokedDesc"))
                 } else if !info.online {
                     Text(L("errReasonPeerOffline"))
                 }
@@ -272,6 +302,7 @@ private struct LinkDeviceDetail: View {
                 container.toasts.show(text: AccountText.error(error, context: .pairing), tone: .error)
             }
         }
+        .linkDeviceRenameAlert(renaming: $renamingLink)
         .sheet(isPresented: $showDispatch) {
             DispatchSheet(target: DispatchTarget(link: info))
         }

@@ -19,6 +19,7 @@
  */
 
 import { browser } from "wxt/browser";
+import type { Browser } from "wxt/browser";
 import { recordConnectionDiagnostic } from "./connection-diagnostics";
 
 const NMH_NAME = "com.fluxdown.nmh";
@@ -72,6 +73,8 @@ export interface DownloadRequest {
    * 省略/空 = 普通单 URL 下载。与 NMH 契约 audio_url 字段对应。
    */
   audioUrl?: string;
+  /** 目标设备上的保存目录（站点配置 saveDir）；省略 = 桌面端默认目录。 */
+  saveDir?: string;
 }
 
 export interface ApiResponse {
@@ -88,6 +91,8 @@ export interface ApiResponse {
    * action:"tasks" 响应携带的任务列表（仅 "tasks" action 使用，其余 action 不设置）。
    */
   tasks?: TaskBrief[];
+  /** 协议 v2 应答附带的结构化数据（download / capabilities / capture_status 等）。 */
+  data?: unknown;
 }
 
 /**
@@ -106,6 +111,7 @@ export interface BatchDownloadItem {
   mimeType?: string;
   method?: string;
   body?: RequestBody;
+  saveDir?: string;
 }
 
 /**
@@ -129,7 +135,7 @@ export interface TaskBrief {
 // 内部状态
 // ──────────────────────────────────────────────────────────────
 
-let _port: chrome.runtime.Port | null = null;
+let _port: Browser.runtime.Port | null = null;
 let _nextMsgId = 1;
 let _connected = false;
 
@@ -145,7 +151,7 @@ const _pendingRequests = new Map<number, PendingRequest>();
 // 端口管理
 // ──────────────────────────────────────────────────────────────
 
-function getPort(): chrome.runtime.Port | null {
+function getPort(): Browser.runtime.Port | null {
   if (_port) return _port;
 
   try {
@@ -180,6 +186,7 @@ function getPort(): chrome.runtime.Port | null {
       message: msg.message,
       taskId: msg.taskId,
       tasks: Array.isArray(msg.tasks) ? (msg.tasks as TaskBrief[]) : undefined,
+      data: msg.data,
     });
   });
 
@@ -369,6 +376,7 @@ function toBatchWireItem(item: BatchDownloadItem): Record<string, any> {
   if (item.mimeType) wire.mimeType = item.mimeType;
   if (item.method) wire.method = item.method;
   if (item.body) wire.body = item.body;
+  if (item.saveDir) wire.saveDir = item.saveDir;
   return wire;
 }
 
@@ -428,6 +436,7 @@ async function nmhSendBatchDownloadLegacy(
         mimeType: item.mimeType,
         method: item.method,
         body: item.body,
+        saveDir: item.saveDir,
       }),
     ),
   );
@@ -491,6 +500,7 @@ export async function nmhSendBatchDownloadRequest(
   const chunks = chunkBatchWireItems(items.map(toBatchWireItem));
 
   let sentChunks = 0;
+  const transactionIds: string[] = [];
   for (const chunk of chunks) {
     const result = await sendWithRetry("batch_download", { items: chunk });
     if (!result.success) {
@@ -508,9 +518,30 @@ export async function nmhSendBatchDownloadRequest(
       return result;
     }
     sentChunks += 1;
+    const data = result.data;
+    if (data && typeof data === "object" && "transactionIds" in data && Array.isArray(data.transactionIds)) {
+      for (const id of data.transactionIds) if (typeof id === "string") transactionIds.push(id);
+    }
   }
 
-  return { success: true, message: `${items.length} items sent` };
+  return {
+    success: true,
+    message: `${items.length} items sent`,
+    data: transactionIds.length > 0 ? { transactionIds } : undefined,
+  };
+}
+
+/**
+ * 协议 v2 的通用请求：不重试，调用方自行处理 `unknown action`
+ * （旧桌面端）等失败。`data` 为应答的结构化载荷。
+ */
+export async function nmhCall<T>(
+  action: string,
+  payload: object,
+  timeoutMs: number = REQUEST_TIMEOUT_MS,
+): Promise<{ success: boolean; message?: string; data?: T }> {
+  const result = await sendMessage(action, payload as Record<string, unknown>, timeoutMs);
+  return { success: result.success, message: result.message, data: result.data as T | undefined };
 }
 
 // ──────────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ import { CAPABILITY_AGENT_OPEN_TASK_FILES, RpcError, downloadTaskFile, rpc, rpcS
 import type { CreateTaskRequest, RemoteCommandParams } from '../../../lib/rpc'
 import { confirmDialog, toast } from '../../../ui'
 import { toastRpcError } from '../../../lib/rpcToast'
+import { rpcErrorKind, rpcErrorText } from '../../../lib/rpcErrorText'
 import { planTaskCommand } from './batchPlan'
 import { PLUGIN_ERROR_PREFIX, shareUrl } from './task'
 import type { DownloadTaskView } from './task'
@@ -202,6 +203,45 @@ export async function openTaskFile(taskId: string): Promise<void> {
 }
 
 export const revealTaskFile = (taskId: string) => guarded(() => rpc.agent.platform.revealTask({ taskId }))
+
+/** 已损坏文件名文案：前 3 个，超出部分折叠为「等 N 个」（与 GPUI 同规则）。 */
+function damagedFilesText(files: readonly string[]): string {
+  const shown = files.slice(0, 3).join(', ')
+  return files.length > 3 ? t('verifyTaskMoreFiles', { files: shown, count: files.length - 3 }) : shown
+}
+
+/** BT 完整性校验：耗时可达数分钟，先提示已开始，结果与失败均以 toast 反馈。 */
+export async function verifyTaskIntegrity(view: DownloadTaskView): Promise<void> {
+  const name = view.name
+  toast.info(t('verifyTaskStarted', { name }))
+  try {
+    const result = await rpc.daemon.task.verify({ taskId: view.taskId })
+    switch (result.status) {
+      case 'intact':
+        toast.success(t('verifyTaskIntact', { name, count: result.verifiedPieces }))
+        break
+      case 'damaged':
+        toast.warning(
+          t('verifyTaskDamaged', {
+            name,
+            bad: result.badPieces,
+            total: result.totalPieces,
+            files: damagedFilesText(result.damagedFiles),
+          }),
+        )
+        break
+      case 'unverifiable':
+        toast.warning(t('verifyTaskUnverifiable', { name }))
+        break
+    }
+  } catch (error) {
+    if (error instanceof RpcError && rpcErrorKind(error) === 'conflict') {
+      toast.warning(t('verifyTaskBusy', { name }))
+    } else {
+      toast.error(t('verifyTaskFailed', { name, error: rpcErrorText(error, t) }))
+    }
+  }
+}
 
 // ── 任务组 ──
 

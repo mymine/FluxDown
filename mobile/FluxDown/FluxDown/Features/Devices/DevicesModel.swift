@@ -141,13 +141,18 @@ final class DevicesModel {
     /// 局域网设备的完整信息：以快照里的实时名称 / 在线状态覆盖加载到的记录；设备不在快照里 = nil。
     func linkInfo(_ fingerprint: String, state: HostState) -> LinkDeviceInfo? {
         guard let live = state.linkDevices.first(where: { $0.fingerprint == fingerprint }) else { return nil }
-        if var info = linkInfos.first(where: { $0.fingerprint == fingerprint }) {
-            info.name = live.name
-            info.online = live.online
-            if let platform = live.platform { info.platform = platform }
-            return info
-        }
-        return LinkDeviceInfo(fingerprint: live.fingerprint, name: live.name, platform: live.platform, online: live.online)
+        var info = linkInfos.first(where: { $0.fingerprint == fingerprint })
+            ?? LinkDeviceInfo(fingerprint: live.fingerprint, name: live.name, platform: live.platform, online: live.online)
+        info.name = live.name
+        info.online = live.online
+        if let platform = live.platform { info.platform = platform }
+        info.customName = live.customName
+        info.appVersion = live.appVersion
+        info.cloudDeviceId = live.cloudDeviceId
+        info.revoked = live.revoked
+        if live.pairedAt > 0 { info.pairedAt = live.pairedAt }
+        if live.lastSeenAt > 0 { info.lastSeenAt = live.lastSeenAt }
+        return info
     }
 
     // MARK: 同步
@@ -309,6 +314,17 @@ final class DevicesModel {
         linkInfos.removeAll { $0.fingerprint == fingerprint }
         await loadLink()
         return nil
+    }
+
+    /// 设置 / 清除本机备注名（`agent.link.rename`）；快照随 `LinkedDevicesChanged` 推送更新。
+    func renameLink(fingerprint: String, name: String?) async -> HostError? {
+        do throws(HostError) {
+            let info = try await container.agent.linkRename(fingerprint: fingerprint, name: name)
+            if let index = linkInfos.firstIndex(where: { $0.fingerprint == fingerprint }) { linkInfos[index] = info }
+            return nil
+        } catch {
+            return error
+        }
     }
 
     // MARK: 刷新

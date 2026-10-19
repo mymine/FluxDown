@@ -2,8 +2,8 @@
 
 use crate::{PortFuture, RssPort};
 use fluxdown_protocol::{
-    AgentEvent, AgentSnapshot, DaemonEvent, DaemonSnapshot, QueueDto, RssItemDto, RssSourceDto,
-    ServiceEvent, WsServerMsg, method,
+    AgentEvent, AgentSnapshot, DaemonEvent, DaemonSnapshot, PluginDto, QueueDto, RssItemDto,
+    RssSourceDto, ServiceEvent, WsServerMsg, method,
 };
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -22,6 +22,8 @@ pub struct RssController {
     pub(crate) port: Arc<dyn RssPort>,
     pub(crate) sources: Vec<RssSourceDto>,
     pub(crate) queues: Vec<QueueDto>,
+    /// 已安装插件快照：新建/编辑订阅时据此生成来源（provider）选项。
+    pub(crate) plugins: Vec<PluginDto>,
     pub(crate) tasks: HashMap<String, (i32, bool)>,
     pub(crate) selected_source: Option<String>,
     pub(crate) items: Vec<RssItemDto>,
@@ -42,6 +44,7 @@ impl RssController {
             port,
             sources: Vec::new(),
             queues: Vec::new(),
+            plugins: Vec::new(),
             tasks: HashMap::new(),
             selected_source: None,
             items: Vec::new(),
@@ -69,6 +72,7 @@ impl RssController {
             .map(|task| (task.task_id.clone(), (task.status, task.file_missing)))
             .collect();
         self.queues.clone_from(&snapshot.queues);
+        self.plugins.clone_from(&snapshot.plugins);
         self.absorb_sources(&snapshot.rss_sources);
         self.invalidate_items();
     }
@@ -139,6 +143,25 @@ impl RssController {
                     self.retain_existing_selection();
                 }
                 selected
+            }
+            // 插件列表只在打开编辑器时读取，变化本身不影响 RSS 页可见内容。
+            AgentEvent::Daemon(DaemonEvent::PluginsChanged(plugins)) => {
+                self.plugins.clone_from(plugins);
+                false
+            }
+            AgentEvent::Daemon(DaemonEvent::Engine(WsServerMsg::PluginAutoDisabled {
+                identity,
+                reason,
+            })) => {
+                if let Some(plugin) = self
+                    .plugins
+                    .iter_mut()
+                    .find(|plugin| plugin.identity == *identity)
+                {
+                    plugin.enabled = false;
+                    plugin.disabled_reason.clone_from(reason);
+                }
+                false
             }
             AgentEvent::Daemon(DaemonEvent::RssChanged { source_id, .. }) => {
                 let selected = self.selected_source.as_deref() == Some(source_id);

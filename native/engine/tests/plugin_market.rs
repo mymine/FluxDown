@@ -10,7 +10,7 @@ use std::io::Write as _;
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_config::BtConfig;
 use fluxdown_engine::plugin::{MarketClient, MarketError};
 use fluxdown_engine::proxy_config::{ProxyConfig, ProxyMode};
 use fluxdown_engine::{Engine, EngineConfig, NoopSelection, NoopSink};

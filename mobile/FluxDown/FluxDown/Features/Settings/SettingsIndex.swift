@@ -35,10 +35,12 @@ enum SettingsIndex {
             ["searchKeywordsSaveDir", "searchKeywordsThreads", "searchKeywordsConcurrent", "searchKeywordsSpeedLimit"]
         ))
         list += DownloadPage.searchEntries(ctx)
+        #if FULL_P2P
         list.append(category(.bt, "settingsCatBt", "settingsCatBtDesc", "point.3.connected.trianglepath.dotted", ["searchKeywordsBtSettings"]))
         list += BtPage.searchEntries(ctx)
         list.append(category(.ed2k, "ed2kSettings", "ed2kSettingsDesc", "server.rack", ["searchKeywordsEd2kSettings"]))
         list += Ed2kPage.searchEntries(ctx)
+        #endif
         list.append(category(.network, "settingsCatProxy", "settingsCatProxyDesc", "globe", ["searchKeywordsProxy"]))
         list += NetworkPage.searchEntries(ctx)
         list.append(category(.extensions, "settingsCatExtensions", "settingsCatExtensionsDesc", "puzzlepiece.extension.fill"))

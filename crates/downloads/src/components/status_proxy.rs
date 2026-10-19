@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use fluxdown_ui_components::FluxIcon;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    Anchor, App, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, div,
+    AnyElement, App, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement as _, Styled, WeakEntity, div,
 };
 use gpui_component::{
     Disableable as _, Icon, h_flex,
@@ -12,7 +12,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 
-use super::status_bar::{status_button, status_button_content};
+use super::status_bar::{WidgetPlacement, compact_tooltip, status_button, status_button_content};
 use crate::{controller::DownloadsCommand, pages::downloads::DownloadView};
 
 const PROXY_MODES: [(&str, &str); 4] = [
@@ -155,7 +155,13 @@ impl DownloadView {
         );
     }
 
-    pub(super) fn render_proxy_control(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// 代理模式控件：地球图标 + 当前模式 + 下拉箭头；紧凑摆放只留图标，模式并入悬浮提示。
+    pub(super) fn render_proxy_control(
+        &self,
+        placement: WidgetPlacement,
+        view: WeakEntity<Self>,
+        cx: &App,
+    ) -> AnyElement {
         let mode = current_proxy_mode(self.controller.config_str("proxy_mode"));
         let label_key = PROXY_MODES
             .iter()
@@ -167,19 +173,25 @@ impl DownloadView {
         let theme = active_theme(cx);
         let icon_size = theme.extended().icon.sm;
         let control_height = theme.density().status_control;
-        let view = cx.weak_entity();
+        let content = status_button_content(Some(FluxIcon::Globe), None, None, cx);
+        let (content, tooltip) = if placement.compact {
+            (content, compact_tooltip(&title, &label))
+        } else {
+            (
+                content
+                    .min_w_0()
+                    .child(div().min_w_0().truncate().child(label))
+                    .child(Icon::new(FluxIcon::ChevronDown).size(icon_size).flex_none()),
+                title,
+            )
+        };
 
         status_button("status-proxy-mode", cx)
             .max_w(control_height * 7.)
             .disabled(self.controller.is_stale())
-            .child(
-                status_button_content(Some(FluxIcon::Globe), None, None, cx)
-                    .min_w_0()
-                    .child(div().min_w_0().truncate().child(label))
-                    .child(Icon::new(FluxIcon::ChevronDown).size(icon_size).flex_none()),
-            )
-            .tooltip(title)
-            .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, window, cx| {
+            .child(content)
+            .tooltip(tooltip)
+            .dropdown_menu_with_anchor(placement.menu_anchor, move |menu, window, cx| {
                 let Some(entity) = view.upgrade() else {
                     return menu;
                 };
@@ -203,6 +215,7 @@ impl DownloadView {
                 .detach();
                 proxy_menu(menu, &entity, cx)
             })
+            .into_any_element()
     }
 }
 

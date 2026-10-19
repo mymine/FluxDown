@@ -7,7 +7,8 @@
 #
 # 产物名与 Flutter 时代一致（官网 /api/release 与旧客户端自动更新按后缀匹配）：
 #   FluxDown-<ver>-linux-x64.{tar.gz,AppImage,deb,pkg.tar.zst}
-# deb / Arch 安装到 /opt/fluxdown（agent 的更新检查按此路径识别包管理安装，native/agent/src/update.rs）。
+# deb / Arch 安装到 /opt/fluxdown，包名恒为 fluxdown：agent 的更新检查按此路径与包名识别官方包，
+# 其它包名（AUR 等）只提示经包管理器更新（native/agent/src/update/install/detect.rs 的 OFFICIAL_PACKAGE）。
 #
 # 用法：VERSION=0.5.0 BIN_DIR=target/x86_64-unknown-linux-gnu/release OUT_DIR=build/installer \
 #       scripts/package_gpui_linux.sh
@@ -120,7 +121,7 @@ Package: fluxdown
 Version: ${VERSION/-/\~}
 Architecture: amd64
 Maintainer: FluxDown Team <contact@fluxdown.app>
-Homepage: https://fluxdown.zerx.dev
+Homepage: https://fluxdown.com
 Section: net
 Priority: optional
 Installed-Size: ${INSTALLED_KB}
@@ -149,7 +150,7 @@ INSTALLED_BYTES=$(du -sb "$ARCHPKG/opt" "$ARCHPKG/usr" | awk '{s+=$1} END {print
   echo "pkgname = fluxdown"
   echo "pkgver = ${VERSION//-/_}-1"
   echo "pkgdesc = Free IDM-alternative download manager"
-  echo "url = https://fluxdown.zerx.dev"
+  echo "url = https://fluxdown.com"
   echo "builddate = $(date +%s)"
   echo "packager = FluxDown CI <ci@fluxdown.app>"
   echo "size = ${INSTALLED_BYTES}"

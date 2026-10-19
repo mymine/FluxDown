@@ -63,6 +63,19 @@ struct PluginsProtocolTests {
         #expect(String(decoding: params, as: UTF8.self) == #"{"pluginId":"p"}"#)
     }
 
+    @Test func siteDefaultParamsEncodeNullWhenRemoving() throws {
+        let remove = try ProtocolJSON.encode(PluginSetSiteDefaultParams(site: "bilibili.com", identity: nil), what: "t")
+        #expect(String(decoding: remove, as: UTF8.self) == #"{"identity":null,"site":"bilibili.com"}"#)
+        let set = try ProtocolJSON.encode(PluginSetSiteDefaultParams(site: "bilibili.com", identity: "a.b"), what: "t")
+        #expect(String(decoding: set, as: UTF8.self) == #"{"identity":"a.b","site":"bilibili.com"}"#)
+        let rows = try ProtocolJSON.decode(
+            [PluginSiteDefault].self,
+            from: Data(#"[{"site":"bilibili.com","identity":"a","candidates":["a","b"],"automatic":true}]"#.utf8),
+            what: "t"
+        )
+        #expect(rows == [PluginSiteDefault(site: "bilibili.com", identity: "a", candidates: ["a", "b"], automatic: true)])
+    }
+
     @Test func componentStatusUsesAdjacentTagAndToleratesUnknownComponent() throws {
         let json = """
         [{"component":"ffmpeg","status":{"source":"managed","path":"/x/ffmpeg","version":"7.1","managedVersion":"7.1","systemPath":"","managedSupported":true}},
@@ -172,16 +185,15 @@ struct PluginsProtocolTests {
         MarketEntry(pluginId: id, version: version, sequence: seq, yanked: yanked, permissions: perms)
     }
 
-    @Test func latestPerPluginPrefersInstallableThenHighestSequenceKeepingFirstSeenOrder() {
+    @Test func latestPerPluginPrefersInstallableAndHidesFullyYankedKeepingFirstSeenOrder() {
         let list = [
             entry("a", "1.0.0", seq: 1), entry("b", "1.0.0", seq: 5, yanked: "malicious"),
             entry("a", "1.1.0", seq: 2), entry("b", "1.1.0", seq: 6, yanked: "deprecated"),
-            entry("a", "1.2.0", seq: 3, yanked: "vulnerable"),
+            entry("a", "1.2.0", seq: 3, yanked: "vulnerable"), entry("c", "1.0.0", seq: 7),
         ]
         let latest = PluginMarket.latestPerPlugin(list)
-        #expect(latest.map(\.pluginId) == ["a", "b"])
+        #expect(latest.map(\.pluginId) == ["a", "c"])
         #expect(latest[0].version == "1.1.0")
-        #expect(latest[1].version == "1.1.0" && !latest[1].installable)
     }
 
     @Test func versionComparisonAndActions() {

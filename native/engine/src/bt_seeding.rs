@@ -12,14 +12,21 @@
 //! [`SEED_TIME_FALLBACK_PERSIST_INTERVAL`] 兜底时发生，见
 //! [`seed_times_persist_due`]。
 
+#[cfg(feature = "bt")]
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "bt")]
 use std::sync::Arc;
+#[cfg(feature = "bt")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "bt")]
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "bt")]
 use tokio::sync::Mutex;
 
+#[cfg(feature = "bt")]
 use crate::bt_downloader::BtHandle;
+#[cfg(feature = "bt")]
 use crate::logger::log_info;
 
 /// Numeric code indicating an active seeder (not a stop reason).
@@ -46,6 +53,7 @@ pub const SEEDING_EVAL_INTERVAL: std::time::Duration = std::time::Duration::from
 /// 零上传的纯做种空闲期因此不产生周期性 DB 写：Linux 下即使不 fsync 的写也会被
 /// 内核回写（约 30s），足以唤醒 NAS 上休眠的 HDD。代价是崩溃/断电最多丢失本间隔
 /// 内的累计做种时长。
+#[cfg(feature = "bt")]
 pub(crate) const SEED_TIME_FALLBACK_PERSIST_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// 本 tick 是否要把做种时长快照一并落库（纯函数，时间注入便于测试）。
@@ -55,6 +63,7 @@ pub(crate) const SEED_TIME_FALLBACK_PERSIST_INTERVAL: Duration = Duration::from_
 /// - 否则仅当距 `last_persist` 满 `fallback` 时兜底写一次。
 ///
 /// 用单调时钟 `Instant`：墙钟回拨/NTP 校时不会让兜底写被无限推迟。
+#[cfg(feature = "bt")]
 pub(crate) fn seed_times_persist_due(
     has_upload_delta: bool,
     now: Instant,
@@ -271,6 +280,7 @@ impl SeedLimitOverrides {
     }
 }
 
+#[cfg(feature = "bt")]
 /// One actively seeding torrent.
 pub struct SeedingEntry {
     pub handle: BtHandle,
@@ -292,6 +302,7 @@ pub struct SeedingEntry {
     pub stop_reason: SeedingStopReason,
 }
 
+#[cfg(feature = "bt")]
 impl SeedingEntry {
     /// Cumulative seeding seconds including the current stint.
     fn effective_seed_time_secs(&self, now: Instant) -> i64 {
@@ -300,6 +311,7 @@ impl SeedingEntry {
     }
 }
 
+#[cfg(feature = "bt")]
 impl std::fmt::Debug for SeedingEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SeedingEntry")
@@ -313,6 +325,7 @@ impl std::fmt::Debug for SeedingEntry {
     }
 }
 
+#[cfg(feature = "bt")]
 /// A completed torrent waiting for a free seeding slot. No session upload
 /// baseline is kept: queued torrents are paused, and unpausing always resets
 /// librqbit's per-session upload counter, so activation restarts from 0.
@@ -322,6 +335,7 @@ struct QueuedSeed {
     seed_time_base_secs: i64,
 }
 
+#[cfg(feature = "bt")]
 /// Outcome of [`SeedingManager::register`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeedingRegistration {
@@ -334,6 +348,7 @@ pub enum SeedingRegistration {
     AlreadyPresent,
 }
 
+#[cfg(feature = "bt")]
 /// State snapshot returned by [`SeedingManager::unregister`].
 #[derive(Debug, Clone, Copy)]
 pub struct UnregisteredSeed {
@@ -344,6 +359,7 @@ pub struct UnregisteredSeed {
     pub seed_time_secs: i64,
 }
 
+#[cfg(feature = "bt")]
 /// Snapshot of live upload state needed by [`SeedingManager::evaluate_limits`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SeedingUploadSnapshot {
@@ -358,6 +374,7 @@ pub struct SeedingUploadSnapshot {
     pub upload_speed_bps: i64,
 }
 
+#[cfg(feature = "bt")]
 /// Internal collections guarded by one lock: the active map plus the FIFO
 /// wait queue. A task id lives in at most one of the two.
 #[derive(Default)]
@@ -366,6 +383,7 @@ struct SeedingState {
     queued: VecDeque<(String, QueuedSeed)>,
 }
 
+#[cfg(feature = "bt")]
 /// Manages the lifecycle of seeding BT torrents.
 pub struct SeedingManager {
     state: Mutex<SeedingState>,
@@ -373,10 +391,12 @@ pub struct SeedingManager {
     cap: AtomicUsize,
 }
 
+#[cfg(feature = "bt")]
 fn short_id(task_id: &str) -> &str {
     task_id.get(..8).unwrap_or(task_id)
 }
 
+#[cfg(feature = "bt")]
 impl SeedingManager {
     /// Create an empty seeding manager with no active-seeder cap.
     pub fn new() -> Self {
@@ -689,12 +709,14 @@ impl SeedingManager {
     }
 }
 
+#[cfg(feature = "bt")]
 impl Default for SeedingManager {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "bt")]
 /// Ratio of `uploaded` against the effective divisor: downloaded bytes,
 /// falling back to the full torrent size when the recorded download count is
 /// implausibly small (< 1% of the size, e.g. data restored from disk after a
@@ -712,6 +734,7 @@ fn ratio_of(uploaded: i64, total_downloaded: i64, total_size: i64) -> f64 {
     }
 }
 
+#[cfg(feature = "bt")]
 /// Pure helper: decide whether a single seeding entry should stop.
 /// `seed_time_secs` is the cumulative seeding time including the current
 /// stint; paused/queued periods are excluded by construction.
@@ -783,6 +806,7 @@ fn evaluate_entry(
     }
 }
 
+#[cfg(feature = "bt")]
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -229,9 +229,13 @@ impl ServerFetchOutcome {
 }
 
 /// 拉取每个订阅 URL（换行分隔，允许 `#` 注释）并返回合并去重后的服务器列表。
+/// 请求经宿主统一出口（[`crate::egress::client_builder`]），与下载任务同一套全局代理。
 ///
 /// 单源失败可容忍：只要至少一源响应即为成功。所有网络错误都记日志。
-pub async fn fetch_server_subscriptions(urls: &str) -> ServerFetchOutcome {
+pub async fn fetch_server_subscriptions(
+    urls: &str,
+    proxy: &crate::proxy_config::ProxyConfig,
+) -> ServerFetchOutcome {
     let sources: Vec<&str> = urls
         .lines()
         .map(str::trim)
@@ -248,7 +252,14 @@ pub async fn fetch_server_subscriptions(urls: &str) -> ServerFetchOutcome {
         };
     }
 
-    let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
+    let client = match crate::egress::client_builder(proxy, "")
+        .map_err(|e| e.to_string())
+        .and_then(|builder| {
+            builder
+                .timeout(FETCH_TIMEOUT)
+                .build()
+                .map_err(|e| e.to_string())
+        }) {
         Ok(c) => c,
         Err(e) => {
             return ServerFetchOutcome {

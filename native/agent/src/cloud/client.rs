@@ -4,8 +4,9 @@
 //! [`CloudClient::set_endpoint`] 覆盖（持久化在 agent 私有状态；GPUI 账户页同样只在调试构建展示该入口）
 //! ——正式包锁定默认地址，避免残留覆盖值指向失效地址。
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fluxdown_protocol::{
     AgentEvent, ApplicationErrorCode, CloudEndpointDto, ErrorReason, RpcErrorData,
@@ -43,6 +44,9 @@ pub struct CloudClient {
     /// 会话被清除（退出 / 刷新令牌被拒 / 远端撤销）时投影 `SessionChanged(None)`，
     /// 让 UI 与 agent 私有状态永不脱节。
     events: Option<AgentEventHub>,
+    /// 本机时钟相对 FluxCloud 的偏移（毫秒，`服务端 - 本机`），取自最近一次响应的 `Date` 头；
+    /// 没有样本时为 0（直接用本机时间）。仅内存，进程内所有克隆共享。
+    clock_offset_ms: Arc<AtomicI64>,
 }
 
 impl CloudClient {
@@ -106,7 +110,39 @@ impl CloudClient {
             refresh: Arc::new(Mutex::new(())),
             session_generation: watch::channel(0).0,
             events: None,
+            clock_offset_ms: Arc::new(AtomicI64::new(0)),
         })
+    }
+
+    /// 按 FluxCloud 时钟估计的当前 unix 毫秒（本机时钟 + `Date` 头偏移）。
+    pub(crate) fn server_now_ms(&self) -> i64 {
+        unix_ms().saturating_add(self.clock_offset_ms.load(Ordering::Relaxed))
+    }
+
+    /// 用响应 `Date` 头（秒精度，取该秒中点）与请求往返中点估计偏移；往返过长的样本误差过大，丢弃。
+    fn observe_server_clock(
+        &self,
+        response: &reqwest::Response,
+        sent_at_ms: i64,
+        received_at_ms: i64,
+    ) {
+        const MAX_SAMPLE_RTT_MS: i64 = 5_000;
+        if received_at_ms.saturating_sub(sent_at_ms) > MAX_SAMPLE_RTT_MS {
+            return;
+        }
+        let Some(server_ms) = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_http_date_ms)
+        else {
+            return;
+        };
+        let local_mid = sent_at_ms.saturating_add(received_at_ms.saturating_sub(sent_at_ms) / 2);
+        self.clock_offset_ms.store(
+            server_ms.saturating_add(500).saturating_sub(local_mid),
+            Ordering::Relaxed,
+        );
     }
 
     /// 接入事件枢纽；生产运行链路必须调用，否则会话清除不会通知 UI。
@@ -662,11 +698,14 @@ impl CloudClient {
             .header("X-FluxDown-Platform", platform)
             .header("X-FluxDown-Version", fluxdown_protocol::APP_VERSION)
             .send();
+        let sent_at = unix_ms();
         // 仅限制响应头，不给无限 SSE body 加总寿命；包括成功 TCP 后不回头的反代。
-        tokio::time::timeout(Duration::from_secs(15), request)
+        let response = tokio::time::timeout(Duration::from_secs(15), request)
             .await
             .map_err(|_| CloudError::network("cloud SSE response headers timeout".to_owned()))?
-            .map_err(|error| CloudError::network(error_chain(&error)))
+            .map_err(|error| CloudError::network(error_chain(&error)))?;
+        self.observe_server_clock(&response, sent_at, unix_ms());
+        Ok(response)
     }
 
     async fn send_once(
@@ -694,11 +733,72 @@ impl CloudClient {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        request
+        let sent_at = unix_ms();
+        let response = request
             .send()
             .await
-            .map_err(|error| CloudError::network(error_chain(&error)))
+            .map_err(|error| CloudError::network(error_chain(&error)))?;
+        self.observe_server_clock(&response, sent_at, unix_ms());
+        Ok(response)
     }
+}
+
+fn unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// 解析 RFC 9110 的 IMF-fixdate（`Sun, 06 Nov 1994 08:49:37 GMT`）为 unix 毫秒（秒精度）。
+/// 服务端 `Date` 头固定使用该格式；其它格式视为无样本。
+fn parse_http_date_ms(value: &str) -> Option<i64> {
+    let mut parts = value.split_ascii_whitespace();
+    let weekday = parts.next()?;
+    if !weekday.ends_with(',') {
+        return None;
+    }
+    let day = parts.next()?.parse::<i64>().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let mut clock = parts.next()?.split(':');
+    let hour = clock.next()?.parse::<i64>().ok()?;
+    let minute = clock.next()?.parse::<i64>().ok()?;
+    let second = clock.next()?.parse::<i64>().ok()?;
+    if clock.next().is_some()
+        || parts.next() != Some("GMT")
+        || parts.next().is_some()
+        || !(1..=31).contains(&day)
+        || !(0..24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0..61).contains(&second)
+    {
+        return None;
+    }
+    // Howard Hinnant 的 days_from_civil：公历日期 → 1970-01-01 起的天数。
+    let shifted_year = if month <= 2 { year - 1 } else { year };
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year - era * 400;
+    let month_index = (month + 9) % 12;
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1_000)
 }
 
 /// 令牌被拒导致清会话时通知 UI 的原因：账号停用 / 设备被移除保留，其余一律是会话过期。
@@ -916,7 +1016,7 @@ impl CloudError {
             Some("registration_incomplete") => Some(ErrorReason::RegistrationIncomplete),
             Some("mail_not_configured") => Some(ErrorReason::MailNotConfigured),
             Some("device_limit") => Some(ErrorReason::DeviceLimit),
-            Some("sync_device_limit") => Some(ErrorReason::SyncDeviceLimit),
+            Some("online_device_limit") => Some(ErrorReason::OnlineDeviceLimit),
             Some("sync_device_untrusted") => Some(ErrorReason::DeviceUntrusted),
             Some("unauthorized") => Some(ErrorReason::SessionExpired),
             Some("target_device_offline") => Some(ErrorReason::TargetDeviceOffline),
@@ -927,6 +1027,19 @@ impl CloudError {
             Some(
                 "notify_target_invalid" | "notify_kind_unavailable" | "notify_email_unverified",
             ) => Some(ErrorReason::NotifyTargetInvalid),
+            Some("payment_disabled" | "usdt_disabled") => Some(ErrorReason::PaymentDisabled),
+            Some("gateway_error") => Some(ErrorReason::PaymentGatewayFailed),
+            Some("plan_not_purchasable" | "usdt_not_available") => {
+                Some(ErrorReason::PlanNotPurchasable)
+            }
+            Some("plan_already_owned") => Some(ErrorReason::PlanAlreadyOwned),
+            Some("not_an_upgrade") => Some(ErrorReason::PlanNotUpgrade),
+            Some("plan_tier_not_higher") => Some(ErrorReason::PlanTierNotHigher),
+            Some("referral_code_invalid") => Some(ErrorReason::ReferralCodeInvalid),
+            Some("referral_self_use") => Some(ErrorReason::ReferralSelfUse),
+            Some("referral_already_used") => Some(ErrorReason::ReferralAlreadyUsed),
+            Some("referral_plan_excluded") => Some(ErrorReason::ReferralPlanExcluded),
+            Some("referral_code_taken") => Some(ErrorReason::ReferralCodeTaken),
             _ => None,
         };
         by_code.or(match self.status {
@@ -950,7 +1063,11 @@ impl CloudError {
             Some(
                 ErrorReason::InvalidVerificationCode
                 | ErrorReason::WrongPassword
-                | ErrorReason::NotifyTargetInvalid,
+                | ErrorReason::NotifyTargetInvalid
+                | ErrorReason::ReferralCodeInvalid
+                | ErrorReason::ReferralSelfUse
+                | ErrorReason::ReferralAlreadyUsed
+                | ErrorReason::ReferralPlanExcluded,
             ) => (ApplicationErrorCode::InvalidArgument, false),
             Some(ErrorReason::RateLimited) => (ApplicationErrorCode::Unavailable, true),
             Some(
@@ -959,20 +1076,28 @@ impl CloudError {
                 | ErrorReason::OriginIdAlreadyChanged
                 | ErrorReason::RegistrationIncomplete
                 | ErrorReason::DeviceLimit
-                | ErrorReason::SyncDeviceLimit
+                | ErrorReason::OnlineDeviceLimit
                 | ErrorReason::TaskStateConflict
                 | ErrorReason::TaskDeviceMismatch
-                | ErrorReason::NotifyChannelLimit,
+                | ErrorReason::NotifyChannelLimit
+                | ErrorReason::PlanAlreadyOwned
+                | ErrorReason::PlanNotUpgrade
+                | ErrorReason::PlanTierNotHigher
+                | ErrorReason::ReferralCodeTaken,
             ) => (ApplicationErrorCode::Conflict, false),
             Some(
                 ErrorReason::RegistrationClosed
                 | ErrorReason::OriginIdChangeNotAllowed
-                | ErrorReason::NotifyDisabled,
+                | ErrorReason::NotifyDisabled
+                | ErrorReason::PaymentDisabled
+                | ErrorReason::PlanNotPurchasable,
             ) => (ApplicationErrorCode::Unsupported, false),
             Some(ErrorReason::MailNotConfigured) => (ApplicationErrorCode::Unavailable, false),
-            Some(ErrorReason::CloudUnreachable | ErrorReason::TargetDeviceOffline) => {
-                (ApplicationErrorCode::Unavailable, true)
-            }
+            Some(
+                ErrorReason::CloudUnreachable
+                | ErrorReason::TargetDeviceOffline
+                | ErrorReason::PaymentGatewayFailed,
+            ) => (ApplicationErrorCode::Unavailable, true),
             _ => {
                 let code = match (self.status, self.code.as_deref()) {
                     (Some(404), _) => ApplicationErrorCode::NotFound,
@@ -1449,8 +1574,8 @@ mod tests {
             (403, "device_limit", Reason::DeviceLimit, Code::Conflict),
             (
                 403,
-                "sync_device_limit",
-                Reason::SyncDeviceLimit,
+                "online_device_limit",
+                Reason::OnlineDeviceLimit,
                 Code::Conflict,
             ),
             (
@@ -1804,6 +1929,7 @@ mod tests {
                     version: 1,
                     dirty: true,
                     deleted: false,
+                    edited_at_ms: None,
                 },
             );
             state
@@ -2045,5 +2171,157 @@ mod tests {
         }
         let unreachable = CloudError::network("dns".to_owned());
         assert_eq!(unreachable.reason(), Some(ErrorReason::CloudUnreachable));
+    }
+
+    #[test]
+    fn billing_error_codes_map_to_stable_reasons_and_rpc_codes() {
+        use fluxdown_protocol::{ApplicationErrorCode, ErrorReason};
+
+        use super::CloudError;
+        let error = |status: u16, code: &str| CloudError {
+            status: Some(status),
+            code: Some(code.to_owned()),
+            message: String::new(),
+            retryable: false,
+            unreachable: false,
+        };
+        let cases = [
+            (
+                503,
+                "payment_disabled",
+                ErrorReason::PaymentDisabled,
+                ApplicationErrorCode::Unsupported,
+            ),
+            (
+                502,
+                "gateway_error",
+                ErrorReason::PaymentGatewayFailed,
+                ApplicationErrorCode::Unavailable,
+            ),
+            (
+                422,
+                "plan_not_purchasable",
+                ErrorReason::PlanNotPurchasable,
+                ApplicationErrorCode::Unsupported,
+            ),
+            (
+                409,
+                "plan_already_owned",
+                ErrorReason::PlanAlreadyOwned,
+                ApplicationErrorCode::Conflict,
+            ),
+            (
+                422,
+                "not_an_upgrade",
+                ErrorReason::PlanNotUpgrade,
+                ApplicationErrorCode::Conflict,
+            ),
+            (
+                422,
+                "plan_tier_not_higher",
+                ErrorReason::PlanTierNotHigher,
+                ApplicationErrorCode::Conflict,
+            ),
+            (
+                400,
+                "referral_code_invalid",
+                ErrorReason::ReferralCodeInvalid,
+                ApplicationErrorCode::InvalidArgument,
+            ),
+            (
+                400,
+                "referral_self_use",
+                ErrorReason::ReferralSelfUse,
+                ApplicationErrorCode::InvalidArgument,
+            ),
+            (
+                400,
+                "referral_already_used",
+                ErrorReason::ReferralAlreadyUsed,
+                ApplicationErrorCode::InvalidArgument,
+            ),
+            (
+                400,
+                "referral_plan_excluded",
+                ErrorReason::ReferralPlanExcluded,
+                ApplicationErrorCode::InvalidArgument,
+            ),
+            (
+                400,
+                "referral_code_taken",
+                ErrorReason::ReferralCodeTaken,
+                ApplicationErrorCode::Conflict,
+            ),
+        ];
+        for (status, code, reason, rpc_code) in cases {
+            let error = error(status, code);
+            assert_eq!(error.reason(), Some(reason), "{code}");
+            let data = error.to_rpc_error();
+            assert_eq!(data.code, rpc_code, "{code}");
+            assert_eq!(data.reason, Some(reason), "{code}");
+        }
+        // 网关失败可重试：客户端据此提示「稍后重试」而不是终止。
+        assert!(error(502, "gateway_error").to_rpc_error().retryable);
+    }
+
+    #[test]
+    fn http_date_parses_to_unix_milliseconds() {
+        assert_eq!(
+            super::parse_http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777_000)
+        );
+        assert_eq!(
+            super::parse_http_date_ms("Fri, 01 Jan 2100 00:00:00 GMT"),
+            Some(4_102_444_800_000)
+        );
+        assert_eq!(
+            super::parse_http_date_ms("Thu, 01 Jan 1970 00:00:00 GMT"),
+            Some(0)
+        );
+        assert_eq!(
+            super::parse_http_date_ms("Sunday, 06-Nov-94 08:49:37 GMT"),
+            None
+        );
+        assert_eq!(super::parse_http_date_ms("garbage"), None);
+    }
+
+    #[tokio::test]
+    async fn response_date_header_calibrates_the_server_clock_estimate() {
+        async fn dated() -> Response {
+            (
+                [(header::DATE, "Fri, 01 Jan 2100 00:00:00 GMT")],
+                axum::Json(json!({ "ok": true })),
+            )
+                .into_response()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock cloud");
+        let address = listener.local_addr().expect("mock address");
+        let app = Router::new().route("/api/v1/dated", get(dated));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve dated mock");
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_cloud_clock_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(StateStore::open(dir.clone()).await.expect("state store"));
+        let state = Arc::new(Mutex::new(AgentState::default()));
+        let client =
+            CloudClient::new(format!("http://{address}"), state, store).expect("cloud client");
+        let before = client.server_now_ms();
+        assert!(before < 4_000_000_000_000, "no sample yet: raw local time");
+        let _: Value = client
+            .public::<Value, Value>(reqwest::Method::GET, "/api/v1/dated", None)
+            .await
+            .expect("dated response");
+        // 样本取该秒中点；允许往返与调度抖动。
+        let drift = (client.server_now_ms() - 4_102_444_800_500).abs();
+        assert!(drift < 2_000, "estimate drifted by {drift}ms");
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "could not remove clock test directory");
+        }
     }
 }

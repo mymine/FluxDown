@@ -259,6 +259,12 @@ impl AgentDownloadsPort {
                         .await?;
                     return Ok(DownloadsResult::TaskActivity(page));
                 }
+                DownloadsCommand::TaskSpeedHistory(query) => {
+                    let history = client
+                        .call(method::DAEMON_TASK_SPEED_HISTORY, Some(query))
+                        .await?;
+                    return Ok(DownloadsResult::TaskSpeedHistory(history));
+                }
                 DownloadsCommand::FileIcon(params) => {
                     let icon: fluxdown_protocol::PlatformFileIconDto = client
                         .call(method::AGENT_PLATFORM_FILE_ICON, Some(params))
@@ -295,6 +301,15 @@ impl AgentDownloadsPort {
                     method::DAEMON_TASK_SET_SEGMENTS,
                     serialize(fluxdown_protocol::SetTaskSegmentsParams { task_id, segments })?,
                 ),
+                DownloadsCommand::VerifyTask { task_id } => {
+                    let result = client
+                        .call(
+                            method::DAEMON_TASK_VERIFY,
+                            Some(json!({ "taskId": task_id })),
+                        )
+                        .await?;
+                    return Ok(DownloadsResult::TaskVerify(result));
+                }
                 DownloadsCommand::Delete {
                     task_id,
                     delete_files,

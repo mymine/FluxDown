@@ -14,7 +14,7 @@ use fluxdown_protocol::{
 use fluxdown_ui_account::AccountHost;
 use fluxdown_ui_downloads::DownloadView;
 use fluxdown_ui_i18n::{I18nCatalog, I18nError, Translator, system_locale};
-use fluxdown_ui_settings::{SettingsStore, SettingsView, component_locale};
+use fluxdown_ui_settings::{SettingsStore, SettingsView, SlotVisibility, component_locale};
 use fluxdown_ui_shell::ShellView;
 use gpui::{App, AppContext as _, Entity, Global, WeakEntity};
 use tokio::sync::mpsc;
@@ -78,6 +78,8 @@ pub(crate) struct Desktop {
     pub settings_store: Entity<SettingsStore>,
     /// 账户 / 设备 / 局域网配对状态：设置页与「添加设备」对话框共享。
     pub account_host: Entity<AccountHost>,
+    /// 设置侧栏「推介有奖」页的可见性（已登录 + 设备本地偏好），设置窗口与命令面板共用。
+    pub referral_visibility: Entity<SlotVisibility>,
     /// 主窗口内的下载页（主窗口关闭后失效）。
     pub main_downloads: Option<WeakEntity<DownloadView>>,
     pub main_shell: Option<WeakEntity<ShellView>>,
@@ -133,6 +135,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         files: launch.torrent_files.clone(),
         activate: launch.activate_existing || !launch.capture_only,
         settings: launch.settings,
+        new_download: launch.new_download,
         progress_task: launch.progress_task.clone(),
     };
     let lock_wait = if launch.after_update || launch.relaunch {
@@ -217,12 +220,23 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         }
     });
     application.run(move |cx| {
-        gpui_component::init(cx);
+        // gpui-shell 组件目录的初始化内含 `gpui_component::init`，故整体替代它并先于主题初始化；
+        // 失败只让插件界面不可用（组件仍已初始化）。
+        if let Err(error) = fluxdown_ui_plugin_ui::init(
+            cx,
+            Arc::new(crate::capability_ports::AgentPluginUiPort::new(
+                agent_client.clone(),
+            )),
+            DesktopPaths::from_env().data_root.join("plugin-ui"),
+        ) {
+            log::error!("plugin desktop interfaces unavailable: {error}");
+        }
         crate::logging::install_ui_watchdog(cx);
         crate::app_icon::install();
         fluxdown_ui_theme::init(cx);
         gpui_component::set_locale(&locale);
         let translator = cx.new(|_| translator);
+        fluxdown_ui_plugin_ui::set_translator(cx, translator.clone());
         let session = cx.new(|cx| AgentSession::new(agent_client.clone(), cx));
         WindowRegistry::init(cx, agent_client.clone());
 
@@ -251,15 +265,17 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         })
         .detach();
 
-        crate::menus::bind_keys(cx);
+        crate::shortcuts::install(cx, &settings_store, &translator);
         crate::menus::install(cx, &translator);
         crate::menus::install_global_actions(cx);
+        let referral_visibility = cx.new(|_| SlotVisibility::default());
         cx.set_global(Desktop {
             translator: translator.clone(),
             session: session.clone(),
             client: agent_client.clone(),
             settings_store,
             account_host,
+            referral_visibility,
             main_downloads: None,
             main_shell: None,
             settings_view: None,
@@ -271,6 +287,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         // 会话 → 运行时统计 / 外壳状态折叠进 Desktop。偏好不在此处理：`SettingsStore` 已订阅同一
         // 会话并叠加本地未回执编辑，外观与语言只从它投影（见 `observe_preferences`）。
         observe_preferences(cx);
+        crate::account_host::bind_referral_visibility(cx);
         after_first_snapshot(cx, crate::legacy_themes::migrate);
         cx.subscribe(&session, |_, signal, cx| match signal {
             SessionSignal::Snapshot(snapshot) => {
@@ -350,6 +367,8 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
                     }
                     if message.settings {
                         crate::windows::settings::open(cx);
+                    } else if message.new_download {
+                        crate::windows::new_download::open_default(cx);
                     } else if message.activate {
                         crate::windows::main::reveal(cx);
                     }
@@ -368,6 +387,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         crate::windows::selection::install(cx);
         crate::windows::file_conflict::install(cx);
         crate::plugin_notices::install(cx);
+        crate::plugin_contributions::install(cx);
         crate::update_notices::install(cx);
         if launch.after_update {
             after_session_settled(cx, crate::update_notices::show_installed);
@@ -380,6 +400,8 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
 
         if launch.settings {
             after_session_settled(cx, crate::windows::settings::open);
+        } else if launch.new_download {
+            after_session_settled(cx, crate::windows::new_download::open_default);
         } else if launch.capture_only {
             // 由 agent 为待确认交互拉起：不开主窗口；确认窗口随快照 / 事件打开，全部关闭后由
             // 窗口注册表退出。启动链接提交完成后若首个快照里已无待确认项，直接退出。
@@ -636,13 +658,15 @@ fn apply_preferences(values: &BTreeMap<String, serde_json::Value>, cx: &mut App)
     }
 }
 
-/// 偏好快照/事件 → 活动栏可选入口可见性（条目与偏好键见 `activity` 注册表）。
+/// 偏好快照/事件 → 活动栏可选入口可见性与 chrome 布局（条目与偏好键见 `activity` /
+/// `chrome_layout`）。
 fn apply_activity_bar_preferences(values: &BTreeMap<String, serde_json::Value>, cx: &mut App) {
     let Some(shell) = Desktop::global(cx).main_shell.clone() else {
         return;
     };
     if let Err(error) = shell.update(cx, |shell, cx| {
         crate::activity::apply_visibility(shell, values, cx);
+        crate::chrome_layout::apply(shell, values, cx);
     }) {
         log::debug!("view or window released before lifecycle update: {error:#}");
     }

@@ -41,7 +41,9 @@ private struct NewDownloadContent: View {
     @State private var showDiscard = false
     @State private var showImporter = false
     @State private var importerKind: ImporterKind = .text
+    #if FULL_P2P
     @State private var importingTorrent = false
+    #endif
     @State private var dropTargeted = false
     @State private var path: [NewDownloadRoute] = []
     /// 「下载到」候选的分区缓存（云端 presence）。
@@ -143,12 +145,14 @@ private struct NewDownloadContent: View {
         .interactiveDismissDisabled(form.isDirty || form.submitting)
         .fileImporter(
             isPresented: $showImporter,
-            allowedContentTypes: importerKind == .torrent ? [TorrentImport.contentType] : [.plainText, .text, .data],
+            allowedContentTypes: importerContentTypes,
             allowsMultipleSelection: true
         ) { result in
             switch importerKind {
             case .text: importFiles(result)
+            #if FULL_P2P
             case .torrent: importTorrentFiles(result)
+            #endif
             }
         }
         .presentationDetents([.large])
@@ -188,7 +192,7 @@ private struct NewDownloadContent: View {
     private func linksSection(_ entries: [UrlEntry], remote: Bool) -> some View {
         let hasText = !form.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let error: String? =
-            if hasText, entries.isEmpty { L("newDownloadNoValidUrl") }
+            if hasText, entries.isEmpty { L(BuildFlavor.key(full: "newDownloadNoValidUrl", store: "newDownloadNoValidUrlGeneric")) }
             else if !hasText, form.showEmptyError { L("mobileEnterUrl") }
             else { nil }
         return Section {
@@ -202,7 +206,7 @@ private struct NewDownloadContent: View {
                 .frame(minHeight: 110)
                 .overlay(alignment: .topLeading) {
                     if form.urlText.isEmpty {
-                        Text(L("batchUrlPlaceholder"))
+                        Text(L(BuildFlavor.key(full: "batchUrlPlaceholder", store: "batchUrlPlaceholderGeneric")))
                             .font(.callout.monospaced())
                             .foregroundStyle(.tertiary)
                             .padding(.top, 8)
@@ -219,7 +223,9 @@ private struct NewDownloadContent: View {
                     .foregroundStyle(Color.fdStatusFailedText)
             }
             pasteButton
+            #if FULL_P2P
             torrentButton(remote: remote)
+            #endif
             importButton
         } header: {
             HStack {
@@ -232,7 +238,7 @@ private struct NewDownloadContent: View {
                 }
             }
         } footer: {
-            Text(L("batchDownloadDesc"))
+            Text(L(BuildFlavor.key(full: "batchDownloadDesc", store: "batchDownloadDescGeneric")))
         }
     }
 
@@ -256,6 +262,7 @@ private struct NewDownloadContent: View {
         .disabled(form.submitting)
     }
 
+    #if FULL_P2P
     /// 种子文件只能在当前主机建任务，「下载到」选了其他设备时禁用（同 GPUI）。
     private func torrentButton(remote: Bool) -> some View {
         Button {
@@ -271,6 +278,7 @@ private struct NewDownloadContent: View {
         .disabled(form.submitting || importingTorrent || form.probe != nil || remote)
         .accessibilityHint(importingTorrent ? L("btProbing") : "")
     }
+    #endif
 
     private var importButton: some View {
         Button(L("importTxtFile"), systemImage: "text.document") {
@@ -278,6 +286,13 @@ private struct NewDownloadContent: View {
             showImporter = true
         }
         .disabled(form.submitting)
+    }
+
+    private var importerContentTypes: [UTType] {
+        #if FULL_P2P
+        if importerKind == .torrent { return [TorrentImport.contentType] }
+        #endif
+        return [.plainText, .text, .data]
     }
 
     // MARK: 预览
@@ -660,6 +675,14 @@ private struct NewDownloadContent: View {
             form.showEmptyError = true
             return
         }
+        #if !FULL_P2P
+        // 商店构建的本机引擎不含 P2P：提交前拦截，避免把链接送进引擎；远端主机照常提交。
+        if container.isLocalHost, form.entries.contains(where: { P2PLink.isP2P($0.url) }) {
+            reject()
+            container.toasts.show(text: L("webChangeUrlErrProtocolUnsupported"), tone: .warning)
+            return
+        }
+        #endif
         if !container.isLocalHost, !form.saveDirValid {
             reject()
             return
@@ -827,6 +850,7 @@ private struct NewDownloadContent: View {
         }
     }
 
+    #if FULL_P2P
     private func importTorrentFiles(_ result: Result<[URL], Error>) {
         switch result {
         case let .failure(error):
@@ -857,8 +881,9 @@ private struct NewDownloadContent: View {
             close()
         }
     }
+    #endif
 
-    /// iPad 拖放：`.torrent` → 导入；`.txt/.url/.list` → TXT 导入路径；其余 → 不支持提示。
+    /// iPad 拖放：`.txt/.url/.list` → TXT 导入路径；full 构建另支持 `.torrent` → 导入；其余 → 不支持提示。
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         guard !providers.isEmpty, !form.submitting else { return false }
         Task {
@@ -866,14 +891,15 @@ private struct NewDownloadContent: View {
             defer { DroppedFiles.discard(loaded.files) }
             if loaded.rejected > 0 {
                 FluxHaptic.warning.play()
-                container.toasts.show(text: L("unsupportedDropHint"), tone: .warning)
+                container.toasts.show(text: L(BuildFlavor.key(full: "unsupportedDropHint", store: "unsupportedDropHintGeneric")), tone: .warning)
             }
             if loaded.failed > 0 {
                 FluxHaptic.error.play()
                 container.toasts.show(text: L("dropReadFailed", ["count": loaded.failed]), tone: .error)
             }
-            let torrents = loaded.files.filter { $0.kind == .torrent }.map(\.url)
             let texts = loaded.files.filter { $0.kind == .text }.map(\.url)
+            #if FULL_P2P
+            let torrents = loaded.files.filter { $0.kind == .torrent }.map(\.url)
             if !torrents.isEmpty {
                 if form.target(in: dispatchTargets) != nil {
                     FluxHaptic.warning.play()
@@ -882,6 +908,7 @@ private struct NewDownloadContent: View {
                     await importTorrents(torrents)
                 }
             }
+            #endif
             if !texts.isEmpty { await mergeTextFiles(texts) }
         }
         return true
@@ -908,7 +935,12 @@ nonisolated enum NewDownloadRoute: Hashable {
 }
 
 /// 文件选择器的用途：决定可选类型与结果去向。
-private nonisolated enum ImporterKind { case text, torrent }
+private nonisolated enum ImporterKind {
+    case text
+    #if FULL_P2P
+    case torrent
+    #endif
+}
 
 /// 读取文本文件（上限 2 MiB，防止误选大文件）；需要 security-scoped 访问。读取失败向上抛出，由调用方提示。
 private nonisolated func readTextFile(_ url: URL) throws -> String {

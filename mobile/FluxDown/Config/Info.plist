@@ -6,6 +6,7 @@
 	<array>
 		<string>$(PRODUCT_BUNDLE_IDENTIFIER).download.*</string>
 	</array>
+#ifdef FULL_P2P
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
@@ -21,6 +22,7 @@
 			</array>
 		</dict>
 	</array>
+#endif
 	<key>CFBundleLocalizations</key>
 	<array>
 		<string>en</string>
@@ -36,8 +38,10 @@
 			<string>com.fluxdown.link</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
+#ifdef FULL_P2P
 				<string>magnet</string>
 				<string>ed2k</string>
+#endif
 				<string>fluxdown</string>
 			</array>
 		</dict>
@@ -62,6 +66,7 @@
 		<key>UIImageName</key>
 		<string>LaunchMark</string>
 	</dict>
+#ifdef FULL_P2P
 	<key>UTImportedTypeDeclarations</key>
 	<array>
 		<dict>
@@ -86,5 +91,6 @@
 			</dict>
 		</dict>
 	</array>
+#endif
 </dict>
 </plist>

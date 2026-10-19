@@ -389,25 +389,44 @@ fn subprotocol_token(headers: &HeaderMap) -> Option<String> {
     if has_rpc { token } else { None }
 }
 
-/// 防 CSWSH：带 `Origin` 时其 authority 必须等于 `Host`（反代场景也接受 `X-Forwarded-Host`
-/// 首段——浏览器无法为 WebSocket 握手设置自定义头，所以跨站页面伪造不了它）。
+/// 防 CSWSH：带 `Origin` 时其主机必须等于 `Host`（反代场景也接受 `X-Forwarded-Host` 首段）的主机
+/// ——浏览器无法为 WebSocket 握手设置这些头，所以跨站页面伪造不了它们。端口：头里带端口时必须
+/// 等于 `Origin` 的有效端口；不带端口时只比主机，因为常见反代配置（nginx
+/// `proxy_set_header Host $host`、Nginx Proxy Manager）会丢掉对外的非默认端口。
 /// 无 `Origin`（非浏览器客户端）放行。
 #[must_use]
 pub fn origin_allowed(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return true;
     };
-    let Some((_, authority)) = origin.to_str().ok().and_then(|o| o.split_once("://")) else {
+    let Some((scheme, authority)) = origin.to_str().ok().and_then(|o| o.split_once("://")) else {
         return false;
     };
-    let authority = authority.trim_end_matches('/');
+    let default_port = if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else {
+        return false;
+    };
+    let Ok(origin) = authority
+        .trim_end_matches('/')
+        .parse::<axum::http::uri::Authority>()
+    else {
+        return false;
+    };
+    let origin_port = origin.port_u16().unwrap_or(default_port);
     let forwarded = HeaderName::from_static("x-forwarded-host");
     [header::HOST, forwarded].iter().any(|name| {
         headers
             .get(name)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(',').next())
-            .is_some_and(|host| host.trim().eq_ignore_ascii_case(authority))
+            .and_then(|host| host.trim().parse::<axum::http::uri::Authority>().ok())
+            .is_some_and(|host| {
+                host.host().eq_ignore_ascii_case(origin.host())
+                    && host.port_u16().is_none_or(|port| port == origin_port)
+            })
     })
 }
 
@@ -1491,6 +1510,38 @@ mod tests {
             ("x-forwarded-host", "nas.example:8443"),
         ]);
         assert!(origin_allowed(&proxied));
+        // nginx `Host $host` / Nginx Proxy Manager 丢掉对外的非默认端口：只比主机。
+        let stripped = headers(&[
+            ("origin", "https://nas.example:18800"),
+            ("host", "nas.example"),
+        ]);
+        assert!(origin_allowed(&stripped));
+        let stripped_forwarded = headers(&[
+            ("origin", "https://nas.example:18800"),
+            ("host", "127.0.0.1:17800"),
+            ("x-forwarded-host", "nas.example"),
+        ]);
+        assert!(origin_allowed(&stripped_forwarded));
+        // 头里显式带端口时仍按 Origin 的有效端口（缺省 = 协议默认端口）比较。
+        let explicit_mismatch = headers(&[
+            ("origin", "https://nas.example"),
+            ("host", "nas.example:17800"),
+        ]);
+        assert!(!origin_allowed(&explicit_mismatch));
+        let default_port = headers(&[
+            ("origin", "https://nas.example"),
+            ("host", "nas.example:443"),
+        ]);
+        assert!(origin_allowed(&default_port));
+        let stripped_cross = headers(&[
+            ("origin", "https://evil.example:18800"),
+            ("host", "nas.example"),
+        ]);
+        assert!(!origin_allowed(&stripped_cross));
+        let ipv6 = headers(&[("origin", "http://[::1]:17800"), ("host", "[::1]:17800")]);
+        assert!(origin_allowed(&ipv6));
+        let extension = headers(&[("origin", "chrome-extension://abcdef"), ("host", "abcdef")]);
+        assert!(!origin_allowed(&extension));
     }
 
     #[test]

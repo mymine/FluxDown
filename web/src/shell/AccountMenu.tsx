@@ -134,15 +134,15 @@ function AccountCard({ avatar, close, openDialog }: { avatar: AccountAvatarState
   )
 }
 
-/** 账户入口：`trigger(open)` 渲染触发器（活动栏头像 / 底部标签），点击展开账户卡片。 */
-export function AccountMenu({ avatar, trigger }: { avatar: AccountAvatarState; trigger: (open: boolean) => ReactNode }) {
+/** 账户入口：`trigger(open)` 渲染触发器（活动栏头像 / 底部标签 / 标题栏头像），点击展开账户卡片（活动栏向右展开，标题栏向下）。 */
+export function AccountMenu({ avatar, trigger, side = 'right' }: { avatar: AccountAvatarState; trigger: (open: boolean) => ReactNode; side?: 'bottom' | 'right' }) {
   const t = useT()
   const [open, setOpen] = useState(false)
   const [dialog, setDialog] = useState<AccountDialog | null>(null)
   const closeDialog = () => setDialog(null)
   return (
     <>
-      <Popover trigger={trigger(open)} title={t('settingsCatAccount')} side="right" align="end" open={open} onOpenChange={setOpen} className="w-72">
+      <Popover trigger={trigger(open)} title={t('settingsCatAccount')} side={side} align="end" open={open} onOpenChange={setOpen} className="w-72">
         {(close) => <AccountCard avatar={avatar} close={close} openDialog={setDialog} />}
       </Popover>
       {dialog === 'login' ? <LoginDialog onClose={closeDialog} /> : null}

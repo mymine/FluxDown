@@ -183,21 +183,19 @@ pub fn public_config_values(all: &HashMap<String, String>) -> BTreeMap<String, S
 ///
 /// `bt_seed_time_limit_minutes` / `bt_seed_inactive_time_limit_minutes` 落库
 /// 时已是分钟；`*_unit` 键仅记录设置页的展示单位，
-/// 引擎 [`fluxdown_engine::bt_downloader::BtConfig`] 直接取分钟值。
+/// 引擎 [`fluxdown_engine::bt_config::BtConfig`] 直接取分钟值。
 /// `bt_seed_enabled` / `bt_auto_reseed` 不在 `BtConfig` 内：引擎在完成 /
 /// 启动时实时读库，落库即生效。
 #[must_use]
-pub fn bt_config_from_map(
-    cfg: &HashMap<String, String>,
-) -> fluxdown_engine::bt_downloader::BtConfig {
-    use fluxdown_engine::bt_downloader::BtMseMode;
+pub fn bt_config_from_map(cfg: &HashMap<String, String>) -> fluxdown_engine::bt_config::BtConfig {
+    use fluxdown_engine::bt_config::BtMseMode;
     use fluxdown_engine::bt_seeding::SeedingLimitOperator;
 
     let subscription_enabled = cfg
         .get("bt_tracker_sub_enabled")
         .map(|value| value == "true")
         .unwrap_or(true);
-    fluxdown_engine::bt_downloader::BtConfig {
+    fluxdown_engine::bt_config::BtConfig {
         enabled: cfg
             .get("bt_enabled")
             .map(|value| value == "true")

@@ -1,6 +1,7 @@
 package com.fluxdown.core.store
 
 import com.fluxdown.core.host.HostEvent
+import com.fluxdown.core.host.HostErrorCode
 import com.fluxdown.core.host.HostException
 import com.fluxdown.core.host.HostSession
 import com.fluxdown.core.host.HostSignal
@@ -18,6 +19,7 @@ import com.fluxdown.core.model.Task
 import com.fluxdown.core.model.TaskGroup
 import com.fluxdown.core.model.TaskRuntime
 import com.fluxdown.core.model.TaskStatus
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
@@ -118,7 +120,17 @@ class HostStore(
         w = Working()
         _state.value = HostState()
         sessionJob = scope.launch {
-            session.signals.collect { apply(it) }
+            try {
+                session.signals.collect { apply(it) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: HostException) {
+                apply(HostSignal.Fatal(e))
+            } catch (e: RuntimeException) {
+                // 绑定层 / 映射 / 归约的意外异常：此作用域没有异常处理器，逃逸即结束整个进程（含后台下载）。
+                // 转成失败态展示并保留原因，进程照常运行。
+                apply(HostSignal.Fatal(HostException(HostErrorCode.Internal, message = "signal pump failed: $e", cause = e)))
+            }
         }
     }
 

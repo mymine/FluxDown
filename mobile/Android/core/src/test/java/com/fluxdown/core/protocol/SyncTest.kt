@@ -42,7 +42,7 @@ class SyncTest {
     @Test
     fun syncReasonKeyLocalizesByReasonWithGenericFallback() {
         fun key(reason: String?, raw: String? = null) = SyncRules.reasonKey(SyncStatusDto(lastError = raw, lastErrorReason = reason))
-        assertEquals("cloudSyncErrorDeviceLimit", key("syncDeviceLimit"))
+        assertEquals("cloudSyncErrorOnlineLimit", key("onlineDeviceLimit"))
         assertEquals("cloudSyncErrorDeviceUntrusted", key("deviceUntrusted"))
         assertEquals("cloudSyncErrorNetwork", key("cloudUnreachable"))
         assertEquals("cloudSyncErrorGeneric", key("mystery"))

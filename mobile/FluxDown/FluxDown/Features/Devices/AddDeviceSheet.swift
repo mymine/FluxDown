@@ -89,6 +89,9 @@ private struct AddDeviceContent: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .linkPairingPrompts()
+        .onChange(of: sections.lanAccess(state), initial: true) { _, access in
+            model.setLan(access)
+        }
         .onChange(of: current == .local, initial: true) { _, isLocal in
             if isLocal { model.start() } else { model.stop() }
         }
@@ -165,9 +168,10 @@ private struct AddDeviceContent: View {
 
     @ViewBuilder
     private func formContent(model: Bindable<PairingModel>, state: HostState) -> some View {
-        let paired = state.linkDevices.map {
+        let paired = state.linkDevices.filter { !$0.revoked }.map {
             LinkDeviceInfo(fingerprint: $0.fingerprint, name: $0.name, platform: $0.platform, online: $0.online)
         }
+        let lan = sections.lanAccess(state)
         let entries = LinkRules.discoveredEntries(sections.discovered(state), paired: paired)
         let readOnly = state.isReadOnly
         Section {
@@ -179,8 +183,14 @@ private struct AddDeviceContent: View {
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets())
             }
+            if lan != .active {
+                // 本机局域网未生效：仍允许发起，但只能单向（对端无法回连本机）。
+                Banner(text: L("localPairingOneWayHint"), tone: .warning, systemImage: FluxSymbol.offline, slim: true)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
+            }
         }
-        OwnCodeSection(model: model.wrappedValue)
+        OwnCodeSection(model: model.wrappedValue, lan: lan, openLanSettings: openLanSettings)
         discoveredSection(model: model, entries: entries)
         manualSection(model: model, readOnly: readOnly)
         Section {} footer: {
@@ -188,9 +198,24 @@ private struct AddDeviceContent: View {
         }
     }
 
+    /// 收起本 sheet 并跳到「设置 → API 服务」（设置页只在远端主机且具备网关能力时有该入口）。
+    private func openLanSettings() {
+        dismiss()
+        container.router.showSettings(.api)
+    }
+
     private func discoveredSection(model: Bindable<PairingModel>, entries: [LinkRules.DiscoveredEntry]) -> some View {
-        Section {
-            if entries.isEmpty {
+        let searching = entries.isEmpty && model.wrappedValue.searching
+        return Section {
+            if searching {
+                HStack(spacing: 12) {
+                    ProgressView()
+                    Text(L("localPairingDiscovering"))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .combine)
+            } else if entries.isEmpty {
                 Text(L("localPairingNoDevices"))
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -222,7 +247,7 @@ private struct AddDeviceContent: View {
                     .foregroundStyle(Color.fdStatusFailedText)
             }
         } header: {
-            Text(L("localPairingDiscovering"))
+            if !entries.isEmpty { Text(L("localPairingNearbyTitle")) }
         }
     }
 
@@ -331,12 +356,25 @@ private struct AddDeviceContent: View {
         }
         if pending {
             let finishing: Bool = if case .finishing = step { true } else { false }
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 12) { rejectButton(disabled: finishing); confirmButton(disabled: finishing) }
-                VStack(spacing: 12) { confirmButton(disabled: finishing); rejectButton(disabled: finishing) }
+            if finishing {
+                Button {
+                    model.cancelFinishing()
+                } label: {
+                    Text(L("cancel"))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+                .controlSize(.large)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) { rejectButton(disabled: false); confirmButton(disabled: false) }
+                    VStack(spacing: 12) { confirmButton(disabled: false); rejectButton(disabled: false) }
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 8)
         }
     }
 
@@ -410,13 +448,17 @@ private struct DiscoveredPeerRow: View {
 private struct OwnCodeSection: View {
     @Environment(AppContainer.self) private var container
     let model: PairingModel
+    let lan: LinkRules.LanAccess
+    let openLanSettings: () -> Void
 
     @ScaledMetric(relativeTo: .largeTitle) private var codeSize: CGFloat = 44
     @State private var copyTick = 0
 
     var body: some View {
         Section {
-            if let own = model.own {
+            if lan != .active {
+                lanHint
+            } else if let own = model.own {
                 codeBlock(own)
                 addresses(own)
             } else if model.ownLoading {
@@ -427,7 +469,7 @@ private struct OwnCodeSection: View {
                 }
                 .accessibilityElement(children: .combine)
             }
-            if let error = model.ownError {
+            if lan == .active, let error = model.ownError {
                 Label(error, systemImage: FluxSymbol.failure)
                     .font(.footnote)
                     .foregroundStyle(Color.fdStatusFailedText)
@@ -440,6 +482,22 @@ private struct OwnCodeSection: View {
             Text(L("localPairingMyCodeTitle"))
         } footer: {
             Text(L("localPairingMyCodeHint"))
+        }
+    }
+
+    /// 未开启 / 未生效局域网：不显示码，只给出原因；`disabled` 且设置页可达时附「前往设置」。
+    @ViewBuilder
+    private var lanHint: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label(
+                L(lan == .disabled ? "localPairingLanDisabledHint" : "localPairingLanRestartHint"),
+                systemImage: FluxSymbol.offline
+            )
+            .font(.subheadline)
+            .fixedSize(horizontal: false, vertical: true)
+            if lan == .disabled, !container.isLocalHost, container.store.state.has(HostCapability.agentGateway) {
+                Button(L("localPairingOpenLanSettings")) { openLanSettings() }
+            }
         }
     }
 
@@ -511,10 +569,12 @@ private struct OwnCodeSection: View {
             VStack(alignment: .leading, spacing: 6) {
                 Label(L("localPairingNoAddress"), systemImage: FluxSymbol.offline)
                     .font(.subheadline)
-                Text(L(container.isLocalHost ? "mobileAddDeviceNoGatewayHint" : "localPairingLanDisabledHint"))
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if container.isLocalHost {
+                    Text(L("mobileAddDeviceNoGatewayHint"))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         } else {
             VStack(alignment: .leading, spacing: 4) {

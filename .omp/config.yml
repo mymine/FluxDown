@@ -7,6 +7,8 @@
 workspace:
   additionalDirectories:
     - ../FluxCloud
+    - ../fluxdown-plugin-index
+    - ../fluxdown-sniff-rules
 
 tools:
   # write: 自动放行 read/write 层级工具，exec（bash/browser 等）需确认。

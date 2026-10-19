@@ -6,5 +6,17 @@
   "extensionDescription": {
     "message": "Intercept browser downloads and send to FluxDown app for high-speed downloading",
     "description": "The description of the extension"
+  },
+  "commandToggleIntercept": {
+    "message": "Toggle download interception",
+    "description": "Keyboard shortcut: toggle download interception"
+  },
+  "commandDownloadPlayingMedia": {
+    "message": "Download the playing video or audio",
+    "description": "Keyboard shortcut: download the playing media"
+  },
+  "commandOpenSidePanel": {
+    "message": "Open the side panel",
+    "description": "Keyboard shortcut: open the FluxDown side panel"
   }
 }

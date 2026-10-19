@@ -1,5 +1,5 @@
 ---
-/** 无头服务器:Docker 命令 + 独立二进制 + OpenWrt / QNAP / 群晖套件。 */
+/** 无头服务器:Docker 命令 + 独立二进制 + OpenWrt / QNAP / 群晖 / 飞牛套件。 */
 import { HardDrive, Router, Server, ArrowRight } from "lucide-react";
 import AssetGroup, { type RowSpec } from "./AssetGroup.astro";
 import CodeBlock from "./CodeBlock.astro";
@@ -66,6 +66,10 @@ const synology: RowSpec[] = [
   { path: `${s}.synology_dsm6_x64`, label: "DSM 6", detail: "x64", ext: ".spk" },
   { path: `${s}.synology_dsm6_arm64`, label: "DSM 6", detail: "ARM64", ext: ".spk" },
 ];
+const fnos: RowSpec[] = [
+  { path: `${s}.fnos_x64`, label: "x64", ext: ".fpk" },
+  { path: `${s}.fnos_arm64`, label: "ARM64", ext: ".fpk" },
+];
 const notify = "#subscribe";
 ---
 
@@ -110,6 +114,10 @@ const notify = "#subscribe";
       <a class="link mt-auto self-start text-[13px]" href={setupGuide}>{t.server.guide}</a>
     </AssetGroup>
     <AssetGroup lang={lang} id="synology" title="Synology" desc={t.server.synologyDesc} versionPath="server.version" fallback={fallback} rows={synology} notifyHref={notify}>
+      <Fragment slot="icon"><HardDrive size={16} strokeWidth={1.75} /></Fragment>
+      <a class="link mt-auto self-start text-[13px]" href={dockerGuide}>{t.server.dockerGuide}</a>
+    </AssetGroup>
+    <AssetGroup lang={lang} id="fnos" title={t.server.fnosTitle} desc={t.server.fnosDesc} versionPath="server.version" fallback={fallback} rows={fnos} notifyHref={notify}>
       <Fragment slot="icon"><HardDrive size={16} strokeWidth={1.75} /></Fragment>
       <a class="link mt-auto self-start text-[13px]" href={dockerGuide}>{t.server.dockerGuide}</a>
     </AssetGroup>

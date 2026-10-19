@@ -3,6 +3,8 @@
 //! `update_only_files` while `Initializing`, so a post-add update silently
 //! dropped the subset and downloaded every file.
 
+#![cfg(feature = "bt")]
+
 use fluxdown_engine::bt_downloader::{
     BtSelectionStrategy, build_add_torrent_options, decide_bt_selection_strategy,
 };

@@ -4,7 +4,8 @@
 //! Windows 的前台授权受调用进程及其启动者影响：后台常驻 agent 发起的打开可能落在其他窗口
 //! 下面（#824）。打开逻辑（产物 / 临时文件 / 保存目录定位、第三方文件管理器探测、无关联
 //! 文件的回退）仍只在 agent 一处实现，这里由界面进程拉起短命 agent，利用用户点击时的前台
-//! 资格发起打开。等待结果后调用方才关窗；系统是否实际置前仍取决于 Windows 的焦点策略。
+//! 资格发起打开。调用方据结果在窗口里报错；进度 / 完成窗口不等结果，对方接管前台即关窗
+//! （见 `windows/progress.rs`）。系统是否实际置前仍取决于 Windows 的焦点策略。
 
 use std::os::windows::process::CommandExt as _;
 use std::process::{Command, ExitStatus, Stdio};

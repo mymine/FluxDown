@@ -215,13 +215,27 @@ fi
 # macOS 自带 bash 3.2 在 `set -u` 下展开空数组会报 unbound variable（ad-hoc 签名时 SIGN_ARGS 为空）。
 sign() { codesign --force ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} -s "$IDENTITY" "$@"; }
 
+# 插件桌面界面（gpui-shell，Longbridge quickjs-jit）在界面进程内生成机器码：加固运行时下
+# 主程序必须带 allow-jit。后台 helper（agent / daemon / nmh）不执行 JIT，不加。
+ENTITLEMENTS="$WORK/desktop.entitlements"
+cat > "$ENTITLEMENTS" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+
 echo "== sign ($IDENTITY)"
 sign -i "$HOST_ID.daemon" "$HELPER/Contents/MacOS/fluxdownd"
 sign -i "$HOST_ID.nmh" "$HELPER/Contents/MacOS/fluxdown_nmh"
 sign "$HELPER/Contents/MacOS/fluxdown-agent"
 sign "$HELPER"
-sign "$APP/Contents/MacOS/fluxdown-desktop"
-sign "$APP"
+sign --entitlements "$ENTITLEMENTS" "$APP/Contents/MacOS/fluxdown-desktop"
+sign --entitlements "$ENTITLEMENTS" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 # ── DMG ──

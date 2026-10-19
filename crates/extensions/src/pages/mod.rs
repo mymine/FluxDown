@@ -5,6 +5,7 @@ use fluxdown_ui_theme::{ComponentTokens, ExtendedTokens, SemanticThemeTokens};
 
 pub mod managed_components;
 pub mod plugins;
+pub mod site_defaults;
 
 /// 一帧内不变的渲染输入：文案、主题 token 与本地服务连接状态。
 #[derive(Clone, Copy)]

@@ -2,7 +2,7 @@
 title: Contributing to the Docs
 description: How to improve these docs.
 section: contributing
-order: 1
+order: 5
 ---
 
 These docs live in the public [zerx-lab/fluxdown](https://github.com/zerx-lab/fluxdown) repository — every page has an **Edit this page** link.
