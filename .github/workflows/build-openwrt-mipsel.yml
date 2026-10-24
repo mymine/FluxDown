@@ -168,7 +168,17 @@ jobs:
           rel="target/${TARGET}/release"
           mkdir -p dist/bin
           cp "$rel/fluxdown-agent" "$rel/fluxdownd" dist/bin/
-          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$PWD/dist/bin" "$IPK_ARCH" "$PWD/dist"
+          # 上游 2026-10：packaging/openwrt/build_ipk.sh → build.sh，
+          # 用法变为 build.sh <ipk|apk> server <ver> <bindir> <arch,...> <outdir>
+          if [ -f packaging/openwrt/build.sh ]; then
+            sh ./packaging/openwrt/build.sh ipk server \
+              "$VERSION" "$PWD/dist/bin" "$IPK_ARCH" "$PWD/dist"
+          elif [ -f packaging/openwrt/build_ipk.sh ]; then
+            ./packaging/openwrt/build_ipk.sh server \
+              "$VERSION" "$PWD/dist/bin" "$IPK_ARCH" "$PWD/dist"
+          else
+            echo "::warning::未找到 packaging/openwrt/build.sh 或 build_ipk.sh，跳过 ipk 打包"
+          fi
           tar czf "dist/fluxdown-server-${VERSION}-mipsel_24kc.tar.gz" -C dist/bin fluxdown-agent fluxdownd
           ls -la dist dist/bin
 
