@@ -20,6 +20,30 @@ struct TasksProtocolTests {
         #expect(old.seedRatioLimitMilli == SeedLimit.inherit && old.seedUploadLimitBps == 0)
     }
 
+    /// 协议 17 起 `TaskDto` 默认值字段不再上线：只剩恒在字段的任务对象必须解码成「全部跟随全局」，
+    /// 且单个字段缺省不影响其余字段（四个 `seed*Limit*` 缺省 = -2；上传限速缺省 = 0）。
+    @Test func seedLimitsDecodeFromPagedTaskDtoWithDefaultFieldsOmitted() throws {
+        let bare = Data(#"""
+        {"taskId":"t","url":"https://e.com/f","fileName":"f","saveDir":"/d","status":1,
+         "downloadedBytes":10,"totalBytes":100,"createdAt":1760000000}
+        """#.utf8)
+        let limits = try ProtocolJSON.decode(TaskSeedLimits.self, from: bare, what: "task")
+        #expect(limits == TaskSeedLimits())
+        #expect(limits.seedRatioLimitMilli == -2)
+        #expect(limits.seedPostRatioLimitMilli == -2)
+        #expect(limits.seedTimeLimitMinutes == -2)
+        #expect(limits.seedInactiveTimeLimitMinutes == -2)
+        #expect(limits.seedUploadLimitBps == 0)
+
+        // 只有非默认值的字段会上线：其余仍按缺省回落。
+        let partial = Data(#"""
+        {"taskId":"t","url":"magnet:?xt=urn:btih:x","fileName":"f","saveDir":"/d","status":3,
+         "downloadedBytes":0,"totalBytes":0,"createdAt":1,"seedTimeLimitMinutes":-1,"seedUploadLimitBps":2048}
+        """#.utf8)
+        let some = try ProtocolJSON.decode(TaskSeedLimits.self, from: partial, what: "task")
+        #expect(some == TaskSeedLimits(seedTimeLimitMinutes: SeedLimit.unlimited, seedUploadLimitBps: 2048))
+    }
+
     @Test func seedLimitField_modeMappingFromWire() {
         #expect(SeedLimitField(wire: -2, unit: .ratio).mode == .inherit)
         #expect(SeedLimitField(wire: -1, unit: .ratio).mode == .unlimited)
@@ -308,5 +332,13 @@ struct TasksProtocolTests {
         #expect(PluginFailure.isIgnorable(status: .failed, errorMessage: "[插件] yt: boom"))
         #expect(!PluginFailure.isIgnorable(status: .failed, errorMessage: "connection reset"))
         #expect(!PluginFailure.isIgnorable(status: .paused, errorMessage: "[插件] yt: boom"))
+    }
+
+    @Test func taskErrorMessageLocalization() {
+        #expect(TaskErrorMessage.localizationKey(for: TaskErrorMessage.postOnlyEndpoint) == "taskErrorPostOnlyEndpoint")
+        #expect(TaskErrorMessage.localizationKey(for: " " + TaskErrorMessage.postOnlyResume + "\n") == "taskErrorPostOnlyResume")
+        #expect(TaskErrorMessage.localizationKey(for: "connection reset") == nil)
+        #expect(TaskErrorMessage.displayText("connection reset", localize: { _ in "x" }) == "connection reset")
+        #expect(TaskErrorMessage.displayText(TaskErrorMessage.postOnlyResume, localize: { "L:" + $0 }) == "L:taskErrorPostOnlyResume")
     }
 }

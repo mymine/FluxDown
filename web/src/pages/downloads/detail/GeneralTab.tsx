@@ -7,6 +7,7 @@ import { useDownloads } from '../state'
 import { taskStateLabel } from '../table/text'
 import { copyUrls, downloadViewsFiles, isDownloadable } from '../model/actions'
 import { MAX_ETA_SECS, PROTOCOL_LABEL, formatBytes, formatDateTime, sourceSite } from '../model/task'
+import { localizeTaskError } from '../model/taskError'
 import type { DownloadTaskView, TaskState } from '../model/task'
 import { canChangeSegments, canChangeUrl } from '../model/taskEdit'
 import { openChangeSegments, openChangeUrl, openGroupDetail } from '../dialogs'
@@ -109,8 +110,8 @@ export function GeneralTab({ view }: { view: DownloadTaskView }) {
         {view.errorMessage !== '' ? (
           <DetailRow label={t('infoError')}>
             <div className="flex items-center gap-1">
-              <span className="min-w-0 flex-1 break-all text-destructive">{view.errorMessage}</span>
-              <CopyErrorButton message={view.errorMessage} />
+              <span className="min-w-0 flex-1 break-all text-destructive">{localizeTaskError(t, view.errorMessage)}</span>
+              <CopyErrorButton message={localizeTaskError(t, view.errorMessage)} />
             </div>
           </DetailRow>
         ) : null}

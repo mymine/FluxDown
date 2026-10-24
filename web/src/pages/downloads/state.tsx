@@ -8,9 +8,9 @@ import { useIsMobile } from '../../ui'
 import {
   rpc,
   useAgent,
-  useAgentSnapshot,
   useDaemon,
   usePref,
+  useTaskTableStatus,
   useTasks,
 } from '../../lib/rpc'
 import type {
@@ -27,37 +27,29 @@ import type {
 import { CategoryIndex, categoriesFromPreference } from './model/categories'
 import { RescanThrottle } from '../../lib/rescanThrottle'
 import { currentDeviceId, visibleRemoteTasks } from './model/devices'
-import { filterMatches, LOCAL_DEVICE, SELECTION_ALL } from './model/filters'
+import { SELECTION_ALL } from './model/filters'
 import type { SidebarSelection } from './model/filters'
 import { remoteCan } from './model/batchPlan'
 import { isDownloadable } from './model/actions'
+import type { SidebarCounts } from './model/counts'
 import { useLiveSpeeds } from './model/liveSpeeds'
-import { isDynamicSortKey } from './model/rowOrder'
-import { buildLocalView, buildRemoteView, isLocalKey, sourceSite, STATE_RANK } from './model/task'
+import { buildVisibleRows, dirCollapseKey, dominantCategory, groupFullySelected, groupsMatchingQuery, selectGroupOnClick, selectionIsGroup } from './model/groupRows'
+import type { BucketInfo, GroupFolderRow, VisibleRow, VisibleRowsInput } from './model/groupRows'
+import { makeAggregate } from './model/groupTree'
+import type { GroupAggregate, GroupCounts } from './model/groupTree'
+import { buildRemoteView, canPause, canResumeSeeding, isLocalKey, sourceSite, STATE_RANK } from './model/task'
 import type { DownloadTaskView, RowKey } from './model/task'
-import { useStableRowOrder } from './model/useStableRowOrder'
+import { useRowEngine } from './model/useRowEngine'
 import { queueLabelById } from './dialogs/utils'
 import { useDaemonReady } from './statusbar/widget'
-import { compareViews, dateBucketOf, DATE_BUCKET_ORDER, matchesQuery, parseViewPrefs, VIEW_PREFS_KEY } from './model/viewPrefs'
+import { compareViews, dateBucketOf, DATE_BUCKET_ORDER, parseViewPrefs, VIEW_PREFS_KEY } from './model/viewPrefs'
 import type { ViewPrefs } from './model/viewPrefs'
 
 // ── 类型 ──
 
-/** 表格可见行：任务行或分组头。 */
-export type VisibleRow =
-  | { type: 'task'; key: RowKey; view: DownloadTaskView }
-  | { type: 'group'; key: string; label: string; count: number; collapsed: boolean }
-
-export interface GroupSummary {
-  id: string
-  name: string
-  originUrl: string
-  saveDir: string
-  total: number
-  completed: number
-  failed: number
-  downloading: number
-  progress: number
+/** 按键读取当前视图（背后是行引擎的持久索引，不随进度帧重建）。 */
+export interface ViewLookup {
+  get: (key: RowKey) => DownloadTaskView | undefined
 }
 
 /** 选中集合投影（选择条 / 工具栏）：只统计仍存在的选中任务。 */
@@ -83,13 +75,28 @@ export interface ClickModifiers {
 export interface DownloadsContextValue {
   /** daemon 连接就绪（false = 只读快照）。 */
   connected: boolean
-  views: readonly DownloadTaskView[]
-  byKey: ReadonlyMap<RowKey, DownloadTaskView>
+  /**
+   * 任务表仍在分页载入（`daemon.taskTotal` / `queueTotal` 存在）：本地任务不完整，不得当作完整列表
+   * （计数、空态、批量操作范围、「任务已消失」推断都要跳过）；此时 `selectedViews` 恒为空。
+   */
+  tasksLoading: boolean
+  /** 服务端任务总数（载入期间取快照头里的 `taskTotal`）。 */
+  taskTotal: number
+  /** 已载入的任务行数。 */
+  loadedTasks: number
+  /** 全部视图（本地 + 远程）：O(N) 现取，只给菜单动作用，渲染路径不要碰。 */
+  allViews: () => readonly DownloadTaskView[]
+  byKey: ViewLookup
+  /** 侧栏计数（随任务增删改增量维护；载入期间不完整）。 */
+  counts: SidebarCounts
+  /** 任一行内容变化时递增（行对象原位更新，靠它让消费者重新读取）。 */
+  contentVersion: number
   categories: CategoryIndex
   queues: readonly QueueDto[]
   queueName: (queueId: string) => string
   groups: readonly GroupDto[]
-  groupSummaries: readonly GroupSummary[]
+  /** 任务组全部成员（不受侧栏筛选 / 搜索影响）的计数与聚合；没有成员返回 undefined。 */
+  groupTotals: (groupId: string) => GroupAggregate | undefined
   cloudDevices: readonly CloudDevice[]
   linkedDevices: readonly LinkDeviceInfo[]
 
@@ -104,8 +111,10 @@ export interface DownloadsContextValue {
 
   /** 当前筛选 + 搜索 + 分组 + 排序后的可见行。 */
   rows: readonly VisibleRow[]
-  /** 可见任务键（表格顺序，不含折叠分组内的任务）。 */
-  visibleKeys: readonly RowKey[]
+  /** 可见任务数（不含折叠分组内的任务）。 */
+  visibleCount: number
+  /** 选中集里仍可见的任务数（表头全选框三态用）。 */
+  visibleSelected: number
   selected: ReadonlySet<RowKey>
   selectedViews: readonly DownloadTaskView[]
   summary: SelectionSummary
@@ -123,7 +132,22 @@ export interface DownloadsContextValue {
   contextSelect: (key: RowKey) => void
   selectAll: () => void
   clearSelection: () => void
-  toggleGroupCollapsed: (groupKey: string) => void
+  /** 折叠 / 展开分组方式的桶标题（偏好 `collapsed_groups`）。 */
+  toggleBucketCollapsed: (bucketKey: string) => void
+  /** 组行点击（普通 / Cmd·Ctrl / Shift 的选区语义见 `selectGroupOnClick`）。 */
+  clickGroup: (row: GroupFolderRow, modifiers: ClickModifiers) => void
+  /** 组行首格复选框：切换全部通过成员（与任务的 toggle 多选同语义）。 */
+  toggleGroupSelected: (row: GroupFolderRow) => void
+  /** 组行右键：成员未全选时先执行普通单击选择。 */
+  contextSelectGroup: (row: GroupFolderRow) => void
+  /** 切换组展开（运行期状态，不持久化）。 */
+  toggleGroupExpanded: (groupId: string) => void
+  /** 切换组内目录折叠（运行期状态）。 */
+  toggleDirCollapsed: (groupId: string, dir: string) => void
+  /** 停靠面板正在显示「组概览」的组 id（聚焦组且选区恰好等于其通过成员）。 */
+  overviewGroupId: string | null
+  /** 聚焦该组（选中其通过成员）并打开详情面板。 */
+  showGroupDetail: (row: GroupFolderRow) => void
 
   /** 详情面板是否打开：桌面取偏好 `detail_open`，移动端（Sheet）为页面本地状态。 */
   detailOpen: boolean
@@ -155,7 +179,23 @@ const EMPTY_GROUPS: readonly GroupDto[] = []
 const EMPTY_CLOUD: readonly CloudDevice[] = []
 const EMPTY_LINKED: readonly LinkDeviceInfo[] = []
 const EMPTY_SELECTED: ReadonlySet<RowKey> = new Set()
+const EMPTY_VIEWS: readonly DownloadTaskView[] = []
+const EMPTY_STRINGS: ReadonlySet<string> = new Set()
 const PREFS_DEBOUNCE_MS = 300
+
+/** 集合切换一个成员（返回新集合）。 */
+function toggledSet(current: ReadonlySet<string>, item: string): ReadonlySet<string> {
+  const next = new Set(current)
+  if (!next.delete(item)) next.add(item)
+  return next
+}
+
+/** 只保留满足条件的成员；没有变化返回原集合（避免无谓重渲染）。 */
+function pruneSet(current: ReadonlySet<string>, keep: (item: string) => boolean): ReadonlySet<string> {
+  if (current.size === 0) return current
+  const kept = [...current].filter(keep)
+  return kept.length === current.size ? current : new Set(kept)
+}
 
 const selectRuntime = (daemon: { taskRuntime: Record<string, TaskRuntimeDto> }) => daemon.taskRuntime
 const selectPriority = (daemon: { priority: string[] }) => daemon.priority
@@ -171,14 +211,11 @@ const selectLinked = (snapshot: { linkedDevices: LinkDeviceInfo[] }) => snapshot
 
 function useViewPrefsState(): { prefs: ViewPrefs; updatePrefs: DownloadsContextValue['updatePrefs'] } {
   const serverValue = usePref<unknown>(VIEW_PREFS_KEY)
-  const snapshot = useAgentSnapshot()
-  const tasks = useTasks()
   const [prefs, setPrefs] = useState<ViewPrefs>(() => parseViewPrefs(serverValue))
   const prefsRef = useRef(prefs)
   /** 最近一次应用 / 写出的规范化序列化值：自己写出的值回流不重载。 */
   const applied = useRef(serverValue === undefined ? undefined : JSON.stringify(parseViewPrefs(serverValue)))
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const defaultsDecided = useRef(false)
 
   const flush = useCallback(() => {
     if (timer.current === null) return
@@ -201,17 +238,6 @@ function useViewPrefsState(): { prefs: ViewPrefs; updatePrefs: DownloadsContextV
     setPrefs(next)
   }, [serverValue])
 
-  // 无偏好时首次按「存在组任务」决定默认分组维度（不写回）。
-  useEffect(() => {
-    if (defaultsDecided.current || !snapshot) return
-    defaultsDecided.current = true
-    if (serverValue === undefined && tasks.some((task) => task.groupId !== '')) {
-      const next: ViewPrefs = { ...prefsRef.current, group_by: 'group' }
-      prefsRef.current = next
-      setPrefs(next)
-    }
-  }, [snapshot, serverValue, tasks])
-
   useEffect(() => flush, [flush])
 
   const updatePrefs = useCallback<DownloadsContextValue['updatePrefs']>(
@@ -228,23 +254,13 @@ function useViewPrefsState(): { prefs: ViewPrefs; updatePrefs: DownloadsContextV
   return { prefs, updatePrefs }
 }
 
-// ── 任务行投影（复用未变化的行对象，行组件才能 memo） ──
-
-interface CachedView {
-  task: object
-  speed: number | null
-  boosted: boolean
-  queuePosition: number
-  runtime: TaskRuntimeDto | undefined
-  connected: boolean
-  view: DownloadTaskView
-}
-
 // ── Provider ──
 
 export function DownloadsProvider({ children }: { children: ReactNode }) {
   const t = useT()
   const tasks = useTasks()
+  const tableStatus = useTaskTableStatus()
+  const tasksLoading = tableStatus.loading
   const runtimes = useDaemon(selectRuntime, EMPTY_RUNTIME)
   const priority = useDaemon(selectPriority, EMPTY_PRIORITY as string[])
   const queuePositions = useDaemon(selectQueuePositions, EMPTY_QUEUE_POSITIONS as QueuePositionDto[])
@@ -295,6 +311,8 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   const [selected, setSelected] = useState<ReadonlySet<RowKey>>(EMPTY_SELECTED)
   const [multiSelectMode, setMultiSelectMode] = useState(false)
   const anchor = useRef<RowKey | null>(null)
+  /** 面板「组概览」聚焦的组（普通单击组行设置；任何任务点选 / 清空选区清除）。 */
+  const [focusedGroup, setFocusedGroup] = useState<string | null>(null)
   const [detailTaskId, setDetailTaskId] = useState<string | null>(null)
   const mobile = useIsMobile()
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false)
@@ -303,138 +321,85 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
 
   const categories = useMemo(() => new CategoryIndex(categoriesFromPreference(categoriesPref)), [categoriesPref])
 
-  // 本地行：复用缓存
-  const cache = useRef(new Map<string, CachedView>())
   const boostedId = priority[0] ?? null
-  const positionById = useMemo(
-    () => new Map(queuePositions.map((entry) => [entry.taskId, entry.position])),
-    [queuePositions],
-  )
-  const localViews = useMemo(() => {
-    const previous = cache.current
-    const next = new Map<string, CachedView>()
-    const views = tasks.map((task) => {
-      const speed = live.download[task.taskId] ?? null
-      const boosted = boostedId === task.taskId
-      const queuePosition = positionById.get(task.taskId) ?? 0
-      const runtime = runtimes[task.taskId]
-      const hit = previous.get(task.taskId)
-      if (
-        hit &&
-        hit.task === task &&
-        hit.speed === speed &&
-        hit.boosted === boosted &&
-        hit.queuePosition === queuePosition &&
-        hit.runtime === runtime &&
-        hit.connected === connected
-      ) {
-        next.set(task.taskId, hit)
-        return hit.view
-      }
-      const view = buildLocalView(task, speed, boosted, queuePosition, runtime, connected)
-      next.set(task.taskId, { task, speed, boosted, queuePosition, runtime, connected, view })
-      return view
-    })
-    cache.current = next
-    return views
-  }, [tasks, live, boostedId, positionById, runtimes, connected])
-
   const currentId = useMemo(() => currentDeviceId(session, cloudDevices), [session, cloudDevices])
   const remoteViews = useMemo(
     () => visibleRemoteTasks(remoteTasks, currentId).map(buildRemoteView),
     [remoteTasks, currentId],
   )
-  const views = useMemo(() => [...localViews, ...remoteViews], [localViews, remoteViews])
-  const byKey = useMemo(() => new Map(views.map((view) => [view.key, view])), [views])
-
-  const queueName = useCallback((queueId: string) => queueLabelById(t, queues, queueId), [t, queues])
-  const groupNames = useMemo(() => new Map(groups.map((group) => [group.groupId, group.name])), [groups])
-
-  const groupSummaries = useMemo<GroupSummary[]>(() => {
-    const summaries = new Map<string, GroupSummary & { downloaded: number; totalBytes: number }>()
-    for (const group of groups) {
-      summaries.set(group.groupId, {
-        id: group.groupId,
-        name: group.name,
-        originUrl: group.sourceUrl,
-        saveDir: group.saveDir,
-        total: 0,
-        completed: 0,
-        failed: 0,
-        downloading: 0,
-        progress: 0,
-        downloaded: 0,
-        totalBytes: 0,
-      })
-    }
-    for (const view of localViews) {
-      if (view.groupId === '') continue
-      const summary = summaries.get(view.groupId)
-      if (!summary) continue
-      summary.total += 1
-      if (view.state === 'completed') summary.completed += 1
-      else if (view.state === 'failed') summary.failed += 1
-      else if (view.state === 'downloading') summary.downloading += 1
-      summary.downloaded += view.downloadedBytes
-      summary.totalBytes += view.sizeBytes
-    }
-    return [...summaries.values()].map(({ downloaded, totalBytes, ...summary }) => ({
-      ...summary,
-      progress:
-        totalBytes > 0
-          ? Math.min(1, downloaded / totalBytes)
-          : summary.total > 0
-            ? summary.completed / summary.total
-            : 0,
-    }))
-  }, [groups, localViews])
-
   const normalizedQuery = useMemo(() => query.trim().toLowerCase(), [query])
+  const groupMatches = useMemo(() => groupsMatchingQuery(groups, normalizedQuery), [groups, normalizedQuery])
 
-  // 筛选 + 搜索
-  const matching = useMemo(() => {
-    const matchesSelection = (view: DownloadTaskView): boolean => {
-      switch (sidebarSelection.kind) {
-        case 'download':
-          return filterMatches(sidebarSelection.filter, view, categories)
-        case 'queue':
-          return view.source === 'local' && view.queueId === sidebarSelection.queueId
-        case 'device': {
-          const device = sidebarSelection.deviceId
-          if (device === LOCAL_DEVICE) return view.source === 'local'
-          return view.source === 'remote' && view.toDevice === device
-        }
+  // 行引擎：任务行投影 / 筛选 / 搜索 / 排序 / 行顺序稳定 / 侧栏计数 / 任务组汇总都按输入差分增量维护，
+  // 一帧进度只触及变化的行（见 model/rowEngine.ts）。
+  const { engine, snapshot } = useRowEngine({
+    tasks,
+    speeds: live.download,
+    uploads: live.upload,
+    boostedId,
+    queuePositions,
+    runtimes,
+    connected,
+    remote: remoteViews,
+    selection: sidebarSelection,
+    query: normalizedQuery,
+    groupMatches,
+    categories,
+    sortKey: prefs.sort_key,
+    sortDir: prefs.sort_dir,
+  })
+  const byKey = useMemo<ViewLookup>(() => ({ get: (key) => engine.viewOf(key) }), [engine])
+  const allViews = useCallback(() => engine.views(), [engine])
+  const groupTotals = useCallback<DownloadsContextValue['groupTotals']>(
+    (groupId) => {
+      const tally = engine.groupTally(groupId)
+      if (tally === undefined) return undefined
+      const counts: GroupCounts = {
+        total: tally.total,
+        done: tally.completed,
+        downloading: tally.downloading,
+        pending: tally.pending,
+        paused: tally.paused,
+        failed: tally.failed,
       }
-    }
-    return views.filter((view) => matchesSelection(view) && matchesQuery(view, normalizedQuery))
-  }, [views, sidebarSelection, categories, normalizedQuery])
-  const matchingKeys = useMemo(() => new Set(matching.map((view) => view.key)), [matching])
-
-  // 排序 + 行顺序稳定（保持期内仅内容变化不改变已有行的相对顺序，见 model/rowOrder.ts）
-  const sorted = useMemo(() => matching.slice().sort((a, b) => compareViews(prefs, a, b)), [matching, prefs])
-  const ordered = useStableRowOrder(
-    sorted,
-    views,
-    [sidebarSelection, normalizedQuery, categories, prefs.sort_key, prefs.sort_dir],
-    isDynamicSortKey(prefs.sort_key),
+      return makeAggregate(counts, tally.totalBytes, tally.downloaded, tally.speed, false)
+    },
+    [engine],
   )
 
-  // 分组
-  const { rows, visibleKeys } = useMemo(() => {
-    const taskRow = (view: DownloadTaskView): VisibleRow => ({ type: 'task', key: view.key, view })
-    if (prefs.group_by === 'none') {
-      return { rows: ordered.map(taskRow), visibleKeys: ordered.map((view) => view.key) }
-    }
+  const queueName = useCallback((queueId: string) => queueLabelById(t, queues, queueId), [t, queues])
 
-    interface Bucket {
-      key: string
-      label: string
-      order: number
-      views: DownloadTaskView[]
+  // 组展开 / 目录折叠：运行期状态，不持久化；组消失时清理。
+  const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(EMPTY_STRINGS)
+  const [dirCollapsed, setDirCollapsed] = useState<ReadonlySet<string>>(EMPTY_STRINGS)
+  useEffect(() => {
+    const live = new Set(groups.map((group) => group.groupId))
+    setExpandedGroups((current) => pruneSet(current, (id) => live.has(id)))
+    setDirCollapsed((current) => pruneSet(current, (key) => live.has(key.slice(0, key.indexOf('\u0000')))))
+  }, [groups])
+
+  const compare = useMemo<VisibleRowsInput['compare']>(() => {
+    const sort = { sort_key: prefs.sort_key, sort_dir: prefs.sort_dir }
+    return (left, right) => compareViews(sort, left, right)
+  }, [prefs.sort_key, prefs.sort_dir])
+  const collapsedBuckets = useMemo(() => new Set(prefs.collapsed_groups), [prefs.collapsed_groups])
+
+  // 分组方式的桶归属：任务按自身视图，组行按聚合代理视图（「类型」取通过成员里占多数的分类）。
+  const bucketOf = useMemo<VisibleRowsInput['bucketOf']>(() => {
+    const groupBy = prefs.group_by
+    if (groupBy === 'none') return null
+    const queueIndex = new Map<string, number>()
+    if (groupBy === 'queue') {
+      queues.forEach((queue, index) => {
+        if (!queueIndex.has(queue.queueId)) queueIndex.set(queue.queueId, index)
+      })
     }
-    const buckets: Bucket[] = []
-    const bucketOf = (view: DownloadTaskView): Omit<Bucket, 'views'> => {
-      switch (prefs.group_by) {
+    const categoryOrder = (id: string): number => {
+      const index = categories.indexOf(id)
+      return index < 0 ? Number.MAX_SAFE_INTEGER : index
+    }
+    return (view, groupMembers): BucketInfo => {
+      switch (groupBy) {
         case 'status':
           return { key: `status:${view.state}`, label: stateLabel(t, view.state), order: STATE_RANK[view.state] }
         case 'date': {
@@ -442,8 +407,12 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
           return { key: `date:${bucket}`, label: t(DATE_LABEL_KEY[bucket]), order: DATE_BUCKET_ORDER[bucket] }
         }
         case 'type': {
-          const id = categories.categoryOf(view)
-          const index = categories.rules.findIndex((rule) => rule.dto.id === id)
+          const own = categories.categoryOf(view)
+          const id =
+            groupMembers === null
+              ? own
+              : (dominantCategory(groupMembers, (member) => categories.categoryOf(member), categoryOrder) ?? own)
+          const index = categories.indexOf(id)
           const rule = categories.rules[index]
           return {
             key: `type:${id}`,
@@ -455,7 +424,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
           if (view.source === 'remote') {
             return { key: 'queue:remote', label: t('remoteTasksGroup'), order: Number.MAX_SAFE_INTEGER }
           }
-          const index = queues.findIndex((queue) => queue.queueId === view.queueId)
+          const index = queueIndex.get(view.queueId) ?? -1
           return {
             key: `queue:${view.queueId}`,
             label: queueLabelById(t, queues, view.queueId),
@@ -467,49 +436,57 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
           const label = site !== '' ? site : view.protocol === 'bt' ? t('viewSiteBt') : '—'
           return { key: `site:${label}`, label, order: 0 }
         }
-        case 'group': {
-          if (view.groupId === '') {
-            return { key: 'group:', label: t('ungroupedTasks'), order: Number.MAX_SAFE_INTEGER }
-          }
-          return { key: `group:${view.groupId}`, label: groupNames.get(view.groupId) ?? view.groupId, order: 0 }
-        }
-        default:
-          return { key: '', label: '', order: 0 }
       }
     }
-    for (const view of ordered) {
-      const info = bucketOf(view)
-      const existing = buckets.find((bucket) => bucket.key === info.key)
-      if (existing) existing.views.push(view)
-      else buckets.push({ ...info, views: [view] })
+  }, [prefs.group_by, queues, categories, t])
+
+  // 可见行：任务组并成文件夹行（按聚合代理排序并入）、分桶、展开成员 / 目录行（O(N)，只在布局或分组归属
+  // 字段变化时重算，进度帧不触发；组行聚合在渲染时读成员行的最新视图）。
+  const built = useMemo(
+    () =>
+      buildVisibleRows({
+        rows: snapshot.rows,
+        groups,
+        compare,
+        bucketOf,
+        collapsedBuckets,
+        expanded: expandedGroups,
+        dirCollapsed,
+        searching: normalizedQuery !== '',
+      }),
+    // 行对象原位更新：内容变化不重排，只有布局 / 分组归属变化（版本号）才重算。
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `snapshot.rows` 随 layoutVersion 换身份，groupingVersion 覆盖分组归属字段
+    [snapshot.rows, snapshot.groupingVersion, groups, compare, bucketOf, collapsedBuckets, expandedGroups, dirCollapsed, normalizedQuery],
+  )
+  const rows: readonly VisibleRow[] = built.rows
+  const visibleCount = built.visibleCount
+
+  // 选中集里仍可见的任务数：没有组参与且不分桶时可见集 = 命中集；否则按可见任务序列（折叠桶 / 折叠目录内的不算）。
+  const visibleSelected = useMemo(() => {
+    if (selected.size === 0) return 0
+    let count = 0
+    if (prefs.group_by === 'none' && built.folders.size === 0) {
+      for (const key of selected) if (engine.isMatched(key)) count += 1
+    } else {
+      const visible = new Set(built.sequence())
+      for (const key of selected) if (visible.has(key)) count += 1
     }
-    buckets.sort((a, b) => a.order - b.order || (a.label < b.label ? -1 : a.label > b.label ? 1 : 0))
-    const collapsedSet = new Set(prefs.collapsed_groups)
-    const out: VisibleRow[] = []
-    const keys: RowKey[] = []
-    for (const bucket of buckets) {
-      const collapsed = collapsedSet.has(bucket.key)
-      out.push({ type: 'group', key: bucket.key, label: bucket.label, count: bucket.views.length, collapsed })
-      if (!collapsed) {
-        for (const view of bucket.views) {
-          out.push(taskRow(view))
-          keys.push(view.key)
-        }
-      }
-    }
-    return { rows: out, visibleKeys: keys }
-  }, [ordered, prefs, queues, groupNames, categories, t])
+    return count
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 命中集随 matchVersion 变化
+  }, [selected, engine, built, snapshot.matchVersion, prefs.group_by])
 
   // 选中集只保留当前筛选 + 搜索下仍在视图内的任务（折叠分组内的仍属于当前视图）。
+  // 任务表载入期间本地任务不完整，「不在视图内」不代表任务被删：跳过，载入完成后再收敛。
   useEffect(() => {
+    if (tasksLoading) return
     setSelected((current) => {
       if (current.size === 0) return current
-      const kept = [...current].filter((key) => matchingKeys.has(key))
+      const kept = [...current].filter((key) => engine.isMatched(key))
       if (kept.length === current.size) return current
       if (anchor.current !== null && !kept.includes(anchor.current)) anchor.current = null
       return kept.length === 0 ? EMPTY_SELECTED : new Set(kept)
     })
-  }, [matchingKeys])
+  }, [engine, snapshot.matchVersion, tasksLoading])
 
   const setSidebarSelection = useCallback((selection: SidebarSelection) => {
     setSidebarSelectionState((current) => (JSON.stringify(current) === JSON.stringify(selection) ? current : selection))
@@ -525,14 +502,21 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   // 搜索 150ms 防抖由输入框侧完成，这里直接存值。
   const setQuery = useCallback((value: string) => setQueryState(value), [])
 
+  const selectedRef = useRef(selected)
+  selectedRef.current = selected
+  const multiModeRef = useRef(multiSelectMode)
+  multiModeRef.current = multiSelectMode
+
   const clickSelect = useCallback(
     (key: RowKey, modifiers: ClickModifiers) => {
+      setFocusedGroup(null)
       if (modifiers.shift && anchor.current !== null) {
-        const from = visibleKeys.indexOf(anchor.current)
-        const to = visibleKeys.indexOf(key)
+        const keys = built.sequence()
+        const from = keys.indexOf(anchor.current)
+        const to = keys.indexOf(key)
         if (from >= 0 && to >= 0) {
           const [start, end] = from <= to ? [from, to] : [to, from]
-          setSelected(new Set(visibleKeys.slice(start, end + 1)))
+          setSelected(new Set(keys.slice(start, end + 1)))
           anchor.current = key
           return
         }
@@ -548,10 +532,11 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       setMultiSelectMode(modifiers.secondary)
       anchor.current = key
     },
-    [visibleKeys],
+    [built],
   )
 
   const toggleSelected = useCallback((key: RowKey) => {
+    setFocusedGroup(null)
     setSelected((current) => {
       const next = new Set(current)
       if (!next.delete(key)) next.add(key)
@@ -564,20 +549,24 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     setSelected((current) => {
       if (current.has(key)) return current
       setMultiSelectMode(false)
+      setFocusedGroup(null)
       return new Set([key])
     })
     anchor.current = key
   }, [])
 
   const selectAll = useCallback(() => {
-    setSelected(new Set(visibleKeys))
+    if (tasksLoading) return
+    setSelected(new Set(built.sequence()))
     setMultiSelectMode(true)
+    setFocusedGroup(null)
     anchor.current = null
-  }, [visibleKeys])
+  }, [built, tasksLoading])
 
   const clearSelection = useCallback(() => {
     setSelected(EMPTY_SELECTED)
     setMultiSelectMode(false)
+    setFocusedGroup(null)
     anchor.current = null
   }, [])
 
@@ -585,6 +574,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
 
   const toggleMultiSelect = useCallback(
     (key: RowKey) => {
+      setFocusedGroup(null)
       setSelected((current) => {
         if (!multiSelect) return new Set([key])
         const next = new Set(current)
@@ -599,20 +589,74 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
 
   const enterMultiSelect = useCallback(() => setMultiSelectMode(true), [])
 
-  const toggleGroupCollapsed = useCallback(
-    (groupKey: string) =>
+  const clickGroup = useCallback(
+    (row: GroupFolderRow, modifiers: ClickModifiers) => {
+      const result = selectGroupOnClick(
+        { selected: selectedRef.current, multiSelect: multiModeRef.current, anchor: anchor.current },
+        row.groupId,
+        row.orderedKeys(),
+        built.sequence(),
+        modifiers,
+      )
+      setSelected(result.selected.size === 0 ? EMPTY_SELECTED : result.selected)
+      setMultiSelectMode(result.multiSelect)
+      setFocusedGroup(result.focusedGroup)
+      anchor.current = result.anchor
+    },
+    [built],
+  )
+
+  const toggleGroupSelected = useCallback(
+    (row: GroupFolderRow) => {
+      const keys = row.orderedKeys()
+      setFocusedGroup(null)
+      setSelected((current) => {
+        if (!multiSelect) return new Set(keys)
+        const next = new Set(current)
+        if (groupFullySelected(current, keys)) for (const key of keys) next.delete(key)
+        else for (const key of keys) next.add(key)
+        return next
+      })
+      setMultiSelectMode(true)
+      anchor.current = keys[keys.length - 1] ?? null
+    },
+    [multiSelect],
+  )
+
+  const contextSelectGroup = useCallback(
+    (row: GroupFolderRow) => {
+      if (!groupFullySelected(selectedRef.current, row.orderedKeys())) clickGroup(row, { shift: false, secondary: false })
+    },
+    [clickGroup],
+  )
+
+  const toggleGroupExpanded = useCallback((groupId: string) => {
+    setExpandedGroups((current) => toggledSet(current, groupId))
+  }, [])
+
+  const toggleDirCollapsed = useCallback((groupId: string, dir: string) => {
+    setDirCollapsed((current) => toggledSet(current, dirCollapseKey(groupId, dir)))
+  }, [])
+
+  const toggleBucketCollapsed = useCallback(
+    (bucketKey: string) =>
       updatePrefs((current) => ({
         ...current,
-        collapsed_groups: current.collapsed_groups.includes(groupKey)
-          ? current.collapsed_groups.filter((item) => item !== groupKey)
-          : [...current.collapsed_groups, groupKey],
+        collapsed_groups: current.collapsed_groups.includes(bucketKey)
+          ? current.collapsed_groups.filter((item) => item !== bucketKey)
+          : [...current.collapsed_groups, bucketKey],
       })),
     [updatePrefs],
   )
 
   const selectedViews = useMemo(
-    () => [...selected].map((key) => byKey.get(key)).filter((view): view is DownloadTaskView => view !== undefined),
-    [selected, byKey],
+    () =>
+      tasksLoading
+        ? EMPTY_VIEWS
+        : [...selected].map((key) => byKey.get(key)).filter((view): view is DownloadTaskView => view !== undefined),
+    // 行内容原位更新：靠 contentVersion 让选中视图随进度刷新。
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- contentVersion 是视图内容的失效信号
+    [selected, byKey, snapshot.contentVersion, tasksLoading],
   )
 
   const summary = useMemo<SelectionSummary>(() => {
@@ -622,8 +666,8 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     let allDownloadable = selectedViews.length > 0
     for (const view of selectedViews) {
       anyLocal ||= view.source === 'local'
-      if (view.state === 'downloading' || view.state === 'pending') anyActive ||= remoteCan(view, 'pause')
-      else if (view.state === 'paused' || view.state === 'failed') anyResumable ||= remoteCan(view, 'resume')
+      if (canPause(view)) anyActive ||= remoteCan(view, 'pause')
+      if (view.state === 'paused' || view.state === 'failed' || canResumeSeeding(view)) anyResumable ||= remoteCan(view, 'resume')
       if (!isDownloadable(view)) allDownloadable = false
     }
     return {
@@ -636,6 +680,12 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     }
   }, [selectedViews])
 
+  const overviewGroupId = useMemo(() => {
+    if (focusedGroup === null) return null
+    const folder = built.folders.get(focusedGroup)
+    return folder !== undefined && selectionIsGroup(selected, folder.members) ? focusedGroup : null
+  }, [focusedGroup, built, selected])
+
   // 详情面板打开时跟随「恰好一个本地选中任务」。
   const singleLocal = selected.size === 1 ? [...selected][0] : undefined
   useEffect(() => {
@@ -647,8 +697,22 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   const showDetail = useCallback(
     (taskId: string) => {
       setDetailTaskId(taskId)
+      setFocusedGroup(null)
       setSelected(new Set([`l:${taskId}`]))
       anchor.current = `l:${taskId}`
+      if (mobile) setMobileDetailOpen(true)
+      else updatePrefs((current) => (current.detail_open ? current : { ...current, detail_open: true }))
+    },
+    [updatePrefs, mobile],
+  )
+
+  const showGroupDetail = useCallback(
+    (row: GroupFolderRow) => {
+      const keys = row.orderedKeys()
+      setSelected(new Set(keys))
+      setMultiSelectMode(false)
+      setFocusedGroup(row.groupId)
+      anchor.current = keys[keys.length - 1] ?? null
       if (mobile) setMobileDetailOpen(true)
       else updatePrefs((current) => (current.detail_open ? current : { ...current, detail_open: true }))
     },
@@ -664,13 +728,18 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   const value = useMemo<DownloadsContextValue>(
     () => ({
       connected,
-      views,
+      tasksLoading,
+      taskTotal: tableStatus.total,
+      loadedTasks: tableStatus.loaded,
+      allViews,
       byKey,
+      counts: snapshot.counts,
+      contentVersion: snapshot.contentVersion,
       categories,
       queues,
       queueName,
       groups,
-      groupSummaries,
+      groupTotals,
       cloudDevices,
       linkedDevices,
       sidebarSelection,
@@ -680,7 +749,8 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       prefs,
       updatePrefs,
       rows,
-      visibleKeys,
+      visibleCount,
+      visibleSelected,
       selected,
       selectedViews,
       summary,
@@ -692,7 +762,14 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       contextSelect,
       selectAll,
       clearSelection,
-      toggleGroupCollapsed,
+      toggleBucketCollapsed,
+      clickGroup,
+      toggleGroupSelected,
+      contextSelectGroup,
+      toggleGroupExpanded,
+      toggleDirCollapsed,
+      overviewGroupId,
+      showGroupDetail,
       detailOpen,
       detailTaskId,
       showDetail,
@@ -702,13 +779,18 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     }),
     [
       connected,
-      views,
+      tasksLoading,
+      tableStatus.total,
+      tableStatus.loaded,
+      allViews,
       byKey,
+      snapshot.counts,
+      snapshot.contentVersion,
       categories,
       queues,
       queueName,
       groups,
-      groupSummaries,
+      groupTotals,
       cloudDevices,
       linkedDevices,
       sidebarSelection,
@@ -718,7 +800,8 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       prefs,
       updatePrefs,
       rows,
-      visibleKeys,
+      visibleCount,
+      visibleSelected,
       selected,
       selectedViews,
       summary,
@@ -730,7 +813,14 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       contextSelect,
       selectAll,
       clearSelection,
-      toggleGroupCollapsed,
+      toggleBucketCollapsed,
+      clickGroup,
+      toggleGroupSelected,
+      contextSelectGroup,
+      toggleGroupExpanded,
+      toggleDirCollapsed,
+      overviewGroupId,
+      showGroupDetail,
       detailOpen,
       detailTaskId,
       showDetail,

@@ -44,8 +44,12 @@ import com.fluxdown.core.model.CloudDevice
 import com.fluxdown.core.model.HostRef
 import com.fluxdown.core.model.LinkDevice
 import com.fluxdown.core.model.TaskStatus
+import com.fluxdown.core.protocol.CloudConnectionDto
+import com.fluxdown.core.protocol.CloudPresence
 import com.fluxdown.core.protocol.DeviceRules
 import com.fluxdown.core.protocol.HostCapability
+import com.fluxdown.core.protocol.HostSection
+import com.fluxdown.core.protocol.Json
 import com.fluxdown.core.protocol.has
 import com.fluxdown.core.store.Connection
 import com.fluxdown.fluxui.chrome.FluxGlassIconButton
@@ -77,7 +81,8 @@ import com.fluxdown.fluxui.theme.FluxText
 import com.fluxdown.fluxui.theme.FluxTheme
 
 /**
- * V1 设备页（Dock 目的地）：当前主机卡 + 云端已信任设备 + 已配对设备（直连：在线点 / 刷新状态 / 重命名 / 解除配对）。
+ * V1 设备页（Dock 目的地）：当前主机卡 + 云端已信任设备（presence 未知时显示「状态未知」）+ 已配对设备
+ * （直连：在线点 / 刷新状态 / 下发 / 重命名 / 解除配对）。
  * 添加设备（账户 / 直连配对）经页头「+」打开 [AddDeviceSheet]；入站配对确认是全局弹层（[InboundPairingPrompt]）。
  */
 @Composable
@@ -90,14 +95,14 @@ fun DevicesScreen() {
     val cloud by remember { derivedStateOf { host.value.cloudDevices } }
     val link by remember { derivedStateOf { host.value.linkDevices } }
     val facts = remember { derivedStateOf { host.value.toFacts() } }
-
-    val cloudSorted = remember(cloud) {
-        cloud.sortedWith(
-            compareByDescending<CloudDevice> { it.isCurrent }
-                .thenByDescending { it.isOnline }
-                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name },
-        )
+    val live by remember { derivedStateOf { host.value.connection == Connection.Live } }
+    val connectionRaw by remember { derivedStateOf { host.value.sections[HostSection.agentCloudConnection] } }
+    // 云端在线状态是否可信（与「下载到」候选同一判定）；不可信时云设备显示「状态未知」，不当离线
+    val presenceKnown = remember(connectionRaw, live) {
+        CloudPresence.isKnown(CloudConnectionDto.fromJson(Json.parseOrNull(connectionRaw)), live)
     }
+
+    val cloudSorted = remember(cloud, presenceKnown) { DeviceRules.sorted(cloud, presenceKnown) }
     val linkSorted = remember(link) {
         link.sortedWith(
             compareBy<LinkDevice> { it.revoked }
@@ -106,6 +111,10 @@ fun DevicesScreen() {
         )
     }
     val sameAccount = remember(cloud, link) { DeviceRules.attachedLinkFingerprints(cloud, link) }
+    // 与「下载到」同一份候选；已挂接的直连记录经 resolveTarget 解析为云条目键，revoked / 不在候选里的没有下发入口
+    val targets = remember(cloud, link, presenceKnown, live) { DeviceRules.dispatchTargets(cloud, link, presenceKnown, live) }
+    fun dispatchTargetId(d: LinkDevice): String? =
+        if (d.revoked) null else DeviceRules.resolveTarget("link:${d.fingerprint}", targets)?.id
     val accountCap by remember { derivedStateOf { host.value.has(HostCapability.agentAuth) } }
     val linkCap by remember { derivedStateOf { host.value.has(HostCapability.agentDeviceLink) } }
     val readOnly by remember { derivedStateOf { host.value.isReadOnly } }
@@ -113,7 +122,6 @@ fun DevicesScreen() {
     var renaming by remember { mutableStateOf<LinkDevice?>(null) }
 
     val listState = rememberLazyListState()
-    DockMiniEffect(listState)
     val swipe = LocalSwipeRevealCoordinator.current
     val gate = rememberFlowInGate()
     val margin = space.screenMargin
@@ -149,6 +157,7 @@ fun DevicesScreen() {
                 hostRef = hostRef,
                 facts = facts.value,
                 onSwitch = { nav.openSheet(SheetRoute.HostSwitch) },
+                onRepair = { (hostRef as? HostRef.Remote)?.let { nav.openSheet(SheetRoute.AddHost(repair = it)) } },
                 modifier = Modifier.padding(horizontal = margin, vertical = 6.dp).fluxFlowIn(1, gate, "host"),
             )
         }
@@ -161,7 +170,7 @@ fun DevicesScreen() {
                 ) {
                     cloudSorted.forEach { d ->
                         row(hasIcon = true) {
-                            DeviceRow(d.name, d.platform, d.isOnline, d.appVersion, d.isCurrent)
+                            DeviceRow(d.name, d.platform, if (presenceKnown) d.isOnline else null, d.appVersion, d.isCurrent)
                         }
                     }
                 }
@@ -196,6 +205,7 @@ fun DevicesScreen() {
                                 device = d,
                                 sameAccount = d.fingerprint in sameAccount,
                                 actionsEnabled = !readOnly,
+                                onDispatch = dispatchTargetId(d)?.let { id -> { nav.openSheet(SheetRoute.NewDownload(targetId = id)) } },
                                 onRename = { renaming = d },
                                 onRemove = { links.confirmRemove(d) },
                             )
@@ -267,7 +277,7 @@ private fun com.fluxdown.core.store.HostState.toFacts(): HostFacts {
 // ── 当前主机卡 ──────────────────────────────────────────────────────────
 
 @Composable
-private fun HostCard(hostRef: HostRef, facts: HostFacts, onSwitch: () -> Unit, modifier: Modifier = Modifier) {
+private fun HostCard(hostRef: HostRef, facts: HostFacts, onSwitch: () -> Unit, onRepair: () -> Unit, modifier: Modifier = Modifier) {
     val c = FluxTheme.colors
     val t = FluxTheme.type
     val actions = LocalTaskActions.current
@@ -278,7 +288,13 @@ private fun HostCard(hostRef: HostRef, facts: HostFacts, onSwitch: () -> Unit, m
         Connection.Stale -> str(R.string.mobileHostConnStale) to Tone.Amber
         is Connection.Failed -> str(R.string.mobileHostConnFailed) to Tone.Coral
     }
-    val connError = (facts.connection as? Connection.Failed)?.let { actions.errorText(it.error) }
+    val failure = (facts.connection as? Connection.Failed)?.error
+    val needsRepair = failure != null && hostRef.needsRepair(failure)
+    val connError = when {
+        needsRepair -> str(R.string.mobileHostRepairNeeded)
+        failure != null -> actions.errorText(failure)
+        else -> null
+    }
 
     Column(
         modifier
@@ -308,6 +324,15 @@ private fun HostCard(hostRef: HostRef, facts: HostFacts, onSwitch: () -> Unit, m
                 },
             )
             if (connError != null) FluxText(connError, style = t.sm, color = c.coralText)
+            if (needsRepair) {
+                FluxButton(
+                    text = str(R.string.mobileHostRepair),
+                    onClick = onRepair,
+                    variant = ButtonVariant.Secondary,
+                    size = ButtonSize.Sm,
+                    icon = FluxIcons.Link,
+                )
+            }
         }
         FluxDivider()
         val disk = facts.diskFree?.let { Format.bytes(it) }
@@ -340,17 +365,27 @@ private fun HostCard(hostRef: HostRef, facts: HostFacts, onSwitch: () -> Unit, m
 private fun DeviceRow(
     name: String,
     platform: String?,
-    online: Boolean,
+    /** null = 云端 presence 不可信（状态未知，不当离线）。 */
+    online: Boolean?,
     version: String?,
     current: Boolean,
     subtitleOverride: String? = null,
+    /** 附在状态行末尾的说明（如「可控制本机」）。 */
+    note: String? = null,
     trailing: (@Composable () -> Unit)? = null,
 ) {
     val c = FluxTheme.colors
     val subtitle = subtitleOverride ?: listOfNotNull(
-        str(if (online) R.string.deviceOnline else R.string.deviceOffline),
+        str(
+            when (online) {
+                true -> R.string.deviceOnline
+                false -> R.string.deviceOffline
+                null -> R.string.devicePresenceUnknown
+            },
+        ),
         platformLabel(platform),
         version?.takeIf { it.isNotBlank() }?.let { "v$it" },
+        note,
     ).joinToString(" · ")
     FluxListRow(
         title = name,
@@ -359,10 +394,10 @@ private fun DeviceRow(
             Box(Modifier.size(44.dp)) {
                 GlyphTile(
                     icon = platformIcon(platform),
-                    tint = if (online) c.ink else c.inkFaint,
+                    tint = if (online == true) c.ink else c.inkFaint,
                     modifier = Modifier.align(Alignment.TopStart),
                 )
-                PresenceMark(online, Modifier.align(Alignment.BottomEnd))
+                PresenceMark(online == true, Modifier.align(Alignment.BottomEnd))
             }
         },
         trailing = trailing ?: if (current) ({ FluxTag(str(R.string.thisDevice), tone = Tone.Accent) }) else null,
@@ -371,13 +406,14 @@ private fun DeviceRow(
 
 /**
  * 已配对设备行（直连）：在线点、生效名（备注名优先）、平台 / 版本；对方已解除 = revoked 标签 + 只给「解除配对」；
- * 挂接到同账号云设备 = 「同一账号」标签；操作：重命名、解除配对。
+ * 挂接到同账号云设备 = 「同一账号」标签；操作：下发（[onDispatch] 非空才显示）、重命名、解除配对。
  */
 @Composable
 private fun LinkedDeviceRow(
     device: LinkDevice,
     sameAccount: Boolean,
     actionsEnabled: Boolean,
+    onDispatch: (() -> Unit)?,
     onRename: () -> Unit,
     onRemove: () -> Unit,
 ) {
@@ -388,6 +424,7 @@ private fun LinkedDeviceRow(
         version = device.appVersion,
         current = false,
         subtitleOverride = if (device.revoked) str(R.string.linkedDeviceRevokedDesc) else null,
+        note = if (device.grantsControl && !device.revoked) str(R.string.linkControlGrantedTag) else null,
         trailing = {
             Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
                 when {
@@ -395,6 +432,16 @@ private fun LinkedDeviceRow(
                     sameAccount -> FluxTag(str(R.string.linkedDeviceSameAccountTag), tone = Tone.Accent)
                 }
                 if (!device.revoked) {
+                    if (onDispatch != null) {
+                        FluxIconButton(
+                            FluxIcons.Send,
+                            str(R.string.deviceDownloadToThis),
+                            onClick = onDispatch,
+                            size = IconButtonSize.Sm,
+                            glass = false,
+                            enabled = actionsEnabled,
+                        )
+                    }
                     FluxIconButton(
                         FluxIcons.Pen,
                         str(R.string.linkedDeviceRename),

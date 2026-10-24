@@ -27,7 +27,7 @@ pub mod types;
 pub mod wire;
 
 pub use address::PeerAddress;
-pub use crypto::{LINK_ENC_V2, LINK_PROTOCOL_VERSION};
+pub use crypto::{LINK_CONTROL_VERSION, LINK_ENC_V2, LINK_PROTOCOL_VERSION};
 pub use error::{LinkError, LinkResult};
 pub use identity::LinkIdentity;
 pub use manager::{

@@ -29,6 +29,7 @@ import com.fluxdown.app.ui.tileIcon
 import com.fluxdown.core.format.Format
 import com.fluxdown.core.host.HostException
 import com.fluxdown.core.model.CloudDevice
+import com.fluxdown.core.model.TaskErrorMessage
 import com.fluxdown.core.protocol.CloudConnectionDto
 import com.fluxdown.core.protocol.CloudPresence
 import com.fluxdown.core.protocol.HostMethod
@@ -157,6 +158,8 @@ internal fun RemoteTaskRow(entry: RemoteRowEntry, style: RowStyle, flowIndex: In
         deleteTask = str(R.string.deleteTask),
         deleteTaskAndFile = str(R.string.deleteTaskAndFile),
         statusError = str(R.string.statusError),
+        errorPostOnlyEndpoint = str(R.string.taskErrorPostOnlyEndpoint),
+        errorPostOnlyResume = str(R.string.taskErrorPostOnlyResume),
         statusCompleted = str(R.string.statusCompleted),
         statusDownloading = str(R.string.statusDownloading),
         statusPending = str(R.string.statusPending),
@@ -248,7 +251,7 @@ internal fun RemoteTaskRow(entry: RemoteRowEntry, style: RowStyle, flowIndex: In
             part("→ $targetName", MetaTone.Ink)
             val status = task.status
             when (status) {
-                RemoteTaskStatus.Failed -> part(firstLine(task.error) ?: s.statusError, MetaTone.Coral)
+                RemoteTaskStatus.Failed -> part(firstLine(s.taskError(task.error)) ?: s.statusError, MetaTone.Coral)
                 RemoteTaskStatus.Completed -> part(s.statusCompleted, MetaTone.Mint)
                 RemoteTaskStatus.Downloading -> Format.speed(task.speed)?.let { part(it.toString(), MetaTone.Accent) }
                     ?: part(s.statusDownloading)
@@ -382,6 +385,16 @@ private data class RemoteRowStrings(
     val statusPaused: String,
     val statusCanceled: String,
     val statusUnknown: String,
-)
+    val errorPostOnlyEndpoint: String,
+    val errorPostOnlyResume: String,
+) {
+    fun taskError(raw: String?): String? = raw?.let {
+        when (TaskErrorMessage.match(it)) {
+            TaskErrorMessage.PostOnlyEndpoint -> errorPostOnlyEndpoint
+            TaskErrorMessage.PostOnlyResume -> errorPostOnlyResume
+            null -> it
+        }
+    }
+}
 
 private fun firstLine(s: String?): String? = s?.lineSequence()?.map { it.trim() }?.firstOrNull { it.isNotEmpty() }

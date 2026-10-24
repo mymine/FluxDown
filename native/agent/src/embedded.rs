@@ -24,8 +24,8 @@ use crate::gateway::{GatewayService, GatewayShell, LocalConnection};
 use crate::lifecycle::Lifecycle;
 use crate::power::PowerService;
 use crate::runtime::{
-    CloudServices, daemon_socket_address, finalize_device_identity, fluxcloud_base_url,
-    spawn_daemon_projection, start_cloud_services,
+    CloudServices, finalize_device_identity, fluxcloud_base_url, spawn_daemon_projection,
+    start_cloud_services,
 };
 use crate::shell::{ShellHost, ShellServices, ShellState, TrayAvailability};
 use crate::state::{AgentState, StateError, StateStore};
@@ -103,8 +103,6 @@ pub async fn start_embedded(
         client_device_name,
         enable_link,
     } = config;
-    let daemon_address = daemon_socket_address(&daemon_url)
-        .map_err(|error| AgentStartError::DaemonEndpoint(format!("{error:#}")))?;
     let daemon_config = DaemonClientConfig::new(daemon_url, daemon_token);
     daemon_config
         .validate()
@@ -134,7 +132,7 @@ pub async fn start_embedded(
     // 子令牌：启动失败或 daemon 致命错误只停止本 agent，不波及宿主的取消令牌。
     let cancel = cancel.child_token();
     // daemon 由宿主提供：监管器从一开始就处于「已停止」，连接被拒时只重连、永不拉起进程。
-    let supervisor = Arc::new(DaemonSupervisor::new(daemon_address));
+    let supervisor = Arc::new(DaemonSupervisor::new(None));
     supervisor.stop();
     let (daemon, daemon_events) =
         match DaemonClient::start_scoped(daemon_config.clone(), supervisor.clone(), cancel.clone())
@@ -219,7 +217,14 @@ pub async fn start_embedded(
         ("power", tokio::spawn(power.clone().run(cancel.clone()))),
         (
             "daemon event projection",
-            spawn_daemon_projection(daemon_events, events.clone(), notice_tx, cancel.clone()),
+            // 嵌入式宿主（移动端）由平台自己处理提示音：不接入 agent 提示音。
+            spawn_daemon_projection(
+                daemon_events,
+                events.clone(),
+                notice_tx,
+                None,
+                cancel.clone(),
+            ),
         ),
     ];
 

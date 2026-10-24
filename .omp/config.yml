@@ -25,7 +25,9 @@ ttsr:
 
 # ---- Subagent / task ----
 task:
-  # 笔记本环境：cargo / gradle / xcodebuild 编译内存与 CPU 开销大，限并发防打爆
+  # 笔记本环境：cargo / gradle / xcodebuild 编译内存与 CPU 开销大，限并发防打爆。
+  # 子代理只许跑 `-p` 精准命令；全量 clippy、无 -p 构建测试、gradlew / xcodebuild 由主会话或
+  # build-verifier 串行跑（.omp/hooks/pre/guard.ts 执行前拦截，规则见 AGENTS.md §7「并行子代理」）。
   maxConcurrency: 6
   # 主代理→专家 agent→verifier 两层足够；防递归失控
   maxRecursionDepth: 2

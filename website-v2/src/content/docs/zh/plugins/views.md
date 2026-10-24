@@ -3,7 +3,7 @@ title: 视图、命令与 UI API
 description: 可移植插件视图、命令与常驻 main 脚本的参考：节点、属性、事件、限制、生命周期与各客户端支持矩阵。
 section: plugins
 order: 12
-sourceHash: "fb6e71c4bd15"
+sourceHash: "d9ffd59b929e"
 ---
 
 本页是插件界面的参考资料：常驻的 **`main` 脚本**、`flux.ui` / `flux.commands` / `flux.rpc` / `flux.events` / `flux.timers` 这组 API、每种节点的属性、事件与限制，以及各客户端分别能显示什么。分步骤的教程见[用可移植视图构建界面](/docs/zh/plugins/ui-guide/)和[原生桌面界面](/docs/zh/plugins/desktop-ui-guide/)。
@@ -220,7 +220,7 @@ flux.ui.view(id: string, def: {
 | `flux.ui.Fragment` | 不产生节点，只用来分组子节点；不能作为视图根。 |
 | `flux.ui.toast(level, text)` | `info`、`success`、`warning` 或 `error`（其他值按 `info` 显示）。它不属于任何会话，会广播给**所有已连接的客户端**（桌面端与 Web 端都显示，移动端忽略）。 |
 | `flux.commands.register(id, handler)` | `handler({ taskIds })`。执行未注册的命令会失败：`command not registered: <id>`。 |
-| `flux.rpc.handle(name, handler)` | 处理函数收到 `args`，可返回任何可 JSON 序列化的值（`undefined` 变成 `null`）。供你自己的桌面视图用 `fluxdown.invoke(name, args)` 调用。未知名称会失败：`rpc not registered: <name>`。 |
+| `flux.rpc.handle(name, handler, opts?)` | 处理函数收到 `(args, ctx)`，可返回任何可 JSON 序列化的值（`undefined` 变成 `null`）。供你自己的桌面视图用 `fluxdown.invoke(name, args)` 调用（`ctx = { caller: "desktop" }`）。传入 `opts = { page: true }` 后，你的[页面脚本](/docs/zh/plugins/page-scripts-guide/)也能调用它（`ctx = { caller: "page", pageUrl }`，属于不可信输入）。未知名称会失败：`rpc not registered: <name>`；页面调用没有 `page: true` 的处理函数会失败：`rpc not exposed to page: <name>`。 |
 | `flux.events.on(name, handler)` | `name` 是 `main.events` 中的某一项（`onStart`、`onDone`、`onError`、`onCancel`、`onMetaProbed`）。同一个名称可以有多个监听者；某个监听者抛错只记一条警告日志，不影响其他监听者。之后所有打开的会话都会重新渲染。载荷见[钩子指南](/docs/zh/plugins/hooks-guide/)。 |
 | `flux.timers.setTimeout / setInterval / clear` | 同时存在的定时器至多 64 个（`too many timers (max 64)`）。有视图会话打开时间隔被钳制到 ≥ 1 秒，否则 ≥ 60 秒。定时器本身不会让视图重新渲染，需要调用 `ctx.refresh()`。 |
 | `flux.tasks.*` | `list()`、`get(id)`、`create(params)`、`pause(id)`、`resume(id)`、`remove(id, deleteFiles?)`，需要 `tasks` 权限。`create` 的参数就是 `daemon.task.create` 的参数（例如 `{ request: { url, startPaused } }`），每个插件每分钟至多 20 次。 |

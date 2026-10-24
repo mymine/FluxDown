@@ -25,7 +25,7 @@ import {
   removeEmail,
 } from './cloudLogic'
 import { useCountdown } from '../settings/sections/account/useCountdown'
-import { WEBHOOK_EVENTS } from './endpoints'
+import { CLOUD_EVENTS } from './endpoints'
 import { cloudActionError } from './useCloudNotify'
 
 export interface DialogTarget {
@@ -444,12 +444,12 @@ export function CloudChannelDialog({
 
         <FormField label={t('cloudNotifyEvents')} error={events.length === 0 ? t('cloudNotifyEventsEmpty') : undefined}>
           <div className="grid grid-cols-2 gap-x-2 narrow:grid-cols-1">
-            {WEBHOOK_EVENTS.map((event) => (
+            {CLOUD_EVENTS.map((event) => (
               <CheckRow
                 key={event.wire}
                 checked={events.includes(event.wire)}
                 onCheckedChange={(checked) =>
-                  setEvents((current) => WEBHOOK_EVENTS.map((item) => item.wire).filter((wire) => (wire === event.wire ? checked : current.includes(wire))))
+                  setEvents((current) => CLOUD_EVENTS.map((item) => item.wire).filter((wire) => (wire === event.wire ? checked : current.includes(wire))))
                 }
               >
                 {t(event.labelKey)}

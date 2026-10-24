@@ -1,17 +1,16 @@
 /**
  * runtime.onMessage 路由（C6）。
  *
- * 消息分三族：`type` 族（任务面板 nmh-*、诊断）、`action` 族（C6 MessageMap）、
- * 以及兼容保留的 `appConfirmedUp`。
+ * 消息分两族：`type` 族（任务面板 nmh-*、诊断）与 `action` 族（C6 MessageMap）。
  *
- * Firefox：直接返回 Promise。Firefox MV2 中 "return true + 异步 sendResponse" 不可靠。
+ * Firefox：直接返回 Promise。
  * Chromium：Chrome 148 之前 onMessage 监听器不能返回 Promise，必须 "return true + sendResponse"。
  */
 import { browser } from "wxt/browser";
 import type { Browser } from "wxt/browser";
 import { hostOf } from "@/rules/url";
 import { installConnectionDiagnostics } from "@/utils/connection-diagnostics-background";
-import { checkFluxDownAvailable, effectiveRemoteMode } from "@/utils/download-dispatch";
+import { checkRemoteAvailable, effectiveRemoteMode } from "@/utils/download-dispatch";
 import {
   nmhOpenFile,
   nmhRevealFile,
@@ -31,7 +30,8 @@ import {
   downloadUrls,
   handoffPage,
 } from "./downloads";
-import { getCapabilities, invalidateCapabilities } from "./host";
+import { showBrowserDownload } from "./browser-downloads";
+import { getCapabilities } from "./host";
 import { markPreempted } from "./intercept";
 import { rememberServiceWorkerScope } from "./sw-scopes";
 import { scopeBelongsTo } from "@/utils/download-source";
@@ -45,6 +45,13 @@ import type {
   SendChannel,
 } from "./protocol";
 import { getEngine, getRuleSyncStatus, syncRemotePacks } from "./rules-store";
+import {
+  approvePageScripts,
+  getPageScriptsStatus,
+  revokePageScripts,
+  viewPageScriptSource,
+} from "./page-scripts";
+import type { PageScriptsStatus } from "./page-scripts/model";
 import { compileWithDraft, engineSettled } from "./rules-store";
 import { getRuleHits } from "./rule-hits";
 import { isListed, toListItem } from "./rule-view";
@@ -92,6 +99,16 @@ const MAX_LINKS = 5000;
 function senderTabId(sender: Sender): number | undefined {
   const id = sender.tab?.id;
   return id !== undefined && id >= 0 ? id : undefined;
+}
+
+/** 消息来自本扩展自己的页面（选项页 / popup / 侧边栏），而不是网页里的内容脚本。 */
+function isExtensionPage(sender: Sender): boolean {
+  return sender.url?.startsWith(browser.runtime.getURL("/")) === true;
+}
+
+/** 非扩展页请求页面脚本管理接口时的空应答（不泄漏任何状态）。 */
+function refusedStatus(): PageScriptsStatus {
+  return { availability: "ok", blocked: null, outcome: null, lastSyncAt: null, plugins: [], attention: null, pendingCount: 0 };
 }
 
 /**
@@ -406,6 +423,11 @@ const handlers: { [A in MessageAction]: Handler<A> } = {
     }
   },
 
+  async showBrowserDownload(req, sender) {
+    if (typeof req.downloadId !== "number") return { ok: false };
+    return { ok: showBrowserDownload(req.downloadId, senderTabId(sender)) };
+  },
+
   async rulesTest(req) {
     const { draft, ...input } = req;
     const engine = draft ? await compileWithDraft(draft) : getEngine();
@@ -435,11 +457,16 @@ const handlers: { [A in MessageAction]: Handler<A> } = {
 
   async getHostStatus() {
     const capabilities = await getCapabilities(true);
+    const remoteMode = await effectiveRemoteMode();
     // ping 成功 → 本机 App 已恢复：立即解除熔断，让「接管」与显示的「已连接」一致。
     // 远程 always 模式下 connected 是远程探测结果，不代表本机 App 在线。
-    if (capabilities.connected && (await effectiveRemoteMode()) !== "always") markAppUp();
+    if (capabilities.connected && remoteMode !== "always") markAppUp();
+    // fallback：本机不可达时下载改投远程，远程可达同样算已连接（与下载路由一致）。
+    const connected =
+      capabilities.connected ||
+      (remoteMode === "fallback" && (await checkRemoteAvailable().catch(() => false)));
     const status: HostStatus = {
-      connected: capabilities.connected,
+      connected,
       protocol: capabilities.protocol,
       capabilities,
       ruleSync: await getRuleSyncStatus(),
@@ -508,6 +535,27 @@ const handlers: { [A in MessageAction]: Handler<A> } = {
       key,
     });
   },
+
+  // 页面脚本管理：只接受扩展页（选项页 / popup），网页上下文的内容脚本消息一律拒绝。
+  async pageScriptsStatus(req, sender) {
+    if (!isExtensionPage(sender)) return refusedStatus();
+    return getPageScriptsStatus(req.refresh);
+  },
+
+  async pageScriptsApprove(req, sender) {
+    if (!isExtensionPage(sender)) return { ok: false, message: "forbidden", status: refusedStatus() };
+    return approvePageScripts(req.identity);
+  },
+
+  async pageScriptsRevoke(req, sender) {
+    if (!isExtensionPage(sender)) return { ok: false, message: "forbidden", status: refusedStatus() };
+    return revokePageScripts(req.identity);
+  },
+
+  async pageScriptsSource(req, sender) {
+    if (!isExtensionPage(sender)) return { ok: false, message: "forbidden" };
+    return viewPageScriptSource(req.identity, req.id);
+  },
 };
 
 interface TypedMessage {
@@ -564,12 +612,6 @@ export function installMessages(): void {
     const typed = await handleTypeMessage(message);
     if (typed !== undefined) return typed;
 
-    // Popup 直连 ping NMH 成功后的熔断恢复信号（fire-and-forget）。
-    if (message.action === "appConfirmedUp") {
-      markAppUp();
-      invalidateCapabilities();
-      return { success: true };
-    }
     if (isMessageAction(message.action)) {
       // 按 action 分发；各 handler 的 req 形状由 MessageMap 约定，发送方经 sendAction 类型化。
       const handler = handlers[message.action] as (req: unknown, s: Sender) => Promise<unknown>;

@@ -5,31 +5,29 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import com.fluxdown.core.model.HostRef
+import com.fluxdown.core.store.RemoteHostCodec
+import com.fluxdown.core.store.RemoteHostRecord
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
-import org.json.JSONArray
-import org.json.JSONException
-import org.json.JSONObject
 import java.util.UUID
 
 /**
- * 已保存的远端主机（`fluxdown-agent --server`）：`hosts.remote` = JSON 数组
- * `[{id, name, endpoint, key}]`，`key` 为 [SecretBox] 密文（以 id 为 AAD），明文访问密钥从不落盘。
+ * 已保存的远端主机（`fluxdown-agent --server` / 开启局域网访问的桌面主机）：`hosts.remote` = JSON 数组
+ * `[{id, name, endpoint, key, linkFingerprint?}]`（编解码见 [RemoteHostCodec]），`key` 为 [SecretBox] 密文（以 id 为 AAD），
+ * 明文凭据从不落盘。凭据 = 手输的访问密钥，或局域网配对得到的设备控制凭据（此时带 `linkFingerprint`）。
  * 本机主机不入库（恒存在，id = [HostRef.Local.ID]）。
  */
 class HostRepo(private val ds: DataStore<Preferences>, private val box: SecretBox) {
-    private class Entry(val ref: HostRef.Remote, val sealedKey: String)
-
     private object K {
         val remote = stringPreferencesKey("hosts.remote")
     }
 
-    val remotes: Flow<List<HostRef.Remote>> = ds.data.map { p -> decode(p[K.remote]).map { it.ref } }
+    val remotes: Flow<List<HostRef.Remote>> = ds.data.map { p -> RemoteHostCodec.decode(p[K.remote]).map { it.ref } }
 
-    /** 解密访问密钥；条目不存在或密钥已不可读（设备迁移 / Keystore 失效）→ null。 */
+    /** 解密凭据；条目不存在或密钥已不可读（设备迁移 / Keystore 失效）→ null。 */
     suspend fun accessKey(id: String): String? {
-        val entry = decode(ds.data.first()[K.remote]).firstOrNull { it.ref.id == id } ?: return null
+        val entry = RemoteHostCodec.decode(ds.data.first()[K.remote]).firstOrNull { it.ref.id == id } ?: return null
         return try {
             box.open(entry.sealedKey, aad = id)
         } catch (_: SecretBox.SecretUnavailableException) {
@@ -37,65 +35,66 @@ class HostRepo(private val ds: DataStore<Preferences>, private val box: SecretBo
         }
     }
 
-    suspend fun add(name: String, endpoint: String, accessKey: String): HostRef.Remote {
-        val id = UUID.randomUUID().toString()
-        val ref = HostRef.Remote(id = id, displayName = name, endpoint = endpoint)
-        val entry = Entry(ref, box.seal(accessKey, aad = id))
-        ds.edit { p -> p[K.remote] = encode(decode(p[K.remote]) + entry) }
-        return ref
+    /**
+     * 新增一台主机。[linkFingerprint] 非空且已有同指纹的条目 = 同一台主机重新配对：原地更新该条目的地址与凭据
+     * （保留 id 与名称），不新增一条。
+     */
+    suspend fun add(name: String, endpoint: String, accessKey: String, linkFingerprint: String? = null): HostRef.Remote {
+        var result: HostRef.Remote? = null
+        ds.edit { p ->
+            val records = RemoteHostCodec.decode(p[K.remote])
+            val existing = linkFingerprint?.let { fp -> RemoteHostCodec.idForFingerprint(records, fp) }
+            val id = existing ?: UUID.randomUUID().toString()
+            val displayName = records.firstOrNull { it.ref.id == existing }?.ref?.displayName ?: name
+            val ref = HostRef.Remote(id = id, displayName = displayName, endpoint = endpoint, linkFingerprint = linkFingerprint)
+            val record = RemoteHostRecord(ref, box.seal(accessKey, aad = id))
+            p[K.remote] = RemoteHostCodec.encode(if (existing == null) records + record else records.map { if (it.ref.id == id) record else it })
+            result = ref
+        }
+        return checkNotNull(result)
     }
 
-    /** 原地更换访问密钥（主机侧已改密钥）；条目不存在 → false。 */
+    /** 原地更换访问密钥（主机侧已改密钥）；条目不存在 → false。保留地址与 `linkFingerprint`。 */
     suspend fun updateAccessKey(id: String, accessKey: String): Boolean {
         var found = false
         ds.edit { p ->
-            val entries = decode(p[K.remote]).map { e ->
+            val records = RemoteHostCodec.decode(p[K.remote]).map { e ->
                 if (e.ref.id != id) {
                     e
                 } else {
                     found = true
-                    Entry(e.ref, box.seal(accessKey, aad = id))
+                    RemoteHostRecord(e.ref, box.seal(accessKey, aad = id))
                 }
             }
-            if (found) p[K.remote] = encode(entries)
+            if (found) p[K.remote] = RemoteHostCodec.encode(records)
         }
         return found
     }
 
-    suspend fun remove(id: String) {
+    /**
+     * 重新配对成功：用新的设备控制凭据 / 指纹 / 地址原地替换同一台主机（id 与名称不变）；条目不存在 → null。
+     */
+    suspend fun replaceLinkCredential(id: String, endpoint: String, credential: String, linkFingerprint: String): HostRef.Remote? {
+        var updated: HostRef.Remote? = null
         ds.edit { p ->
-            val kept = decode(p[K.remote]).filter { it.ref.id != id }
-            if (kept.isEmpty()) p.remove(K.remote) else p[K.remote] = encode(kept)
+            val records = RemoteHostCodec.decode(p[K.remote]).map { e ->
+                if (e.ref.id != id) {
+                    e
+                } else {
+                    val ref = e.ref.copy(endpoint = endpoint, linkFingerprint = linkFingerprint)
+                    updated = ref
+                    RemoteHostRecord(ref, box.seal(credential, aad = id))
+                }
+            }
+            if (updated != null) p[K.remote] = RemoteHostCodec.encode(records)
         }
+        return updated
     }
 
-    private fun encode(entries: List<Entry>): String = JSONArray().also { arr ->
-        entries.forEach { e ->
-            arr.put(
-                JSONObject()
-                    .put("id", e.ref.id)
-                    .put("name", e.ref.displayName)
-                    .put("endpoint", e.ref.endpoint)
-                    .put("key", e.sealedKey),
-            )
-        }
-    }.toString()
-
-    /** 损坏的整体 / 单条一律丢弃（返回已能解析的部分），不让坏数据拖垮启动。 */
-    private fun decode(raw: String?): List<Entry> {
-        if (raw.isNullOrEmpty()) return emptyList()
-        val arr = try {
-            JSONArray(raw)
-        } catch (_: JSONException) {
-            return emptyList()
-        }
-        return (0 until arr.length()).mapNotNull { i ->
-            val o = arr.optJSONObject(i) ?: return@mapNotNull null
-            val id = o.optString("id")
-            val endpoint = o.optString("endpoint")
-            val key = o.optString("key")
-            if (id.isEmpty() || endpoint.isEmpty() || key.isEmpty()) return@mapNotNull null
-            Entry(HostRef.Remote(id, o.optString("name").ifEmpty { endpoint }, endpoint), key)
+    suspend fun remove(id: String) {
+        ds.edit { p ->
+            val kept = RemoteHostCodec.decode(p[K.remote]).filter { it.ref.id != id }
+            if (kept.isEmpty()) p.remove(K.remote) else p[K.remote] = RemoteHostCodec.encode(kept)
         }
     }
 }

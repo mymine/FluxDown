@@ -57,7 +57,10 @@ pub(crate) fn install(cx: &mut App) {
             })) => notify_auto_disabled(identity, reason, cx),
             _ => {}
         },
-        SessionSignal::Stale | SessionSignal::Fatal(_) | SessionSignal::ServiceStopped => {}
+        SessionSignal::Stale
+        | SessionSignal::Fatal(_)
+        | SessionSignal::ServiceStopped
+        | SessionSignal::ServiceFailed(_) => {}
     })
     .detach();
 }

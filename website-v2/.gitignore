@@ -4,6 +4,8 @@ dist/
 .astro/
 # wrangler 本地缓存（cdn/ Worker 部署）
 .wrangler/
+# IP 归属地库（deploy.sh 下载，容器只读挂载）
+/geo/
 
 # dependencies
 node_modules/

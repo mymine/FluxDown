@@ -8,15 +8,11 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.annotation.StringRes
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.Lifecycle
@@ -35,8 +31,6 @@ import com.fluxdown.app.feature.settings.startSettingsIntent
 import com.fluxdown.app.i18n.str
 import com.fluxdown.app.nav.LocalNavigator
 import com.fluxdown.app.nav.SettingsPage
-import com.fluxdown.core.protocol.CustomCategoryDto
-import com.fluxdown.fluxui.controls.FluxActionRow
 import com.fluxdown.fluxui.controls.FluxListRow
 import com.fluxdown.fluxui.controls.FluxSectionFoot
 import com.fluxdown.fluxui.controls.FluxTag
@@ -47,9 +41,6 @@ import com.fluxdown.fluxui.icons.FluxIcons
 import com.fluxdown.fluxui.material.rememberFlowInGate
 import com.fluxdown.fluxui.overlay.FluxBanner
 import com.fluxdown.fluxui.overlay.FluxBannerKind
-import com.fluxdown.fluxui.overlay.FluxDialogButton
-import com.fluxdown.fluxui.overlay.FluxDialogButtonStyle
-import com.fluxdown.fluxui.overlay.FluxDialogSpec
 import com.fluxdown.fluxui.overlay.LocalFluxOverlays
 
 // ───────────────────────────── 行目录（页面渲染与设置搜索共用） ─────────────────────────────
@@ -60,7 +51,6 @@ internal enum class GeneralGroup(val key: String, @StringRes val title: Int) {
     System("system", R.string.settingsGroupSystem),
     DownloadsView("downloadsView", R.string.mobileGeneralGroupDownloadsView),
     Entries("entries", R.string.mobileGeneralGroupEntries),
-    Categories("categories", R.string.customCategories),
 }
 
 /** 通用页的每一行；行 id 与 iOS `GeneralRow` 一致（`general.<slug>`）。[key] = 目录键（agent 偏好），无则为设备 / 只读 / 列表行。 */
@@ -81,8 +71,7 @@ internal enum class GeneralRow(
     SidebarCategory("sidebarCategory", GeneralGroup.DownloadsView, R.string.showSidebarCategory, R.string.showSidebarCategoryNestedDesc, "ui.show_sidebar_category", FluxIcons.Folders),
     ActivityRss("activityRss", GeneralGroup.Entries, R.string.showActivityRss, null, "ui.show_activity_rss", FluxIcons.Rss),
     ActivityWebhooks("activityWebhooks", GeneralGroup.Entries, R.string.showActivityWebhooks, null, "ui.show_activity_webhooks", FluxIcons.Webhook),
-    ActivityTheme("activityTheme", GeneralGroup.Entries, R.string.showActivityTheme, null, "ui.show_activity_theme", FluxIcons.Palette),
-    Categories("categories", GeneralGroup.Categories, R.string.customCategories, R.string.categoryPriorityNote, CustomCategoryDto.PREFERENCE_KEY, FluxIcons.Folder);
+    ActivityTheme("activityTheme", GeneralGroup.Entries, R.string.showActivityTheme, null, "ui.show_activity_theme", FluxIcons.Palette);
 
     val id: String = "general.$slug"
 }
@@ -95,147 +84,61 @@ private fun GlassSectionScope.toggleRow(ctx: SettingsCtx, row: GeneralRow) {
 // ───────────────────────────── 页面 ─────────────────────────────
 
 /**
- * S3 · 通用。分组（同 iOS）：后台下载 → 系统 → 下载页显示 → 入口 → 自定义分类。
+ * S3 · 通用。分组（同 iOS）：后台下载 → 系统 → 下载页显示 → 入口。自定义分类在下载页。
  * 偏好键一律经 `ConfigEditor` 写入（agent 偏好，☁︎ 键同步）。iOS 的「离开时继续下载」是 iOS 后台任务的开关；
  * Android 本机下载靠前台服务常驻，没有对应的可调行为，因此改为电池优化入口。
  */
 @Composable
 internal fun GeneralPage() {
     val nav = LocalNavigator.current
-    val context = LocalContext.current
-    val overlays = LocalFluxOverlays.current
     val ctx = rememberSettingsCtx(openPicker = {})
     val gate = rememberFlowInGate()
-    var editing by remember { mutableStateOf<CategoryTarget?>(null) }
-    var reordering by rememberSaveable { mutableStateOf(false) }
-    val store = remember(ctx, overlays, context) { CategoryStore(ctx, overlays, context) }
-    val list = store.list
-    val hasBase = store.defaultSaveDir.isNotEmpty()
 
-    fun confirmDelete(entry: CustomCategoryDto) {
-        overlays.showDialog(
-            FluxDialogSpec(
-                title = context.str(R.string.deleteCategory),
-                message = context.str(R.string.deleteCategoryConfirm),
-                icon = FluxIcons.Trash2,
-                buttons = listOf(
-                    FluxDialogButton(context.str(R.string.cancel)),
-                    FluxDialogButton(context.str(R.string.delete), FluxDialogButtonStyle.Destructive) { store.delete(entry) },
-                ),
-            ),
-        )
-    }
-
-    fun confirmReset() {
-        overlays.showDialog(
-            FluxDialogSpec(
-                title = context.str(R.string.resetBuiltinCategories),
-                message = context.str(R.string.resetAllCategoriesConfirm),
-                icon = FluxIcons.RotateCcw,
-                buttons = listOf(
-                    FluxDialogButton(context.str(R.string.cancel)),
-                    FluxDialogButton(context.str(R.string.resetBuiltinCategories), FluxDialogButtonStyle.Destructive) { store.resetBuiltin() },
-                ),
-            ),
-        )
-    }
-
-    Box(Modifier.fillMaxSize()) {
-        SettingsPageFrame(title = str(R.string.settingsCatGeneral), onBack = { nav.pop() }) {
-            var index = 0
-            if (ctx.readOnly) {
-                flowItem(index++, gate, "banner") {
-                    FluxBanner(str(R.string.localServiceDisconnected), kind = FluxBannerKind.Warn, slim = true)
-                }
-            }
-            flowItem(index++, gate, GeneralGroup.Background.key) {
-                GlassSection(
-                    title = str(GeneralGroup.Background.title),
-                    footer = str(R.string.mobileGeneralBgFootnote),
-                ) {
-                    toggleRow(ctx, GeneralRow.KeepAwake)
-                    row { BatteryOptimizationRow(ctx) }
-                }
-            }
-            flowItem(index++, gate, GeneralGroup.System.key) {
-                GlassSection(title = str(GeneralGroup.System.title)) {
-                    toggleRow(ctx, GeneralRow.Analytics)
-                    linkHandlingRows(ctx)
-                }
-            }
-            flowItem(index++, gate, GeneralGroup.DownloadsView.key) {
-                GlassSection(
-                    title = str(GeneralGroup.DownloadsView.title),
-                    footer = str(R.string.mobileGeneralDownloadsViewFooterAndroid),
-                ) {
-                    toggleRow(ctx, GeneralRow.SidebarStatus)
-                    toggleRow(ctx, GeneralRow.SidebarQueues)
-                    toggleRow(ctx, GeneralRow.SidebarCategory)
-                }
-            }
-            flowItem(index++, gate, GeneralGroup.Entries.key) {
-                GlassSection(
-                    title = str(GeneralGroup.Entries.title),
-                    footer = str(R.string.mobileGeneralEntriesFooter),
-                ) {
-                    toggleRow(ctx, GeneralRow.ActivityRss)
-                    if (FeatureFlags.WEBHOOKS) toggleRow(ctx, GeneralRow.ActivityWebhooks)
-                    toggleRow(ctx, GeneralRow.ActivityTheme)
-                }
-            }
-            flowItem(index++, gate, GeneralGroup.Categories.key) {
-                GlassSection {
-                    categoryRows(
-                        ctx = ctx,
-                        store = store,
-                        list = list,
-                        reordering = reordering,
-                        onReorderingChange = { reordering = it },
-                        onEdit = { editing = CategoryTarget(it) },
-                        onDeleteRequest = ::confirmDelete,
-                    )
-                }
-            }
-            flowItem(index++, gate, "categoryActions") {
-                GlassSection(footer = if (hasBase) null else str(R.string.mobileGeneralAutoDirsNeedDefault)) {
-                    row(hasIcon = true) {
-                        FluxActionRow(
-                            title = str(R.string.addCategory),
-                            onClick = { editing = CategoryTarget(null) },
-                            icon = FluxIcons.Plus,
-                            enabled = !ctx.readOnly,
-                        )
-                    }
-                    row(hasIcon = true) {
-                        FluxActionRow(
-                            title = str(R.string.autoCategoryDirs),
-                            onClick = { store.applyAutoDirs() },
-                            icon = FluxIcons.FolderOpen,
-                            enabled = hasBase && !ctx.readOnly,
-                        )
-                    }
-                    row(hasIcon = true) {
-                        FluxActionRow(
-                            title = str(R.string.resetBuiltinCategories),
-                            onClick = ::confirmReset,
-                            tone = Tone.Coral,
-                            icon = FluxIcons.RotateCcw,
-                            enabled = !ctx.readOnly,
-                        )
-                    }
-                }
-            }
-            flowItem(index++, gate, "legend") {
-                FluxSectionFoot(str(R.string.settingsSyncLegend))
+    SettingsPageFrame(title = str(R.string.settingsCatGeneral), onBack = { nav.pop() }) {
+        var index = 0
+        if (ctx.readOnly) {
+            flowItem(index++, gate, "banner") {
+                FluxBanner(str(R.string.localServiceDisconnected), kind = FluxBannerKind.Warn, slim = true)
             }
         }
-        CategoryEditorSheet(
-            target = editing,
-            isLocalHost = ctx.isLocalHost,
-            onSave = { store.save(it) },
-            onDelete = { store.delete(it) },
-            onDismiss = { editing = null },
-        )
+        flowItem(index++, gate, GeneralGroup.Background.key) {
+            GlassSection(
+                title = str(GeneralGroup.Background.title),
+                footer = str(R.string.mobileGeneralBgFootnote),
+            ) {
+                toggleRow(ctx, GeneralRow.KeepAwake)
+                row { BatteryOptimizationRow(ctx) }
+            }
+        }
+        flowItem(index++, gate, GeneralGroup.System.key) {
+            GlassSection(title = str(GeneralGroup.System.title)) {
+                toggleRow(ctx, GeneralRow.Analytics)
+                linkHandlingRows(ctx)
+            }
+        }
+        flowItem(index++, gate, GeneralGroup.DownloadsView.key) {
+            GlassSection(
+                title = str(GeneralGroup.DownloadsView.title),
+                footer = str(R.string.mobileGeneralDownloadsViewFooterAndroid),
+            ) {
+                toggleRow(ctx, GeneralRow.SidebarStatus)
+                toggleRow(ctx, GeneralRow.SidebarQueues)
+                toggleRow(ctx, GeneralRow.SidebarCategory)
+            }
+        }
+        flowItem(index++, gate, GeneralGroup.Entries.key) {
+            GlassSection(
+                title = str(GeneralGroup.Entries.title),
+                footer = str(R.string.mobileGeneralEntriesFooter),
+            ) {
+                toggleRow(ctx, GeneralRow.ActivityRss)
+                if (FeatureFlags.WEBHOOKS) toggleRow(ctx, GeneralRow.ActivityWebhooks)
+                toggleRow(ctx, GeneralRow.ActivityTheme)
+            }
+        }
+        flowItem(index++, gate, "legend") {
+            FluxSectionFoot(str(R.string.settingsSyncLegend))
+        }
     }
 }
 
@@ -350,9 +253,3 @@ internal fun generalSearchEntries(ctx: SettingsSearchContext): List<SettingsEntr
             icon = row.icon,
         )
     }
-
-/** 设置首页读数：分类条数（偏好尚未下发时无读数，显示分类说明）。 */
-internal fun generalReadout(ctx: SettingsSearchContext): String? {
-    val pref = ctx.form.pref(CustomCategoryDto.PREFERENCE_KEY) ?: return null
-    return ctx.str(R.string.mobileGeneralReadoutCategories, "n" to CustomCategoryDto.fromPreference(pref).size)
-}

@@ -117,8 +117,19 @@ pub(crate) const WEBHOOK_EVENTS: &[(&str, &str)] = &[
     ("task.completed", "webhookEventCompleted"),
     ("task.failed", "webhookEventFailed"),
     ("task.paused", "webhookEventPaused"),
+    ("queue.started", "webhookEventQueueStarted"),
     ("queue.drained", "webhookEventQueueDrained"),
 ];
+
+/// 仅本机 webhook 可订阅、FluxCloud 不认识的事件（agent 上报前也会丢弃）。
+const LOCAL_ONLY_EVENTS: &[&str] = &["queue.started"];
+
+/// 云端推送渠道可订阅的事件：[`WEBHOOK_EVENTS`] 去掉本机专属事件，保持原顺序。
+pub(crate) fn cloud_events() -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    WEBHOOK_EVENTS
+        .iter()
+        .filter(|(wire, _)| !LOCAL_ONLY_EVENTS.contains(wire))
+}
 
 /// 配置串 → 端点列表：空串 / 非 JSON 数组视为空列表，数组里的非对象元素跳过。
 pub(crate) fn parse_endpoints(raw: &str) -> Vec<EndpointSpec> {
@@ -745,7 +756,26 @@ pub(crate) fn delivery_log_group(ctx: &SectionContext, _cx: &mut App) -> Setting
 
 #[cfg(test)]
 mod tests {
-    use super::parse_endpoints;
+    use super::{WEBHOOK_EVENTS, cloud_events, parse_endpoints};
+
+    /// 本机 webhook 订阅全部引擎事件；云端渠道不提供 FluxCloud 不认识的 `queue.started`，
+    /// 其余事件顺序不变。
+    #[test]
+    fn cloud_events_drop_only_local_only_queue_started() {
+        assert!(
+            WEBHOOK_EVENTS
+                .iter()
+                .any(|(wire, _)| *wire == "queue.started")
+        );
+        let cloud: Vec<&str> = cloud_events().map(|(wire, _)| *wire).collect();
+        assert!(!cloud.contains(&"queue.started"));
+        let expected: Vec<&str> = WEBHOOK_EVENTS
+            .iter()
+            .map(|(wire, _)| *wire)
+            .filter(|wire| *wire != "queue.started")
+            .collect();
+        assert_eq!(cloud, expected);
+    }
 
     #[test]
     fn malformed_fields_fall_back_like_engine_and_web() {

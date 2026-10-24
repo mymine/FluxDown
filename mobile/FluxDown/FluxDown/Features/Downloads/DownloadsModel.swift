@@ -7,13 +7,28 @@ import Foundation
 
 /// 状态文件夹（范围条）；顺序即显示顺序（02-downloads §3.2）。
 nonisolated enum StatusFolder: CaseIterable, Hashable {
-    case all, active, completed, failed, paused
+    case all, active, completed, seeding, failed, paused
+
+    /// 范围条显示（也是 `Facets.folderCounts` 的索引序）的文件夹：「做种中」是 BT 专属，商店版不含 BT，隐藏。
+    static let visible: [StatusFolder] = {
+        #if FULL_FLAVOR
+        allCases
+        #else
+        allCases.filter { $0 != .seeding }
+        #endif
+    }()
+
+    /// 本机任务是否属于该文件夹：「做种中」按 `isSeeding`（1 / 8）判定，其余按状态；做种任务同时仍在「已完成」。
+    func accepts(_ task: DownloadTask) -> Bool {
+        self == .seeding ? task.isSeeding : accepts(task.status)
+    }
 
     func accepts(_ status: TaskStatus) -> Bool {
         switch self {
         case .all: true
         case .active: status == .pending || status == .downloading || status == .preparing
         case .completed: status == .completed
+        case .seeding: false
         case .failed: status == .failed
         case .paused: status == .paused
         }
@@ -30,6 +45,7 @@ nonisolated enum StatusFolder: CaseIterable, Hashable {
             case .paused, .completed, .failed, .canceled: false
             }
         case .completed: status == .completed
+        case .seeding: false
         case .failed: status == .failed || status == .canceled
         case .paused: status == .paused
         }
@@ -56,17 +72,18 @@ func normalizedQueueId(_ id: String) -> String { id.isEmpty ? TaskQueue.main : i
 nonisolated enum TaskVisual: Hashable {
     case downloading, queued, pending, preparing, verifying, paused, failed, seeding, missing, completed
 
-    init(_ task: DownloadTask, queuePosition: Int) {
+    /// `queued`：任务在引擎排队顺序里（有排序键）。
+    init(_ task: DownloadTask, queued: Bool) {
         switch task.status {
         case .downloading: self = .downloading
-        case .pending: self = queuePosition > 0 ? .queued : .pending
+        case .pending: self = queued ? .queued : .pending
         case .preparing: self = task.totalBytes > 0 ? .verifying : .preparing
         case .paused: self = .paused
         case .failed: self = .failed
         case .completed:
             if task.fileMissing {
                 self = .missing
-            } else if task.seedingStatus == .seeding {
+            } else if task.presentsSeeding {
                 self = .seeding
             } else {
                 self = .completed
@@ -97,8 +114,8 @@ nonisolated struct TaskItem: Identifiable, Equatable {
     let task: DownloadTask
     let speedDown: Int64
     let speedUp: Int64
-    /// >0 → 「排队 #n」。
-    let queuePosition: Int
+    /// 引擎排序键（任务在队列期间不变）；nil = 不在排队。名次不进模型：渲染可见行时按 `QueueOrder` 取。
+    let queueOrder: Int64?
     let boosted: Bool
     /// 有待答的「文件已存在」询问（任务在等用户决定，行上显示「待确认」角标）。
     let awaitingDecision: Bool
@@ -196,9 +213,12 @@ nonisolated struct DownloadsList: Equatable {
     let visibleIds: [String]
     /// 本机任务 + 远程任务总数（区分「无任务」与「筛选后为空」）。
     let taskTotal: Int
+    /// false = 任务表尚未载入完成（首个快照前 / 分页载入中）：`sections` 与计数不是完整结果，UI 只能显示加载态。
     let loaded: Bool
+    /// 载入中的服务端任务总数（进度文案）；载入完成后为 0。
+    let loadingTotal: UInt64
 
-    static let initial = DownloadsList(sections: [], visibleIds: [], taskTotal: 0, loaded: false)
+    static let initial = DownloadsList(sections: [], visibleIds: [], taskTotal: 0, loaded: false, loadingTotal: 0)
 
     var isEmpty: Bool { sections.allSatisfy { $0.count == 0 } }
 }
@@ -217,7 +237,7 @@ nonisolated struct QueueFacet: Equatable, Identifiable {
 
 /// 分面：文件夹计数（队列 / 搜索范围内）· 当前文件夹内的分类计数 · 各队列任务数 · 远程任务数。
 nonisolated struct Facets: Equatable {
-    /// 按 `StatusFolder.allCases` 顺序。
+    /// 按 `StatusFolder.visible` 顺序。
     let folderCounts: [Int]
     let categories: [CategoryPill]
     let queues: [QueueFacet]
@@ -227,7 +247,7 @@ nonisolated struct Facets: Equatable {
     let matching: Int
 
     static let initial = Facets(
-        folderCounts: Array(repeating: 0, count: StatusFolder.allCases.count),
+        folderCounts: Array(repeating: 0, count: StatusFolder.visible.count),
         categories: [],
         queues: [],
         remoteCount: 0,
@@ -235,7 +255,7 @@ nonisolated struct Facets: Equatable {
     )
 
     func count(_ folder: StatusFolder) -> Int {
-        guard let index = StatusFolder.allCases.firstIndex(of: folder), folderCounts.indices.contains(index) else { return 0 }
+        guard let index = StatusFolder.visible.firstIndex(of: folder), folderCounts.indices.contains(index) else { return 0 }
         return folderCounts[index]
     }
 }

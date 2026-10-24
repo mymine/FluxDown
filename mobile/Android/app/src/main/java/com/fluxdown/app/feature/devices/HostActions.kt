@@ -29,13 +29,26 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
-/** 把主机连接失败映射为用户可读文案：先按 code（Unauthorized / Timeout / Unavailable / ProtocolIncompatible），其余回退通用失败。 */
-internal fun Context.hostErrorText(error: Throwable): String = when ((error as? HostException)?.code) {
-    HostErrorCode.Unauthorized -> str(R.string.webLoginInvalidKey)
-    HostErrorCode.Timeout -> str(R.string.mobileHostErrTimeout)
-    HostErrorCode.Unavailable -> str(R.string.webLoginUnreachable)
-    HostErrorCode.ProtocolIncompatible -> str(R.string.mobileHostErrIncompatible)
-    else -> str(R.string.localServiceActionFailed)
+/**
+ * 局域网配对的主机被主机拒绝（设备控制凭据失效：对端已解除配对 / 主机重装 / 访问被撤销）：需要重新配对，
+ * 不是「访问密钥错误」——这类主机没有可重新输入的访问密钥。
+ */
+internal fun HostRef.needsRepair(error: Throwable?): Boolean =
+    this is HostRef.Remote && linkFingerprint != null && (error as? HostException)?.code == HostErrorCode.Unauthorized
+
+/**
+ * 把主机连接失败映射为用户可读文案：先按 code（Unauthorized / Timeout / Unavailable / ProtocolIncompatible），其余回退通用失败。
+ * 传入失败的主机 [ref] 时，局域网配对主机的 Unauthorized 给「需要重新配对」。
+ */
+internal fun Context.hostErrorText(error: Throwable, ref: HostRef? = null): String = when {
+    ref?.needsRepair(error) == true -> str(R.string.mobileHostRepairNeeded)
+    else -> when ((error as? HostException)?.code) {
+        HostErrorCode.Unauthorized -> str(R.string.webLoginInvalidKey)
+        HostErrorCode.Timeout -> str(R.string.mobileHostErrTimeout)
+        HostErrorCode.Unavailable -> str(R.string.webLoginUnreachable)
+        HostErrorCode.ProtocolIncompatible -> str(R.string.mobileHostErrIncompatible)
+        else -> str(R.string.localServiceActionFailed)
+    }
 }
 
 /**
@@ -82,7 +95,7 @@ internal class HostActions(
                     if (e is CancellationException) throw e
                     haptics.reject()
                     overlays.toast(
-                        context.str(R.string.mobileHostSwitchFailed, "name" to name, "reason" to context.hostErrorText(e)),
+                        context.str(R.string.mobileHostSwitchFailed, "name" to name, "reason" to context.hostErrorText(e, ref)),
                         FluxToastKind.Error,
                         FluxIcons.WifiOff,
                     )

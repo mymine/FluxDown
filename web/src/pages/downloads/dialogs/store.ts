@@ -10,6 +10,8 @@ export interface NewDownloadOptions {
   urls?: string[]
   torrentFiles?: File[]
   queueId?: string
+  /** 预选「下载到」目标（`cloud:<deviceId>` / `link:<fingerprint>`）；缺省 = 本服务器。 */
+  target?: string
 }
 
 /** 打开中的「新建下载」会话；已打开时再次 `openNewDownload` 只追加注入项。 */
@@ -17,6 +19,7 @@ export interface NewDownloadSession {
   /** 每次从关闭到打开递增，用作组件 key（表单整体重置）。 */
   session: number
   queueId?: string
+  target?: string
   /** 打开时预填的链接。 */
   initialUrls: string[]
   /** 会话期间追加的链接 / 种子（id 递增，组件按 id 去重处理）。 */
@@ -80,6 +83,7 @@ export function openNewDownload(options: NewDownloadOptions = {}): void {
     newDownload: {
       session: counter,
       queueId: options.queueId,
+      target: options.target,
       initialUrls: urls,
       injections: torrentFiles.length > 0 ? [{ id: counter, urls: [], torrentFiles }] : [],
     },

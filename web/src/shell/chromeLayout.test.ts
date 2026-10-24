@@ -1,16 +1,24 @@
 import { describe, expect, test } from 'bun:test'
-import { CHROME_ZONES, defaultLayout, moveItem, normalizeLayout, serializeLayout, zoneFamily } from './chromeLayout'
-import type { ChromeFamily, ChromeItemSpec, ChromeZone } from './chromeLayout'
+import { CHROME_ZONES, defaultLayout, isHidden, moveItem, normalizeLayout, serializeLayout, setHidden, zoneFamily } from './chromeLayout'
+import type { ChromeFamily, ChromeItemSpec, StoredChromeLayout } from './chromeLayout'
+import type { ChromeZone } from './chromeLayout'
 
 interface Fixture {
   catalog: ChromeItemSpec[]
-  normalize: { name: string; stored: unknown; expected: Record<ChromeZone, string[]> }[]
+  normalize: { name: string; stored: unknown; expected: StoredChromeLayout }[]
   moves: {
     name: string
     stored: unknown
     move: { id: string; zone: ChromeZone; target: string | null }
     changed: boolean
-    expected: Record<ChromeZone, string[]>
+    expected: StoredChromeLayout
+  }[]
+  visibility: {
+    name: string
+    stored: unknown
+    set: { id: string; hidden: boolean }
+    changed: boolean
+    expected: StoredChromeLayout
   }[]
 }
 
@@ -38,6 +46,18 @@ describe('chrome layout move (shared fixtures)', () => {
   }
 })
 
+describe('chrome layout visibility (shared fixtures)', () => {
+  for (const item of fixture.visibility) {
+    test(item.name, () => {
+      const layout = normalizeLayout(item.stored, fixture.catalog)
+      const result = setHidden(layout, fixture.catalog, item.set.id, item.set.hidden)
+      expect(result.changed).toBe(item.changed)
+      expect(serializeLayout(result.layout)).toEqual(item.expected)
+      if (!item.changed) expect(result.layout).toBe(layout)
+    })
+  }
+})
+
 describe('chrome layout helpers', () => {
   test('默认布局等于 normalize(null)，且区域键齐全', () => {
     const layout = defaultLayout(fixture.catalog)
@@ -53,5 +73,12 @@ describe('chrome layout helpers', () => {
   test('未变化的移动返回同一个布局对象', () => {
     const layout = defaultLayout(fixture.catalog)
     expect(moveItem(layout, fixture.catalog, 'feed', 'railTop', null).layout).toBe(layout)
+  })
+
+  test('默认布局不含隐藏项；isHidden 反映 hidden 列表', () => {
+    expect(defaultLayout(fixture.catalog).hidden).toEqual([])
+    const layout = normalizeLayout({ hidden: ['feed', 'home'] }, fixture.catalog)
+    expect(isHidden(layout, 'feed')).toBe(true)
+    expect(isHidden(layout, 'home')).toBe(false)
   })
 })

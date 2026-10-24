@@ -1,11 +1,9 @@
 ---
 /** 桌面端平台矩阵:Windows / macOS / Linux 三列,列出每个架构与包格式;下方 Scoop 安装。 */
-import { AlertTriangle } from "lucide-react";
 import AssetGroup, { type RowSpec } from "./AssetGroup.astro";
 import CodeBlock from "./CodeBlock.astro";
 import { BrandIcon } from "@/components/icons/brand";
 import { download } from "@/i18n/messages/download";
-import { href } from "@/i18n/routing";
 import type { Lang } from "@/i18n/config";
 import { GITHUB_URL } from "@/lib/site-nav";
 
@@ -35,7 +33,6 @@ const linux: RowSpec[] = [
   { path: "assets.linux_arch", label: t.kind.arch, detail: "x64", ext: ".pkg.tar.zst" },
   { path: "assets.linux_tarball", label: t.kind.portable, detail: "x64", ext: ".tar.gz" },
 ];
-const notify = "#subscribe";
 const SCOOP_CMD = "scoop bucket add extras\nscoop install extras/fluxdown";
 ---
 
@@ -49,14 +46,10 @@ const SCOOP_CMD = "scoop bucket add extras\nscoop install extras/fluxdown";
     <AssetGroup lang={lang} id="windows" os="windows" title={t.os.windows} desc={t.desktop.windowsReq} versionPath="version" fallback={fallback} rows={windows}>
       <Fragment slot="icon"><BrandIcon name="windows" size={15} /></Fragment>
     </AssetGroup>
-    <AssetGroup lang={lang} id="macos" os="macos" title={t.os.macos} versionPath="version" fallback={fallback} rows={macos} notifyHref={notify}>
+    <AssetGroup lang={lang} id="macos" os="macos" title={t.os.macos} versionPath="version" fallback={fallback} rows={macos}>
       <Fragment slot="icon"><BrandIcon name="apple" size={16} /></Fragment>
-      <a href={href("/macos-gatekeeper", lang)} class="note">
-        <AlertTriangle size={14} strokeWidth={1.75} className="text-warn" aria-hidden="true" />
-        <span>{t.desktop.macHelp} <span class="link">{t.desktop.macHelpLink}</span></span>
-      </a>
     </AssetGroup>
-    <AssetGroup lang={lang} id="linux" os="linux" title={t.os.linux} versionPath="version" fallback={fallback} rows={linux} notifyHref={notify}>
+    <AssetGroup lang={lang} id="linux" os="linux" title={t.os.linux} versionPath="version" fallback={fallback} rows={linux}>
       <Fragment slot="icon"><BrandIcon name="linux" size={16} /></Fragment>
     </AssetGroup>
   </div>
@@ -78,23 +71,6 @@ const SCOOP_CMD = "scoop bucket add extras\nscoop install extras/fluxdown";
     .matrix {
       grid-template-columns: repeat(3, minmax(0, 1fr));
     }
-  }
-  .note {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    margin-top: auto;
-    padding: 10px 12px;
-    border-radius: 8px;
-    font-size: 12.5px;
-    line-height: 1.5;
-    color: var(--fg-muted);
-    background: color-mix(in oklch, var(--warn) 8%, transparent);
-    box-shadow: 0 0 0 1px color-mix(in oklch, var(--warn) 30%, transparent) inset;
-  }
-  .note :global(svg) {
-    flex: none;
-    margin-top: 2px;
   }
   .scoop {
     display: grid;

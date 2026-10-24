@@ -1,8 +1,13 @@
 {
   "name": "fluxdown-plugin-sdk",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "Types, JSX runtime, manifest validator and CLI for building FluxDown plugins.",
   "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zerx-lab/FluxDown.git",
+    "directory": "packages/plugin-sdk"
+  },
   "type": "module",
   "bin": {
     "fluxdown-plugin": "dist/cli.js"
@@ -31,6 +36,9 @@
     "./types/desktop": {
       "types": "./types/desktop.d.ts"
     },
+    "./types/page": {
+      "types": "./types/page.d.ts"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -42,12 +50,11 @@
     "node": ">=20"
   },
   "scripts": {
-    "gen": "bun scripts/gen-view-types.ts && bun scripts/gen-theme-types.ts",
-    "gen:check": "bun scripts/gen-view-types.ts --check && bun scripts/gen-theme-types.ts --check",
+    "gen": "bun scripts/gen-view-types.ts && bun scripts/gen-theme-types.ts && bun examples/youtube-down/build.ts",
+    "gen:check": "bun scripts/gen-view-types.ts --check && bun scripts/gen-theme-types.ts --check && bun examples/youtube-down/build.ts --check",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "bun test",
-    "build": "bun scripts/build.ts",
-    "sync-index": "bun scripts/sync-index.ts"
+    "build": "bun scripts/build.ts"
   },
   "dependencies": {
     "esbuild": "^0.28.2",

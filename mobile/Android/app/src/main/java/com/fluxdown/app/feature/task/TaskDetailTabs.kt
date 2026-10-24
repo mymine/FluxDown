@@ -37,6 +37,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.fluxdown.app.R
 import com.fluxdown.app.actions.LocalTaskActions
+import com.fluxdown.app.i18n.localizedTaskError
 import com.fluxdown.app.i18n.str
 import com.fluxdown.app.shell.LocalAppContainer
 import com.fluxdown.app.shell.hostState
@@ -137,10 +138,11 @@ internal fun GeneralTab(modelOf: () -> DetailModel?) {
         }
         if (task.autoRoute.isNotEmpty()) row { FluxKeyValue(str(R.string.taskRoute), routeLabel(task.autoRoute)) }
         if (task.status == TaskStatus.Failed && task.errorMessage.isNotEmpty()) row {
+            val errorText = localizedTaskError(task.errorMessage)
             FluxKeyValue(
-                str(R.string.infoError), task.errorMessage, mono = true, tone = Tone.Coral,
+                str(R.string.infoError), errorText, mono = true, tone = Tone.Coral,
                 onClick = {
-                    context.copyText(task.fileName, task.errorMessage)
+                    context.copyText(task.fileName, errorText)
                     overlays.toast(errorCopied, FluxToastKind.Success, FluxIcons.Copy)
                 },
             )

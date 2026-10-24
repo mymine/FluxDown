@@ -1,0 +1,114 @@
+[
+  {
+    "name": "first matching rule with a directory wins in order",
+    "route": {
+      "rules": [
+        { "matchMode": "extension", "extensions": ["mp4", "mkv"], "saveDir": "/videos" },
+        { "matchMode": "extension", "extensions": ["mp4"], "saveDir": "/second" }
+      ]
+    },
+    "fileName": "Movie.MP4",
+    "url": "",
+    "expected": "/videos"
+  },
+  {
+    "name": "matched rule without a directory skips to the next matching rule",
+    "route": {
+      "rules": [
+        { "matchMode": "extension", "extensions": ["pdf"] },
+        { "matchMode": "extension", "extensions": ["pdf"], "saveDir": "/books" }
+      ]
+    },
+    "fileName": "a.pdf",
+    "url": "",
+    "expected": "/books"
+  },
+  {
+    "name": "matched rule without a directory blocks the other fallback",
+    "route": {
+      "rules": [{ "matchMode": "extension", "extensions": ["pdf"] }],
+      "otherDir": "/other"
+    },
+    "fileName": "a.pdf",
+    "url": "",
+    "expected": null
+  },
+  {
+    "name": "other directory applies when no rule matches",
+    "route": {
+      "rules": [{ "matchMode": "extension", "extensions": ["mp4"] }],
+      "otherDir": "/other"
+    },
+    "fileName": "setup.exe",
+    "url": "",
+    "expected": "/other"
+  },
+  {
+    "name": "extensions may be written with a leading dot",
+    "route": {
+      "rules": [{ "matchMode": "extension", "extensions": [".jpg"], "saveDir": "/pictures" }]
+    },
+    "fileName": "photo.JPG",
+    "url": "",
+    "expected": "/pictures"
+  },
+  {
+    "name": "url segment fills a name without extension",
+    "route": {
+      "rules": [{ "matchMode": "extension", "extensions": ["flac"], "saveDir": "/music" }]
+    },
+    "fileName": "",
+    "url": "https://x.test/a/My%20Song.flac?x=1",
+    "expected": "/music"
+  },
+  {
+    "name": "query parameters are not a file name",
+    "route": {
+      "rules": [{ "matchMode": "extension", "extensions": ["jpg"], "saveDir": "/pictures" }]
+    },
+    "fileName": "",
+    "url": "https://pbs.twimg.com/media/abc?format=jpg&name=orig",
+    "expected": null
+  },
+  {
+    "name": "final name decides even when the url looked like a playlist",
+    "route": {
+      "rules": [
+        { "matchMode": "extension", "extensions": ["m3u8", "ts"], "saveDir": "/streams" },
+        { "matchMode": "extension", "extensions": ["mp4"], "saveDir": "/videos" }
+      ]
+    },
+    "fileName": "clip.mp4",
+    "url": "https://cdn.test/live/index.m3u8",
+    "expected": "/videos"
+  },
+  {
+    "name": "regex matches case-insensitively and invalid regex never matches",
+    "route": {
+      "rules": [
+        { "matchMode": "regex", "regexPattern": "(", "saveDir": "/bad" },
+        { "matchMode": "regex", "regexPattern": "^ubuntu-.*\\.iso$", "saveDir": "/iso" }
+      ]
+    },
+    "fileName": "Ubuntu-24.04.ISO",
+    "url": "",
+    "expected": "/iso"
+  },
+  {
+    "name": "empty regex never matches",
+    "route": {
+      "rules": [{ "matchMode": "regex", "regexPattern": "", "saveDir": "/all" }],
+      "otherDir": "/other"
+    },
+    "fileName": "a.bin",
+    "url": "",
+    "expected": "/other"
+  },
+  {
+    "name": "nothing to match without any name",
+    "route": { "otherDir": "/other" },
+    "fileName": "",
+    "url": "https://x.test/download",
+    "expected": null
+  }
+]

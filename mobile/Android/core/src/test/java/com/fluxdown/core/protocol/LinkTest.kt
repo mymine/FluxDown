@@ -106,4 +106,72 @@ class LinkTest {
         assertEquals(LinkPairFinish(true, "Mac"), finish)
         assertEquals(LinkPairFinish(false, null), LinkPairFinish.fromJson(Json.parse("""{"paired":false}""")))
     }
+
+    @Test
+    fun controlFieldsOnTheWire() {
+        // requestControl 只在为 true 时出现：普通设备配对的 wire 与旧版一致。
+        assertEquals("""{"address":"a","code":"123456"}""", LinkPairBeginParams("a", "123456").toJson().toJson())
+        assertEquals(
+            """{"address":"a","code":"123456","requestControl":true}""",
+            LinkPairBeginParams("a", "123456", requestControl = true).toJson().toJson(),
+        )
+        assertEquals(
+            LinkRules.Validation.Ok(LinkPairBeginParams("h", "123456", requestControl = true)),
+            LinkRules.validate("h", "123456", requestControl = true),
+        )
+        val requests = LinkPairingRequest.listFromJson(
+            Json.parse("""[{"sessionId":"s","peerName":"P","peerFingerprint":"fp","sas":"1","expiresAtUnixMs":42,"requestsControl":true}]"""),
+        )
+        assertTrue(requests.single().requestsControl)
+        assertFalse(LinkPairingRequest("s", "P", "fp", null, "1", 1).requestsControl)
+        assertEquals("tok", LinkControlCredential.fromJson(Json.parse("""{"token":"tok"}""")).token)
+        assertTrue(LinkRules.isControlUnsupported("pairingVersionMismatch"))
+        assertTrue(LinkRules.isControlUnsupported("peerOutdated"))
+        assertFalse(LinkRules.isControlUnsupported("pairingRejected"))
+        assertFalse(LinkRules.isControlUnsupported(null))
+    }
+
+    @Test
+    fun deadlinesUseRelativeTtl() {
+        // ttlMs 从「收到 DTO 的本机时刻」起算，与主机时钟无关；缺失 / 0（旧主机）才回退 expiresAtUnixMs。
+        assertEquals(10_000L + 60_000L, LinkRules.localDeadline(60_000, wireExpiresAtUnixMs = 5, nowMs = 10_000))
+        assertEquals(5L, LinkRules.localDeadline(null, wireExpiresAtUnixMs = 5, nowMs = 10_000))
+        assertEquals(5L, LinkRules.localDeadline(0, wireExpiresAtUnixMs = 5, nowMs = 10_000))
+        val requests = LinkPairingRequest.listFromJson(
+            Json.parse("""[{"sessionId":"s","peerName":"P","peerFingerprint":"fp","sas":"1","expiresAtUnixMs":1,"ttlMs":30000}]"""),
+            nowMs = 1_000,
+        )
+        assertEquals(31_000L, requests.single().expiresAtUnixMs)
+        val code = LinkPairingCode.fromJson(
+            Json.parse("""{"code":"123456","expiresAtUnixMs":1,"ttlMs":120000,"addresses":[],"fingerprint":"f","deviceName":"d"}"""),
+            nowMs = 2_000,
+        )
+        assertEquals(122_000L, code.expiresAtUnixMs)
+        assertEquals(
+            120L,
+            LinkRules.secondsUntil(code.expiresAtUnixMs, nowMs = 2_000),
+        )
+    }
+
+    @Test
+    fun hostEntriesPutControllableFirst() {
+        val peers = listOf(
+            LinkDiscoveredPeer("fp-a", "Alpha", null, "10.0.0.2", 17800, null, "mdns"),
+            LinkDiscoveredPeer("fp-b", "Bravo", null, "10.0.0.3", 17800, null, "mdns"),
+            LinkDiscoveredPeer("fp-c", "Charlie", null, "10.0.0.4", 17800, null, "mdns"),
+            LinkDiscoveredPeer("fp-d", "Delta", null, "10.0.0.5", 17800, null, "mdns"),
+        )
+        val paired = listOf(
+            // 已配对但只能被它控制（本机不可控制它）：不跳过配对。
+            LinkDevice("fp-a", "A", null, online = true, grantsControl = true),
+            LinkDevice("fp-c", "C", null, online = true, controllable = true),
+            // 对方已解除：即使曾可控制也不算。
+            LinkDevice("fp-d", "D", null, online = true, controllable = true, revoked = true),
+        )
+        val entries = LinkRules.hostEntries(peers, paired)
+        assertEquals(listOf("Charlie", "Alpha", "Bravo", "Delta"), entries.map { it.name })
+        assertEquals(listOf(true, false, false, false), entries.map { it.controllable })
+        assertEquals("fp-c", entries.first().fingerprint)
+        assertEquals("10.0.0.4:17800", entries.first().address)
+    }
 }

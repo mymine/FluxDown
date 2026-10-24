@@ -28,8 +28,7 @@
 //! `tasks.auto_route` 并广播 [`crate::events::EngineEvent::TaskRouteChanged`]，
 //! 标签见 [`route`] 常量组。
 
-use crate::logger::log_info;
-use crate::proxy_config::{ProxyConfig, ProxyMode, detect_system_proxy};
+use crate::proxy_config::{ProxyConfig, ProxyMode};
 
 // ---------------------------------------------------------------------------
 // 路由标签（wire 契约：DB `tasks.auto_route`、TaskRouteChanged 事件、
@@ -149,14 +148,10 @@ pub struct ProxyCandidate {
 ///
 /// 仅对 `mode == Auto` 的配置有意义；其余模式返回空列表。
 pub fn resolve_candidates(config: &ProxyConfig) -> Vec<ProxyCandidate> {
-    let system = match detect_system_proxy() {
-        Ok(system) => system,
-        Err(error) => {
-            log_info!("[auto-proxy] 系统代理检测失败: {error}");
-            None
-        }
-    };
-    resolve_candidates_with_system(config, system)
+    if config.mode != ProxyMode::Auto {
+        return Vec::new();
+    }
+    resolve_candidates_with_system(config, crate::proxy_config::detect_auto_system_proxy())
 }
 
 fn resolve_candidates_with_system(
@@ -247,9 +242,14 @@ fn strip_url_context(lower: &str) -> String {
     out
 }
 
-/// 路由切换可能修复的传输层错误。覆盖建连失败与 body 中途断流；HTTP
-/// 状态、校验失败等永久错误不应靠换链路重试。
+/// 路由切换可能修复的传输层错误。HTTP 下载器写入的文案带类型化分类标签
+/// （[`crate::net_failure::tag_of`]），有标签即以标签为准；无标签的文案
+/// （FTP / HLS / DASH 下载器、旧库存量）回退英文关键词。HTTP 状态、校验
+/// 失败等永久错误不应靠换链路重试。
 pub fn is_route_transport_error(msg: &str) -> bool {
+    if crate::net_failure::tag_of(msg).is_some() {
+        return true;
+    }
     let lower = strip_url_context(&msg.to_lowercase());
     let lower = lower.as_str();
     lower.contains("connection refused")
@@ -267,6 +267,23 @@ pub fn is_route_transport_error(msg: &str) -> bool {
         || lower.contains("connection abort")
         || lower.contains("incomplete download")
         || lower.contains("error decoding response body")
+}
+
+/// 路由标签 → 路径。裸 `proxy:*`（旧库存量，无来源后缀）无法确定是哪条
+/// 代理 → `None`；空标签（非 Auto）→ `None`。
+#[must_use]
+pub fn route_of_label(label: &str) -> Option<RoutePath> {
+    if label.starts_with("direct") {
+        Some(RoutePath::Direct)
+    } else if !label.starts_with("proxy") {
+        None
+    } else if label.ends_with(":system") {
+        Some(RoutePath::Proxy(CandidateSource::System))
+    } else if label.ends_with(":manual") {
+        Some(RoutePath::Proxy(CandidateSource::ManualFields))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

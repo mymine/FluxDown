@@ -12,6 +12,7 @@ export interface RowSpec {
   label: string;
   detail?: string;
   ext: string;
+  versionPath?: string;
 }
 
 interface Props {
@@ -25,9 +26,8 @@ interface Props {
   versionPath?: string;
   fallback: string;
   rows: RowSpec[];
-  notifyHref?: string;
 }
-const { lang, id, title, desc, os, versionPath, fallback, rows, notifyHref } = Astro.props;
+const { lang, id, title, desc, os, versionPath, fallback, rows } = Astro.props;
 const t = download[lang];
 ---
 
@@ -43,13 +43,17 @@ const t = download[lang];
     </div>
     <span class="chip group-yours" data-yours hidden><span class="live-dot"></span>{t.state.yours}</span>
   </div>
-  <div class="group-rows">
-    {rows.map((row) => <AssetRow {...row} fallback={fallback} />)}
-  </div>
-  <p class="group-empty" data-empty hidden>
-    {t.state.notInRelease}
-    {notifyHref && <a class="link" href={notifyHref}>{t.state.notify}</a>}
-  </p>
+  <slot name="notice" />
+  {rows.length > 0 && (
+    <Fragment>
+      <div class="group-rows">
+        {rows.map((row) => <AssetRow {...row} fallback={fallback} />)}
+      </div>
+      <p class="group-empty" data-empty hidden>
+        {t.state.notInRelease}
+      </p>
+    </Fragment>
+  )}
   <slot />
 </div>
 

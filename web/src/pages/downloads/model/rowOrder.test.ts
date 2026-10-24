@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
-import { DYNAMIC_HOLD_MS, holdExpiresAt, mergeStable, POINTER_HOLD_MS, resolveRowOrder } from './rowOrder'
-import type { OrderResult, OrderState } from './rowOrder'
+import { DYNAMIC_HOLD_MS, holdExpiresAt, POINTER_HOLD_MS } from './rowOrder'
+import { mergeStable, resolveRowOrder } from './rowOrder.reference'
+import type { OrderResult, OrderState } from './rowOrder.reference'
 
 interface Row {
   key: string

@@ -1,6 +1,12 @@
 ---
-/** 浏览器扩展:官方商店链接(静态)、离线安装包(实时)与用户脚本说明。 */
-import { ArrowUpRight, ArrowRight } from "lucide-react";
+/**
+ * 浏览器扩展:官方商店链接(静态)、两类离线包(实时)与用户脚本说明。
+ * 离线包严格分成两类,不得混排:
+ *   - 商店签名安装包:Chrome 网上应用店签名的 CRX(.github/workflows/cws-crx.yml 审核后补传)与
+ *     Mozilla 签名 XPI,装好后由浏览器按商店身份更新;
+ *   - 开发者模式解压包:CI 直接打的 zip,浏览器从不更新,必须醒目警示。
+ */
+import { ArrowUpRight, ArrowRight, ShieldCheck, FolderOpen, RefreshCw, AlertTriangle } from "lucide-react";
 import AssetGroup, { type RowSpec } from "./AssetGroup.astro";
 import { BrandIcon, type BrandName } from "@/components/icons/brand";
 import { download } from "@/i18n/messages/download";
@@ -14,15 +20,21 @@ interface Props {
 const { lang } = Astro.props;
 const t = download[lang];
 const title = t.ext.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+const fallback = `${GITHUB_URL}/releases`;
+const docs = withBase(`/docs/${lang}/browser-extension/install/`);
 
 const stores: { name: BrandName; label: string; url: string }[] = [
   { name: "chrome", label: t.ext.chrome, url: "https://chromewebstore.google.com/detail/fluxdown/meleenglfggcmcajknpeeeiobnpfmahc" },
   { name: "edge", label: t.ext.edge, url: "https://microsoftedge.microsoft.com/addons/detail/fluxdown/nglkkjbogjghekbhhcnccnpfedjbdhhd" },
   { name: "firefox", label: t.ext.firefox, url: "https://addons.mozilla.org/firefox/addon/fluxdown/" },
 ];
-const offline: RowSpec[] = [
-  { path: "assets.extension", label: t.ext.offlineChrome, detail: "Chrome · Edge · Brave", ext: ".zip" },
-  { path: "assets.firefox_extension", label: t.ext.offlineFirefox, ext: ".xpi" },
+// 商店签名 CRX 审核后才补传,版本可能落后于 Firefox 包,所以按行显示版本
+const signed: RowSpec[] = [
+  { path: "assets.chrome_crx", label: t.ext.signedCrx, detail: t.ext.signedCrxDetail, ext: ".crx", versionPath: "extension_crx_version" },
+  { path: "assets.firefox_extension", label: t.ext.signedFirefox, detail: t.ext.signedFirefoxDetail, ext: ".xpi", versionPath: "extension_version" },
+];
+const unpacked: RowSpec[] = [
+  { path: "assets.extension", label: t.ext.unpackedZip, detail: t.ext.unpackedZipDetail, ext: ".zip" },
 ];
 ---
 
@@ -45,20 +57,45 @@ const offline: RowSpec[] = [
       ))
     }
   </div>
-  <div class="cells ext-more border-t border-line">
-    <AssetGroup lang={lang} title={t.ext.offlineTitle} desc={t.ext.offlineNote} versionPath="extension_version" fallback={`${GITHUB_URL}/releases`} rows={offline}>
-      <a class="link mt-auto self-start text-[13px]" href={withBase(`/docs/${lang}/browser-extension/install/`)}>{t.ext.extensionDocs}</a>
-    </AssetGroup>
-    <div class="flex flex-col gap-3 p-[clamp(20px,2.4vw,30px)]" id="userscript">
-      <div class="flex items-center gap-3">
-        <span class="store-icon" aria-hidden="true"><BrandIcon name="tampermonkey" size={16} /></span>
-        <h3 class="text-[17px] font-[560] tracking-[-0.015em]">{t.ext.userscriptTitle}</h3>
-      </div>
-      <p class="max-w-[52ch] text-[13.5px] leading-relaxed text-muted">{t.ext.userscriptDesc}</p>
-      <a class="link mt-auto inline-flex items-center gap-1 self-start text-[13px]" href={withBase(`/docs/${lang}/getting-started/settings/`)}>
-        {t.ext.userscriptDocs}<ArrowRight size={13} strokeWidth={2} aria-hidden="true" />
-      </a>
+  <div class="cells channels border-t border-line">
+    <div class="channel" data-tone="ok" id="extension-signed">
+      <AssetGroup lang={lang} title={t.ext.signedTitle} desc={t.ext.signedDesc} fallback={fallback} rows={signed}>
+        <Fragment slot="icon"><ShieldCheck size={16} strokeWidth={1.75} /></Fragment>
+        <div slot="notice" class="callout" role="note">
+          <RefreshCw size={16} strokeWidth={2} className="callout-icon" aria-hidden="true" />
+          <div class="flex flex-col gap-1">
+            <strong class="callout-badge">{t.ext.signedBadge}</strong>
+            <p>{t.ext.signedNotice}</p>
+          </div>
+        </div>
+        <ol class="steps">{t.ext.signedSteps.map((step) => <li>{step}</li>)}</ol>
+        <a class="link mt-auto self-start text-[13px]" href={docs}>{t.ext.extensionDocs}</a>
+      </AssetGroup>
     </div>
+    <div class="channel" data-tone="warn" id="extension-unpacked">
+      <AssetGroup lang={lang} title={t.ext.unpackedTitle} desc={t.ext.unpackedDesc} versionPath="extension_version" fallback={fallback} rows={unpacked}>
+        <Fragment slot="icon"><FolderOpen size={16} strokeWidth={1.75} /></Fragment>
+        <div slot="notice" class="callout" role="note">
+          <AlertTriangle size={16} strokeWidth={2} className="callout-icon" aria-hidden="true" />
+          <div class="flex flex-col gap-1">
+            <strong class="callout-badge">{t.ext.unpackedBadge}</strong>
+            <p>{t.ext.unpackedNotice}</p>
+          </div>
+        </div>
+        <ol class="steps">{t.ext.unpackedSteps.map((step) => <li>{step}</li>)}</ol>
+        <a class="link mt-auto self-start text-[13px]" href={docs}>{t.ext.extensionDocs}</a>
+      </AssetGroup>
+    </div>
+  </div>
+  <div class="flex flex-col gap-3 border-t border-line p-[clamp(20px,2.4vw,30px)]" id="userscript">
+    <div class="flex items-center gap-3">
+      <span class="store-icon" aria-hidden="true"><BrandIcon name="tampermonkey" size={16} /></span>
+      <h3 class="text-[17px] font-[560] tracking-[-0.015em]">{t.ext.userscriptTitle}</h3>
+    </div>
+    <p class="max-w-[52ch] text-[13.5px] leading-relaxed text-muted">{t.ext.userscriptDesc}</p>
+    <a class="link mt-auto inline-flex items-center gap-1 self-start text-[13px]" href={withBase(`/docs/${lang}/getting-started/settings/`)}>
+      {t.ext.userscriptDocs}<ArrowRight size={13} strokeWidth={2} aria-hidden="true" />
+    </a>
   </div>
   <div class="rule"></div>
 </section>
@@ -100,12 +137,57 @@ const offline: RowSpec[] = [
     background: var(--bg-elev);
     box-shadow: 0 0 0 1px var(--line-strong) inset;
   }
-  .ext-more {
+  .channels {
     grid-template-columns: minmax(0, 1fr);
   }
   @media (min-width: 760px) {
-    .ext-more {
+    .channels {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+  }
+  /* 两类离线包用色带 + 底色 + 色调提示框区分:绿 = 签名可自动更新,琥珀 = 解压包不会更新 */
+  .channel {
+    --tone: var(--ok);
+    position: relative;
+    background: color-mix(in oklch, var(--tone) 5%, transparent);
+    box-shadow: inset 0 3px 0 var(--tone);
+  }
+  .channel[data-tone="warn"] {
+    --tone: var(--warn);
+  }
+  .channel :global(.group-icon) {
+    color: var(--tone);
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--tone) 55%, transparent) inset;
+  }
+  .callout {
+    display: flex;
+    gap: 10px;
+    padding: 12px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--fg);
+    background: color-mix(in oklch, var(--tone) 13%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--tone) 45%, transparent) inset;
+  }
+  .callout :global(.callout-icon) {
+    flex: none;
+    margin-top: 2px;
+    color: var(--tone);
+  }
+  .callout-badge {
+    font-size: 13.5px;
+    font-weight: 620;
+    color: color-mix(in oklch, var(--tone) 70%, var(--fg));
+  }
+  .steps {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-left: 1.25em;
+    list-style: decimal;
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--fg-muted);
   }
 </style>

@@ -496,7 +496,7 @@ impl DiagnosticsService {
     }
 
     async fn probe_daemon(&self) -> DaemonProbe {
-        let endpoint = &self.daemon_config.rpc_url;
+        let endpoint = self.daemon_config.endpoint_label();
         let ping = tokio::time::timeout(
             DAEMON_TIMEOUT,
             self.daemon
@@ -683,7 +683,7 @@ impl DiagnosticsService {
             "appVersion": fluxdown_protocol::APP_VERSION,
             "platform": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
             "dataDir": self.store.data_dir().display().to_string(),
-            "daemonRpcUrl": self.daemon_config.rpc_url,
+            "daemonRpcUrl": self.daemon_config.endpoint_label(),
             "deviceId": state.device_id,
             "deviceName": state.device_name,
             "devicePlatform": state.platform,
@@ -716,20 +716,18 @@ impl DiagnosticsService {
             .ok_or_else(|| {
                 DiagnosticsError::Export("prepareLogExport returned no exportId".to_owned())
             })?;
-        let url = daemon_export_url(&self.daemon_config.rpc_url, export_id)?;
+        // 会话级凭据与地址只在已认证的 daemon 连接上存在；没有会话就是 daemon 不可用，不退回
+        // 长期 token。
+        let access = self.daemon_config.http_session().access().ok_or_else(|| {
+            DiagnosticsError::Export("daemon session is not established".to_owned())
+        })?;
+        let url = daemon_export_url(&access.base_url, export_id);
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(DAEMON_TIMEOUT)
             .build()
             .map_err(|error| DiagnosticsError::Export(error.to_string()))?;
-        // 会话级凭据只在已认证的 daemon 连接上存在；没有会话就是 daemon 不可用，不退回长期 token。
-        let credential = self
-            .daemon_config
-            .http_session()
-            .credential()
-            .ok_or_else(|| {
-                DiagnosticsError::Export("daemon session is not established".to_owned())
-            })?;
+        let credential = access.credential;
         let response = client
             .get(url)
             .bearer_auth(credential)
@@ -1878,19 +1876,12 @@ fn daemon_log_dir(describe: Option<&Value>) -> Option<&str> {
         .filter(|dir| !dir.is_empty())
 }
 
-/// `ws://host:port/rpc` → `http://host:port/exports/{id}`。
-fn daemon_export_url(rpc_url: &str, export_id: &str) -> Result<reqwest::Url, DiagnosticsError> {
-    let mut url = reqwest::Url::parse(rpc_url)
-        .map_err(|error| DiagnosticsError::Export(format!("daemon URL invalid: {error}")))?;
-    let scheme = match url.scheme() {
-        "wss" | "https" => "https",
-        _ => "http",
-    };
-    url.set_scheme(scheme)
-        .map_err(|()| DiagnosticsError::Export("daemon URL scheme not switchable".to_owned()))?;
+/// daemon 会话的 HTTP 基址 → `<基址>/exports/{id}`。
+fn daemon_export_url(base: &reqwest::Url, export_id: &str) -> reqwest::Url {
+    let mut url = base.clone();
     url.set_path(&format!("/exports/{export_id}"));
     url.set_query(None);
-    Ok(url)
+    url
 }
 
 fn pretty_json<T: serde::Serialize>(value: &T) -> Vec<u8> {
@@ -2536,10 +2527,14 @@ mod tests {
 
     #[test]
     fn daemon_export_url_and_log_dir_are_derived() {
-        let url = daemon_export_url("ws://127.0.0.1:17801/rpc?x=1", "logs:abc").ok();
+        let access = crate::daemon_client::DaemonHttpAccess::from_rpc_url(
+            "ws://127.0.0.1:17801/rpc?x=1",
+            String::new(),
+        )
+        .expect("session access");
         assert_eq!(
-            url.map(|u| u.to_string()),
-            Some("http://127.0.0.1:17801/exports/logs:abc".to_owned())
+            daemon_export_url(&access.base_url, "logs:abc").to_string(),
+            "http://127.0.0.1:17801/exports/logs:abc"
         );
         let describe = serde_json::json!({ "logDir": "/data/logs" });
         assert_eq!(daemon_log_dir(Some(&describe)), Some("/data/logs"));

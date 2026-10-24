@@ -12,6 +12,7 @@ import com.fluxdown.app.data.DeviceSettings
 import com.fluxdown.app.data.HostRepo
 import com.fluxdown.app.data.SecretBox
 import com.fluxdown.app.data.ViewPrefsRepo
+import com.fluxdown.app.feature.devices.LinkApi
 import com.fluxdown.app.feature.newtask.ImportCenter
 import com.fluxdown.app.service.LocalActivity
 import com.fluxdown.app.diag.AppDiagnostics
@@ -168,8 +169,17 @@ class AppContainer(context: Context) {
         openOrFail(ref).map { adopt(ref, it) }
     }
 
-    /** 保存远端主机：先真实连接并拿到首个快照（鉴权 / 协议 / 可达性），通过后加密保存访问密钥。 */
-    suspend fun addRemoteHost(name: String, endpoint: String, accessKey: String): Result<HostRef.Remote> {
+    /**
+     * 保存远端主机：先真实连接并拿到首个快照（鉴权 / 协议 / 可达性），通过后加密保存凭据。
+     * [accessKey] 是手输的访问密钥，或局域网配对得到的设备控制凭据（此时 [linkFingerprint] = 主机指纹；
+     * 已有同指纹的主机则原地更新，不新增一条）。
+     */
+    suspend fun addRemoteHost(
+        name: String,
+        endpoint: String,
+        accessKey: String,
+        linkFingerprint: String? = null,
+    ): Result<HostRef.Remote> {
         val url = endpoint.trim()
         val key = accessKey.trim()
         return try {
@@ -178,11 +188,47 @@ class AppContainer(context: Context) {
             }
             val probe = FluxBridge.openRemote(url, key)
             awaitFirstSnapshot(probe)
-            Result.success(hostRepo.add(name.trim().ifEmpty { url.substringAfter("://") }, url, key))
+            val saved = hostRepo.add(name.trim().ifEmpty { url.substringAfter("://") }, url, key, linkFingerprint)
+            // 同一台主机重新配对（同指纹原地更新）而它正是当前主机：旧会话握着失效凭据，用新凭据重开。
+            if (linkFingerprint != null) reopenIfCurrent(saved)
+            Result.success(saved)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.w(TAG, "add remote host failed: ${e.message}")
+            Result.failure(e.asHostException())
+        }
+    }
+
+    private suspend fun reopenIfCurrent(ref: HostRef.Remote) = switchLock.withLock {
+        if (_host.value.id == ref.id) openOrFail(ref).onSuccess { adopt(ref, it) }
+    }
+
+    /**
+     * 已配对主机被拒（设备凭据失效）后重新配对成功：先用新凭据真实连接，通过后原地替换同一台主机的地址、凭据与指纹
+     * （id、名称不变），并在它就是当前主机时用新凭据重开会话（旧会话握着失效凭据）。主机不存在 → NotFound。
+     */
+    suspend fun repairRemoteHost(
+        hostId: String,
+        endpoint: String,
+        credential: String,
+        linkFingerprint: String,
+    ): Result<HostRef.Remote> = switchLock.withLock {
+        val url = endpoint.trim()
+        val key = credential.trim()
+        try {
+            if (url.isEmpty() || key.isEmpty()) {
+                throw HostException(HostErrorCode.InvalidArgument, message = "endpoint and credential are required")
+            }
+            awaitFirstSnapshot(FluxBridge.openRemote(url, key))
+            val ref = hostRepo.replaceLinkCredential(hostId, url, key, linkFingerprint)
+                ?: throw HostException(HostErrorCode.NotFound, message = "host not saved")
+            if (_host.value.id == ref.id) adopt(ref, open(ref))
+            Result.success(ref)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "repair remote host failed: ${e.message}")
             Result.failure(e.asHostException())
         }
     }
@@ -200,6 +246,8 @@ class AppContainer(context: Context) {
     suspend fun updateRemoteAccessKey(accessKey: String): Result<Unit> = switchLock.withLock {
         val ref = _host.value as? HostRef.Remote
             ?: return@withLock Result.failure(HostException(HostErrorCode.InvalidArgument, message = "current host is local"))
+        // 局域网配对的主机用设备专属控制凭据：主机改访问密钥不影响它，这里不能把它覆盖成访问密钥。
+        if (ref.linkFingerprint != null) return@withLock Result.success(Unit)
         val saved = try {
             hostRepo.updateAccessKey(ref.id, accessKey.trim())
         } catch (e: CancellationException) {
@@ -215,14 +263,29 @@ class AppContainer(context: Context) {
         openOrFail(ref).map { adopt(ref, it) }
     }
 
-    /** 删除已保存的远端主机；正在使用时先回到本机。本机不可删除。 */
+    /**
+     * 删除已保存的远端主机；正在使用时先回到本机。本机不可删除。
+     * 局域网配对的主机同时对本机主机调 `agent.link.remove`（尽力而为，失败只记日志），让主机侧撤销该设备的控制权限。
+     */
     suspend fun removeHost(id: String) {
         if (id == HostRef.Local.ID) return
+        val fingerprint = (hosts.value.firstOrNull { it.id == id } as? HostRef.Remote)?.linkFingerprint
         switchLock.withLock {
             if (_host.value.id == id) {
                 adopt(localRef, openOrFail(localRef).getOrElse { UnavailableSession(it.asHostException()) })
             }
             hostRepo.remove(id)
+        }
+        if (fingerprint != null) unpairLinkedHost(fingerprint)
+    }
+
+    private suspend fun unpairLinkedHost(fingerprint: String) {
+        try {
+            withLocalSession { LinkApi(it).remove(fingerprint) }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "unpair linked host failed: ${e.message}")
         }
     }
 
@@ -335,8 +398,11 @@ class AppContainer(context: Context) {
         }
     }
 
-    /** 打开（或复用进程内已有的）本机主机会话；每次返回新会话，关闭互不影响。 */
-    private suspend fun openLocalSession(): HostSession {
+    /**
+     * 对进程内本机主机新开一个独立会话（本机 agent 的 `agent.link.*` 等）；每次返回新会话，调用方负责 [HostSession.close]，
+     * 与当前主机选择无关（当前是远端主机时也照常可用）。
+     */
+    suspend fun openLocalSession(): HostSession {
         val (dataDir, saveDir) = withContext(Dispatchers.IO) {
             val data = File(appContext.filesDir, "fluxdown").also { it.mkdirs() }
             val save = com.fluxdown.app.ui.defaultLocalSaveDir(appContext)
@@ -344,6 +410,16 @@ class AppContainer(context: Context) {
             data.path to save.path
         }
         return FluxBridge.openLocal(dataDir = dataDir, saveDir = saveDir, platform = PLATFORM, deviceName = systemDeviceName())
+    }
+
+    /** 开一个本机独立会话跑 [block]，结束（含失败 / 取消）即关闭。 */
+    suspend fun <T> withLocalSession(block: suspend (HostSession) -> T): T {
+        val local = openLocalSession()
+        try {
+            return block(local)
+        } finally {
+            local.close()
+        }
     }
 
     /**

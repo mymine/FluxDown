@@ -1,0 +1,36 @@
+{
+  "limit": 10,
+  "read": [
+    { "name": "missing", "value": null, "expected": [] },
+    { "name": "not an array", "value": "/a", "expected": [] },
+    {
+      "name": "trims, drops empty and non-string, dedupes keeping first",
+      "value": [" /a ", "", 3, null, "/b", "/a", "   "],
+      "expected": ["/a", "/b"]
+    },
+    {
+      "name": "caps at limit",
+      "value": ["/1", "/2", "/3", "/4", "/5", "/6", "/7", "/8", "/9", "/10", "/11"],
+      "expected": ["/1", "/2", "/3", "/4", "/5", "/6", "/7", "/8", "/9", "/10"]
+    },
+    { "name": "case-sensitive", "value": ["/A", "/a"], "expected": ["/A", "/a"] }
+  ],
+  "record": [
+    { "name": "into empty", "history": [], "dir": "/a", "expected": ["/a"] },
+    { "name": "new dir goes first", "history": ["/a", "/b"], "dir": "/c", "expected": ["/c", "/a", "/b"] },
+    { "name": "existing dir moves to front", "history": ["/a", "/b", "/c"], "dir": " /c ", "expected": ["/c", "/a", "/b"] },
+    { "name": "already first is unchanged", "history": ["/a", "/b"], "dir": "/a", "expected": null },
+    { "name": "blank dir is ignored", "history": ["/a"], "dir": "  ", "expected": null },
+    {
+      "name": "oldest drops past limit",
+      "history": ["/1", "/2", "/3", "/4", "/5", "/6", "/7", "/8", "/9", "/10"],
+      "dir": "/new",
+      "expected": ["/new", "/1", "/2", "/3", "/4", "/5", "/6", "/7", "/8", "/9"]
+    }
+  ],
+  "choices": [
+    { "name": "excludes current", "history": ["/a", "/b", "/c"], "current": " /b ", "expected": ["/a", "/c"] },
+    { "name": "current not in history", "history": ["/a", "/b"], "current": "/x", "expected": ["/a", "/b"] },
+    { "name": "only current", "history": ["/a"], "current": "/a", "expected": [] }
+  ]
+}

@@ -13,15 +13,18 @@ use axum::extract::{Path as AxumPath, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use fluxdown_protocol::{CLOSE_REASON_SERVICE_QUIT, EventFrame, RpcNotification, RpcResponse};
+use fluxdown_protocol::{CLOSE_REASON_SERVICE_QUIT, RpcResponse};
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::blob_store::BlobKind;
+use crate::event_pump::{
+    EventPump, MAX_PENDING_FRAMES, OUTBOX_CAPACITY, finish_writer, run_writer,
+};
 use crate::rpc::{DaemonAuth, MAX_SLOW_CALLS, RpcSession, SessionReply, SlowCalls, Step};
 use crate::service::DaemonService;
 
@@ -273,11 +276,13 @@ async fn download_export(
     (StatusCode::OK, bytes).into_response()
 }
 
-/// 一条连接只有此循环写 socket。普通调用保持 FIFO，但等待 actor/DB 时仍推送事件；
-/// 慢调用沿用有界后台执行。不能把普通 create 改为慢方法，否则 agent 的独立通道会
-/// 破坏 create/pause 等命令的串行顺序。
+/// 连接循环只读套接字、受理 RPC，并把应答 / 控制帧放进有序出站通道；套接字写端由
+/// [`run_writer`] 独占，事件经 [`EventPump`] 合并后由它写出（见 `event_pump` 模块）。因此
+/// 等待 actor/DB 或套接字写慢时广播接收都不停。普通调用保持 FIFO，慢调用沿用有界后台
+/// 执行。不能把普通 create 改为慢方法，否则 agent 的独立通道会破坏 create/pause 等命令的
+/// 串行顺序。
 async fn run_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     state: HttpState,
     mut auth_permit: Option<OwnedSemaphorePermit>,
     bearer_authenticated: bool,
@@ -294,7 +299,10 @@ async fn run_socket(
     // 旧版 agent 没有名额，也不受握手时限约束。
     let auth_deadline = tokio::time::sleep(AUTH_DEADLINE);
     tokio::pin!(auth_deadline);
-    let mut events = None;
+    let (sink, mut incoming_frames) = socket.split();
+    let (out, outbox) = mpsc::channel::<Message>(OUTBOX_CAPACITY);
+    let mut events = EventPump::new();
+    let writer = tokio::spawn(run_writer(sink, outbox, events.reader()));
     let mut slow = SlowCalls::new(MAX_SLOW_CALLS);
     let mut ordered = std::pin::pin!(None);
     loop {
@@ -305,37 +313,21 @@ async fn run_socket(
                 } else {
                     "daemon-shutdown"
                 };
-                if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
-                    code: 1001,
-                    reason: reason.into(),
-                }))).await {
-                    // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
-                    tracing::debug!(%error, close_code = 1001, "daemon WebSocket close frame was not delivered");
-                }
+                send_close(&out, 1001, reason).await;
                 break;
             }
             _ = &mut auth_deadline, if auth_permit.is_some() => {
-                if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
-                    code: 1008,
-                    reason: "auth-timeout".into(),
-                }))).await {
-                    // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
-                    tracing::debug!(%error, close_code = 1008, "daemon WebSocket close frame was not delivered");
-                }
+                send_close(&out, 1008, "auth-timeout").await;
                 break;
             }
-            incoming = socket.next(), if ordered.as_ref().get_ref().is_none() => {
+            // 写端已退出（写失败或 4009 已发出）：连接结束。
+            () = out.closed() => break,
+            incoming = incoming_frames.next(), if ordered.as_ref().get_ref().is_none() => {
                 let Some(Ok(message)) = incoming else { break; };
                 match message {
                     Message::Text(text) => {
                         if !session.is_authenticated() && text.len() > PRE_AUTH_FRAME_LIMIT {
-                            if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
-                                code: 1009,
-                                reason: "frame too large before authentication".into(),
-                            }))).await {
-                                // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
-                                tracing::debug!(%error, close_code = 1009, "daemon WebSocket close frame was not delivered");
-                            }
+                            send_close(&out, 1009, "frame too large before authentication").await;
                             break;
                         }
                         let reply = match session.accept(&text) {
@@ -352,80 +344,68 @@ async fn run_socket(
                             }
                         };
                         if reply.became_ready {
-                            let (receiver, _) = service.events().subscribe_and_snapshot();
-                            events = Some(receiver);
+                            events.attach(service.events().subscribe(), MAX_PENDING_FRAMES);
                         }
                         if session.is_authenticated() {
                             auth_permit = None;
                         }
-                        let Ok(json) = serde_json::to_string(&reply.response) else { break; };
-                        if socket.send(Message::Text(json.into())).await.is_err() { break; }
+                        if send_json(&out, &reply.response).await.is_err() { break; }
                         if reply.shutdown_requested {
                             quit_requested.store(true, Ordering::Release);
                             cancel.cancel();
                         }
                         if reply.close {
-                            if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
-                                code: 1008,
-                                reason: "unauthorized".into(),
-                            }))).await {
-                                // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
-                                tracing::debug!(%error, close_code = 1008, "daemon WebSocket close frame was not delivered");
-                            }
+                            send_close(&out, 1008, "unauthorized").await;
                             break;
                         }
                     }
                     Message::Close(_) => break,
                     Message::Ping(payload) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() { break; }
+                        if out.send(Message::Pong(payload)).await.is_err() { break; }
                     }
                     Message::Pong(_) => {}
                     Message::Binary(_) => {
-                        if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
-                            code: 1003,
-                            reason: "text frames required".into(),
-                        }))).await {
-                            // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
-                            tracing::debug!(%error, close_code = 1003, "daemon WebSocket close frame was not delivered");
-                        }
+                        send_close(&out, 1003, "text frames required").await;
                         break;
                     }
-                }
-            }
-            event = receive_event(&mut events), if events.is_some() => {
-                match event {
-                    Ok(frame) => {
-                        if send_event(&mut socket, frame).await.is_err() { break; }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
-                            code: 4009,
-                            reason: "event-gap".into(),
-                        }))).await {
-                            // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
-                            tracing::debug!(%error, close_code = 4009, "daemon WebSocket close frame was not delivered");
-                        }
-                        break;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             response = receive_ordered(ordered.as_mut()), if ordered.as_ref().get_ref().is_some() => {
                 ordered.as_mut().set(None);
-                let Ok(json) = serde_json::to_string(&response) else { break; };
-                if socket.send(Message::Text(json.into())).await.is_err() { break; }
+                if send_json(&out, &response).await.is_err() { break; }
             }
             finished = slow.next(), if !slow.is_empty() => {
                 let Some(response) = finished else { continue; };
-                let Ok(json) = serde_json::to_string(&response) else { break; };
-                if socket.send(Message::Text(json.into())).await.is_err() { break; }
+                if send_json(&out, &response).await.is_err() { break; }
             }
         }
     }
-    // 先中止在途调用，再释放连接所有权的选择订阅。
+    // 先中止在途调用，再冲刷出站消息（含关闭帧），最后释放连接所有权的选择订阅。
     ordered.as_mut().set(None);
     drop(slow);
+    finish_writer(out, writer).await;
+    drop(events);
     session.disconnect();
+}
+
+/// 应答序列化后放进出站通道；写端已退出时返回 `Err`。
+async fn send_json<T: serde::Serialize>(out: &mpsc::Sender<Message>, value: &T) -> Result<(), ()> {
+    let json = serde_json::to_string(value).map_err(|_| ())?;
+    out.send(Message::Text(json.into())).await.map_err(|_| ())
+}
+
+async fn send_close(out: &mpsc::Sender<Message>, code: u16, reason: &'static str) {
+    let close = Message::Close(Some(CloseFrame {
+        code,
+        reason: reason.into(),
+    }));
+    if out.send(close).await.is_err() {
+        // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
+        tracing::debug!(
+            close_code = code,
+            "daemon WebSocket close frame was not delivered"
+        );
+    }
 }
 
 async fn receive_ordered<F: Future<Output = RpcResponse>>(
@@ -435,25 +415,6 @@ async fn receive_ordered<F: Future<Output = RpcResponse>>(
         Some(call) => call.await,
         None => std::future::pending().await,
     }
-}
-
-async fn receive_event(
-    receiver: &mut Option<broadcast::Receiver<EventFrame>>,
-) -> Result<EventFrame, broadcast::error::RecvError> {
-    match receiver {
-        Some(receiver) => receiver.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-async fn send_event(socket: &mut WebSocket, frame: EventFrame) -> Result<(), ()> {
-    let params = serde_json::to_value(frame).map_err(|_| ())?;
-    let notification = RpcNotification::new(fluxdown_protocol::method::SERVICE_EVENT, Some(params));
-    let json = serde_json::to_string(&notification).map_err(|_| ())?;
-    socket
-        .send(Message::Text(json.into()))
-        .await
-        .map_err(|_| ())
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -469,7 +430,7 @@ fn authorized(headers: &HeaderMap, auth: &DaemonAuth) -> bool {
     bearer_token(headers).is_some_and(|credential| auth.authorizes_http(credential))
 }
 
-fn temporary_path(path: &Path) -> PathBuf {
+pub(crate) fn temporary_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -489,13 +450,13 @@ async fn set_private_dir_permissions(path: &Path) -> Result<(), std::io::Error> 
 }
 
 #[cfg(unix)]
-async fn set_private_file_permissions(path: &Path) -> Result<(), std::io::Error> {
+pub(crate) async fn set_private_file_permissions(path: &Path) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await
 }
 
 #[cfg(not(unix))]
-async fn set_private_file_permissions(path: &Path) -> Result<(), std::io::Error> {
+pub(crate) async fn set_private_file_permissions(path: &Path) -> Result<(), std::io::Error> {
     crate::private_fs::restrict_to_current_user(path, false).await
 }
 

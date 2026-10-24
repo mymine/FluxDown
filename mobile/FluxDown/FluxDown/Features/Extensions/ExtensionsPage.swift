@@ -2,6 +2,7 @@ import FluxDomain
 import FluxUI
 import SwiftUI
 import UniformTypeIdentifiers
+#if FULL_FLAVOR
 
 /// S11 · 扩展：插件（已安装 / 市场 / 文件安装）与组件，**仅远端 `--server` 主机**。
 ///
@@ -484,3 +485,4 @@ struct PermissionRow: View {
         .accessibilityElement(children: .combine)
     }
 }
+#endif

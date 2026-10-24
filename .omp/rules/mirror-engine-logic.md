@@ -1,0 +1,39 @@
+---
+description: RSS 过滤 / 文件名解析 / Webhook 事件与端点 / 线程数风险档改动须同步 Web、扩展与各端
+condition: '[\s\S]'
+scope: "tool:edit, tool:write"
+globs:
+  - '**/native/engine/src/rss/filter.rs'
+  - '**/web/src/pages/rss/filter{,.test}.ts'
+  - '**/native/engine/src/naming/**'
+  - '**/fluxDown/utils/filename{,.test}.ts'
+  - '**/native/engine/src/webhook.rs'
+  - '**/crates/settings/src/sections/webhook.rs'
+  - '**/web/src/pages/webhooks/endpoints.ts'
+  - '**/native/protocol/src/daemon_config.rs'
+  - '**/native/engine/src/segment_coordinator.rs'
+  - '**/web/src/lib/threadsRisk.ts'
+interruptMode: never
+---
+
+你正在改动引擎侧纯逻辑（RSS 过滤 / 文件名 / Webhook / 线程数）的一侧。下列条目里，标题是事实源一侧、「→」后是必须同回合同步的镜像端：改任一侧都要把另一侧过一遍；有共享夹具的先改夹具用例，再改两侧实现，两侧测试都要跑（`/verify` 第 3 步）。只改了一侧就交付 = 不完整。
+
+## `engine/src/rss/filter.rs`
+
+→ `web/src/pages/rss/filter.ts`（两份逐条对齐，`filter.test.ts` 复用 Rust 用例；预览与实际下载必须一致）
+
+## `native/engine/src/naming/{disposition,charset}.rs`（Content-Disposition 解析、旧式字节打分解码、TLD / 页面字符集先验）
+
+→ `fluxDown/utils/filename.ts`（`parseContentDispositionFilename` / `decodeLegacyBytes`）逐条对齐；跨实现用例 `native/engine/src/naming/fixtures/content_disposition.json` 由 Rust 测试与 `filename.test.ts`（Chrome / Firefox 两种头值模型）共用，改规则先改用例。扩展发来的非空名按显式名处理（只 sanitize），拿不准（脚本端点名等）必须发空串，交给引擎推断并在完成期按实际 GET 响应定名（`tasks.name_inferred`，见 `.omp/knowledge/engine.md`「naming/」）
+
+## `engine/src/webhook.rs` 的 `WebhookEventKind`
+
+→ protocol 与各客户端事件选择器（含 TS `WEBHOOK_EVENTS`），wire 名逐字一致
+
+## `engine/src/webhook.rs` 的 `EndpointSpec` 宽松解析（`lenient` / `reload_endpoints`）
+
+→ GPUI `crates/settings/src/sections/webhook.rs::parse_endpoints` + Web `web/src/pages/webhooks/endpoints.ts::parseEndpoint`：非对象元素跳过、字段类型不符回退默认值；端点写入两端都走「取最新值重算、冲突重放」（GPUI `SettingsStore::mutate_daemon` ↔ Web `patchEndpoints`），不得写回整份旧数组
+
+## 线程数上限与风险档（`native/protocol/src/daemon_config.rs`：`MAX_TASK_SEGMENTS` = 512 / `HIGH_SEGMENTS_WARN_ABOVE` = 64 / `SEVERE_SEGMENTS_WARN_ABOVE` = 256）
+
+→ 引擎 `segment_coordinator::MAX_SEGMENTS`（显式线程数硬上限；Auto 仍由 advisor / `HINT_UNCAP_MAX` 封顶 64）+ `web/src/lib/threadsRisk.ts` + Web `config.ts` 与移动端 `SettingsCatalog` 的 `default_segments` 范围；GPUI / Web 在设置、队列、新建下载三处 > 64 动态展示风险提示（`RevealCallout`）

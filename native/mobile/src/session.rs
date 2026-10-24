@@ -14,9 +14,9 @@ use fluxdown_protocol::method::{
     DAEMON_TASK_RESUME_ALL, DAEMON_TASK_RESUME_MANY, SYSTEM_HELLO,
 };
 use fluxdown_protocol::{
-    APP_VERSION, ClientHello, CreatedTask, DaemonConfigPatch, DaemonCreateTaskParams,
-    DaemonCreateTasksParams, DaemonCreateTasksResult, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    RequestId, RpcRequest, RssSourceDto, ServiceRole,
+    APP_VERSION, CategoryRouteDto, ClientHello, CreateTaskRequest, CreatedTask, DaemonConfigPatch,
+    DaemonCreateTaskParams, DaemonCreateTasksParams, DaemonCreateTasksResult, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, RequestId, RpcRequest, RssSourceDto, ServiceRole,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -71,6 +71,8 @@ pub struct HostSession {
     cancel: CancellationToken,
     /// 导入等后台任务的执行器（与会话的驱动同一个 runtime）。
     runtime: Handle,
+    /// 主机当前分类路由（驱动随快照 / 偏好事件更新），建任务时按它路由。
+    routes: watch::Receiver<Option<CategoryRouteDto>>,
 }
 
 /// 启动驱动并等待首次同步：连接 / 握手 / 鉴权 / 快照任一失败都作为错误返回，
@@ -84,6 +86,7 @@ pub(crate) async fn open_session(
     let (signals_tx, signals_rx) = mpsc::channel(SIGNAL_QUEUE);
     let (link_tx, link_rx) = watch::channel(LinkState::Connecting);
     let (first_tx, first_rx) = oneshot::channel();
+    let (routes_tx, routes_rx) = watch::channel(None);
     let driver = Driver {
         connector,
         hello: client_hello()?,
@@ -92,6 +95,7 @@ pub(crate) async fn open_session(
         cancel: cancel.clone(),
         first: Some(first_tx),
         timing,
+        routes: routes_tx,
     };
     let task = runtime.spawn(driver.run());
     match first_rx.await {
@@ -101,6 +105,7 @@ pub(crate) async fn open_session(
                 link: link_rx,
                 cancel,
                 runtime: runtime.clone(),
+                routes: routes_rx,
             }),
             task,
         )),
@@ -225,6 +230,52 @@ fn prepare_call(method: &str, params_json: Option<&str>) -> Result<Option<Value>
     Ok((!value.is_null()).then_some(value))
 }
 
+/// 把表单请求映射为 `daemon.task.create` 参数：`offered_save_dir` 为 `Some` 且 `route`
+/// 存在、提交目录仍跟随系统给出的目录时，`saveDir` 取路由基准目录并带上 `categoryRoute`；
+/// 其余情况原样提交、不路由。
+pub(crate) fn routed_create_params(
+    request: CreateTaskRequestDto,
+    route: Option<&CategoryRouteDto>,
+) -> DaemonCreateTaskParams {
+    let unattended = request.unattended;
+    let (request, category_route) = routed_request(request, route);
+    DaemonCreateTaskParams {
+        request,
+        torrent_blob_id: None,
+        // 交互式：声明了 client.selections，需要选择时请求会推到本 UI；免打扰由调用方声明。
+        unattended,
+        hint_file_size: None,
+        name_hint: None,
+        category_route,
+    }
+}
+
+/// [`routed_create_params`] 的请求部分，批量导入复用：返回协议请求与要随之发送的路由。
+pub(crate) fn routed_request(
+    request: CreateTaskRequestDto,
+    route: Option<&CategoryRouteDto>,
+) -> (CreateTaskRequest, Option<CategoryRouteDto>) {
+    let offered = request.offered_save_dir.clone();
+    let mut request = CreateTaskRequest::from(request);
+    let routed = match (offered, route) {
+        (Some(offered), Some(route)) if route.follows(&request.save_dir, &offered) => {
+            request.save_dir = route.base_dir(&request.save_dir, &offered);
+            Some(route.clone())
+        }
+        _ => None,
+    };
+    (request, routed)
+}
+
+/// 会话路由下命中的分类保存目录；无路由 / 无命中 / 命中分类未配置目录时为 `None`。
+fn category_save_dir_for(
+    route: Option<&CategoryRouteDto>,
+    file_name: &str,
+    url: &str,
+) -> Option<String> {
+    fluxdown_agent::route_save_dir(route?, file_name, url).map(str::to_owned)
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl HostSession {
     /// 拉取式信号流：首个为 `Snapshot`；`None` = 会话已永久关闭（`Fatal` 之后、
@@ -255,14 +306,8 @@ impl HostSession {
     // daemon.task.*
 
     pub async fn create_task(&self, request: CreateTaskRequestDto) -> Result<String, FluxError> {
-        let params = DaemonCreateTaskParams {
-            request: request.into(),
-            torrent_blob_id: None,
-            // 交互式：声明了 client.selections，需要选择时请求会推到本 UI。
-            unattended: false,
-            hint_file_size: None,
-            name_hint: None,
-        };
+        let route = self.routes.borrow().clone();
+        let params = routed_create_params(request, route.as_ref());
         let value = self
             .rpc(DAEMON_TASK_CREATE, encode(&params, "create task")?)
             .await?;
@@ -429,11 +474,24 @@ impl HostSession {
         self.cancel.cancel();
     }
 
+    /// 新建下载表单的分类目录预测：按已连接主机当前分类路由，返回 `file_name`（不含 `.` 时
+    /// 回退 `url` 路径末段）命中的分类保存目录；无路由 / 无命中返回 `None`。与建任务时
+    /// 的路由同一套匹配语义（agent `route_save_dir`）。
+    pub fn category_save_dir(&self, file_name: String, url: String) -> Option<String> {
+        category_save_dir_for(self.routes.borrow().as_ref(), &file_name, &url)
+    }
+
     /// 批量导入（GPUI 同一套语义，见 `import.rs`）：按 256 条分块调用 `daemon.task.createMany`，
     /// 结果不确定时同一 `batchId` 退避重发，可取消。立即返回句柄；经句柄拉取进度与最终汇总。
     /// 本机主机与远端 `/rpc` 走同一路径。丢弃句柄不会取消导入。
     pub fn start_import(&self, batches: Vec<ImportBatchDto>) -> Arc<ImportHandle> {
-        crate::import::start(&self.runtime, Arc::new(self.chunk_sender()), batches)
+        let route = self.routes.borrow().clone();
+        crate::import::start(
+            &self.runtime,
+            Arc::new(self.chunk_sender()),
+            batches,
+            route.as_ref(),
+        )
     }
 }
 
@@ -466,7 +524,91 @@ mod tests {
             http_user: "u".to_owned(),
             http_password: "p".to_owned(),
             save_site_auth: true,
+            unattended: false,
+            offered_save_dir: None,
         }
+    }
+
+    fn route() -> fluxdown_protocol::CategoryRouteDto {
+        fluxdown_protocol::CategoryRouteDto {
+            rules: vec![fluxdown_protocol::CategoryRuleDto {
+                match_mode: "extension".to_owned(),
+                extensions: vec!["jpg".to_owned()],
+                regex_pattern: String::new(),
+                save_dir: "/pictures".to_owned(),
+            }],
+            other_dir: String::new(),
+        }
+    }
+
+    fn routed(save_dir: &str, offered: Option<&str>) -> fluxdown_protocol::DaemonCreateTaskParams {
+        let mut req = request("https://example.com/a.jpg");
+        req.save_dir = save_dir.to_owned();
+        req.offered_save_dir = offered.map(str::to_owned);
+        super::routed_create_params(req, Some(&route()))
+    }
+
+    #[test]
+    fn routed_create_params_routes_only_when_form_follows_system_dirs() {
+        // 表单留空 / 保持初始目录 / 预填的分类目录：以初始目录为基准目录并带路由。
+        for submitted in ["", "/default", " /pictures "] {
+            let params = routed(submitted, Some("/default"));
+            assert_eq!(params.request.save_dir, "/default", "{submitted:?}");
+            assert_eq!(params.category_route, Some(route()), "{submitted:?}");
+        }
+        // 用户改选了别的目录：原样提交、不路由。
+        let chosen = routed("/elsewhere", Some("/default"));
+        assert_eq!(chosen.request.save_dir, "/elsewhere");
+        assert_eq!(chosen.category_route, None);
+    }
+
+    #[test]
+    fn routed_create_params_never_routes_without_offered_dir_or_route() {
+        let plain = routed("", None);
+        assert_eq!(plain.request.save_dir, "");
+        assert_eq!(plain.category_route, None);
+
+        let mut req = request("https://example.com/a.jpg");
+        req.offered_save_dir = Some("/default".to_owned());
+        let no_route = super::routed_create_params(req, None);
+        assert_eq!(no_route.request.save_dir, "");
+        assert_eq!(no_route.category_route, None);
+    }
+
+    #[test]
+    fn category_save_dir_follows_the_route_and_is_none_without_one() {
+        let route = route();
+        assert_eq!(
+            super::category_save_dir_for(Some(&route), "photo.JPG", "").as_deref(),
+            Some("/pictures")
+        );
+        // 文件名不含 `.` 时回退 URL 路径末段。
+        assert_eq!(
+            super::category_save_dir_for(Some(&route), "", "https://x.test/a/b.jpg?x=1").as_deref(),
+            Some("/pictures")
+        );
+        assert_eq!(
+            super::category_save_dir_for(Some(&route), "setup.exe", ""),
+            None
+        );
+        assert_eq!(super::category_save_dir_for(None, "photo.jpg", ""), None);
+    }
+
+    #[tokio::test]
+    async fn session_without_custom_dirs_has_no_category_save_dir() {
+        let (session, _recorder, _link) = ready().await;
+        assert_eq!(
+            session.category_save_dir("photo.jpg".to_owned(), String::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn routed_create_params_forwards_unattended() {
+        let mut req = request("https://example.com/a.jpg");
+        req.unattended = true;
+        assert!(super::routed_create_params(req, None).unattended);
+        assert!(!routed("", None).unattended);
     }
 
     async fn ready() -> (Arc<HostSession>, Arc<Recorder>, LinkHandle) {
@@ -707,6 +849,7 @@ mod tests {
         let (session, recorder, _link) = ready().await;
         for method in [
             "system.snapshot",
+            "system.taskPage",
             "system.shutdown",
             "rss.listSources",
             "daemon.",

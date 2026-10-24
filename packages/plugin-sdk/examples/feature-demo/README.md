@@ -9,7 +9,7 @@
 ## 验收清单
 
 ### 授权与风险
-- [ ] 安装后弹出授权对话框：风险徽标为「完全信任」（含 `desktop`），列出 4 个权限（任务 / 浏览器规则 / 桌面界面 / 后台常驻）与网络主机 `httpbin.org`，并说明原生文件 / 进程 / 网络操作不逐次记录。
+- [ ] 安装后弹出授权对话框：风险徽标为「完全信任」（含 `desktop`、`pageScripts`），列出 5 个权限（任务 / 浏览器规则 / 桌面界面 / 后台常驻 / 网页脚本）与网络主机 `httpbin.org`，并说明原生文件 / 进程 / 网络操作不逐次记录。
 - [ ] 未勾选「我已了解」时确定按钮不可用；取消后插件行显示「需要授权」徽标 + 「授权」按钮，启用开关不可用。
 - [ ] 授权后插件变为已加载、已启用。
 
@@ -59,6 +59,10 @@
 - [ ] `demo-headers-rejected`（改写请求头）被扩展拒收，原因「plugin 规则不得改写请求头」。
 - [ ] 禁用插件后再同步，plugin 层规则清空。
 
+### 页面脚本
+- [ ] 授权对话框的权限列表含「在网页中运行脚本」，「页面脚本」分区列出「页面脚本演示」与 `https://httpbin.org/*`；风险徽标为「完全信任」。
+- [ ] 浏览器扩展选项页开启插件页面脚本并确认后，打开 `https://httpbin.org/` 控制台出现 `[feature-demo] page-hello { greeting: "hello from feature-demo", caller: "page", ... }`。
+
 ### 审计
 - [ ] 插件 tab 顶部「审计日志」与插件详情「审计记录」可见：`consent.granted`、`install`、`fetch`（target 不含 query）、`tasks.create` / `tasks.control`、`settings.update`、`fs.write`、`desktop.load` / `desktop.invoke` / `desktop.call` / `desktop.unload`。
 - [ ] 「加载更多」、「复制 JSON」、「清空」（二次确认）可用。
@@ -69,4 +73,4 @@
 
 ## 不覆盖的能力
 
-`ffmpeg` / `ytdlp` / `auth` 权限与订阅 provider 依赖受管组件或站点账号，本插件不声明，以免授权与风险判定被它们干扰；它们由现有插件覆盖：`ytdlp`、多文件清单与 `dom` 规则见同目录的 `youtube-down`，其余见索引仓中的 yt-dlp 插件。
+`ffmpeg` / `ytdlp` / `auth` 权限与订阅 provider 依赖受管组件或站点账号，本插件不声明，以免授权与风险判定被它们干扰；它们由现有插件覆盖：多文件清单、`dom` 规则与 `memoryLimitMb` 见同目录的 `youtube-down`，`ytdlp` 等见索引仓中的 yt-dlp 插件。

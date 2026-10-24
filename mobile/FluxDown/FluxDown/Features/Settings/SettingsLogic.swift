@@ -253,7 +253,7 @@ nonisolated struct SettingsDownloadContext: Equatable {
 nonisolated enum SettingsDownloadRow: String, CaseIterable, Identifiable {
     case saveDir, rememberLastSaveDir
     case silentDownload, silentSkipSelection, useServerTime, fileExistsBehavior
-    case fileMissingAction, idleFileScan, defaultQueue, dedupSameUrl
+    case fileMissingAction, completedRecordRetention, idleFileScan, defaultQueue, dedupSameUrl
     case defaultSegments, autoMaxConnections, cdnMulti, cdnMaxNodes, multiNic, maxConcurrent
     case speedLimit, uploadLimit
     case autoRetryCount, autoRetryDelay, autoResumeOnStart
@@ -265,7 +265,7 @@ nonisolated enum SettingsDownloadRow: String, CaseIterable, Identifiable {
         switch self {
         case .saveDir, .rememberLastSaveDir: .saveLocation
         case .silentDownload, .silentSkipSelection, .useServerTime, .fileExistsBehavior,
-             .fileMissingAction, .idleFileScan, .defaultQueue, .dedupSameUrl: .behavior
+             .fileMissingAction, .completedRecordRetention, .idleFileScan, .defaultQueue, .dedupSameUrl: .behavior
         case .defaultSegments, .autoMaxConnections, .cdnMulti, .cdnMaxNodes, .multiNic, .maxConcurrent,
              .speedLimit, .uploadLimit: .connection
         case .autoRetryCount, .autoRetryDelay, .autoResumeOnStart: .retry
@@ -283,6 +283,7 @@ nonisolated enum SettingsDownloadRow: String, CaseIterable, Identifiable {
         case .useServerTime: "use_server_time"
         case .fileExistsBehavior: "file_exists_behavior"
         case .fileMissingAction: "file_missing_action"
+        case .completedRecordRetention: "completed_record_retention_days"
         case .idleFileScan: "idle_file_scan"
         case .defaultQueue: "default_queue_id"
         case .dedupSameUrl: "dedup_same_url"
@@ -310,6 +311,7 @@ nonisolated enum SettingsDownloadRow: String, CaseIterable, Identifiable {
         case .useServerTime: "useServerTime"
         case .fileExistsBehavior: "fileExistsBehavior"
         case .fileMissingAction: "fileMissingAction"
+        case .completedRecordRetention: "completedRecordRetention"
         case .idleFileScan: "idleFileScan"
         case .defaultQueue: "defaultQueueSetting"
         case .dedupSameUrl: "mobileDedupSameUrl"
@@ -337,6 +339,7 @@ nonisolated enum SettingsDownloadRow: String, CaseIterable, Identifiable {
         case .useServerTime: "useServerTimeDesc"
         case .fileExistsBehavior: "fileExistsBehaviorDesc"
         case .fileMissingAction: "fileMissingActionDesc"
+        case .completedRecordRetention: "completedRecordRetentionDesc"
         case .idleFileScan: "idleFileScanDesc"
         case .defaultQueue: "defaultQueueSettingDesc"
         case .dedupSameUrl: "mobileDedupSameUrlDesc"
@@ -381,6 +384,27 @@ nonisolated enum SettingsDownloadRow: String, CaseIterable, Identifiable {
 
     static func visible(in group: SettingsDownloadSection, _ ctx: SettingsDownloadContext) -> [SettingsDownloadRow] {
         allCases.filter { $0.group == group && $0.isVisible(in: ctx) }
+    }
+}
+
+/// 已完成记录保留天数的下拉模式逻辑（镜像 GPUI `sections/retention.rs` 与 Web `retention.ts`）。
+nonisolated enum SettingsRetention {
+    /// 预设天数（0 = 从不），与下拉项一一对应。
+    static let presets = [0, 1, 7, 30]
+    /// 切到「自定义」且没有可复用的自定义值时的起始天数（刻意不等于任何预设）。
+    static let customStart = 14
+    static let customID = "custom"
+
+    /// 下拉当前项：预设天数的字符串，或 `customID`。
+    static func modeID(days: Int, customFlag: Bool) -> String {
+        if (customFlag && days > 0) || !presets.contains(days) { return customID }
+        return String(days)
+    }
+
+    /// 切到「自定义」时写入的天数：当前值已是非预设值则沿用，否则用起始值。
+    static func customTarget(current: Int, max: Int) -> Int {
+        let base = current > 0 && !presets.contains(current) ? current : customStart
+        return min(max, Swift.max(1, base))
     }
 }
 

@@ -27,8 +27,19 @@
 //!
 //! 路由观察只在同一网络环境下可信，加载/记录时指纹不符即整表丢弃重学
 //! （RFC 8305 §4「历史数据 MUST NOT 跨接口使用、换网 SHOULD flush」；
-//! Chromium 以 `last_local_address_when_quic_worked` 做同构判定）。指纹只存
-//! 哈希，不落原始 IP/代理地址。
+//! Chromium 以 `last_local_address_when_quic_worked` 做同构判定）。网络指纹
+//! 只由出口 LAN IP 决定；系统代理端点单独成 epoch——开关 / 更换系统代理
+//! 只作废 system 路径的观察，直连与手动代理的结论原样保留（否则每次在代理
+//! 客户端里切一下「系统代理」开关就会丢光全部先验，Auto 永远在冷启动）。
+//! 两者都只存哈希，不落原始 IP/代理地址。
+//!
+//! # 路径失败（bad path）
+//!
+//! 传输层失败不是速率样本（0 B/s 无法进几何均值），单独记一个时间折扣的
+//! 失败权重（半衰 [`FAIL_HALF_LIFE_SECS`]，封顶 [`FAIL_MAX_WEIGHT`]）：权重
+//! ≥ [`BLOCKED_WEIGHT`] 即视为「近期走不通」，起飞不再选它（同 Chromium 把
+//! 失败代理标记为 bad 一段时间再重试的语义）。该路径任何一次成功实测立即
+//! 清零失败权重。
 //!
 //! # NoSwitch（完整性防线）
 //!
@@ -55,7 +66,8 @@ const ROUTE_CONFIG_KEY: &str = "auto_route_health";
 
 /// 持久化格式版本。语义规则变化时递增——旧版本数据加载时整体丢弃重学。
 /// v2：TTL 阶梯（冷却/胜绩/AdoptProxy）→ 每路径时间折扣速率估计。
-const ROUTE_FORMAT_VERSION: u32 = 2;
+/// v3：网络指纹不再含系统代理端点（另存 `sys`）；新增路径失败权重。
+const ROUTE_FORMAT_VERSION: u32 = 3;
 
 /// NoSwitch 记录的有效期：与 `cdn_node_health`/`domain_conn_caps` 一致的
 /// 24h（aria2 `--server-stat-timeout` 默认同为 86400s）。
@@ -83,6 +95,16 @@ const PRUNE_WEIGHT: f64 = 0.05;
 /// 路径统计的绝对保留上限：7 天未更新即丢弃（与权重衰减双保险）。
 const MAX_STAT_AGE_SECS: u64 = 7 * 24 * 3600;
 
+/// 路径失败权重的半衰期：1h。一次失败让该路径在约 1h 内不被选作起飞路径，
+/// 连续失败（封顶 4 次）最长约 3h；之后回到正常排序，由真实流量重新验证。
+const FAIL_HALF_LIFE_SECS: f64 = 3600.0;
+
+/// 失败权重封顶。
+const FAIL_MAX_WEIGHT: f64 = 4.0;
+
+/// 衰减后失败权重不低于此值即视为「近期走不通」。
+const BLOCKED_WEIGHT: f64 = 0.5;
+
 /// 单条路径的时间折扣速率统计。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct PathStat {
@@ -91,6 +113,15 @@ struct PathStat {
     /// 上次更新时刻的有效样本权重（读取时按经过时间衰减）。
     weight: f64,
     /// 上次更新的 Unix 秒。
+    ts: u64,
+}
+
+/// 单条路径的时间折扣失败权重（传输层失败次数的折扣和）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct FailStat {
+    /// 上次更新时刻的失败权重（读取时按 [`FAIL_HALF_LIFE_SECS`] 衰减）。
+    weight: f64,
+    /// 上次失败的 Unix 秒。
     ts: u64,
 }
 
@@ -104,6 +135,12 @@ struct HostRoute {
     manual: Option<PathStat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     system: Option<PathStat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direct_fail: Option<FailStat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual_fail: Option<FailStat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_fail: Option<FailStat>,
     /// 上次 validator 不一致（代理命中不同 CDN edge）的 Unix 秒，0 = 无。
     #[serde(default)]
     nosw_ts: u64,
@@ -129,27 +166,69 @@ impl HostRoute {
         }
     }
 
-    /// 反向 failover 语义：丢弃两条代理路径的估计，直连估计与 NoSwitch 保留。
+    fn fail(&self, route: RoutePath) -> Option<FailStat> {
+        match route {
+            RoutePath::Direct => self.direct_fail,
+            RoutePath::Proxy(CandidateSource::ManualFields) => self.manual_fail,
+            RoutePath::Proxy(CandidateSource::System) => self.system_fail,
+            RoutePath::Link(_) => None,
+        }
+    }
+
+    fn fail_mut(&mut self, route: RoutePath) -> Option<&mut Option<FailStat>> {
+        match route {
+            RoutePath::Direct => Some(&mut self.direct_fail),
+            RoutePath::Proxy(CandidateSource::ManualFields) => Some(&mut self.manual_fail),
+            RoutePath::Proxy(CandidateSource::System) => Some(&mut self.system_fail),
+            RoutePath::Link(_) => None,
+        }
+    }
+
+    /// 反向 failover 语义：丢弃两条代理路径的速率估计，直连估计、失败
+    /// 记录与 NoSwitch 保留。
     fn clear_proxy_stats(&mut self) {
         self.manual = None;
         self.system = None;
     }
 
+    /// 系统代理端点变化：system 路径的全部观察都属于旧端点。
+    fn clear_system(&mut self) {
+        self.system = None;
+        self.system_fail = None;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.direct.is_none()
+            && self.manual.is_none()
+            && self.system.is_none()
+            && self.direct_fail.is_none()
+            && self.manual_fail.is_none()
+            && self.system_fail.is_none()
+            && self.nosw_ts == 0
+    }
+
     /// 最新观察时间（容量裁剪排序用）。
     fn newest_ts(&self) -> u64 {
-        [self.direct, self.manual, self.system]
-            .iter()
+        let rates = [self.direct, self.manual, self.system]
+            .into_iter()
             .flatten()
-            .map(|s| s.ts)
-            .fold(self.nosw_ts, u64::max)
+            .map(|s| s.ts);
+        let fails = [self.direct_fail, self.manual_fail, self.system_fail]
+            .into_iter()
+            .flatten()
+            .map(|s| s.ts);
+        rates.chain(fails).fold(self.nosw_ts, u64::max)
     }
 }
 
-/// 落盘格式：`{"v":2,"net":"<hash16>","hosts":{...}}`。
+/// 落盘格式：`{"v":3,"net":"<hash16>","sys":"<hash16>","hosts":{...}}`。
 #[derive(Serialize, Deserialize)]
 struct RouteFile {
     v: u32,
     net: String,
+    /// 系统代理端点指纹；空 = 记录时未知 / 未开启系统代理。
+    #[serde(default)]
+    sys: String,
     hosts: HashMap<String, HostRoute>,
 }
 
@@ -167,8 +246,11 @@ static ROUTES: OnceLock<StdMutex<HashMap<String, HostRoute>>> = OnceLock::new();
 /// 当前生效的网络指纹（表 epoch）。空 = 尚未初始化 / 网络未就绪。
 static NET_EPOCH: OnceLock<StdMutex<String>> = OnceLock::new();
 
-/// 指纹计算结果缓存（60s）。
-static FINGERPRINT: OnceLock<StdMutex<Option<(String, Instant)>>> = OnceLock::new();
+/// 当前生效的系统代理端点指纹（system 路径的 epoch）。空 = 未知 / 未开启。
+static SYS_EPOCH: OnceLock<StdMutex<String>> = OnceLock::new();
+
+/// 网络快照缓存（60s）。
+static FINGERPRINT: OnceLock<StdMutex<Option<(NetSnapshot, Instant)>>> = OnceLock::new();
 
 /// 离线启动时暂存的磁盘先验：load 拿不到在线指纹无从校验，先存着，
 /// 待 [`ensure_net_epoch`] 首次拿到在线指纹时比对采纳（不符即弃）。
@@ -183,6 +265,10 @@ fn routes() -> &'static StdMutex<HashMap<String, HostRoute>> {
 
 fn net_epoch() -> &'static StdMutex<String> {
     NET_EPOCH.get_or_init(|| StdMutex::new(String::new()))
+}
+
+fn sys_epoch() -> &'static StdMutex<String> {
+    SYS_EPOCH.get_or_init(|| StdMutex::new(String::new()))
 }
 
 fn pending() -> &'static StdMutex<Option<RouteFile>> {
@@ -246,15 +332,57 @@ fn stat_alive(stat: &PathStat, now: u64) -> bool {
         && now - stat.ts <= MAX_STAT_AGE_SECS
 }
 
-/// 纯函数：网络指纹 = sha256(系统代理 host:port + '\0' + 本机 LAN IP) 前
-/// 16 hex。两个输入都可为空（离线/无系统代理），退化为常量指纹——表现
-/// 同纯时间折扣失效，不比现状差。
-fn fingerprint_of(proxy: &str, lan_ip: &str) -> String {
+/// 衰减到 `now` 的失败权重；非法数据 / 未来时间戳 → None。
+fn fail_weight(stat: &FailStat, now: u64) -> Option<f64> {
+    if stat.ts == 0 || stat.ts > now || !stat.weight.is_finite() {
+        return None;
+    }
+    let elapsed = (now - stat.ts) as f64;
+    Some(stat.weight.max(0.0) * 0.5f64.powf(elapsed / FAIL_HALF_LIFE_SECS))
+}
+
+/// 纯函数：把一次传输失败折入失败权重。
+fn blend_fail(slot: &mut Option<FailStat>, now: u64) {
+    let w = slot
+        .as_ref()
+        .and_then(|s| fail_weight(s, now))
+        .unwrap_or(0.0);
+    *slot = Some(FailStat {
+        weight: (w + 1.0).min(FAIL_MAX_WEIGHT),
+        ts: now,
+    });
+}
+
+/// 纯函数：失败记录是否仍让该路径处于「近期走不通」。
+fn is_blocked(stat: &FailStat, now: u64) -> bool {
+    fail_weight(stat, now).is_some_and(|w| w >= BLOCKED_WEIGHT)
+}
+
+/// 网络环境快照：`net` 为网络指纹（只含出口 LAN IP），`sys` 为系统代理
+/// 端点指纹。空串 = 未知。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct NetSnapshot {
+    net: String,
+    sys: String,
+}
+
+/// 纯函数：带域分隔的 sha256 前 16 hex。
+fn hash16(domain: &str, input: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(proxy.as_bytes());
+    hasher.update(domain.as_bytes());
     hasher.update([0u8]);
-    hasher.update(lan_ip.as_bytes());
+    hasher.update(input.as_bytes());
     hex::encode(&hasher.finalize()[..8])
+}
+
+/// 纯函数：网络指纹 = sha256("net" + '\0' + 本机出口 LAN IP) 前 16 hex。
+fn fingerprint_of(lan_ip: &str) -> String {
+    hash16("net", lan_ip)
+}
+
+/// 纯函数：系统代理端点指纹（`host:port`）。
+fn system_endpoint_of(endpoint: &str) -> String {
+    hash16("sys", endpoint)
 }
 
 /// 本机默认路由的出口 LAN IP。`UdpSocket::connect` **不发任何数据包**，
@@ -276,83 +404,150 @@ pub(crate) fn network_reachable() -> bool {
     lan_ip().is_some()
 }
 
-/// 计算当前网络指纹（无缓存）。**拿不到出口 IP = 网络未就绪，返回空串
+/// 计算当前网络快照（无缓存）。**拿不到出口 IP = 网络未就绪，`net` 为空
 /// 表示 unknown**——不是「另一张网」：调用方见空指纹一律维持现状，
-/// 避免睡眠唤醒/Wi-Fi 漫游/VPN 重拨的无路由窗口误清全表。
-fn compute_net_fingerprint() -> String {
+/// 避免睡眠唤醒/Wi-Fi 漫游/VPN 重拨的无路由窗口误清全表。系统代理端点
+/// 取 Auto 实际使用的系统候选（含 PAC 解析出的端点）。
+fn compute_snapshot() -> NetSnapshot {
     let Some(lan) = lan_ip() else {
-        return String::new();
+        return NetSnapshot::default();
     };
-    let proxy = crate::proxy_config::detect_system_proxy()
-        .ok()
-        .flatten()
-        .map(|p| format!("{}:{}", p.host, p.port))
+    let sys = crate::proxy_config::detect_auto_system_proxy()
+        .map(|p| system_endpoint_of(&format!("{}:{}", p.host, p.port)))
         .unwrap_or_default();
-    fingerprint_of(&proxy, &lan)
+    NetSnapshot {
+        net: fingerprint_of(&lan),
+        sys,
+    }
 }
 
-/// 带 60s 缓存的当前网络指纹。
-fn net_fingerprint() -> String {
+/// 带 60s 缓存的当前网络快照。
+fn net_snapshot() -> NetSnapshot {
     let cache = FINGERPRINT.get_or_init(|| StdMutex::new(None));
     if let Ok(mut slot) = cache.lock() {
-        if let Some((fp, at)) = slot.as_ref()
+        if let Some((snap, at)) = slot.as_ref()
             && at.elapsed() < FINGERPRINT_CACHE
         {
-            return fp.clone();
+            return snap.clone();
         }
-        let fp = compute_net_fingerprint();
-        *slot = Some((fp.clone(), Instant::now()));
-        return fp;
+        let snap = compute_snapshot();
+        *slot = Some((snap.clone(), Instant::now()));
+        return snap;
     }
-    compute_net_fingerprint()
+    compute_snapshot()
 }
 
-/// 校准表 epoch：网络指纹变化（换 Wi-Fi / 开关 VPN / 改系统代理）时清空
-/// 内存表——旧网络学到的路由结论对新网络是噪声（RFC 8305 flush 语义）。
-/// 指纹为空（网络未就绪）时维持现状。每次 lookup/record 前调用。
+/// 校准表 epoch：网络指纹变化（换 Wi-Fi / 开关 VPN）时清空内存表——旧
+/// 网络学到的路由结论对新网络是噪声（RFC 8305 flush 语义）；系统代理端点
+/// 换成另一个已知端点时只作废 system 路径。指纹为空（网络未就绪）时维持
+/// 现状。每次 lookup/record 前调用。
 fn ensure_net_epoch() {
-    let fp = net_fingerprint();
-    if fp.is_empty() {
+    apply_snapshot(&net_snapshot());
+}
+
+fn apply_snapshot(snap: &NetSnapshot) {
+    if snap.net.is_empty() {
         return;
     }
-    let Ok(mut cur) = net_epoch().lock() else {
-        return;
+    let first_online = {
+        let Ok(mut cur) = net_epoch().lock() else {
+            return;
+        };
+        if *cur == snap.net {
+            None
+        } else {
+            let had = !cur.is_empty();
+            cur.clone_from(&snap.net);
+            Some(!had)
+        }
     };
-    if *cur == fp {
+    match first_online {
+        Some(false) => {
+            if let Ok(mut map) = routes().lock() {
+                if !map.is_empty() {
+                    log_info!(
+                        "[route-health] 网络指纹变化，丢弃 {} 个 host 的路由先验重学",
+                        map.len()
+                    );
+                }
+                map.clear();
+            }
+            if let Ok(mut p) = pending().lock() {
+                *p = None;
+            }
+        }
+        // 离线启动后首次上线：这是磁盘先验唯一的运行时回读路径。
+        Some(true) => adopt_pending(snap),
+        None => {}
+    }
+    sync_sys_epoch(&snap.sys);
+}
+
+/// 系统代理端点 epoch：只在「已知端点 → 另一个已知端点」时作废 system
+/// 路径；关闭系统代理（端点未知）不清任何东西——重新打开同一端点时先验
+/// 原样可用。
+fn sync_sys_epoch(sys: &str) {
+    if sys.is_empty() {
         return;
     }
-    let had = !cur.is_empty();
-    *cur = fp.clone();
-    drop(cur);
-    if had {
-        if let Ok(mut map) = routes().lock() {
-            if !map.is_empty() {
-                log_info!(
-                    "[route-health] 网络指纹变化，丢弃 {} 个 host 的路由先验重学",
-                    map.len()
-                );
+    let changed = {
+        let Ok(mut cur) = sys_epoch().lock() else {
+            return;
+        };
+        if *cur == sys {
+            return;
+        }
+        let had = !cur.is_empty();
+        *cur = sys.to_string();
+        had
+    };
+    if changed && let Ok(mut map) = routes().lock() {
+        let mut cleared = 0usize;
+        for entry in map.values_mut() {
+            if entry.system.is_some() || entry.system_fail.is_some() {
+                entry.clear_system();
+                cleared += 1;
             }
-            map.clear();
         }
-        if let Ok(mut p) = pending().lock() {
-            *p = None;
+        map.retain(|_, e| !e.is_empty());
+        if cleared > 0 {
+            log_info!(
+                "[route-health] 系统代理端点变化，作废 {} 个 host 的系统代理路径观察",
+                cleared
+            );
         }
-    } else {
-        // 离线启动后首次上线：这是磁盘先验唯一的运行时回读路径。
-        adopt_pending(&fp);
     }
+}
+
+/// 纯函数：把磁盘表并入时按系统代理端点 epoch 过滤——记录时与当前都是
+/// 已知端点且不同 → 丢弃 system 路径观察。
+fn strip_foreign_system(hosts: &mut HashMap<String, HostRoute>, recorded: &str, current: &str) {
+    if recorded.is_empty() || current.is_empty() || recorded == current {
+        return;
+    }
+    for entry in hosts.values_mut() {
+        entry.clear_system();
+    }
+    hosts.retain(|_, e| !e.is_empty());
 }
 
 /// 采纳离线启动时暂存的磁盘先验（指纹相符才装表，否则丢弃）。
-fn adopt_pending(fp: &str) {
+fn adopt_pending(snap: &NetSnapshot) {
     let stashed = pending().lock().ok().and_then(|mut p| p.take());
     let Some(file) = stashed else { return };
-    if file.net != fp {
+    if file.net != snap.net {
         log_info!("[route-health] 网络就绪但指纹与上次运行不符，暂存先验丢弃重学");
         return;
     }
     let now = now_unix_secs();
     let mut incoming = file.hosts;
+    strip_foreign_system(&mut incoming, &file.sys, &snap.sys);
+    if snap.sys.is_empty()
+        && let Ok(mut cur) = sys_epoch().lock()
+        && cur.is_empty()
+    {
+        cur.clone_from(&file.sys);
+    }
     prune(&mut incoming, now);
     let loaded = incoming.len();
     if let Ok(mut map) = routes().lock() {
@@ -374,10 +569,18 @@ fn prune(map: &mut HashMap<String, HostRoute>, now: u64) {
                 *slot = None;
             }
         }
+        for slot in [&mut e.direct_fail, &mut e.manual_fail, &mut e.system_fail] {
+            if slot
+                .as_ref()
+                .is_some_and(|s| fail_weight(s, now).is_none_or(|w| w < PRUNE_WEIGHT))
+            {
+                *slot = None;
+            }
+        }
         if !fresh(e.nosw_ts, now) {
             e.nosw_ts = 0;
         }
-        e.direct.is_some() || e.manual.is_some() || e.system.is_some() || e.nosw_ts != 0
+        !e.is_empty()
     });
     if map.len() > MAX_HOSTS {
         let mut ts_sorted: Vec<u64> = map.values().map(HostRoute::newest_ts).collect();
@@ -398,13 +601,18 @@ fn prune(map: &mut HashMap<String, HostRoute>, now: u64) {
 /// Engine 启动时从 config 表读回持久化先验（与 `load_cdn_health` 同一
 /// 生命周期点调用）。版本/指纹不匹配、解析失败 → 空表重学。
 pub(crate) async fn load(db: &Db) {
-    load_with_fp(db, net_fingerprint()).await;
+    load_with_snapshot(db, net_snapshot()).await;
 }
 
-/// [`load`] 的指纹注入变体（测试确定性；生产路径恒经 [`load`]）。
-async fn load_with_fp(db: &Db, fp: String) {
+/// [`load`] 的快照注入变体（测试确定性；生产路径恒经 [`load`]）。
+async fn load_with_snapshot(db: &Db, snap: NetSnapshot) {
     if let Ok(mut cur) = net_epoch().lock() {
-        *cur = fp.clone();
+        cur.clone_from(&snap.net);
+    }
+    if !snap.sys.is_empty()
+        && let Ok(mut cur) = sys_epoch().lock()
+    {
+        cur.clone_from(&snap.sys);
     }
     let raw = match db.get_config(ROUTE_CONFIG_KEY).await {
         Ok(Some(v)) => v,
@@ -432,7 +640,7 @@ async fn load_with_fp(db: &Db, fp: String) {
         );
         return;
     }
-    if fp.is_empty() {
+    if snap.net.is_empty() {
         // 网络未就绪：无从校验指纹。暂存待 ensure_net_epoch 首次上线时
         // 比对采纳（开机自启早于网络就绪的常态路径）。
         if let Ok(mut p) = pending().lock() {
@@ -441,12 +649,19 @@ async fn load_with_fp(db: &Db, fp: String) {
         log_info!("[route-health] 网络未就绪，路由先验暂存待采纳");
         return;
     }
-    if parsed.net != fp {
+    if parsed.net != snap.net {
         log_info!("[route-health] 网络指纹与上次运行不符，路由先验整体丢弃重学");
         return;
     }
     let now = now_unix_secs();
     let mut incoming = parsed.hosts;
+    strip_foreign_system(&mut incoming, &parsed.sys, &snap.sys);
+    if snap.sys.is_empty()
+        && let Ok(mut cur) = sys_epoch().lock()
+    {
+        // 当前未开系统代理：沿用记录时的端点 epoch，重新打开同一端点时先验有效。
+        cur.clone_from(&parsed.sys);
+    }
     prune(&mut incoming, now);
     let loaded = incoming.len();
     if let Ok(mut map) = routes().lock() {
@@ -468,7 +683,7 @@ pub(crate) fn path_prior(host: &str, route: RoutePath) -> Option<PathPrior> {
 }
 
 /// 记录一次路径实测：`per_conn_bps` 为该路径单连接稳态速率（B/s）。
-/// 非有限值或 ≤0 直接忽略。立即落盘。
+/// 非有限值或 ≤0 直接忽略。成功实测同时清零该路径的失败权重。立即落盘。
 pub(crate) fn record_path_rate(host: &str, route: RoutePath, per_conn_bps: f64, db: &Db) {
     if !per_conn_bps.is_finite() || per_conn_bps <= 0.0 || route.is_link() {
         return;
@@ -480,8 +695,41 @@ pub(crate) fn record_path_rate(host: &str, route: RoutePath, per_conn_bps: f64, 
         if let Some(slot) = e.slot_mut(route) {
             blend(slot, per_conn_bps, now);
         }
+        if let Some(fail) = e.fail_mut(route) {
+            *fail = None;
+        }
     }
     persist(db);
+}
+
+/// 记录一次路径传输层失败（建连被拒 / 超时 / TLS 被劫持 / 中途断流等，
+/// 见 [`crate::net_failure::NetFailure`]）。速率估计不动——失败与速率是
+/// 两个维度：被墙的直连不是「慢」，而是「不通」。立即落盘。
+pub(crate) fn record_path_failure(host: &str, route: RoutePath, db: &Db) {
+    if route.is_link() {
+        return;
+    }
+    ensure_net_epoch();
+    let now = now_unix_secs();
+    if let Ok(mut map) = routes().lock() {
+        let e = map.entry(host.to_string()).or_default();
+        if let Some(fail) = e.fail_mut(route) {
+            blend_fail(fail, now);
+        }
+    }
+    persist(db);
+}
+
+/// 该路径近期是否走不通（失败权重未衰减到 [`BLOCKED_WEIGHT`] 以下，且此后
+/// 无成功实测）。起飞选路据此避开。
+pub(crate) fn path_blocked(host: &str, route: RoutePath) -> bool {
+    ensure_net_epoch();
+    let now = now_unix_secs();
+    routes()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(host).and_then(|e| e.fail(route)))
+        .is_some_and(|stat| is_blocked(&stat, now))
 }
 
 /// 该 host 是否有未过期的 validator 不一致记录。forward failover 门禁
@@ -541,11 +789,13 @@ pub(crate) fn clear_all(db: &Db) {
     // 针对旧候选代理的先验都必须作废（net 为空的空表下次 load 同样会被
     // 丢弃，语义一致）。
     let net = net_epoch().lock().map(|c| c.clone()).unwrap_or_default();
+    let sys = sys_epoch().lock().map(|c| c.clone()).unwrap_or_default();
     spawn_write(
         db,
         &RouteFile {
             v: ROUTE_FORMAT_VERSION,
             net,
+            sys,
             hosts: HashMap::new(),
         },
     );
@@ -586,9 +836,11 @@ fn persist(db: &Db) {
         prune(&mut map, now_unix_secs());
         map.clone()
     };
+    let sys = sys_epoch().lock().map(|c| c.clone()).unwrap_or_default();
     let file = RouteFile {
         v: ROUTE_FORMAT_VERSION,
         net,
+        sys,
         hosts: snapshot,
     };
     spawn_write(db, &file);
@@ -598,9 +850,11 @@ fn persist(db: &Db) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        HALF_LIFE_SECS, HostRoute, MAX_HOSTS, MAX_STAT_AGE_SECS, MAX_WEIGHT, PathStat,
-        ROUTE_CONFIG_KEY, ROUTE_FORMAT_VERSION, RouteFile, blend, decayed_weight, fingerprint_of,
-        load_with_fp, now_unix_secs, prior_of, prune, routes,
+        FAIL_HALF_LIFE_SECS, FAIL_MAX_WEIGHT, FailStat, HALF_LIFE_SECS, HostRoute, MAX_HOSTS,
+        MAX_STAT_AGE_SECS, MAX_WEIGHT, NetSnapshot, PathStat, ROUTE_CONFIG_KEY,
+        ROUTE_FORMAT_VERSION, RouteFile, blend, blend_fail, decayed_weight, fingerprint_of,
+        is_blocked, load_with_snapshot, now_unix_secs, prior_of, prune, routes,
+        strip_foreign_system, system_endpoint_of,
     };
     use std::collections::HashMap;
 
@@ -691,6 +945,7 @@ mod tests {
             manual: Some(stat(5e6, 2.0, NOW)),
             system: Some(stat(4e6, 2.0, NOW)),
             nosw_ts: NOW,
+            ..HostRoute::default()
         };
         e.clear_proxy_stats();
         assert_eq!(e.manual, None);
@@ -747,21 +1002,85 @@ mod tests {
 
     #[test]
     fn fingerprint_is_deterministic_and_input_sensitive() {
-        let a = fingerprint_of("p:1", "192.168.1.5");
-        assert_eq!(a, fingerprint_of("p:1", "192.168.1.5"));
-        assert_ne!(
-            a,
-            fingerprint_of("p:2", "192.168.1.5"),
-            "代理变化必须换 epoch"
-        );
-        assert_ne!(
-            a,
-            fingerprint_of("p:1", "10.0.0.3"),
-            "LAN IP 变化必须换 epoch"
-        );
+        let a = fingerprint_of("192.168.1.5");
+        assert_eq!(a, fingerprint_of("192.168.1.5"));
+        assert_ne!(a, fingerprint_of("10.0.0.3"), "LAN IP 变化必须换 epoch");
         assert_eq!(a.len(), 16, "16 hex = 8 字节截断");
-        // 边界组合不得同构：("ab","") vs ("a","b")。
-        assert_ne!(fingerprint_of("ab", ""), fingerprint_of("a", "b"));
+        // 网络指纹与系统代理端点指纹分域：同一输入不得同构。
+        assert_ne!(
+            fingerprint_of("127.0.0.1:7890"),
+            system_endpoint_of("127.0.0.1:7890")
+        );
+    }
+
+    #[test]
+    fn one_failure_blocks_for_about_one_half_life_and_repeats_extend_it() {
+        let hl = FAIL_HALF_LIFE_SECS as u64;
+        let mut slot = None;
+        blend_fail(&mut slot, NOW);
+        let once = slot.unwrap();
+        assert!(is_blocked(&once, NOW));
+        assert!(is_blocked(&once, NOW + hl), "一个半衰期内仍视为走不通");
+        assert!(!is_blocked(&once, NOW + hl + 60), "过期后回到正常排序");
+
+        for _ in 0..10 {
+            blend_fail(&mut slot, NOW);
+        }
+        let repeated = slot.unwrap();
+        assert!(repeated.weight <= FAIL_MAX_WEIGHT, "失败权重封顶");
+        assert!(
+            is_blocked(&repeated, NOW + 3 * hl),
+            "连续失败延长到 3 个半衰期"
+        );
+        assert!(!is_blocked(&repeated, NOW + 3 * hl + 60));
+        // 时钟回拨：未来时间戳不判阻断。
+        let future = FailStat {
+            weight: FAIL_MAX_WEIGHT,
+            ts: NOW + 10,
+        };
+        assert!(!is_blocked(&future, NOW));
+    }
+
+    #[test]
+    fn system_endpoint_change_strips_only_system_path() {
+        let entry = HostRoute {
+            direct: Some(stat(1e6, 2.0, NOW)),
+            system: Some(stat(4e6, 2.0, NOW)),
+            system_fail: Some(FailStat {
+                weight: 1.0,
+                ts: NOW,
+            }),
+            ..HostRoute::default()
+        };
+        let only_system = HostRoute {
+            system: Some(stat(4e6, 2.0, NOW)),
+            ..HostRoute::default()
+        };
+        let fresh_map = || {
+            HashMap::from([
+                ("mixed.example".to_string(), entry),
+                ("sys-only.example".to_string(), only_system),
+            ])
+        };
+
+        let mut changed = fresh_map();
+        strip_foreign_system(&mut changed, "sys-a", "sys-b");
+        let mixed = changed["mixed.example"];
+        assert_eq!(mixed.direct, entry.direct, "直连结论不受系统代理更换影响");
+        assert_eq!(mixed.system, None);
+        assert_eq!(mixed.system_fail, None);
+        assert!(
+            !changed.contains_key("sys-only.example"),
+            "清空后的条目移除"
+        );
+
+        // 系统代理关闭（端点未知）或端点未变：原样保留。
+        for (recorded, current) in [("sys-a", ""), ("", "sys-b"), ("sys-a", "sys-a")] {
+            let mut kept = fresh_map();
+            strip_foreign_system(&mut kept, recorded, current);
+            assert_eq!(kept["mixed.example"].system, entry.system);
+            assert!(kept.contains_key("sys-only.example"));
+        }
     }
 
     async fn mem_db() -> crate::db::Db {
@@ -786,19 +1105,24 @@ mod tests {
         let file = RouteFile {
             v: ROUTE_FORMAT_VERSION,
             net: "net-a".to_string(),
+            sys: String::new(),
             hosts,
         };
         db.set_config(ROUTE_CONFIG_KEY, &serde_json::to_string(&file).unwrap())
             .await
             .expect("seed config");
 
-        load_with_fp(&db, "net-b".to_string()).await;
+        let snap = |net: &str| NetSnapshot {
+            net: net.to_string(),
+            sys: String::new(),
+        };
+        load_with_snapshot(&db, snap("net-b")).await;
         assert!(
             !routes().lock().unwrap().contains_key("load-epoch.example"),
             "指纹不符必须整表丢弃"
         );
 
-        load_with_fp(&db, "net-a".to_string()).await;
+        load_with_snapshot(&db, snap("net-a")).await;
         let loaded = routes().lock().unwrap().get("load-epoch.example").copied();
         let loaded = loaded.expect("指纹相符必须加载条目");
         let same = |a: Option<PathStat>, b: Option<PathStat>| match (a, b) {
@@ -823,7 +1147,14 @@ mod tests {
         db.set_config(ROUTE_CONFIG_KEY, &raw)
             .await
             .expect("seed config");
-        load_with_fp(&db, "net-v1".to_string()).await;
+        load_with_snapshot(
+            &db,
+            NetSnapshot {
+                net: "net-v1".to_string(),
+                sys: String::new(),
+            },
+        )
+        .await;
         assert!(
             !routes().lock().unwrap().contains_key("v1.example"),
             "旧格式版本必须整体丢弃"

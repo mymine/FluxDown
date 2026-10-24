@@ -15,5 +15,6 @@ export * from './rpc';
 export * from './rss';
 export * from './selection';
 export * from './task';
+export * from './table';
 export * from './webhook';
 export * from './ws';

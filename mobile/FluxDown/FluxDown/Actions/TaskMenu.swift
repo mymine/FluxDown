@@ -25,13 +25,14 @@ struct TaskMenuItems: View {
             if actions.canRedownload(task) {
                 Button(L("redownloadTask"), systemImage: FluxSymbol.retry) { actions.confirmRedownload(task) }
             }
-            if status == .paused || status == .failed {
+            if status == .paused || status == .failed || task.presentsResumeSeeding {
                 Button(L("resume"), systemImage: FluxSymbol.resume) { actions.resume([task.taskId]) }
             }
-            if status.isActive || status == .pending {
+            if status.isActive || status == .pending || task.presentsSeeding {
                 Button(L("pause"), systemImage: FluxSymbol.pause) { actions.pause([task.taskId]) }
             }
-            if status != .completed {
+            // 只有未结束的任务能优先下载（主机对已完成 / 失败任务拒绝 Boost）。
+            if status != .completed && status != .failed {
                 Toggle(isOn: Binding(get: { boosted }, set: { _ in actions.boost(task, boosted: boosted) })) {
                     Label(L(boosted ? "cancelBoost" : "boostDownload"), systemImage: FluxSymbol.boost)
                 }

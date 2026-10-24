@@ -1,0 +1,157 @@
+{
+  "memberDir": [
+    { "groupDir": "/d/Pack", "taskDir": "/d/Pack", "expect": "" },
+    { "groupDir": "/d/Pack", "taskDir": "/d/Pack/sub/a", "expect": "sub/a" },
+    { "groupDir": "/d/Pack/", "taskDir": "/d/Pack/sub/", "expect": "sub" },
+    { "groupDir": "C:\\dl\\Pack", "taskDir": "C:\\dl\\Pack\\S1", "expect": "S1" },
+    { "groupDir": "/d/Pack", "taskDir": "/d/Package/x", "expect": "" },
+    { "groupDir": "/d/Pack", "taskDir": "/other", "expect": "" },
+    { "groupDir": "", "taskDir": "/d/x", "expect": "" }
+  ],
+  "displayName": [
+    { "name": "  Pack ", "saveDir": "/d/x", "id": "g1", "expect": "Pack" },
+    { "name": "", "saveDir": "/d/Season 1/", "id": "g1", "expect": "Season 1" },
+    { "name": "", "saveDir": "C:\\dl\\Show", "id": "g1", "expect": "Show" },
+    { "name": " ", "saveDir": "", "id": "g1", "expect": "g1" }
+  ],
+  "compressPath": [
+    { "path": "", "expect": "" },
+    { "path": "a", "expect": "a" },
+    { "path": "a/b", "expect": "a / b" },
+    { "path": "a/b/c", "expect": "… / b / c" },
+    { "path": "/a/b/c/d/", "expect": "… / c / d" }
+  ],
+  "sparklineSample": [
+    { "len": 0, "max": 24, "expect": [] },
+    { "len": 3, "max": 24, "expect": [0, 1, 2] },
+    { "len": 5, "max": 2, "expect": [0, 2] },
+    { "len": 50, "max": 24, "expect": [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 25, 27, 29, 31, 33, 35, 37, 39, 41, 43, 45, 47] }
+  ],
+  "sparklineHeight": [
+    { "progress": 0, "status": 1, "expect": 0.14 },
+    { "progress": 0.5, "status": 1, "expect": 0.5 },
+    { "progress": 0.1, "status": 4, "expect": 0.3333 },
+    { "progress": 0.2, "status": 3, "expect": 1 },
+    { "progress": 1.4, "status": 2, "expect": 1 }
+  ],
+  "aggregate": [
+    {
+      "title": "downloading wins; speed only from downloading members",
+      "members": [
+        { "id": "a", "name": "a.bin", "status": 1, "totalBytes": 100, "downloadedBytes": 50, "speed": 10 },
+        { "id": "b", "name": "b.bin", "status": 3, "totalBytes": 100, "downloadedBytes": 100, "speed": 0 },
+        { "id": "c", "name": "c.bin", "status": 4, "totalBytes": 100, "downloadedBytes": 0, "speed": 0 }
+      ],
+      "expect": { "state": "downloading", "total": 3, "done": 1, "downloading": 1, "pending": 0, "paused": 0, "failed": 1, "sizeBytes": 300, "downloadedBytes": 150, "speed": 10, "progress": 0.5, "etaSeconds": 15 }
+    },
+    {
+      "title": "preparing counts as downloading",
+      "members": [
+        { "id": "a", "name": "a.bin", "status": 5, "totalBytes": 0, "downloadedBytes": 0, "speed": 0 },
+        { "id": "b", "name": "b.bin", "status": 2, "totalBytes": 200, "downloadedBytes": 100, "speed": 0 }
+      ],
+      "expect": { "state": "downloading", "total": 2, "done": 0, "downloading": 1, "pending": 0, "paused": 1, "failed": 0, "sizeBytes": 200, "downloadedBytes": 100, "speed": 0, "progress": 0.5, "etaSeconds": null }
+    },
+    {
+      "title": "queued beats failed",
+      "members": [
+        { "id": "a", "name": "a.bin", "status": 0, "totalBytes": 0, "downloadedBytes": 0, "speed": 0 },
+        { "id": "b", "name": "b.bin", "status": 4, "totalBytes": 0, "downloadedBytes": 0, "speed": 0 }
+      ],
+      "expect": { "state": "pending", "total": 2, "done": 0, "downloading": 0, "pending": 1, "paused": 0, "failed": 1, "sizeBytes": 0, "downloadedBytes": 0, "speed": 0, "progress": 0, "etaSeconds": null }
+    },
+    {
+      "title": "paused beats failed: pausing a group must not read as a failure",
+      "members": [
+        { "id": "a", "name": "a.bin", "status": 3, "totalBytes": 10, "downloadedBytes": 10, "speed": 0 },
+        { "id": "b", "name": "b.bin", "status": 4, "totalBytes": 10, "downloadedBytes": 0, "speed": 0 },
+        { "id": "c", "name": "c.bin", "status": 2, "totalBytes": 10, "downloadedBytes": 5, "speed": 0 }
+      ],
+      "expect": { "state": "paused", "total": 3, "done": 1, "downloading": 0, "pending": 0, "paused": 1, "failed": 1, "sizeBytes": 30, "downloadedBytes": 15, "speed": 0, "progress": 0.5, "etaSeconds": null }
+    },
+    {
+      "title": "failed beats completed",
+      "members": [
+        { "id": "a", "name": "a.bin", "status": 3, "totalBytes": 10, "downloadedBytes": 10, "speed": 0 },
+        { "id": "b", "name": "b.bin", "status": 4, "totalBytes": 10, "downloadedBytes": 0, "speed": 0 }
+      ],
+      "expect": { "state": "failed", "total": 2, "done": 1, "downloading": 0, "pending": 0, "paused": 0, "failed": 1, "sizeBytes": 20, "downloadedBytes": 10, "speed": 0, "progress": 0.5, "etaSeconds": null }
+    },
+    {
+      "title": "all completed",
+      "members": [
+        { "id": "a", "name": "a.bin", "status": 3, "totalBytes": 10, "downloadedBytes": 10, "speed": 0 },
+        { "id": "b", "name": "b.bin", "status": 3, "totalBytes": 0, "downloadedBytes": 0, "speed": 0 }
+      ],
+      "expect": { "state": "completed", "total": 2, "done": 2, "downloading": 0, "pending": 0, "paused": 0, "failed": 0, "sizeBytes": 10, "downloadedBytes": 10, "speed": 0, "progress": 1, "etaSeconds": null }
+    },
+    {
+      "title": "paused with completed is paused",
+      "members": [
+        { "id": "a", "name": "a.bin", "status": 3, "totalBytes": 10, "downloadedBytes": 10, "speed": 0 },
+        { "id": "b", "name": "b.bin", "status": 2, "totalBytes": 10, "downloadedBytes": 0, "speed": 0 }
+      ],
+      "expect": { "state": "paused", "total": 2, "done": 1, "downloading": 0, "pending": 0, "paused": 1, "failed": 0, "sizeBytes": 20, "downloadedBytes": 10, "speed": 0, "progress": 0.5, "etaSeconds": null }
+    },
+    {
+      "title": "unknown sizes fall back to completed share",
+      "members": [
+        { "id": "a", "name": "a.bin", "status": 3, "totalBytes": 0, "downloadedBytes": 0, "speed": 0 },
+        { "id": "b", "name": "b.bin", "status": 2, "totalBytes": 0, "downloadedBytes": 0, "speed": 0 }
+      ],
+      "expect": { "state": "paused", "total": 2, "done": 1, "downloading": 0, "pending": 0, "paused": 1, "failed": 0, "sizeBytes": 0, "downloadedBytes": 0, "speed": 0, "progress": 0.5, "etaSeconds": null }
+    },
+    {
+      "title": "paused member speed is ignored",
+      "members": [
+        { "id": "a", "name": "a.bin", "status": 1, "totalBytes": 100, "downloadedBytes": 0, "speed": 5 },
+        { "id": "b", "name": "b.bin", "status": 2, "totalBytes": 100, "downloadedBytes": 0, "speed": 7 }
+      ],
+      "expect": { "state": "downloading", "total": 2, "done": 0, "downloading": 1, "pending": 0, "paused": 1, "failed": 0, "sizeBytes": 200, "downloadedBytes": 0, "speed": 5, "progress": 0, "etaSeconds": 40 }
+    }
+  ],
+  "flatten": [
+    {
+      "title": "root members first, then each directory once in natural order",
+      "groupDir": "/d/P",
+      "collapsedDirs": [],
+      "members": [
+        { "id": "a", "name": "ep10.mkv", "saveDir": "/d/P", "totalBytes": 10 },
+        { "id": "b", "name": "ep2.mkv", "saveDir": "/d/P/", "totalBytes": 20 },
+        { "id": "c", "name": "x.srt", "saveDir": "/d/P/Subs", "totalBytes": 1 },
+        { "id": "d", "name": "b.txt", "saveDir": "/d/P/extras/b", "totalBytes": 2 },
+        { "id": "e", "name": "Part10.txt", "saveDir": "/d/P/extras", "totalBytes": 3 },
+        { "id": "f", "name": "part9.txt", "saveDir": "/d/P/extras", "totalBytes": 4 },
+        { "id": "g", "name": "moved.bin", "saveDir": "/elsewhere", "totalBytes": 5 }
+      ],
+      "expect": [
+        { "member": "b", "nested": false },
+        { "member": "a", "nested": false },
+        { "member": "g", "nested": false },
+        { "dir": "extras", "count": 2, "sizeBytes": 7, "collapsed": false },
+        { "member": "f", "nested": true },
+        { "member": "e", "nested": true },
+        { "dir": "extras/b", "count": 1, "sizeBytes": 2, "collapsed": false },
+        { "member": "d", "nested": true },
+        { "dir": "Subs", "count": 1, "sizeBytes": 1, "collapsed": false },
+        { "member": "c", "nested": true }
+      ]
+    },
+    {
+      "title": "collapsed directory keeps only its row",
+      "groupDir": "/d/P",
+      "collapsedDirs": ["extras"],
+      "members": [
+        { "id": "a", "name": "ep1.mkv", "saveDir": "/d/P", "totalBytes": 10 },
+        { "id": "e", "name": "a.txt", "saveDir": "/d/P/extras", "totalBytes": 3 },
+        { "id": "d", "name": "b.txt", "saveDir": "/d/P/extras/b", "totalBytes": 2 }
+      ],
+      "expect": [
+        { "member": "a", "nested": false },
+        { "dir": "extras", "count": 1, "sizeBytes": 3, "collapsed": true },
+        { "dir": "extras/b", "count": 1, "sizeBytes": 2, "collapsed": false },
+        { "member": "d", "nested": true }
+      ]
+    }
+  ]
+}

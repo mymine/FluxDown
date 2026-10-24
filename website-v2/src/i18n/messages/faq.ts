@@ -47,8 +47,8 @@ export const faq = defineMessages({
         items: [
           {
             q: "Which platforms are supported?",
-            a: "Windows (10 or later, x64/ARM64), macOS (Apple Silicon & Intel), and Linux (x64) are fully supported. Windows 7/8/8.1 are not supported. On macOS, you may encounter a 'damaged app' warning — see our macOS Gatekeeper guide for a quick fix.",
-            link: "/macos-gatekeeper",
+            a: "Windows (10 or later, x64/ARM64), macOS (Apple Silicon & Intel), and Linux (x64) are fully supported. Windows 7/8/8.1 are not supported. macOS builds are signed with an Apple Developer ID and notarized, so they open like any other app.",
+            link: null,
           },
           {
             q: "Which browsers are supported?",
@@ -57,13 +57,8 @@ export const faq = defineMessages({
           },
           {
             q: "How do I install the browser extension?",
-            a: "The easiest way is to install directly from the Chrome Web Store or Firefox Add-ons Store — just search 'FluxDown' and click install. Alternatively, you can download the offline extension zip from our Download page, extract it, open chrome://extensions, enable Developer Mode, and click 'Load unpacked' to select the extracted folder.",
+            a: "The easiest way is to install directly from the Chrome Web Store, Edge Add-ons or Firefox Add-ons — just search 'FluxDown' and click install. If you can't open the store, the Download page also has the store-signed .crx: drag it onto chrome://extensions with Developer Mode on, and Chrome keeps it updated like a store install.",
             link: "/download",
-          },
-          {
-            q: "macOS says FluxDown is 'damaged' or from an 'unidentified developer'. What should I do?",
-            a: "This happens because FluxDown is not yet signed with an Apple developer certificate. It does not mean the app is actually damaged. You can fix it in most cases by running a single Terminal command. Visit our macOS Gatekeeper guide at /macos-gatekeeper for step-by-step instructions.",
-            link: "/macos-gatekeeper",
           },
         ],
       },
@@ -127,8 +122,8 @@ export const faq = defineMessages({
         items: [
           {
             q: "支持哪些操作系统？",
-            a: "目前完整支持 Windows（10 及以上，x64/ARM64）、macOS（Apple Silicon 与 Intel）和 Linux（x64）。不支持 Windows 7/8/8.1。macOS 用户可能会遇到「应用已损坏」的提示，请参阅我们的 macOS Gatekeeper 指南快速解决。",
-            link: "/macos-gatekeeper",
+            a: "目前完整支持 Windows（10 及以上，x64/ARM64）、macOS（Apple Silicon 与 Intel）和 Linux（x64）。不支持 Windows 7/8/8.1。macOS 版本已使用 Apple Developer ID 签名并通过公证，可以像其他应用一样直接打开。",
+            link: null,
           },
           {
             q: "支持哪些浏览器？",
@@ -137,13 +132,8 @@ export const faq = defineMessages({
           },
           {
             q: "如何安装浏览器扩展？",
-            a: "最简单的方式是直接从 Chrome 应用商店或 Firefox 附加组件商店安装——搜索「FluxDown」点击安装即可。你也可以从下载页面下载离线扩展 zip 文件，解压后打开 chrome://extensions，开启开发者模式，点击「加载已解压的扩展程序」选择解压后的文件夹。",
+            a: "最简单的方式是直接从 Chrome 网上应用店、Edge 附加组件或 Firefox 附加组件商店安装——搜索「FluxDown」点击安装即可。打不开商店时，下载页也提供商店签名的 .crx：开启开发者模式后拖入 chrome://extensions 即可安装，之后会像商店版一样自动更新。",
             link: "/download",
-          },
-          {
-            q: "macOS 提示 FluxDown「已损坏」或来自「身份不明的开发者」怎么办？",
-            a: "这是因为 FluxDown 暂未使用 Apple 开发者证书签名，并不意味着应用真的已损坏。大多数情况下只需在终端执行一条命令即可解决。请访问我们的 macOS Gatekeeper 指南（/macos-gatekeeper）查看详细步骤。",
-            link: "/macos-gatekeeper",
           },
         ],
       },

@@ -35,8 +35,9 @@ struct AccountPage: View {
             }
             AccountCloudFeatures(sections: sections, session: session)
             AccountEndpointSection(readOnly: readOnly)
-            if session != nil {
+            if let session {
                 logoutSection(readOnly: readOnly)
+                deleteAccountSection(session: session, readOnly: readOnly)
             }
         }
         .overlay {
@@ -70,6 +71,7 @@ struct AccountPage: View {
             case let .originId(current): OriginIdSheet(current: current)
             case let .email(userId, email): EmailChangeSheet(userId: userId, currentEmail: email)
             case let .password(userId, email, hasPassword): PasswordChangeSheet(userId: userId, email: email, hasPassword: hasPassword)
+            case let .deleteAccount(userId, email, hasPassword): DeleteAccountSheet(userId: userId, email: email, hasPassword: hasPassword)
             }
         }
         .onChange(of: session == nil) { _, loggedOut in
@@ -333,6 +335,21 @@ struct AccountPage: View {
         }
     }
 
+    // MARK: 注销账户
+
+    private func deleteAccountSection(session: AgentSessionDto, readOnly: Bool) -> some View {
+        Section {
+            Button(role: .destructive) {
+                sheet = .deleteAccount(userId: session.user.id, email: session.user.email, hasPassword: session.user.hasPassword)
+            } label: {
+                Text(L("accountDeleteRow"))
+            }
+            .disabled(readOnly)
+        } footer: {
+            Text(L("accountDeleteRowFooter"))
+        }
+    }
+
     // MARK: 动作
 
     private func refresh() {
@@ -382,6 +399,7 @@ private nonisolated enum AccountSheet: Identifiable {
     case originId(current: Int64?)
     case email(userId: String, email: String)
     case password(userId: String, email: String, hasPassword: Bool?)
+    case deleteAccount(userId: String, email: String, hasPassword: Bool?)
 
     var id: String {
         switch self {
@@ -391,6 +409,7 @@ private nonisolated enum AccountSheet: Identifiable {
         case .originId: "originId"
         case .email: "email"
         case .password: "password"
+        case .deleteAccount: "deleteAccount"
         }
     }
 

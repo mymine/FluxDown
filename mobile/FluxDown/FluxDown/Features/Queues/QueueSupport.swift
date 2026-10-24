@@ -41,8 +41,9 @@ enum QueueText {
     }
 
     /// D7 行摘要：n 个任务 · 并发 · ↓ 限速 · ↑ 限速 · 定时（0 = 不限制的项省略）。
-    static func summary(_ queue: TaskQueue, taskCount: Int) -> String {
-        var parts = [L("nTasks", ["n": taskCount])]
+    /// `taskCount == nil` = 任务表还在分页载入，数量未知：显示载入文案而不是 0。
+    static func summary(_ queue: TaskQueue, taskCount: Int?) -> String {
+        var parts = [taskCount.map { L("nTasks", ["n": $0]) } ?? L("mobileTasksLoading")]
         if queue.maxConcurrent > 0 {
             parts.append(L("queueSummaryConcurrent", ["n": queue.maxConcurrent]))
         }

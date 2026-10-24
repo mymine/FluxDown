@@ -138,8 +138,9 @@
 @utility h-task-row {
   height: var(--fx-density-task-row);
 }
+/* 宽松 = 旧 Flutter 默认列表行高 64px；舒适行高更大（字号放大）时跟随它（GPUI `row_height` 同规则）。 */
 @utility h-task-row-relaxed {
-  height: calc(var(--fx-density-task-row) * 1.5);
+  height: max(64px, var(--fx-density-task-row));
 }
 @utility h-task-row-compact {
   height: var(--fx-density-task-row-compact);

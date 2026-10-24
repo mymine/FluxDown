@@ -49,6 +49,7 @@ struct LinkDeviceRow: View {
     let online: Bool
     var revoked = false
     var sameAccount = false
+    var grantsControl = false
 
     var body: some View {
         HStack(spacing: 14) {
@@ -73,6 +74,10 @@ struct LinkDeviceRow: View {
                     StatusBadge(text: L("linkedDeviceRevokedTag"), tone: .warning)
                 } else if sameAccount {
                     StatusBadge(text: L("linkedDeviceSameAccountTag"), tone: .neutral)
+                }
+                if grantsControl, !revoked {
+                    // 这台设备已获批完全控制本机（手机经「添加主机 → 局域网配对」授权的）。
+                    StatusBadge(text: L("linkControlGrantedTag"), tone: .warning)
                 }
             }
             Spacer(minLength: 0)

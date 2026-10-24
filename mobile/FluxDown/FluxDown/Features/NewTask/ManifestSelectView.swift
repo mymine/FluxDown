@@ -1,6 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
+#if FULL_FLAVOR
 
 // N5 · 插件清单预解析 → 任务组（`02-downloads.md` §15）。
 // N1 单条 http(s) 链接经 `daemon.group.resolvePreview` 命中清单，数据已就绪后推入本页。
@@ -48,15 +49,6 @@ nonisolated struct ManifestBaseOptions: Hashable {
             startPaused: startPaused,
             items: items
         )
-    }
-}
-
-/// 队列显示名：主队列 / 稍后下载用本地化名，其余取队列自带名称（N1 与清单选择共用）。
-func newTaskQueueLabel(_ q: TaskQueue) -> String {
-    switch q.queueId {
-    case "", TaskQueue.main: L("mainQueue")
-    case TaskQueue.later: L("downloadLater")
-    default: q.name
     }
 }
 
@@ -483,3 +475,4 @@ struct ManifestSelectView: View {
         }
     }
 }
+#endif

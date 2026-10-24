@@ -376,6 +376,10 @@ pub struct BridgeHttpRequest {
     /// 由运行时注入，插件脚本不能自行打开认证能力。
     #[serde(skip)]
     pub auth_allowed: bool,
+    /// 由运行时注入（仅开发模式插件为 true），插件脚本不能自行打开：
+    /// 允许访问环回 / 私网等非公网地址，便于连接本机服务联调。
+    #[serde(skip)]
+    pub private_network_allowed: bool,
 }
 
 impl Default for BridgeHttpRequest {
@@ -387,6 +391,7 @@ impl Default for BridgeHttpRequest {
             body: None,
             auth_ref: None,
             auth_allowed: false,
+            private_network_allowed: false,
         }
     }
 }
@@ -557,6 +562,9 @@ pub struct HostContext {
     /// manifest `permissions` 是否含 `"auth"`——决定是否允许插件读取/保存
     /// 通用认证凭据以及让 `flux.fetch` 自动注入凭据。
     pub auth_permitted: bool,
+    /// 插件是否为开发模式（「从目录安装」）。仅此类插件的 `flux.fetch` 可访问
+    /// 非公网地址（环回 / 私网）；正式安装的插件恒为 false。
+    pub private_network_allowed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +580,17 @@ pub trait PluginTaskPort: Send + Sync {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, PluginError>;
+}
+
+/// 一次页面脚本调用（[`HostCall::Invoke`] 且 `page_url` 为 `Some`）执行期间，插件经
+/// `flux.tasks.create` / `flux.tasks.resume` 成功开始的任务。宿主据此把用户在浏览器里的
+/// 操作登记为「用户开始」（进度 / 完成窗口）；其余调用来源（视图、命令、事件、定时器）恒为空。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartedTasks {
+    /// `create` 返回的新任务 ID，按调用顺序。
+    pub created: Vec<String>,
+    /// `resume` 成功的已有任务 ID，按调用顺序。
+    pub resumed: Vec<String>,
 }
 
 /// 投递给常驻宿主的一次调用。
@@ -599,9 +618,12 @@ pub enum HostCall {
         id: String,
         task_ids: Vec<String>,
     },
+    /// `page_url` 为 `Some` 表示来自浏览器页面脚本（只命中 `{ page: true }` 处理器，
+    /// ctx 为 `{ caller: "page", pageUrl }`）；`None` 表示桌面视图（ctx 为 `{ caller: "desktop" }`）。
     Invoke {
         name: String,
         args: serde_json::Value,
+        page_url: Option<String>,
     },
     Event(PluginEvent),
     Timer {
@@ -618,8 +640,11 @@ pub enum HostCall {
 pub enum HostReply {
     /// 视图树（未规范化的原始 JSON）。
     Tree(serde_json::Value),
-    /// 命令 / RPC 的返回值。
-    Value(serde_json::Value),
+    /// 命令 / RPC 的返回值；`started` 只有页面脚本调用可能非空。
+    Value {
+        value: serde_json::Value,
+        started: StartedTasks,
+    },
     None,
 }
 

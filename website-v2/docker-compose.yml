@@ -13,8 +13,12 @@ services:
     image: fluxdown-website-v2:latest
     container_name: fluxdown-website-v2
     restart: unless-stopped
+    # 只给本机反代用：反代写入的 X-Client-IP 是可信访客 IP，容器端口不得直接对外。
     ports:
-      - "4322:4321"
+      - "127.0.0.1:4322:4321"
+    # IP 归属地库由 deploy.sh 下载到 ./geo（src/lib/geoip.ts 默认读 /app/geo/ip2region_v4.xdb）
+    volumes:
+      - ./geo:/app/geo:ro
     environment:
       - NODE_ENV=production
       - HOST=0.0.0.0

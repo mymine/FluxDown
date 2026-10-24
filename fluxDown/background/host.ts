@@ -10,8 +10,13 @@ import {
   effectiveRemoteMode,
   isUnreachableFailure,
 } from "@/utils/download-dispatch";
-import { nmhCall } from "@/utils/native-messaging";
+import { createDedicatedPool } from "@/utils/nmh-dedicated";
+import type { DedicatedPool, NmhPortLike } from "@/utils/nmh-dedicated";
+import { NMH_NAME, nmhCall } from "@/utils/native-messaging";
+import { browser } from "wxt/browser";
 import type { CaptureState } from "./capture-logic";
+import { parsePageScriptSource, parsePageScriptsIndex } from "./page-scripts/model";
+import type { PageScriptSource, PageScriptsIndex } from "./page-scripts/model";
 import type { HostCapabilities, HostSyncStatus, ResolverInfo } from "./protocol";
 
 const CAPABILITIES_TTL_MS = 60_000;
@@ -49,6 +54,9 @@ interface CapabilitiesData {
   resolvers?: ResolverInfo[];
   pluginRulesSequence?: number;
   pluginRulesEpoch?: string | null;
+  actions?: unknown;
+  pageScriptsSequence?: unknown;
+  pageScriptsEpoch?: unknown;
 }
 
 const PROTOCOL_ONE_OFFLINE: HostCapabilities = {
@@ -57,6 +65,9 @@ const PROTOCOL_ONE_OFFLINE: HostCapabilities = {
   resolvers: [],
   connected: false,
   pluginRulesSequence: 0,
+  actions: [],
+  pageScriptsSequence: null,
+  pageScriptsEpoch: null,
 };
 
 let cached: { value: HostCapabilities; expiresAt: number } | null = null;
@@ -81,6 +92,12 @@ async function probeCapabilities(): Promise<HostCapabilities> {
   const reply = await nmhCall<CapabilitiesData>("capabilities", {});
   if (reply.success) {
     const data = reply.data ?? {};
+    const pageScriptsKnown =
+      typeof data.pageScriptsSequence === "number" &&
+      Number.isInteger(data.pageScriptsSequence) &&
+      data.pageScriptsSequence >= 0 &&
+      typeof data.pageScriptsEpoch === "string" &&
+      data.pageScriptsEpoch !== "";
     const caps: HostCapabilities = {
       protocol: data.protocol !== undefined && data.protocol >= 2 ? 2 : 1,
       pluginsSupported: data.pluginsSupported === true,
@@ -94,6 +111,10 @@ async function probeCapabilities(): Promise<HostCapabilities> {
         typeof data.pluginRulesEpoch === "string" && data.pluginRulesEpoch !== ""
           ? data.pluginRulesEpoch
           : null,
+      actions: Array.isArray(data.actions) ? data.actions.filter((a): a is string => typeof a === "string") : [],
+      // 序号与 epoch 缺一不可：任一缺失 = 桌面端没有页面脚本信息（daemon 不支持 / 查询失败）。
+      pageScriptsSequence: pageScriptsKnown ? (data.pageScriptsSequence as number) : null,
+      pageScriptsEpoch: pageScriptsKnown ? (data.pageScriptsEpoch as string) : null,
     };
     return caps;
   }
@@ -105,7 +126,16 @@ async function probeCapabilities(): Promise<HostCapabilities> {
     return PROTOCOL_ONE_OFFLINE;
   }
   // 桌面端 v2 但 daemon 侧失败（如 plugin.list 报错）：已连接，解析能力未知。
-  return { protocol: 2, pluginsSupported: false, resolvers: [], connected: true, pluginRulesSequence: 0 };
+  return {
+    protocol: 2,
+    pluginsSupported: false,
+    resolvers: [],
+    connected: true,
+    pluginRulesSequence: 0,
+    actions: [],
+    pageScriptsSequence: null,
+    pageScriptsEpoch: null,
+  };
 }
 
 /** 取桌面端能力（缓存 60 s；`force` 跳过缓存）。 */
@@ -135,9 +165,9 @@ export function getCapabilities(force = false): Promise<HostCapabilities> {
   return inflight;
 }
 
-/** 供 App 已确认可达（ping 成功）时使旧的「未连接」缓存立刻失效。 */
-export function invalidateCapabilities(): void {
-  cached = null;
+/** 最近一次探测结果（可能已过期，不触发探测）；从未探测过为 null。 */
+export function peekCapabilities(): HostCapabilities | null {
+  return cached?.value ?? null;
 }
 
 /** 查询 capture 事务状态；任何失败返回空表（调用方视为「暂无结论」）。 */
@@ -176,4 +206,58 @@ export async function fetchSniffRules(
   );
   if (!reply.success || !reply.data) return null;
   return reply.data;
+}
+
+/** `page_scripts` / `page_script_source` 很快，走共享端口。 */
+export function supportsPageScripts(caps: Pick<HostCapabilities, "protocol" | "connected" | "actions">): boolean {
+  return caps.connected && caps.protocol >= 2 && caps.actions.includes("page_scripts");
+}
+
+/** 拉取页面脚本索引；失败 / 形状非法返回 null（调用方保留现有注册）。 */
+export async function fetchPageScripts(): Promise<PageScriptsIndex | null> {
+  const reply = await nmhCall<unknown>("page_scripts", {});
+  if (!reply.success || reply.data === undefined) return null;
+  return parsePageScriptsIndex(reply.data);
+}
+
+export type PageScriptSourceReply = { ok: true; source: PageScriptSource } | { ok: false; message?: string };
+
+/** 拉取单条脚本源码（桌面端对超过 900 KiB 的脚本应答 `page script too large`）。 */
+export async function fetchPageScriptSource(identity: string, id: string): Promise<PageScriptSourceReply> {
+  const reply = await nmhCall<unknown>("page_script_source", { identity, id });
+  if (!reply.success) return { ok: false, message: reply.message };
+  const source = parsePageScriptSource(reply.data);
+  return source ? { ok: true, source } : { ok: false, message: "invalid page_script_source reply" };
+}
+
+/** 页面脚本调用插件处理器的超时（处理器可能联网，数十秒级）。 */
+const PLUGIN_INVOKE_TIMEOUT_MS = 90_000;
+
+/**
+ * `plugin_invoke` 不得走共享端口：NMH 中继与 agent 连接都是一问一答串行模型，
+ * 数十秒的处理器调用会堵住下载 / capabilities / 规则同步。每个插件按需单独 connectNative，
+ * 同插件的调用在其专用端口内排队，空闲 30 s 自动断开。
+ */
+const invokePool: DedicatedPool = createDedicatedPool({
+  connect: () => browser.runtime.connectNative(NMH_NAME) as NmhPortLike,
+});
+
+export type InvokeReply = { ok: true; value: unknown } | { ok: false; message: string };
+
+/** 调用插件用 `flux.rpc.handle(name, fn, { page: true })` 暴露的处理器；`pageUrl` 由 background 按 sender.url 填写。 */
+export async function invokePlugin(
+  identity: string,
+  name: string,
+  args: unknown,
+  pageUrl: string,
+  pool: DedicatedPool = invokePool,
+): Promise<InvokeReply> {
+  const reply = await pool.call<{ value?: unknown }>(
+    identity,
+    "plugin_invoke",
+    { identity, name, args: args === undefined ? null : args, pageUrl },
+    PLUGIN_INVOKE_TIMEOUT_MS,
+  );
+  if (!reply.success) return { ok: false, message: reply.message ?? "plugin invoke failed" };
+  return { ok: true, value: reply.data?.value };
 }

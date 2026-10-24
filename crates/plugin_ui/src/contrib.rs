@@ -22,6 +22,8 @@ pub struct ViewRef {
     pub view: PluginViewDeclDto,
     /// 插件包在 daemon 所在机器上的目录。
     pub package_dir: Option<String>,
+    /// 插件包修订号；变化即包代码已被替换，宿主须重建该 view（不复用旧脚本视图）。
+    pub package_revision: u64,
 }
 
 /// 一个插件命令。
@@ -66,6 +68,7 @@ impl Contributions {
                     plugin_name: plugin.name.clone(),
                     view: view.clone(),
                     package_dir: plugin.package_dir.clone(),
+                    package_revision: plugin.package_revision,
                 };
                 match view.location.as_str() {
                     "activity" => out.activity.push(view_ref),

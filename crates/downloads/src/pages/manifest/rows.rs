@@ -1,11 +1,10 @@
 use fluxdown_ui_components::{
-    CheckState, ControlExt as _, FluxIcon, IconControlExt as _, card, check_mark, check_row,
-    field_hint, tabular_numbers,
+    CheckState, ControlExt as _, FluxIcon, card, check_mark, check_row, field_hint, tabular_numbers,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    Anchor, AnyElement, ClickEvent, Context, Div, IntoElement, ParentElement, SharedString, Styled,
-    div,
+    Anchor, AnyElement, ClickEvent, Context, Div, InteractiveElement as _, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, div,
 };
 use gpui_component::{
     Icon,
@@ -74,10 +73,27 @@ impl ManifestView {
             .w_full()
             .gap(tokens.spacing.xs)
             .child(
-                Button::new(("manifest-dir-check", node))
-                    .ghost()
-                    .control_icon(cx)
-                    .tooltip(SharedString::from(label.to_owned()))
+                // 与文件行 `check_row` 同几何（px xs + control 行高），复选框不被按钮内边距挤压。
+                div()
+                    .id(("manifest-dir-check", node))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .min_h(active_theme(cx).density().control)
+                    .px(tokens.spacing.xs)
+                    .rounded(tokens.radius.md)
+                    .cursor_pointer()
+                    .hover({
+                        let hover = active_theme(cx).extended().colors.row_hover;
+                        move |style| style.bg(hover)
+                    })
+                    .tooltip({
+                        let label = SharedString::from(label.to_owned());
+                        move |window, cx| {
+                            fluxdown_ui_components::tooltip_view(label.clone(), window, cx)
+                        }
+                    })
                     .child(check_mark(state, cx))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.selection.toggle_directory(node);

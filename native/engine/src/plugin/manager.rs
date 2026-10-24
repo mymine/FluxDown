@@ -47,6 +47,8 @@ const DEFAULT_RESOLVE_BUDGET: ExecutionBudget = ExecutionBudget {
     timeout: Duration::from_secs(10),
     memory_limit_bytes: 64 * 1024 * 1024,
 };
+/// resolver 可经 manifest `memoryLimitMb` 声明的 QuickJS 堆硬顶。
+pub const RESOLVE_MEMORY_CEILING: usize = 512 * 1024 * 1024;
 /// 默认 hook 预算。
 const DEFAULT_HOOK_BUDGET: ExecutionBudget = ExecutionBudget {
     timeout: Duration::from_secs(5),
@@ -143,6 +145,8 @@ pub struct LoadedPlugin {
     main_entry: Option<PathBuf>,
     /// 非 dev 模式的 `main` 源码缓存。
     main_cache: Option<String>,
+    /// 视图图标 SVG 文本（view id → 内容），加载期读入并校验。
+    view_icons: Vec<(String, String)>,
     /// 熔断计数（连续 Timeout/MemoryLimit）。
     timeout_streak: Arc<AtomicU32>,
 }
@@ -247,6 +251,8 @@ pub struct PluginInfo {
     pub load_error: String,
     /// manifest 声明的贡献点（视图 / 命令 / 嗅探规则）；加载失败的插件为空。
     pub contributions: super::manifest::ContributesDecl,
+    /// 视图图标 SVG 文本（view id → 内容）；加载失败的插件为空。
+    pub view_icons: Vec<(String, String)>,
     /// manifest 是否声明了 `main`（可移植视图由 main 提供）。
     pub has_main: bool,
     /// 由权限推导的风险等级。
@@ -257,6 +263,8 @@ pub struct PluginInfo {
     pub consent_pending: Vec<String>,
     /// 尚未授权的网络主机。
     pub consent_pending_hosts: Vec<String>,
+    /// 插件包修订号：包代码被替换（安装 / 升级 / dev 安装 / dev 重载）后变化，只做相等比较。
+    pub package_revision: u64,
     /// 插件包绝对目录；仅已加载插件为 Some。
     pub package_dir: Option<String>,
 }
@@ -295,6 +303,8 @@ pub struct PluginManager {
     host: host_manager::HostState,
     /// 多插件选择框按站点串行化（见 [`routing`]）。
     site_prompts: routing::SitePromptLocks,
+    /// 插件包修订号（见 [`super::package_revision`]）。
+    package_revisions: super::package_revision::PackageRevisions,
 }
 
 impl PluginManager {
@@ -337,6 +347,7 @@ impl PluginManager {
             audit,
             host: host_manager::HostState::new(),
             site_prompts: routing::SitePromptLocks::default(),
+            package_revisions: super::package_revision::PackageRevisions::new(),
         }
     }
 
@@ -501,6 +512,55 @@ impl PluginManager {
                 ))),
             };
         }
+        if file_check.is_ok()
+            && let Some(contributes) = manifest.contributes.as_ref()
+        {
+            for script in &contributes.page_scripts {
+                let mut contents: std::collections::HashMap<&str, Vec<u8>> =
+                    std::collections::HashMap::new();
+                for file in &script.js {
+                    match tokio::fs::read(dir.join(file)).await {
+                        Ok(bytes) => {
+                            contents.insert(file.as_str(), bytes);
+                        }
+                        Err(e) => {
+                            file_check = Err(PluginError::ManifestInvalid(format!(
+                                "pageScript '{}' 读取 '{file}' 失败: {e}",
+                                script.id
+                            )));
+                            break;
+                        }
+                    }
+                }
+                if file_check.is_ok() {
+                    file_check =
+                        super::manifest::concat_page_script(script, |p| contents.get(p).cloned())
+                            .map(|_| ());
+                }
+                if file_check.is_err() {
+                    break;
+                }
+            }
+        }
+        let mut view_icons = Vec::new();
+        if file_check.is_ok()
+            && let Some(contributes) = manifest.contributes.as_ref()
+        {
+            for view in &contributes.views {
+                let Some(icon) = &view.icon else { continue };
+                file_check = match tokio::fs::read(dir.join(icon)).await {
+                    Ok(bytes) => super::manifest::validate_view_icon(&view.id, bytes)
+                        .map(|svg| view_icons.push((view.id.clone(), svg))),
+                    Err(e) => Err(PluginError::ManifestInvalid(format!(
+                        "view '{}' icon '{icon}' 读取失败: {e}",
+                        view.id
+                    ))),
+                };
+                if file_check.is_err() {
+                    break;
+                }
+            }
+        }
         if let Err(e) = file_check {
             log_info!("[plugin] 跳过 {}: {e}", manifest.identity);
             return Err(FailedPlugin {
@@ -622,6 +682,7 @@ impl PluginManager {
             subscription_cache,
             main_entry,
             main_cache,
+            view_icons,
             timeout_streak: Arc::new(AtomicU32::new(0)),
         })
     }
@@ -638,7 +699,7 @@ impl PluginManager {
         mut req: ResolveRequest,
     ) -> Result<Option<ResolveResult>, PluginError> {
         // 从快照克隆所需（避免跨 await 持锁）。
-        let (manifest, streak, source, dev_ver) = {
+        let (manifest, streak, source, dev_ver, dev_mode) = {
             let snapshot = self.plugins.read().await.clone();
             let Some(p) = snapshot.iter().find(|p| p.manifest.identity == identity) else {
                 return Err(PluginError::Runtime(format!(
@@ -661,6 +722,7 @@ impl PluginManager {
                 p.timeout_streak.clone(),
                 source,
                 p.manifest.version.clone(),
+                p.dev,
             )
         };
         let Some(source) = source else {
@@ -716,6 +778,7 @@ impl PluginManager {
                     // resolve 平面授予 yt-dlp（直链提取的主战场）；ffmpeg 无产物牢笼故不授予。
                     ytdlp_permitted: manifest.has_permission(PERMISSION_YTDLP),
                     auth_permitted: manifest.has_permission(PERMISSION_AUTH),
+                    private_network_allowed: dev_mode,
                     ..Default::default()
                 },
             )
@@ -764,7 +827,7 @@ impl PluginManager {
             ));
         }
 
-        let (manifest, source, version, enabled) = {
+        let (manifest, source, version, enabled, dev_mode) = {
             let snapshot = self.plugins.read().await.clone();
             let Some(plugin) = snapshot.iter().find(|p| p.manifest.identity == identity) else {
                 return Err(PluginError::Runtime(format!("插件 {identity} 不存在")));
@@ -780,6 +843,7 @@ impl PluginManager {
                 source,
                 plugin.manifest.version.clone(),
                 plugin.enabled,
+                plugin.dev,
             )
         };
 
@@ -841,6 +905,7 @@ impl PluginManager {
                 self.auth_budget_for(&manifest),
                 HostContext {
                     auth_permitted: true,
+                    private_network_allowed: dev_mode,
                     ..Default::default()
                 },
             )
@@ -871,7 +936,7 @@ impl PluginManager {
         provider_id: &str,
         request: SubscriptionFetchRequest,
     ) -> Result<ParsedFeed, PluginError> {
-        let (manifest, streak, source, version, identity) = {
+        let (manifest, streak, source, version, identity, dev_mode) = {
             let snapshot = self.plugins.read().await.clone();
             let Some(p) = snapshot
                 .iter()
@@ -895,6 +960,7 @@ impl PluginManager {
                 source,
                 p.manifest.version.clone(),
                 p.manifest.identity.clone(),
+                p.dev,
             )
         };
         let Some(source) = source else {
@@ -947,6 +1013,7 @@ impl PluginManager {
                 HostContext {
                     ytdlp_permitted: manifest.has_permission(PERMISSION_YTDLP),
                     auth_permitted: manifest.has_permission(PERMISSION_AUTH),
+                    private_network_allowed: dev_mode,
                     ..Default::default()
                 },
             )
@@ -1026,6 +1093,7 @@ impl PluginManager {
                 ffmpeg_root,
                 ytdlp_permitted,
                 auth_permitted,
+                private_network_allowed: p.dev,
             };
             // 授权外部工具（ffmpeg 有产物牢笼 / yt-dlp 任意上下文）→ 抬升墙钟预算。
             let budget = if (ffmpeg_permitted && host.ffmpeg_root.is_some()) || ytdlp_permitted {
@@ -1085,18 +1153,23 @@ impl PluginManager {
         }
     }
 
-    /// resolve 预算：manifest timeoutMs 可下调，30s 硬顶。
+    /// resolve 预算：manifest `timeoutMs` 可下调，30s 硬顶；`memoryLimitMb` 替换默认
+    /// 堆上限，[`RESOLVE_MEMORY_CEILING`] 硬顶。
     fn resolve_budget_for(&self, manifest: &PluginManifest) -> ExecutionBudget {
-        let timeout = manifest
-            .resolvers
-            .first()
+        let resolver = manifest.resolvers.first();
+        let timeout = resolver
             .and_then(|r| r.timeout_ms)
             .map(Duration::from_millis)
             .unwrap_or(self.resolve_budget.timeout)
             .min(HARD_TIMEOUT_CEILING);
+        let memory_limit_bytes = resolver
+            .and_then(|r| r.memory_limit_mb)
+            .map(|mb| usize::try_from(mb).map_or(usize::MAX, |mb| mb.saturating_mul(1024 * 1024)))
+            .unwrap_or(self.resolve_budget.memory_limit_bytes)
+            .min(RESOLVE_MEMORY_CEILING);
         ExecutionBudget {
             timeout,
-            memory_limit_bytes: self.resolve_budget.memory_limit_bytes,
+            memory_limit_bytes,
         }
     }
 
@@ -1193,6 +1266,7 @@ impl PluginManager {
             self.load_all().await;
             return Err(error);
         }
+        self.package_revisions.bump(&identity);
         self.audit_event(&identity, "install", manifest.version.clone(), "dev");
         Ok(identity)
     }
@@ -1240,7 +1314,9 @@ impl PluginManager {
         if let Some(error) = self.dev_load_failure(identity).await {
             return Err(error);
         }
-        self.validate_loaded(identity).await
+        self.validate_loaded(identity).await?;
+        self.package_revisions.bump(identity);
+        Ok(())
     }
 
     async fn finish_install_outcome(
@@ -1265,6 +1341,7 @@ impl PluginManager {
             self.load_all().await;
             return Err(error);
         }
+        self.package_revisions.bump(&identity);
         let new_version = self.installed_version(&identity).await.unwrap_or_default();
         match previous_version {
             Some(previous) if previous != new_version => self.audit_event(
@@ -1775,11 +1852,13 @@ impl PluginManager {
                 load_status: PluginLoadStatus::Loaded.as_str().to_string(),
                 load_error: String::new(),
                 contributions: p.manifest.contributes.clone().unwrap_or_default(),
+                view_icons: p.view_icons.clone(),
                 has_main: p.manifest.main.is_some(),
                 risk: p.manifest.risk(),
                 network_hosts: p.manifest.network_hosts(),
                 consent_pending: loaded_pending.0,
                 consent_pending_hosts: loaded_pending.1,
+                package_revision: self.package_revisions.get(&p.manifest.identity),
                 package_dir: Some(p.dir.to_string_lossy().into_owned()),
             });
         }
@@ -1853,6 +1932,7 @@ impl PluginManager {
                 load_status: PluginLoadStatus::Failed.as_str().to_string(),
                 load_error: truncate_load_error(&p.error),
                 contributions: super::manifest::ContributesDecl::default(),
+                view_icons: Vec::new(),
                 has_main: false,
                 risk: p
                     .manifest
@@ -1866,6 +1946,7 @@ impl PluginManager {
                     .unwrap_or_default(),
                 consent_pending: failed_pending.0,
                 consent_pending_hosts: failed_pending.1,
+                package_revision: self.package_revisions.get(&p.identity),
                 package_dir: None,
             });
         }
@@ -2653,6 +2734,7 @@ mod tests {
             subscription_cache: None,
             main_entry: None,
             main_cache: None,
+            view_icons: Vec::new(),
             timeout_streak: Arc::new(AtomicU32::new(0)),
         }
     }

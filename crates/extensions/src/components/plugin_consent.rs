@@ -6,7 +6,7 @@
 
 use std::{rc::Rc, sync::Arc};
 
-use fluxdown_protocol::PluginDto;
+use fluxdown_protocol::{PluginDto, PluginPageScriptDeclDto};
 use fluxdown_ui_components::{
     BusyExt as _, ControlExt as _, FluxIcon, check_row, dialog_scroll_body,
 };
@@ -23,7 +23,7 @@ use gpui_component::{
     v_flex,
 };
 
-use super::plugin_detail::permission_label;
+use super::plugin_detail::{page_script_rows, permission_label};
 use crate::{ExtensionsPort, controller::grant_plugin_consent, error_text, pages::Frame, ui};
 
 /// 对话框展示内容。
@@ -35,6 +35,8 @@ pub struct ConsentRequest {
     pub risk: String,
     pub permissions: Vec<String>,
     pub network_hosts: Vec<String>,
+    /// 插件声明的页面脚本（标题 + 匹配站点）；市场安装前确认不携带。
+    pub page_scripts: Vec<PluginPageScriptDeclDto>,
 }
 
 impl ConsentRequest {
@@ -49,6 +51,7 @@ impl ConsentRequest {
             risk: plugin.risk.clone(),
             permissions: plugin.consent_pending.clone(),
             network_hosts: plugin.consent_pending_hosts.clone(),
+            page_scripts: plugin.contributions.page_scripts.clone(),
         }
     }
 }
@@ -182,6 +185,13 @@ impl Render for ConsentDialog {
                 frame,
             ))
             .children(hosts)
+            .when(!request.page_scripts.is_empty(), |this| {
+                this.child(ui::title_text(
+                    translator.text("pluginConsentPageScripts").to_owned(),
+                    frame,
+                ))
+                .children(page_script_rows(&request.page_scripts, frame))
+            })
             .when(full, |this| {
                 this.child(ui::status_line(
                     FluxIcon::CircleAlert,

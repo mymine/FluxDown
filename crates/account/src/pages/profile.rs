@@ -6,7 +6,9 @@
 //! - Origin ID：强调色 12% 底 + 强调色等宽数字 + 复制图标；无 ID 灰色 `#—` 不可点。
 
 use fluxdown_protocol::{AgentSessionDto, CloudPlan};
-use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, card, icon_button, tabular_numbers};
+use fluxdown_ui_components::{
+    ButtonVariant, FluxIcon, button, card, icon_button, tabular_numbers, tooltip_view,
+};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::{ExtendedTokens, SemanticThemeTokens, active_theme};
 use gpui::{
@@ -14,8 +16,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _, white,
 };
 use gpui_component::{
-    Disableable as _, Icon, Sizable as _, h_flex, spinner::Spinner, switch::Switch,
-    tooltip::Tooltip, v_flex,
+    Disableable as _, Icon, Sizable as _, h_flex, spinner::Spinner, switch::Switch, v_flex,
 };
 
 use crate::assets::{CLOUD_ICON_PATH, CROWN_ICON_PATH, REFRESH_ICON_PATH};
@@ -197,9 +198,7 @@ pub(crate) fn render(
                                     .disabled(disabled)
                                     .tooltip({
                                         let label = t(translator, "accountNicknameEditTooltip");
-                                        move |window, cx| {
-                                            Tooltip::new(label.clone()).build(window, cx)
-                                        }
+                                        move |window, cx| tooltip_view(label.clone(), window, cx)
                                     })
                                     .on_click(cx.listener(
                                         |view, _: &ClickEvent, window, cx| {
@@ -243,7 +242,7 @@ pub(crate) fn render(
                                 .disabled(disabled)
                                 .tooltip({
                                     let label = t(translator, "accountOriginIdEditTooltip");
-                                    move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+                                    move |window, cx| tooltip_view(label.clone(), window, cx)
                                 })
                                 .on_click(cx.listener(
                                     |view, _: &ClickEvent, window, cx| {
@@ -280,9 +279,7 @@ pub(crate) fn render(
                         cx,
                     )
                     .disabled(disabled || refreshing)
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(refresh_tooltip.clone()).build(window, cx)
-                    })
+                    .tooltip(move |window, cx| tooltip_view(refresh_tooltip.clone(), window, cx))
                     .on_click(cx.listener(
                         move |view, _: &ClickEvent, window: &mut gpui::Window, cx| {
                             view.refresh_cloud_info(window, cx);

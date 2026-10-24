@@ -8,7 +8,7 @@ import UniformTypeIdentifiers
 /// 交给与文件选择器相同的导入路径，用完 `discard`。
 nonisolated enum DroppedFiles {
     nonisolated enum Kind: Sendable, Hashable {
-        #if FULL_P2P
+        #if FULL_FLAVOR
         case torrent
         #endif
         /// `.txt` / `.url` / `.list`：宽松解析链接。
@@ -21,7 +21,7 @@ nonisolated enum DroppedFiles {
     }
 
     /// 暂存内容上限：full 为种子上限（TXT 读取自身还有更小的上限）。
-    #if FULL_P2P
+    #if FULL_FLAVOR
     private static let stageLimit = TorrentFile.maxBytes + 1
     #else
     private static let stageLimit = 2 * 1024 * 1024 + 1
@@ -29,7 +29,7 @@ nonisolated enum DroppedFiles {
 
     static func kind(ofFileNamed name: String) -> Kind? {
         let ext = (name as NSString).pathExtension.lowercased()
-        #if FULL_P2P
+        #if FULL_FLAVOR
         if ext == "torrent" { return .torrent }
         #endif
         return ["txt", "url", "list"].contains(ext) ? .text : nil

@@ -1,7 +1,7 @@
 import FluxDomain
 import Foundation
 
-#if FULL_P2P
+#if FULL_FLAVOR
 // BitTorrent / eD2K 设置页的纯逻辑（行目录、可见性、时长换算、读数）。无 UI / 无主机依赖，便于单测。
 
 // MARK: - BitTorrent

@@ -1,70 +1,64 @@
-//! 外部捕获的分类保存目录（规则唯一事实源；原生 Android `Categories.kt::CategoryRules.saveDirFor`
-//! 镜像同一语义）。
+//! 外部捕获的分类保存目录：由 `custom_categories` 偏好构建随建任务交给 daemon 的路由规则
+//! （[`CategoryRouteDto`]），并为确认表单按捕获名预填命中的分类目录。
 //!
-//! 只看可见分类，按 `position` 顺序；先找首个配置了目录且命中的普通分类（非 all / other），
-//! 否则当文件不命中任何普通分类时取 `other` 的目录。文件名为空或不含 `.` 时用 URL 路径末段
-//! （解码后且含 `.`）参与匹配。扩展名比较不区分大小写，正则不区分大小写，非法正则视为不命中。
+//! 匹配语义与引擎 `category_route.rs` 逐条对齐（引擎在建任务与下载完成时按同一规则定落点），
+//! 两端共用夹具 `native/engine/src/fixtures/category_route_cases.json`；原生 Android
+//! `Categories.kt::CategoryRules.saveDirFor` 镜像同一语义。只看可见分类，按 `position`
+//! 顺序；先找首个配置了目录且命中的普通分类（非 all / other），否则当文件不命中任何普通
+//! 分类时取 `other` 的目录。文件名为空或不含 `.` 时用 URL 路径末段（解码后且含 `.`）参与
+//! 匹配。扩展名比较不区分大小写，正则不区分大小写，非法正则视为不命中。
 
 use std::collections::BTreeMap;
 
-use fluxdown_protocol::{CUSTOM_CATEGORIES_PREF_KEY, CustomCategoryDto};
+use fluxdown_protocol::{CUSTOM_CATEGORIES_PREF_KEY, CategoryRouteDto, CategoryRuleDto};
 use serde_json::Value;
 
+/// 偏好中的分类路由规则；没有任何可见分类配置目录时为 `None`。
+pub(crate) fn category_route(preferences: &BTreeMap<String, Value>) -> Option<CategoryRouteDto> {
+    CategoryRouteDto::from_preference(preferences.get(CUSTOM_CATEGORIES_PREF_KEY))
+}
+
 /// 命中的分类保存目录；无命中 / 命中分类未配置目录时返回 `None`。
-pub(crate) fn category_save_dir(
-    preferences: &BTreeMap<String, Value>,
+#[must_use]
+pub fn route_save_dir<'a>(
+    route: &'a CategoryRouteDto,
     file_name: &str,
     url: &str,
-) -> Option<String> {
+) -> Option<&'a str> {
+    let url_name;
     let name = if file_name.contains('.') {
-        file_name.to_owned()
+        file_name
     } else {
-        file_name_from_url(url).unwrap_or_else(|| file_name.to_owned())
+        url_name = file_name_from_url(url);
+        url_name.as_deref().unwrap_or(file_name)
     };
     if name.is_empty() {
         return None;
     }
-    let categories =
-        CustomCategoryDto::from_preference(preferences.get(CUSTOM_CATEGORIES_PREF_KEY))
-            .into_iter()
-            .filter(|category| category.visible)
-            .collect::<Vec<_>>();
-    let is_special = |category: &CustomCategoryDto| {
-        matches!(category.builtin_type.as_deref(), Some("all" | "other"))
-    };
-    let normals = categories
+    if let Some(rule) = route
+        .rules
         .iter()
-        .filter(|category| !is_special(category))
-        .collect::<Vec<_>>();
-    if let Some(category) = normals
-        .iter()
-        .find(|category| !category.save_dir.is_empty() && matches(category, &name))
+        .find(|rule| !rule.save_dir.is_empty() && matches(rule, name))
     {
-        return Some(category.save_dir.clone());
+        return Some(rule.save_dir.as_str());
     }
-    categories
-        .iter()
-        .find(|category| category.builtin_type.as_deref() == Some("other"))
-        .filter(|other| !other.save_dir.is_empty())
-        .filter(|_| !normals.iter().any(|category| matches(category, &name)))
-        .map(|other| other.save_dir.clone())
+    (!route.other_dir.is_empty() && !route.rules.iter().any(|rule| matches(rule, name)))
+        .then_some(route.other_dir.as_str())
 }
 
-fn matches(category: &CustomCategoryDto, name: &str) -> bool {
-    if category.match_mode == "regex" {
-        if category.regex_pattern.is_empty() {
-            return false;
-        }
-        return regex::RegexBuilder::new(&category.regex_pattern)
-            .case_insensitive(true)
-            .build()
-            .is_ok_and(|regex| regex.is_match(name));
+fn matches(rule: &CategoryRuleDto, name: &str) -> bool {
+    if rule.match_mode == "regex" {
+        return !rule.regex_pattern.is_empty()
+            && regex::RegexBuilder::new(&rule.regex_pattern)
+                .case_insensitive(true)
+                .build()
+                .is_ok_and(|regex| regex.is_match(name));
     }
     let Some((_, extension)) = name.rsplit_once('.') else {
         return false;
     };
     !extension.is_empty()
-        && category.extensions.iter().any(|candidate| {
+        && rule.extensions.iter().any(|candidate| {
             candidate
                 .trim_start_matches('.')
                 .eq_ignore_ascii_case(extension)
@@ -102,9 +96,10 @@ fn percent_decode(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use fluxdown_protocol::CategoryRouteDto;
     use serde_json::json;
 
-    use super::category_save_dir;
+    use super::{category_route, route_save_dir};
 
     fn prefs(
         categories: serde_json::Value,
@@ -126,19 +121,55 @@ mod tests {
         })
     }
 
+    fn save_dir(
+        preferences: &std::collections::BTreeMap<String, serde_json::Value>,
+        file_name: &str,
+        url: &str,
+    ) -> Option<String> {
+        let route = category_route(preferences)?;
+        route_save_dir(&route, file_name, url).map(str::to_owned)
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Case {
+        name: String,
+        route: CategoryRouteDto,
+        file_name: String,
+        url: String,
+        expected: Option<String>,
+    }
+
+    /// 与引擎 `category_route.rs` 共用的跨实现用例。
     #[test]
-    fn first_matching_category_with_dir_wins_in_position_order() {
+    fn shared_cases_match_engine() {
+        let cases: Vec<Case> = serde_json::from_str(include_str!(
+            "../../engine/src/fixtures/category_route_cases.json"
+        ))
+        .expect("category route fixture");
+        assert!(!cases.is_empty());
+        for case in cases {
+            assert_eq!(
+                route_save_dir(&case.route, &case.file_name, &case.url),
+                case.expected.as_deref(),
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn route_follows_visible_categories_in_position_order() {
         let preferences = prefs(json!([
             category("video2", None, &["mp4"], "/second", 5),
             category("video", Some("video"), &["mp4", "mkv"], "/videos", 1),
             category("docs", Some("document"), &["pdf"], "", 2),
         ]));
         assert_eq!(
-            category_save_dir(&preferences, "Movie.MP4", "").as_deref(),
+            save_dir(&preferences, "Movie.MP4", "").as_deref(),
             Some("/videos")
         );
-        // 命中但未配置目录 → 不回退到其他分类的目录。
-        assert_eq!(category_save_dir(&preferences, "a.pdf", ""), None);
+        assert_eq!(save_dir(&preferences, "a.pdf", ""), None);
     }
 
     #[test]
@@ -148,14 +179,14 @@ mod tests {
             category("other", Some("other"), &[], "/other", 7),
         ]));
         assert_eq!(
-            category_save_dir(&preferences, "setup.exe", "").as_deref(),
+            save_dir(&preferences, "setup.exe", "").as_deref(),
             Some("/other")
         );
-        assert_eq!(category_save_dir(&preferences, "clip.mp4", ""), None);
+        assert_eq!(save_dir(&preferences, "clip.mp4", ""), None);
     }
 
     #[test]
-    fn url_segment_fills_missing_name_and_hidden_categories_are_ignored() {
+    fn hidden_categories_are_ignored_and_no_dir_means_no_route() {
         let mut hidden = category("music", None, &["flac"], "/music-hidden", 1);
         hidden["visible"] = json!(false);
         let preferences = prefs(json!([
@@ -163,26 +194,18 @@ mod tests {
             category("audio", Some("audio"), &["flac"], "/music", 2),
         ]));
         assert_eq!(
-            category_save_dir(&preferences, "", "https://x.test/a/My%20Song.flac?x=1").as_deref(),
+            save_dir(&preferences, "", "https://x.test/a/My%20Song.flac?x=1").as_deref(),
             Some("/music")
         );
         assert_eq!(
-            category_save_dir(&preferences, "", "https://x.test/download"),
+            category_route(&prefs(json!([category(
+                "audio",
+                Some("audio"),
+                &["flac"],
+                "",
+                1
+            )]))),
             None
-        );
-    }
-
-    #[test]
-    fn regex_matches_case_insensitively_and_invalid_regex_never_matches() {
-        let preferences = prefs(json!([
-            {"id": "bad", "name": "bad", "matchMode": "regex", "regexPattern": "(",
-             "position": 1, "saveDir": "/bad"},
-            {"id": "iso", "name": "iso", "matchMode": "regex", "regexPattern": "^ubuntu-.*\\.iso$",
-             "position": 2, "saveDir": "/iso"},
-        ]));
-        assert_eq!(
-            category_save_dir(&preferences, "Ubuntu-24.04.ISO", "").as_deref(),
-            Some("/iso")
         );
     }
 }

@@ -3,18 +3,27 @@ name: Release
 # ── 统一发布：一个 vX.Y.Z（预览 vX.Y.Z-rc.N）GitHub Release 承载本次全部组件 ──
 # 流程：changes（变更检测 + 源码解析）→ prepare-release（生成双语说明、建草稿 release）
 #       → 各 build-* 并行构建 → upload-<组件>（上传产物 + SHA256SUMS-<组件>.txt 完成哨兵，
-#       同步 OSS）→ publish-release（汇总校验和、刷新说明头部、草稿转正、决定 latest）。
-# 组件之间互不阻断：某组件打包失败只让它自己的 upload 被跳过，其余组件照常发布；
-# 官网 /api/release 只认有完成哨兵的组件，缺失组件自动回落到它上一个完整版本。
+#       同步 OSS）→ publish-release（汇总校验和、刷新说明头部、全部组件齐全才草稿转正、决定 latest）。
+# 组件之间互不阻断：某组件打包失败只让它自己的 upload 被跳过，其余组件照常上传；
+# 但 release 保持草稿（不触发 published webhook、官网与客户端仍提供上一版本），直到 tag 与历次补发
+# 累计应发布的组件全部有完成哨兵（含 Server Docker）后才由那次运行转正。
 # 补救：
 #   - 偶发失败（源码无需改动）：本次运行页 “Re-run failed jobs”，只重跑失败组件与收尾 job。
 #   - 需要改代码 / 改打包脚本：修复合入发布分支后 workflow_dispatch 补发该组件，
 #     source_ref 指向包含修复的分支或提交；产物以原 tag 的版本号上传到同一个 release。
 # 演练（rehearsal=true，仅手动触发）：以「尚不存在」的 tag 跑完整条流水线——分支守卫、变更检测、
 #   引擎门禁、全部构建 / 签名 / 公证 / 打包、发布说明、校验和与 release 头部预览、OSS 与商店凭据探活；
-#   不建 release、不上传资产、不推 Docker 镜像、不提交商店、不清理 artifact。构建源码 = --ref 所指提交
-#   （workflow 文件与源码同一提交，与 tag 推送一致）。副作用步骤一律以 rehearsal == 'false' 放行（失败即关闭）。
-#   gh workflow run release.yml --ref main -f rehearsal=true -f tag=vX.Y.Z-rc.N -f component=all
+#   不建 release、不上传资产、不打 Docker 镜像 tag（镜像只按 digest 推送、不可见）、不提交商店。
+#   构建源码 = --ref 所指提交（workflow 文件与源码同一提交，与 tag 推送一致）。
+#   副作用步骤一律以 rehearsal == 'false' 放行（失败即关闭）。
+#   gh workflow run release.yml --ref stable -f rehearsal=true -f tag=vX.Y.Z -f component=changed
+# 演练产物晋升（只构建一次）：tag 推送时 changes 找同一提交、同一 tag 的演练（.github/scripts/release_gate.py），
+#   演练里已产出完成哨兵的组件（app / server / cli / mobile）不再重新构建，upload-* 直接取该演练运行的
+#   artifact，Docker 只把演练 digest 改打版本 tag；扩展恒重建（1–2 分钟，商店提交在同一 job）。
+#   找不到可复用演练时整条流水线照常从源码构建。演练失败的组件在演练运行页 Re-run 即可，什么都没发布。
+# tag 推送前置：同一提交的 CI（ci.yml）必须成功（仍在跑则等待），否则在建草稿、开始构建前失败。
+# Artifact 生命周期：只作中间产物，release 转正即由 cleanup-artifacts 删除；未发布 tag 的演练 / 草稿
+#   运行保留供晋升与 Re-run；所有构建 artifact 带 retention-days 兜底，不会长期堆积在 Actions 里。
 run-name: >-
   ${{ inputs.rehearsal && format('Release 演练 {0}（不发布）', inputs.tag)
   || (github.event_name == 'workflow_dispatch' && format('Release 补发 {0} · {1}', inputs.tag, inputs.component))
@@ -76,7 +85,6 @@ jobs:
   #   web/**、native/{agent,daemon,protocol,engine-protocol,api}/** → headless 服务器（server，Docker 镜像 + 多平台二进制）；
   #                            agent/daemon/protocol 同时属于 GPUI 桌面客户端（app）
   #   crates/**              → GPUI 桌面客户端（app）
-  #   native/server/**       → 已冻结的旧 headless 宿主，不再触发任何构建
   #   native/engine/**       → 桌面客户端 + 服务器 + 移动端（共享下载引擎）
   #   native/mobile/**、mobile/Android/** → 原生 Android 移动端资产
   #   docker/**              → 服务器（部署文件变更需重发镜像）
@@ -99,6 +107,8 @@ jobs:
       cli: ${{ steps.detect.outputs.cli }}
       engine: ${{ steps.detect.outputs.engine }}
       any: ${{ steps.detect.outputs.any }}
+      # 本次应发布组件（逗号分隔，规范顺序）：prepare-release 播种 / publish-release 判定共用
+      expected: ${{ steps.expected.outputs.list }}
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
@@ -107,6 +117,9 @@ jobs:
       is_highest_stable: ${{ steps.resolve.outputs.is_highest_stable }}
       source_is_tag: ${{ steps.resolve.outputs.source_is_tag }}
       rehearsal: ${{ steps.resolve.outputs.rehearsal }}
+      # 演练产物晋升：可复用的演练运行 id 与组件（逗号分隔；空 = 照常构建）
+      reuse_run: ${{ steps.reuse.outputs.reuse_run }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -275,8 +288,6 @@ jobs:
               case "$f" in
                 fluxDown/*)          EXTENSION=true ;;
                 web/*)               SERVER=true ;;
-                # 旧 headless 宿主 native/server 已冻结，不再触发任何组件
-                native/server/*) ;;
                 native/cli/*)        CLI=true ;;
                 native/api/*)        APP=true; SERVER=true; CLI=true; MOBILE=true ;;
                 native/protocol/*)   APP=true; SERVER=true; CLI=true; MOBILE=true ;;
@@ -328,29 +339,76 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "::notice::Components changed in ${PREV:-<none>}..${TAG}: app=$APP extension=$EXTENSION server=$SERVER mobile=$MOBILE cli=$CLI engine=$ENGINE"
 
-  # ── 前置 Job: 引擎协议与依赖门禁 ──
+      - name: List expected components
+        id: expected
+        env:
+          C_APP: ${{ steps.detect.outputs.app }}
+          C_EXTENSION: ${{ steps.detect.outputs.extension }}
+          C_SERVER: ${{ steps.detect.outputs.server }}
+          C_CLI: ${{ steps.detect.outputs.cli }}
+          C_MOBILE: ${{ steps.detect.outputs.mobile }}
+        run: |
+          EXPECTED=""
+          for c in APP EXTENSION SERVER CLI MOBILE; do
+            v="C_$c"
+            if [ "${!v}" = true ]; then EXPECTED="${EXPECTED:+${EXPECTED},}${c,,}"; fi
+          done
+          echo "list=$EXPECTED" >> "$GITHUB_OUTPUT"
+
+      # tag 推送前置：同一提交的 CI 必须成功。仍在跑则等待（紧跟合入推 tag 时不抢跑），
+      # 红了在建草稿 / 开始构建前就失败（v0.6.1 曾在 CI 已红后推 tag，整条流水线白跑）。
+      # 补发与演练不卡：补发源码由引擎门禁与构建自证，演练本身就是验证。
+      - name: Require green CI on the tagged commit
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 .github/scripts/release_gate.py ci-gate --sha "${{ steps.resolve.outputs.source }}"
+
+      # 演练产物晋升：仅 tag 推送查找同提交同 tag 的演练（补发 / 演练恒从源码构建）。
+      - name: Find reusable rehearsal
+        id: reuse
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ github.event_name }}" != push ]; then
+            { echo "reuse_run="; echo "reuse="; } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 .github/scripts/release_gate.py find-rehearsal --github-output \
+            --tag "${{ steps.resolve.outputs.tag }}" --sha "${{ steps.resolve.outputs.source }}" \
+            --expected "${{ steps.expected.outputs.list }}"
+
+  # ── 前置 Job: librqbit MSE fork 门禁 ──
+  # 只守 CI 不覆盖的项：librqbit 解析来源 + fork 的 MSE 单测。引擎 fmt / 单测由 CI 在同一提交上证明
+  # （changes 的 CI 门禁），这里不重复跑——曾因发布时重跑的不稳定单测 / fmt 一票否决全部组件。
+  # 构建 job 不等本门禁（不占关键路径）；upload-* 与 Docker 推送要求它成功，未过门禁的产物不会发布。
+  # 复用演练产物时演练已在同一提交上过了本门禁，跳过。
   verify-engine:
     name: Verify Engine and MSE
     needs: changes
     runs-on: ubuntu-latest
+    env:
+      RUN_GATE: ${{ needs.changes.outputs.engine == 'true' && needs.changes.outputs.reuse_run == '' }}
 
     steps:
       - name: Skip unchanged engine
-        if: needs.changes.outputs.engine != 'true'
-        run: echo "Engine is unchanged; protocol verification is not required."
+        if: env.RUN_GATE != 'true'
+        run: echo "Engine is unchanged or verified by the reused rehearsal; MSE verification is not required."
 
       - name: Checkout repository
-        if: needs.changes.outputs.engine == 'true'
+        if: env.RUN_GATE == 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.changes.outputs.source }}
 
       - name: Setup Rust toolchain
-        if: needs.changes.outputs.engine == 'true'
+        if: env.RUN_GATE == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust dependencies
-        if: needs.changes.outputs.engine == 'true'
+        if: env.RUN_GATE == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -363,53 +421,16 @@ jobs:
 
       - name: Verify librqbit patch source
         id: librqbit
-        if: needs.changes.outputs.engine == 'true'
-        shell: bash
-        run: |
-          cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
-          python - "$RUNNER_TEMP/cargo-metadata.json" <<'PY'
-          import json
-          import os
-          import pathlib
-          import sys
-
-          metadata = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-          packages = [package for package in metadata["packages"] if package["name"] == "librqbit"]
-          if len(packages) != 1:
-              raise SystemExit(f"expected one librqbit package, found {len(packages)}")
-          package = packages[0]
-          manifest = pathlib.Path(package["manifest_path"]).as_posix()
-          if package["version"] != "9.0.1":
-              raise SystemExit(f"unexpected librqbit version: {package['version']}")
-          source = package["source"] or ""
-          prefix = "git+https://github.com/zerx-lab/rqbit?rev="
-          if not source.startswith(prefix):
-              raise SystemExit(f"librqbit must resolve from a pinned MSE fork revision, got: {source}")
-          requested_rev, separator, resolved_rev = source.removeprefix(prefix).partition("#")
-          if not separator or requested_rev != resolved_rev:
-              raise SystemExit(f"librqbit requested and resolved revisions differ: {source}")
-          if "/native/engine/vendor/" in manifest:
-              raise SystemExit(f"librqbit must not resolve from the vendored copy: {manifest}")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              print(f"manifest={manifest}", file=output)
-          print(f"verified fork librqbit {package['version']}: {manifest} ({source})")
-          PY
+        if: env.RUN_GATE == 'true'
+        run: python3 .github/scripts/verify_librqbit.py --github-output
 
       - name: Test resolved librqbit MSE fork
-        if: needs.changes.outputs.engine == 'true'
+        if: env.RUN_GATE == 'true'
         run: |
           cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib mse
           cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib read_buf
           cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib fresh_redial
           cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib --no-run
-
-      - name: Verify engine workspace
-        if: needs.changes.outputs.engine == 'true'
-        run: |
-          cargo check --locked -p fluxdown_engine
-          cargo test --locked -p fluxdown_engine
-          cargo test --locked -p fluxdown_engine --features plugins,components plugin
-          cargo fmt --check
 
   # ── 并行 Job 1: GPUI 桌面客户端 Windows（x64 + ARM64）：Inno 安装器 + 便携 zip ──
   # 四个可执行文件同目录：fluxdown-desktop（界面）→ fluxdown-agent（常驻网关/托盘）→ fluxdownd
@@ -418,8 +439,8 @@ jobs:
   # 产物名、Inno AppId 与 Flutter 时代一致，旧 Flutter 客户端的自动更新直接覆盖升级为 GPUI。
   build-windows:
     name: Build Windows (${{ matrix.arch }})
-    needs: [changes, verify-engine]
-    if: needs.changes.outputs.app == 'true'
+    needs: [changes]
+    if: needs.changes.outputs.app == 'true' && !contains(format(',{0},', needs.changes.outputs.reuse), ',app,')
     strategy:
       fail-fast: false
       matrix:
@@ -532,6 +553,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: windows-installer-${{ matrix.arch }}
           path: build/installer/FluxDown-*-setup.exe
           if-no-files-found: error
@@ -540,6 +562,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: windows-portable-${{ matrix.arch }}
           path: build/installer/FluxDown-*-portable.zip
           if-no-files-found: error
@@ -610,7 +633,7 @@ jobs:
         if: needs.changes.outputs.prerelease == 'true' || needs.changes.outputs.rehearsal != 'false'
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
-          cd fluxDown/.output/firefox-mv2
+          cd fluxDown/.output/firefox-mv3
           zip -r "../../../build/extension/FluxDown-${VERSION}-firefox-unsigned.zip" .
 
       - name: Install web-ext
@@ -620,7 +643,7 @@ jobs:
       # 演练代替 AMO 签名的本地校验：lint 出 error 即失败（AMO 提交时的同类校验会拒收）。
       - name: Lint Firefox extension (rehearsal)
         if: needs.changes.outputs.prerelease != 'true' && needs.changes.outputs.rehearsal != 'false'
-        run: web-ext lint --source-dir fluxDown/.output/firefox-mv2
+        run: web-ext lint --source-dir fluxDown/.output/firefox-mv3
 
       # ── Firefox 双版本策略（仅稳定版）：AMO 市场用 X.Y.Z（与 tag 一致），GitHub Release XPI 用 X.Y.Z.1
       #    两个版本号不同，彻底避免同版本号重复提交冲突。
@@ -633,7 +656,7 @@ jobs:
         continue-on-error: true
         run: |
           web-ext sign \
-            --source-dir fluxDown/.output/firefox-mv2 \
+            --source-dir fluxDown/.output/firefox-mv3 \
             --channel=listed \
             --api-key=${{ secrets.AMO_JWT_ISSUER }} \
             --api-secret=${{ secrets.AMO_JWT_SECRET }} \
@@ -648,11 +671,11 @@ jobs:
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
           mkdir -p build/extension
-          python3 -c "import json;f='fluxDown/.output/firefox-mv2/manifest.json';m=json.load(open(f));m['version']='$VERSION.1';open(f,'w').write(json.dumps(m,indent=2))"
+          python3 -c "import json;f='fluxDown/.output/firefox-mv3/manifest.json';m=json.load(open(f));m['version']='$VERSION.1';open(f,'w').write(json.dumps(m,indent=2))"
           echo "Manifest version set to $VERSION.1 for unlisted signing"
 
           web-ext sign \
-            --source-dir fluxDown/.output/firefox-mv2 \
+            --source-dir fluxDown/.output/firefox-mv3 \
             --channel=unlisted \
             --api-key=${{ secrets.AMO_JWT_ISSUER }} \
             --api-secret=${{ secrets.AMO_JWT_SECRET }} \
@@ -702,6 +725,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: browser-extension-chrome
           path: build/extension/FluxDown-*-chrome.zip
           if-no-files-found: error
@@ -836,6 +860,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: browser-extension-firefox
           # 稳定版：AMO 签名的 .xpi；预览版 / 演练：未签名 .zip
           path: |
@@ -917,8 +942,8 @@ jobs:
   build-linux:
     name: Build Linux (x64)
     runs-on: ubuntu-22.04
-    needs: [changes, verify-engine]
-    if: needs.changes.outputs.app == 'true'
+    needs: [changes]
+    if: needs.changes.outputs.app == 'true' && !contains(format(',{0},', needs.changes.outputs.reuse), ',app,')
     env:
       CARGO_HTTP_MULTIPLEXING: "false"
       CARGO_NET_RETRY: "10"
@@ -988,6 +1013,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: linux-appimage
           path: build/installer/FluxDown-*-linux-x64.AppImage
           if-no-files-found: error
@@ -996,6 +1022,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: linux-deb
           path: build/installer/FluxDown-*-linux-x64.deb
           if-no-files-found: error
@@ -1004,6 +1031,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: linux-arch
           path: build/installer/FluxDown-*-linux-x64.pkg.tar.zst
           if-no-files-found: error
@@ -1012,6 +1040,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: linux-portable
           path: build/installer/FluxDown-*-linux-x64.tar.gz
           if-no-files-found: error
@@ -1020,16 +1049,18 @@ jobs:
   # scripts/package_gpui_macos.sh：FluxDown.app（agent 辅助 bundle）→ Developer ID 签名
   # （Hardened Runtime）→ DMG → notarytool 公证 → staple（DMG 与 .app 均 staple，Gatekeeper
   # 离线可验，避免“已损坏”提示）。缺签名/公证 secrets 时直接失败，绝不发布 ad-hoc 包。
+  # 两个架构都跑在 Apple Silicon runner（x64 经 --target x86_64-apple-darwin 交叉编译，产物无需在本机执行）：
+  # 历史上 7 次签名 / 公证网络失败有 6 次出在 Intel runner（macos-15-intel）。
   build-macos:
     name: Build macOS (${{ matrix.arch }})
-    needs: [changes, verify-engine]
-    if: needs.changes.outputs.app == 'true'
+    needs: [changes]
+    if: needs.changes.outputs.app == 'true' && !contains(format(',{0},', needs.changes.outputs.reuse), ',app,')
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x64
-            runner: macos-15-intel
+            runner: macos-15
             script_arch: x86_64
           - arch: arm64
             runner: macos-15
@@ -1094,6 +1125,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: macos-dmg-${{ matrix.arch }}
           path: build/installer/FluxDown-*-macos-${{ matrix.arch }}.dmg
           if-no-files-found: error
@@ -1102,6 +1134,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: macos-portable-${{ matrix.arch }}
           path: build/installer/FluxDown-*-macos-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
@@ -1114,8 +1147,8 @@ jobs:
     # cargo-ndk 预编译包需要 GLIBC 2.39。
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    needs: [changes, verify-engine]
-    if: needs.changes.outputs.mobile == 'true'
+    needs: [changes]
+    if: needs.changes.outputs.mobile == 'true' && !contains(format(',{0},', needs.changes.outputs.reuse), ',mobile,')
     env:
       CARGO_HTTP_MULTIPLEXING: "false"
       CARGO_NET_RETRY: "10"
@@ -1184,6 +1217,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: android-apk
           path: build/android/FluxDown-*.apk
           if-no-files-found: error
@@ -1192,8 +1226,8 @@ jobs:
   build-web:
     name: Build Server Web SPA
     runs-on: ubuntu-latest
-    needs: [changes, verify-engine]
-    if: needs.changes.outputs.server == 'true'
+    needs: [changes]
+    if: needs.changes.outputs.server == 'true' && !contains(format(',{0},', needs.changes.outputs.reuse), ',server,')
 
     steps:
       - name: Checkout repository
@@ -1216,6 +1250,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: server-webroot
           path: web/dist
 
@@ -1231,8 +1266,8 @@ jobs:
   # 运行：fluxdown-agent --server（agent 拉起同级 fluxdownd）。
   build-server-binaries:
     name: Build Server (${{ matrix.platform }})
-    needs: [changes, verify-engine, build-web]
-    if: needs.changes.outputs.server == 'true'
+    needs: [changes, build-web]
+    if: needs.changes.outputs.server == 'true' && !contains(format(',{0},', needs.changes.outputs.reuse), ',server,')
     strategy:
       fail-fast: false
       matrix:
@@ -1339,11 +1374,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: server-bin-${{ matrix.platform }}
           path: release-assets/*
 
-  # ── 并行 Job 5c': NAS/软路由包（OpenWrt ipk + QNAP qpkg + 群晖 spk + 飞牛 fpk，复用 linux musl 静态产物）──
-  # ipk 纯脚本手打（packaging/openwrt/build_ipk.sh，无需 OpenWrt SDK）；
+  # ── 并行 Job 5c': NAS/软路由包（OpenWrt ipk/apk + QNAP qpkg + 群晖 spk + 飞牛 fpk，复用 linux musl 静态产物）──
+  # ipk / apk 纯脚本手打（packaging/openwrt/build.sh，无需 OpenWrt SDK；apk 需 apk-tools v3，在 alpine 容器内打）；
   # qpkg 用官方 QDK qbuild（packaging/qnap/build_qpkg.sh）。
   # 不跑 InstallToUbuntu.sh（其 apt 依赖列表含 ubuntu 24.04 已不存在的 `python` 包），手动装 QDK。
   # spk 纯脚本手打（packaging/synology/build_spk.sh，做法同 SynoCommunity spksrc，无需群晖 toolkit）；
@@ -1353,7 +1389,7 @@ jobs:
   build-server-nas-packages:
     name: Build Server (OpenWrt/QNAP/Synology/fnOS packages)
     needs: [changes, build-server-binaries]
-    if: needs.changes.outputs.server == 'true'
+    if: needs.changes.outputs.server == 'true' && !contains(format(',{0},', needs.changes.outputs.reuse), ',server,')
     runs-on: ubuntu-latest
 
     steps:
@@ -1399,10 +1435,25 @@ jobs:
           VERSION=${{ steps.version.outputs.VERSION }}
           X64="extracted/fluxdown-server-${VERSION}-linux-x64"
           A64="extracted/fluxdown-server-${VERSION}-linux-arm64"
-          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$X64" x86_64 release-assets
-          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$A64" \
+          ./packaging/openwrt/build.sh ipk server "$VERSION" "$X64" x86_64 release-assets
+          ./packaging/openwrt/build.sh ipk server "$VERSION" "$A64" \
             aarch64_generic,aarch64_cortex-a53,aarch64_cortex-a72,aarch64_cortex-a76 release-assets
-          ./packaging/openwrt/build_ipk.sh luci "$VERSION" release-assets
+          ./packaging/openwrt/build.sh ipk luci "$VERSION" release-assets
+
+      # OpenWrt 25.12 起改用 apk（apk-tools v3）；`apk mkpkg` 只有 alpine 3.24+ 自带。
+      # mkpkg 默认 compat 3.0.0_pre1，25.12 自带的 apk 3.0.5 可直接安装。
+      - name: Build OpenWrt apk
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          X64="extracted/fluxdown-server-${VERSION}-linux-x64"
+          A64="extracted/fluxdown-server-${VERSION}-linux-arm64"
+          docker run --rm -v "$PWD:/w" -w /w \
+            -e VERSION="$VERSION" -e X64="$X64" -e A64="$A64" alpine:3.24 sh -ec '
+              ./packaging/openwrt/build.sh apk server "$VERSION" "$X64" x86_64 release-assets
+              ./packaging/openwrt/build.sh apk server "$VERSION" "$A64" \
+                aarch64_generic,aarch64_cortex-a53,aarch64_cortex-a72,aarch64_cortex-a76 release-assets
+              ./packaging/openwrt/build.sh apk luci "$VERSION" release-assets
+            '
 
       - name: Build QNAP qpkg
         run: |
@@ -1450,6 +1501,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: server-bin-nas-packages
           path: release-assets/*
 
@@ -1461,8 +1513,8 @@ jobs:
   # CLI 是单二进制（无 webroot），产物即 fluxdown(.exe)。
   build-cli-binaries:
     name: Build CLI (${{ matrix.platform }})
-    needs: [changes, verify-engine]
-    if: needs.changes.outputs.cli == 'true'
+    needs: [changes]
+    if: needs.changes.outputs.cli == 'true' && !contains(format(',{0},', needs.changes.outputs.reuse), ',cli,')
     strategy:
       fail-fast: false
       matrix:
@@ -1553,18 +1605,23 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: cli-bin-${{ matrix.platform }}
           path: release-assets/*
 
   # ── 并行 Job 5c: Docker 镜像（linux/amd64 + linux/arm64，推 ghcr.io）──
   # linux 二进制 tarball 已由 build-server-binaries（musl 静态链接）产出，此处只推镜像。
   # Rust 编译在 Dockerfile 内按 TARGETARCH 交叉编译（不走 QEMU）；QEMU 仅用于 arm64 运行时层的 apt。
-  # 演练：照常登录 ghcr（验证凭据）并完整构建双架构镜像，但不推送。
+  # 演练：完整构建双架构镜像并只按 digest 推送（无 tag），digest 存为 docker-digest artifact；
+  # tag 推送复用该演练时只做 imagetools 改 tag（几秒），不再编译。需要 verify-engine 成功才推送。
   build-server-docker:
     name: Build Server (Docker)
     runs-on: ubuntu-latest
     needs: [changes, verify-engine]
     if: needs.changes.outputs.server == 'true'
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/fluxdown-server
+      REUSE_DOCKER: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',server,') }}
 
     steps:
       - name: Checkout repository
@@ -1589,6 +1646,7 @@ jobs:
           echo "VERSION=${V#v}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU (arm64 runtime layer)
+        if: env.REUSE_DOCKER != 'true'
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
@@ -1614,12 +1672,13 @@ jobs:
             type=raw,value=latest,enable=${{ needs.changes.outputs.is_highest_stable == 'true' }}
 
       - name: Build and push Docker image
+        if: env.REUSE_DOCKER != 'true' && needs.changes.outputs.rehearsal == 'false'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/server.Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ needs.changes.outputs.rehearsal == 'false' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -1629,10 +1688,69 @@ jobs:
           cache-from: type=gha,scope=server
           cache-to: type=gha,scope=server,mode=max
 
+      # 演练：只按 digest 推送（不打任何 tag，镜像不可见），digest 存为 artifact 供 tag 推送晋升。
+      - name: Build rehearsal Docker image (push by digest)
+        id: rehearsal_build
+        if: needs.changes.outputs.rehearsal != 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/server.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            FLUXDOWN_ANALYTICS_APP_KEY=${{ secrets.ANALYTICS_APP_KEY }}
+            FLUXCLOUD_BASE_URL=${{ secrets.FLUXCLOUD_BASE_URL }}
+            FLUXDOWN_APP_VERSION=${{ steps.version.outputs.VERSION }}
+          cache-from: type=gha,scope=server
+          cache-to: type=gha,scope=server,mode=max
+
+      - name: Save rehearsal image digest
+        if: needs.changes.outputs.rehearsal != 'false'
+        run: |
+          mkdir -p docker-digest
+          echo "${{ steps.rehearsal_build.outputs.digest }}" > docker-digest/digest.txt
+          grep -Eq '^sha256:[0-9a-f]{64}$' docker-digest/digest.txt
+
+      - name: Keep rehearsal image digest
+        if: needs.changes.outputs.rehearsal != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          retention-days: 14
+          name: docker-digest
+          path: docker-digest/digest.txt
+          if-no-files-found: error
+
+      # 晋升：把演练 digest 打上版本（与 latest）tag，纯 registry 操作，不重新编译。
+      - name: Download rehearsal image digest
+        if: env.REUSE_DOCKER == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-digest
+          path: docker-digest
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ needs.changes.outputs.reuse_run }}
+
+      - name: Promote rehearsal image
+        if: env.REUSE_DOCKER == 'true'
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          DIGEST=$(cat docker-digest/digest.txt)
+          grep -Eq '^sha256:[0-9a-f]{64}$' <<< "$DIGEST"
+          ARGS=()
+          while IFS= read -r t; do [ -n "$t" ] && ARGS+=(-t "$t"); done <<< "$TAGS"
+          docker buildx imagetools create "${ARGS[@]}" "${IMAGE}@${DIGEST}"
+          docker buildx imagetools inspect "${IMAGE}:${{ steps.version.outputs.VERSION }}"
+
   # ── Release Job 1: 准备统一 release（生成双语说明 + 建草稿）──
   # 与构建并行；上传 job 只在草稿就绪后开始。
   # tag 推送：生成说明并写入（release 已存在时只刷新说明，不改草稿/发布状态）；
   # 手动补发：release 已存在则不动，缺失时以兜底标题新建草稿（说明可事后手改）。
+  # 写入的说明经 release_publish.py --seed-notes 带上本次应发布组件（与已有记录取并集），
+  # 即使 publish-release 没跑到，后续补发也不会把缺组件的 release 提前转正。
   # 演练：在本 runner 打本地 tag 后照常生成说明，写入 job summary 与 artifact，不建草稿。
   prepare-release:
     name: Prepare Release
@@ -1712,6 +1830,7 @@ jobs:
         if: needs.changes.outputs.rehearsal == 'false'
         env:
           EXISTS: ${{ steps.existing.outputs.exists }}
+          EXPECTED: ${{ needs.changes.outputs.expected }}
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
             NOTES=RELEASE_NOTES.md
@@ -1722,6 +1841,10 @@ jobs:
             NOTES="$RUNNER_TEMP/notes.md"
             echo "Release ${TAG}" > "$NOTES"
           fi
+
+          SEED=(--tag "$TAG" --expected "$EXPECTED" --seed-notes "$NOTES")
+          if [ "$EXISTS" = true ]; then SEED+=(--release-exists); fi
+          python3 .github/scripts/release_publish.py "${SEED[@]}"
 
           if [ "$EXISTS" = true ]; then
             gh release edit "$TAG" --notes-file "$NOTES"
@@ -1745,6 +1868,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: rehearsal-release-notes
           path: RELEASE_NOTES.md
           if-no-files-found: error
@@ -1757,7 +1881,10 @@ jobs:
   upload-app:
     name: Upload Desktop App
     runs-on: ubuntu-latest
-    needs: [changes, prepare-release, build-windows, build-linux, build-macos]
+    needs: [changes, prepare-release, verify-engine, build-windows, build-linux, build-macos]
+    # 复用演练产物（构建被跳过）或本次构建全部成功；引擎门禁与草稿就绪是发布前提。
+    if: ${{ !cancelled() && needs.prepare-release.result == 'success' && needs.verify-engine.result == 'success'
+      && (contains(format(',{0},', needs.changes.outputs.reuse), ',app,') || (needs.build-windows.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')) }}
 
     steps:
       - name: Checkout repository
@@ -1766,6 +1893,8 @@ jobs:
       - name: Download Windows artifacts
         uses: actions/download-artifact@v4
         with:
+          github-token: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',app,') && secrets.GITHUB_TOKEN || '' }}
+          run-id: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',app,') && needs.changes.outputs.reuse_run || github.run_id }}
           pattern: windows-*
           path: release-assets/
           merge-multiple: true
@@ -1773,6 +1902,8 @@ jobs:
       - name: Download Linux artifacts
         uses: actions/download-artifact@v4
         with:
+          github-token: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',app,') && secrets.GITHUB_TOKEN || '' }}
+          run-id: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',app,') && needs.changes.outputs.reuse_run || github.run_id }}
           pattern: linux-*
           path: release-assets/
           merge-multiple: true
@@ -1780,6 +1911,8 @@ jobs:
       - name: Download macOS artifacts
         uses: actions/download-artifact@v4
         with:
+          github-token: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',app,') && secrets.GITHUB_TOKEN || '' }}
+          run-id: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',app,') && needs.changes.outputs.reuse_run || github.run_id }}
           pattern: macos-*
           path: release-assets/
           merge-multiple: true
@@ -1797,6 +1930,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: rehearsal-sums-app
           path: release-assets/SHA256SUMS-app.txt
           if-no-files-found: error
@@ -1839,6 +1973,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: rehearsal-sums-extension
           path: release-assets/SHA256SUMS-extension.txt
           if-no-files-found: error
@@ -1856,7 +1991,10 @@ jobs:
   upload-server:
     name: Upload Server
     runs-on: ubuntu-latest
-    needs: [changes, prepare-release, build-server-binaries, build-server-nas-packages]
+    needs: [changes, prepare-release, verify-engine, build-server-binaries, build-server-nas-packages]
+    # 复用演练产物（构建被跳过）或本次构建全部成功；引擎门禁与草稿就绪是发布前提。
+    if: ${{ !cancelled() && needs.prepare-release.result == 'success' && needs.verify-engine.result == 'success'
+      && (contains(format(',{0},', needs.changes.outputs.reuse), ',server,') || (needs.build-server-binaries.result == 'success' && needs.build-server-nas-packages.result == 'success')) }}
 
     steps:
       - name: Checkout repository
@@ -1865,6 +2003,8 @@ jobs:
       - name: Download server artifacts
         uses: actions/download-artifact@v4
         with:
+          github-token: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',server,') && secrets.GITHUB_TOKEN || '' }}
+          run-id: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',server,') && needs.changes.outputs.reuse_run || github.run_id }}
           pattern: server-bin-*
           path: release-assets/
           merge-multiple: true
@@ -1882,6 +2022,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: rehearsal-sums-server
           path: release-assets/SHA256SUMS-server.txt
           if-no-files-found: error
@@ -1898,7 +2039,10 @@ jobs:
   upload-cli:
     name: Upload CLI
     runs-on: ubuntu-latest
-    needs: [changes, prepare-release, build-cli-binaries]
+    needs: [changes, prepare-release, verify-engine, build-cli-binaries]
+    # 复用演练产物（构建被跳过）或本次构建全部成功；引擎门禁与草稿就绪是发布前提。
+    if: ${{ !cancelled() && needs.prepare-release.result == 'success' && needs.verify-engine.result == 'success'
+      && (contains(format(',{0},', needs.changes.outputs.reuse), ',cli,') || (needs.build-cli-binaries.result == 'success')) }}
 
     steps:
       - name: Checkout repository
@@ -1907,6 +2051,8 @@ jobs:
       - name: Download CLI artifacts
         uses: actions/download-artifact@v4
         with:
+          github-token: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',cli,') && secrets.GITHUB_TOKEN || '' }}
+          run-id: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',cli,') && needs.changes.outputs.reuse_run || github.run_id }}
           pattern: cli-bin-*
           path: release-assets/
           merge-multiple: true
@@ -1924,6 +2070,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: rehearsal-sums-cli
           path: release-assets/SHA256SUMS-cli.txt
           if-no-files-found: error
@@ -1940,7 +2087,10 @@ jobs:
   upload-mobile:
     name: Upload Mobile
     runs-on: ubuntu-latest
-    needs: [changes, prepare-release, build-android]
+    needs: [changes, prepare-release, verify-engine, build-android]
+    # 复用演练产物（构建被跳过）或本次构建全部成功；引擎门禁与草稿就绪是发布前提。
+    if: ${{ !cancelled() && needs.prepare-release.result == 'success' && needs.verify-engine.result == 'success'
+      && (contains(format(',{0},', needs.changes.outputs.reuse), ',mobile,') || (needs.build-android.result == 'success')) }}
 
     steps:
       - name: Checkout repository
@@ -1949,6 +2099,8 @@ jobs:
       - name: Download Android APK artifacts
         uses: actions/download-artifact@v4
         with:
+          github-token: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',mobile,') && secrets.GITHUB_TOKEN || '' }}
+          run-id: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',mobile,') && needs.changes.outputs.reuse_run || github.run_id }}
           pattern: android-apk
           path: release-assets/
           merge-multiple: true
@@ -1966,6 +2118,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: rehearsal-sums-mobile
           path: release-assets/SHA256SUMS-mobile.txt
           if-no-files-found: error
@@ -1980,9 +2133,10 @@ jobs:
           dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
 
   # ── Release Job 3: 收尾发布（tag 推送与补发都跑，幂等）──
-  # 汇总 SHA256SUMS.txt、刷新说明头部（已发布组件 + 服务器/CLI 安装说明）、草稿转正、
-  # 决定 latest（稳定版 + 桌面端完整 + 最高稳定版本）。有组件未完成时发布其余组件后
-  # 以失败结束并在 job summary 给出补发命令。实现见 .github/scripts/release_publish.py。
+  # 汇总 SHA256SUMS.txt、刷新说明头部（已发布组件 + 服务器/CLI 安装说明 + 累计应发布组件 /
+  # Docker 状态）、决定 latest（稳定版 + 桌面端完整 + 最高稳定版本）。累计应发布组件全部完成才
+  # 草稿转正；否则保持草稿、以失败结束并在 job summary 给出补发命令，补发齐全的那次运行转正。
+  # 实现见 .github/scripts/release_publish.py。
   # 演练：同一脚本以 --rehearsal-dir 读取本次的哨兵与说明 artifact，只产出总校验和、release 正文
   # 与计划中的 gh 操作预览（rehearsal-release-preview），不调用任何 gh 写操作。
   publish-release:
@@ -2036,17 +2190,8 @@ jobs:
           TAG: ${{ needs.changes.outputs.tag }}
           DOCKER_RESULT: ${{ needs.build-server-docker.result }}
           REHEARSAL: ${{ needs.changes.outputs.rehearsal }}
-          C_APP: ${{ needs.changes.outputs.app }}
-          C_EXTENSION: ${{ needs.changes.outputs.extension }}
-          C_SERVER: ${{ needs.changes.outputs.server }}
-          C_CLI: ${{ needs.changes.outputs.cli }}
-          C_MOBILE: ${{ needs.changes.outputs.mobile }}
+          EXPECTED: ${{ needs.changes.outputs.expected }}
         run: |
-          EXPECTED=""
-          for c in APP EXTENSION SERVER CLI MOBILE; do
-            v="C_$c"
-            if [ "${!v}" = true ]; then EXPECTED="${EXPECTED:+${EXPECTED},}${c,,}"; fi
-          done
           MODE=()
           if [ "$REHEARSAL" != false ]; then MODE=(--rehearsal-dir rehearsal); fi
           python3 .github/scripts/release_publish.py \
@@ -2057,6 +2202,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           overwrite: true
+          retention-days: 14
           name: rehearsal-release-preview
           path: |
             rehearsal/SHA256SUMS.txt
@@ -2065,7 +2211,7 @@ jobs:
 
   # ── 发布公告：草稿转正后推送到 Telegram 频道（t.me/fluxdown）──
   # release 由 GITHUB_TOKEN 发布，不会触发 on: release 事件，所以公告在本流水线内发送。
-  # 部分组件失败时 publish-release 以非零退出但 release 已转正，照常公告；仍为草稿则跳过。
+  # 只有组件齐全、本次把草稿转正时才公告（tag 推送或补齐的那次补发）；仍为草稿则跳过。
   # 公告失败不影响发布结果。
   notify-telegram:
     name: Notify Telegram Channel
@@ -2155,63 +2301,51 @@ jobs:
           print(f"Telegram message_id={resp['result']['message_id']}")
           EOF
 
-  # ── 最终 Job: 清理 GitHub Actions Artifact，仅保留当前 tag 这一组 ──
-  # 原因：Free 账号 artifact 配额仅 500MB，每次 release 会上传 ~400MB
-  # Release 资产已独立存储在 GitHub Release，artifact 只是 CI 中间产物可安全清理
-  # always()：无论哪些组件被跳过/失败都执行清理，失败不阻断（continue-on-error）
-  # 演练不清理：它的 artifact 就是交付物（由下一次真实发布的清理回收）。
+  # ── 发布公告：同一时机推送到 QQ「FD会员专属群」──
+  # 经 TgBot（tg-bot.zerx.dev）bot 3 的 Webhook 流程「FluxDown 发版公告」（flow 18）转发；
+  # 只发中文更新日志，Markdown 转纯文本，实现见 .github/scripts/release_notify_qq.py。
+  # 门控同 notify-telegram；webhook 地址即凭据，存 secrets.QQ_RELEASE_WEBHOOK_URL。公告失败不影响发布结果。
+  notify-qq:
+    name: Notify QQ Group
+    runs-on: ubuntu-latest
+    needs: [changes, publish-release]
+    if: ${{ always() && !cancelled() && needs.changes.outputs.rehearsal == 'false' && needs.publish-release.outputs.was_draft == 'true' }}
+    continue-on-error: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - name: Send release announcement
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.changes.outputs.tag }}
+          QQ_WEBHOOK_URL: ${{ secrets.QQ_RELEASE_WEBHOOK_URL }}
+        run: |
+          gh release view "$TAG" --json isDraft,isPrerelease,name,url,body > "$RUNNER_TEMP/release.json"
+          python3 .github/scripts/release_notify_qq.py "$RUNNER_TEMP/release.json"
+
+  # ── 最终 Job: 清理 GitHub Actions Artifact（实现见 .github/scripts/release_artifacts.py）──
+  # artifact 只是中间产物（release 资产独立存储在 GitHub Release）：tag 已正式发布的运行
+  # （tag 推送 / 演练 / 补发）一律删除；未发布 tag 的演练与草稿运行保留（晋升 / Re-run 要用），
+  # 进行中的运行不动。演练也执行清理（只回收已发布版本），未被发布的演练由 retention-days 兜底过期。
+  # always()：无论哪些组件被跳过/失败都执行清理，失败不阻断（continue-on-error）。
   cleanup-artifacts:
     name: Cleanup CI Artifacts
     runs-on: ubuntu-latest
     needs: [changes, publish-release]
-    if: ${{ always() && !cancelled() && needs.changes.outputs.rehearsal != 'true' }}
+    if: ${{ always() && !cancelled() }}
 
     steps:
-      - name: Cleanup GitHub Actions artifacts (keep current tag + in-flight runs)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cleanup GitHub Actions artifacts of published releases
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          CURRENT_TAG="${{ needs.changes.outputs.tag }}"
-          echo "🧹 Artifact cleanup: keeping artifacts from tag ${CURRENT_TAG} and any still-running workflow runs"
-
-          # 收集所有未完成（queued/in_progress）run 的 id：并行的其他 tag 发布
-          # 仍在使用自己的 artifact，绝不能删（曾导致 v0.2.4-rc.1 的 Windows
-          # installer 被并行的 v0.2.3 cleanup 提前删除，Release 缺 x64 安装包）
-          ACTIVE_RUN_IDS=$(gh api --paginate \
-            "repos/${{ github.repository }}/actions/runs?status=in_progress" \
-            -q '.workflow_runs[].id'; gh api --paginate \
-            "repos/${{ github.repository }}/actions/runs?status=queued" \
-            -q '.workflow_runs[].id')
-          ACTIVE_JSON=$(printf '%s\n' $ACTIVE_RUN_IDS | jq -cs 'map(tonumber)')
-          echo "Active run ids: ${ACTIVE_JSON}"
-
-          # 列出所有 artifact：跳过当前 tag 的、跳过属于未完成 run 的，删除其余
-          # workflow_run.head_branch 在 tag 推送时等于 tag 名（v0.1.43 这样）
-          DELETE_IDS=$(gh api --paginate \
-            repos/${{ github.repository }}/actions/artifacts \
-            -q ".artifacts[] | select(.workflow_run.head_branch != \"${CURRENT_TAG}\") | select(.workflow_run.id as \$rid | (${ACTIVE_JSON} | index(\$rid)) == null) | .id")
-
-          if [ -z "$DELETE_IDS" ]; then
-            echo "✅ No old artifacts to delete"
-            exit 0
-          fi
-
-          DELETE_COUNT=$(echo "$DELETE_IDS" | wc -l)
-          echo "Will delete ${DELETE_COUNT} old artifact(s)"
-
-          # 串行删除避免触发 GitHub TLS 限流（之前并发 8 大量 timeout）
-          FAIL=0
-          for id in $DELETE_IDS; do
-            if gh api -X DELETE repos/${{ github.repository }}/actions/artifacts/${id} 2>/dev/null; then
-              echo "  🗑️  Deleted artifact ${id}"
-            else
-              echo "  ⚠️  Failed to delete artifact ${id}"
-              FAIL=$((FAIL+1))
-            fi
-          done
-
-          echo "✅ Artifact cleanup complete. Deleted $((DELETE_COUNT-FAIL))/${DELETE_COUNT}"
-          if [ "$FAIL" -gt 0 ]; then
-            echo "⚠️  ${FAIL} deletion(s) failed (will be retried next release)"
-          fi
+          GH_REPO: ${{ github.repository }}
+        run: python3 .github/scripts/release_artifacts.py

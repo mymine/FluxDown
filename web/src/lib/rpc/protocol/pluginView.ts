@@ -96,6 +96,22 @@ export interface PluginInvokeParams {
   args?: JsonValue;
 }
 
+/** `daemon.plugin.pageInvoke` 参数：页面脚本调用以 `{ page: true }` 注册的处理器。 */
+export interface PluginPageInvokeParams {
+  identity: string;
+  name: string;
+  args?: JsonValue;
+  /** 发起调用的页面地址。 */
+  pageUrl: string;
+}
+
+/** `daemon.plugin.pageInvoke` 结果：处理器返回值与本次调用期间插件开始的任务。 */
+export interface PluginPageInvokeResultDto {
+  value: JsonValue;
+  createdTaskIds: string[];
+  resumedTaskIds: string[];
+}
+
 /** 根节点上承载渲染错误的 prop 名（与 Rust `VIEW_ERROR_PROP` 一致）。 */
 export const VIEW_ERROR_PROP = '__error';
 

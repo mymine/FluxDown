@@ -44,6 +44,8 @@ enum SentCodeStore {
     static func emailOldKey(userId: String) -> String { "email-old:\(userId)" }
     /// 修改 / 设置密码：绑定邮箱验证码。
     static func passwordKey(userId: String) -> String { "password:\(userId)" }
+    /// 注销账户：绑定邮箱验证码（与改密码的码用途不同，分开记）。
+    static func deleteKey(userId: String) -> String { "delete:\(userId)" }
 
     static func remember(_ key: String, ttlSeconds: UInt64) {
         records[key] = AccountRules.SentCode(sentAtMs: AccountText.nowMs(), ttlSeconds: Int64(clamping: ttlSeconds))

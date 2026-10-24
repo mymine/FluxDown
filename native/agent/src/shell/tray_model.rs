@@ -73,31 +73,35 @@ impl TrayPresenter {
             .clone()
             .unwrap_or_else(fluxdown_ui_i18n::system_locale);
         translator.set_locale(&locale);
-        port.apply(&build(translator, &inputs));
+        port.apply(&build(translator, &inputs, COUNTDOWN_IN_MENU));
         self.last = Some(inputs);
     }
 }
 
-fn build(translator: &Translator, inputs: &Inputs) -> TrayModel {
-    let tooltip = inputs.power.countdown_remaining_secs.map_or_else(
+/// macOS 不给状态栏项设 tooltip（#953：macOS 27 上 tooltip 收不到移出事件而常驻），
+/// 倒计时改挂在「取消关机」菜单项上。
+const COUNTDOWN_IN_MENU: bool = cfg!(target_os = "macos");
+
+fn build(translator: &Translator, inputs: &Inputs, countdown_in_menu: bool) -> TrayModel {
+    let remaining = inputs.power.countdown_remaining_secs.map(format_remaining);
+    let tooltip = remaining.as_ref().map_or_else(
         || DEFAULT_TOOLTIP.to_owned(),
-        |remaining| {
-            translator.text_with(
-                "shutdownCountdown",
-                &[("time", &format_remaining(remaining))],
-            )
-        },
+        |time| translator.text_with("shutdownCountdown", &[("time", time)]),
     );
+    let cancel_shutdown = inputs.power.armed_delay_secs.map(|_| {
+        let label = translator.text("trayCancelShutdown");
+        match remaining.as_ref() {
+            Some(time) if countdown_in_menu => format!("{label} ({time})"),
+            _ => label.to_owned(),
+        }
+    });
     TrayModel {
         visible: inputs.visible,
         show_window: translator.text("trayShowWindow").to_owned(),
         settings: translator.text("settings").to_owned(),
         pause_all: translator.text("pauseAll").to_owned(),
         resume_all: translator.text("resumeAll").to_owned(),
-        cancel_shutdown: inputs
-            .power
-            .armed_delay_secs
-            .map(|_| translator.text("trayCancelShutdown").to_owned()),
+        cancel_shutdown,
         restart: translator.text("trayRestart").to_owned(),
         quit: translator.text("trayExit").to_owned(),
         tooltip,
@@ -127,15 +131,20 @@ mod tests {
                 countdown_remaining_secs: Some(65),
             },
         };
-        let model = build(&translator("zh"), &inputs);
+        let model = build(&translator("zh"), &inputs, false);
         assert!(model.tooltip.contains("01:05"), "{}", model.tooltip);
-        assert!(model.cancel_shutdown.is_some());
+        let cancel = model.cancel_shutdown.expect("cancel item while armed");
+        assert!(!cancel.contains("01:05"), "{cancel}");
+
+        let model = build(&translator("zh"), &inputs, true);
+        let cancel = model.cancel_shutdown.expect("cancel item while armed");
+        assert!(cancel.ends_with("(01:05)"), "{cancel}");
 
         let idle = Inputs {
             power: PowerStatusDto::default(),
             ..inputs
         };
-        let model = build(&translator("zh"), &idle);
+        let model = build(&translator("zh"), &idle, true);
         assert_eq!(model.tooltip, DEFAULT_TOOLTIP);
         assert_eq!(model.cancel_shutdown, None);
     }
@@ -152,7 +161,7 @@ mod tests {
             },
         };
         for locale in ["en", "zh"] {
-            let model = build(&translator(locale), &inputs);
+            let model = build(&translator(locale), &inputs, false);
             for (label, key) in [
                 (model.show_window.as_str(), "trayShowWindow"),
                 (model.pause_all.as_str(), "pauseAll"),

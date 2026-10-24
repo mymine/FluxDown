@@ -105,7 +105,10 @@ pub(crate) struct PriceDisplay {
     pub stage_label: Option<String>,
 }
 
-pub(crate) fn price_display(plan: &CloudPlan, credit: i64) -> PriceDisplay {
+/// 抵扣额只作用于可购买（[`CardState::Available`]）的卡片：当前 / 不可选套餐不是升级目标，
+/// 用已付金额去减它们的价格会把「已付」误显示成「已抵扣」。
+pub(crate) fn price_display(plan: &CloudPlan, state: CardState, credit: i64) -> PriceDisplay {
+    let credit = if state.selectable() { credit } else { 0 };
     let currency = plan.currency.as_str();
     let main = format_minor(payable(plan, credit), currency);
     if credit > 0 {
@@ -415,7 +418,7 @@ mod tests {
     fn price_display_variants() {
         let pro = plan("pro", 3000, 1);
         assert_eq!(
-            price_display(&pro, 0),
+            price_display(&pro, CardState::Available, 0),
             PriceDisplay {
                 main: "¥30.00".to_owned(),
                 strike: None,
@@ -425,7 +428,7 @@ mod tests {
         );
         let promo = with_campaign(plan("pro", 3000, 1), 1990);
         assert_eq!(
-            price_display(&promo, 0),
+            price_display(&promo, CardState::Available, 0),
             PriceDisplay {
                 main: "¥19.90".to_owned(),
                 strike: Some("¥30.00".to_owned()),
@@ -435,7 +438,7 @@ mod tests {
         );
         // 有抵扣：划线价是生效价，不再显示档位名。
         assert_eq!(
-            price_display(&promo, 500),
+            price_display(&promo, CardState::Available, 500),
             PriceDisplay {
                 main: "¥14.90".to_owned(),
                 strike: Some("¥19.90".to_owned()),
@@ -443,6 +446,22 @@ mod tests {
                 stage_label: None
             }
         );
+        // 当前 / 不可选套餐不套用抵扣：显示原本价格。
+        for state in [
+            CardState::Current,
+            CardState::TierBlocked,
+            CardState::CreditBlocked,
+        ] {
+            assert_eq!(
+                price_display(&pro, state, 2000),
+                PriceDisplay {
+                    main: "¥30.00".to_owned(),
+                    strike: None,
+                    credit: None,
+                    stage_label: None
+                }
+            );
+        }
     }
 
     #[test]

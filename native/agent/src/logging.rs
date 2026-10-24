@@ -92,7 +92,7 @@ pub fn finish(result: &AgentResult) {
     log.flush_suppressed();
 }
 
-fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut text = String::new();
     let mut source = Some(error);
     while let Some(cause) = source {

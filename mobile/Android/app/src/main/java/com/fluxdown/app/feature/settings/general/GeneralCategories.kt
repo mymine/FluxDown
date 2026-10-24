@@ -8,7 +8,10 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import com.fluxdown.app.R
 import com.fluxdown.app.feature.settings.SettingRowBox
 import com.fluxdown.app.feature.settings.SettingsCtx
+import com.fluxdown.app.i18n.fill
 import com.fluxdown.app.i18n.str
+import com.fluxdown.app.ui.friendlyLocalPath
+import com.fluxdown.app.ui.prepareLocalDirectories
 import com.fluxdown.core.protocol.CategoryRules
 import com.fluxdown.core.protocol.CustomCategoryDto
 import com.fluxdown.fluxui.controls.ButtonSize
@@ -24,15 +27,26 @@ import com.fluxdown.fluxui.icons.FluxIcons
 import com.fluxdown.fluxui.overlay.FluxOverlayState
 import com.fluxdown.fluxui.overlay.FluxToastAction
 import com.fluxdown.fluxui.overlay.FluxToastKind
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/** 「自定义分类」行 id（下载页；与 iOS 一致）。 */
+internal const val CATEGORIES_ROW_ID = "download.categories"
 
 /** 分类编辑器的呈现目标；每次打开新建一个实例（以实例身份区分「再次打开」，草稿随之重置）。 */
 internal class CategoryTarget(val existing: CustomCategoryDto?)
 
-/** 分类列表的读写（唯一写路径：`ConfigEditor.setPreference`，整张重排后的列表，`position` = 下标）。 */
+/**
+ * 分类列表的读写（唯一写路径：`ConfigEditor.setPreference`，整张重排后的列表，`position` = 下标）。
+ * 本机主机的目录在 [scope] 内经 IO 线程创建（分类目录写入偏好后立即可在文件管理器中看到）。
+ */
 internal class CategoryStore(
     private val ctx: SettingsCtx,
     private val overlays: FluxOverlayState,
     private val context: Context,
+    private val scope: CoroutineScope,
 ) {
     val list: List<CustomCategoryDto>
         get() = CustomCategoryDto.fromPreference(ctx.form.pref(CustomCategoryDto.PREFERENCE_KEY))
@@ -68,17 +82,35 @@ internal class CategoryStore(
         )
     }
 
+    /**
+     * 一键分类目录：改写偏好后，本机主机把各分类目录逐个建好（含此前已写入但从未建出的目录）；
+     * 远端主机的路径在服务器上，由引擎在下载时创建。
+     */
     fun applyAutoDirs() {
         val current = list
         val base = defaultSaveDir
         val updated = CategoryRules.autoDirs(current, base) ?: return
         val changed = CategoryRules.autoDirsChangeCount(current, base)
-        if (changed == 0) {
-            overlays.toast(context.str(R.string.mobileGeneralAutoDirsUnchanged), FluxToastKind.Info)
+        if (changed > 0) write(updated)
+        val done = if (changed == 0) {
+            context.str(R.string.mobileGeneralAutoDirsUnchanged) to FluxToastKind.Info
+        } else {
+            context.str(R.string.mobileGeneralAutoDirsDone, "n" to changed) to FluxToastKind.Success
+        }
+        if (!ctx.isLocalHost) {
+            overlays.toast(done.first, done.second)
             return
         }
-        write(updated)
-        overlays.toast(context.str(R.string.mobileGeneralAutoDirsDone, "n" to changed), FluxToastKind.Success)
+        scope.launch {
+            val failed = withContext(Dispatchers.IO) { prepareLocalDirectories(updated.map { it.saveDir }) }
+            val firstFailed = failed.firstOrNull()
+            if (firstFailed == null) {
+                overlays.toast(done.first, done.second)
+            } else {
+                val dir = friendlyLocalPath(context, firstFailed)
+                overlays.toast(context.str(R.string.mobileSaveDirNotWritable).fill("dir" to dir), FluxToastKind.Error)
+            }
+        }
     }
 
     fun resetBuiltin() = write(CustomCategoryDto.builtinDefaults)
@@ -189,7 +221,7 @@ internal fun GlassSectionScope.categoryRows(
     onDeleteRequest: (CustomCategoryDto) -> Unit,
 ) {
     row {
-        SettingRowBox(ctx, GeneralRow.Categories.id, CustomCategoryDto.PREFERENCE_KEY) {
+        SettingRowBox(ctx, CATEGORIES_ROW_ID, CustomCategoryDto.PREFERENCE_KEY) {
             FluxListRow(
                 title = str(R.string.customCategories),
                 subtitle = str(R.string.categoryPriorityNote),
@@ -235,7 +267,10 @@ private fun CategoryRow(
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val detail = categoryDetail(context, entry)
-    val subtitle = listOfNotNull(detail, entry.saveDir.takeIf { it.isNotEmpty() }).joinToString("\n").ifEmpty { null }
+    val saveDir = androidx.compose.runtime.remember(entry.saveDir, ctx.isLocalHost) {
+        entry.saveDir.takeIf { it.isNotEmpty() }?.let { if (ctx.isLocalHost) friendlyLocalPath(context, it) else it }
+    }
+    val subtitle = listOfNotNull(detail, saveDir).joinToString("\n").ifEmpty { null }
     FluxListRow(
         title = categoryDisplayName(context, entry),
         subtitle = subtitle,

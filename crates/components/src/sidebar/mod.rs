@@ -8,11 +8,9 @@ use gpui::{
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, RenderOnce,
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, percentage, px,
 };
-use gpui_component::{
-    Icon, ResizableState, h_flex, h_resizable, resizable_panel, tooltip::Tooltip,
-};
+use gpui_component::{Icon, ResizableState, h_flex, h_resizable, resizable_panel};
 
-use crate::{FluxIcon, toolbar_action_button};
+use crate::{FluxIcon, toolbar_action_button, tooltip_view};
 
 use motion::SidebarMotion;
 
@@ -41,7 +39,7 @@ pub fn sidebar_toggle_button(
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .tooltip({
             let label = label.clone();
-            move |window, cx| Tooltip::new(label.clone()).build(window, cx)
+            move |window, cx| tooltip_view(label.clone(), window, cx)
         })
         .child(
             toolbar_action_button(

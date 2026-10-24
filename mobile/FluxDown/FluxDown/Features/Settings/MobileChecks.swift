@@ -10,7 +10,7 @@ import os
 
 nonisolated enum MobileCheckID: String, CaseIterable, Sendable {
     case notifications, background, storage, network, localNetwork, engine
-    #if FULL_P2P
+    #if FULL_FLAVOR
     case links
     #endif
 
@@ -19,7 +19,7 @@ nonisolated enum MobileCheckID: String, CaseIterable, Sendable {
         case .notifications: "mobileDiagCheckNotifications"
         case .background: "mobileDiagCheckBackground"
         case .storage: "mobileDiagCheckStorage"
-        #if FULL_P2P
+        #if FULL_FLAVOR
         case .links: "mobileDiagCheckLinks"
         #endif
         case .network: "mobileDiagCheckNetwork"
@@ -161,7 +161,7 @@ nonisolated enum MobileChecks {
         return MobileCheck(id: .storage, level: .ok, detail: detail)
     }
 
-    #if FULL_P2P
+    #if FULL_FLAVOR
     // MARK: 链接与文件
 
     /// Info.plist `CFBundleURLTypes` 声明的全部 URL scheme（小写）。
@@ -402,7 +402,7 @@ enum MobileCheckRunner {
             ),
             MobileChecks.storage(writable: await writable, freeBytes: free),
         ]
-        #if FULL_P2P
+        #if FULL_FLAVOR
         let info = Bundle.main.infoDictionary ?? [:]
         let queryable = MobileChecks.queryableSchemes(in: info)
         var handlers: [String: Bool] = [:]

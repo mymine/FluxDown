@@ -13,6 +13,7 @@ use std::rc::Rc;
 use fluxdown_protocol::{CloudConnectionState, method};
 use fluxdown_ui_components::{
     ButtonVariant, FluxIcon, activity_button, button, nav_icon_color, sidebar_navigation_button,
+    tooltip_view,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -22,7 +23,7 @@ use gpui::{
 };
 use gpui_component::{
     Disableable as _, Icon, WindowExt as _, h_flex, notification::Notification, popover::Popover,
-    switch::Switch, tooltip::Tooltip, v_flex,
+    switch::Switch, v_flex,
 };
 
 use crate::assets::CROWN_ICON_PATH;
@@ -571,7 +572,7 @@ impl Render for AccountRailButton {
         div()
             .id("activity-account-tooltip")
             .when(!self.open, |this| {
-                this.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                this.tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
             })
             .child(popover)
     }

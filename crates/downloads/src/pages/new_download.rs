@@ -4,6 +4,7 @@
 //! 提交时经 `agent.capture.resolve` 确认，Cookie / 请求头 / 请求体等上下文由 agent 合并；
 //! 未确认的捕获在窗口关闭时一并忽略。
 
+mod category;
 mod hints;
 mod preview;
 mod probe;
@@ -12,6 +13,7 @@ use hints::HintAutofill;
 use probe::LinkProbe;
 
 use std::{
+    cell::Cell,
     collections::{BTreeMap, HashMap},
     rc::Rc,
     sync::Arc,
@@ -22,7 +24,8 @@ use crate::{
     components::threads_risk::threads_risk_callout,
     controller::{
         DownloadsCommand, DownloadsPort, DownloadsResult, LAST_DOWNLOAD_TARGET_PREF,
-        LAST_SAVE_DIR_PREF, REMEMBER_LAST_SAVE_DIR_PREF,
+        LAST_SAVE_DIR_PREF, REMEMBER_LAST_SAVE_DIR_PREF, SAVE_DIR_HISTORY_ENABLED_PREF,
+        SAVE_DIR_HISTORY_PREF,
     },
     model::{
         devices::{DeviceEntry, DeviceKind, DispatchTarget, other_devices, resolve_target},
@@ -34,6 +37,8 @@ use crate::{
             compose_request, custom_segments, detect_ua_preset, manual_proxy_url, parse_entries,
             parse_input, ua_preset_keys, ua_preset_value,
         },
+        save_dir_category::{CategoryMode, NewDownloadCategory, category_options},
+        save_dir_history::{read_save_dir_history, record_save_dir, save_dir_choices},
     },
     strings::NewDownloadStrings,
     submission::{
@@ -50,12 +55,13 @@ use fluxdown_ui_components::{
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
+    Anchor, AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Div, Entity, FontWeight,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels,
+    Render, SharedString, StatefulInteractiveElement as _, Styled, Window, canvas, deferred, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    Disableable as _, Icon, Sizable as _, Size, WindowExt as _,
+    Disableable as _, Icon, Sizable as _, Size, ThemeStyled as _, WindowExt as _,
     button::{Button, ButtonVariants as _, DropdownButton},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
@@ -74,6 +80,10 @@ const PRESET_DROPDOWN_WIDTH: f32 = 140.;
 const HEADER_NAME_WIDTH: f32 = 168.;
 /// 链接停止变化多久后才查询站点凭据（逐键输入时不逐字符发 RPC）。
 const SITE_AUTH_LOOKUP_DEBOUNCE: Duration = Duration::from_millis(250);
+/// 保存目录历史下拉的最大高度（超出滚动）。
+const SAVE_DIR_MENU_MAX_HEIGHT: f32 = 320.;
+/// 链接输入框随内容自增高的上限（行，含软换行）；默认一行，超出后框内滚动。与 Web 同值。
+const URLS_MAX_ROWS: usize = 10;
 
 /// 队列下拉候选（显示名由表单按内置队列本地化）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +97,8 @@ pub struct NewDownloadQueue {
 pub struct NewDownloadContext {
     /// 保存目录初值（沿用上次 / 全局默认）。
     pub save_dir: String,
+    /// 保存目录历史（最新在前）；`None` = 偏好关闭，不列出也不记录。
+    pub save_dir_history: Option<Vec<String>>,
     /// 「开始下载」默认落入的队列。
     pub queue_id: String,
     /// 线程数初值；0 = 自动。
@@ -97,6 +109,10 @@ pub struct NewDownloadContext {
     pub manual_proxy_url: String,
     /// 预填链接（拖放）。
     pub initial_urls: Vec<String>,
+    /// 分类目录路由（偏好 `custom_categories`）；`None` = 没有分类配置目录。
+    pub category_route: Option<fluxdown_protocol::CategoryRouteDto>,
+    /// 保存目录分类下拉的候选（同一偏好投影：可见、非 `all`、配置了目录的分类，按 `position`）。
+    pub category_options: Vec<NewDownloadCategory>,
     /// 「下载到」候选：账号其他设备 + 已配对设备（本机始终可选，不在其中）；空 = 不显示选择器。
     pub targets: Vec<DeviceEntry>,
     /// 「下载到」初值：设备本地偏好里上次的目标（目标已不存在则为本机）。
@@ -174,6 +190,11 @@ pub(crate) fn build_new_download_context(
     } else {
         config_str("default_segments").parse::<i32>().unwrap_or(0)
     };
+    let save_dir_history = preferences
+        .get(SAVE_DIR_HISTORY_ENABLED_PREF)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+        .then(|| read_save_dir_history(preferences.get(SAVE_DIR_HISTORY_PREF)));
     let target = preferences
         .get(LAST_DOWNLOAD_TARGET_PREF)
         .and_then(serde_json::Value::as_str)
@@ -181,8 +202,12 @@ pub(crate) fn build_new_download_context(
         // `link:<fp>` 已挂接到云条目时解析为该云条目；目标已不存在则回退本机。
         .and_then(|target| resolve_target(target, &targets))
         .unwrap_or_default();
+    let categories = fluxdown_protocol::CustomCategoryDto::from_preference(
+        preferences.get(fluxdown_protocol::CUSTOM_CATEGORIES_PREF_KEY),
+    );
     NewDownloadContext {
         save_dir: save_dir.to_owned(),
+        save_dir_history,
         queue_id: queue_id.to_owned(),
         segments,
         queues: queues
@@ -193,6 +218,8 @@ pub(crate) fn build_new_download_context(
             })
             .collect(),
         manual_proxy_url: manual_proxy_url(config),
+        category_route: fluxdown_protocol::CategoryRouteDto::from_categories(&categories),
+        category_options: category_options(&categories),
         initial_urls: Vec::new(),
         targets,
         target,
@@ -275,6 +302,16 @@ pub struct NewDownloadView {
     /// 远端保存目录（与本机 `save_dir` 各自保留，来回切换目标不互相覆盖）；
     /// 空 = 使用目标设备默认目录。
     remote_save_dir: Entity<InputState>,
+    /// 保存目录历史下拉是否展开（按下输入框展开，点外部 / 选中 / 打开目录选择器收起）。
+    save_dir_menu_open: bool,
+    /// 保存目录组合框上一帧的窗口坐标，用于判定外部点击是否落在输入框上。
+    save_dir_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// 保存目录的分类模式（默认自动）；仅 `context.category_route` 存在时有意义。
+    category_mode: CategoryMode,
+    /// 自动模式上一次写入目录框的值：目录框仍等于它说明用户没手动改过，可继续跟随。
+    category_auto_dir: Option<String>,
+    /// 自动模式按当前输入预测出的分类目录（触发器显示命中分类）；变化时同步更新，渲染只读。
+    category_predicted: Option<String>,
 }
 
 impl NewDownloadView {
@@ -290,6 +327,7 @@ impl NewDownloadView {
         let strings = NewDownloadStrings::from_translator(translator.read(cx));
         let urls = cx.new(|cx| {
             TextareaState::new(window, cx)
+                .auto_grow(1, URLS_MAX_ROWS)
                 .default_value(context.initial_urls.join("\n"))
                 .placeholder(strings.url_placeholder.clone())
         });
@@ -371,6 +409,11 @@ impl NewDownloadView {
             picking: false,
             target,
             remote_save_dir,
+            save_dir_menu_open: false,
+            save_dir_bounds: Rc::default(),
+            category_mode: CategoryMode::Auto,
+            category_auto_dir: None,
+            category_predicted: None,
         };
         this.refresh_entries(window, cx);
         this.subscribe_inputs(&translator, window, cx);
@@ -431,6 +474,17 @@ impl NewDownloadView {
             )
             .detach();
         }
+        // 重命名框是自动分类的预测输入之一；探测预填走 `set_value`（不发 Change），由探测同步处理。
+        cx.subscribe_in(
+            &self.rename,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::Change = event {
+                    this.sync_category(window, cx);
+                }
+            },
+        )
+        .detach();
         cx.subscribe(&self.user_agent, |this, input, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
                 let detected = detect_ua_preset(&input.read(cx).value());
@@ -529,6 +583,15 @@ impl NewDownloadView {
                 .find(|save_dir| !save_dir.is_empty())
         {
             let save_dir = save_dir.to_owned();
+            // 捕获方带来的分类目录视为自动写入值：之后仍可跟随文件名变化。
+            if self
+                .context
+                .category_route
+                .as_ref()
+                .is_some_and(|route| route.is_category_dir(&save_dir))
+            {
+                self.category_auto_dir = Some(save_dir.clone());
+            }
             self.save_dir
                 .update(cx, |input, cx| input.set_value(save_dir, window, cx));
         }
@@ -803,9 +866,12 @@ impl NewDownloadView {
     ) {
         let NewDownloadContext {
             save_dir,
+            save_dir_history,
             queue_id,
             segments,
             queues,
+            category_route,
+            category_options,
             manual_proxy_url,
             ..
         } = context;
@@ -830,11 +896,60 @@ impl NewDownloadView {
             self.proxy_choice = ProxyChoice::FollowGlobal;
         }
         self.context.save_dir = save_dir;
+        self.context.save_dir_history = save_dir_history;
         self.context.queue_id = queue_id;
         self.context.segments = segments;
         self.context.queues = queues;
+        self.context.category_route = category_route;
+        self.context.category_options = category_options;
+        if let CategoryMode::Category(id) = &self.category_mode
+            && !self
+                .context
+                .category_options
+                .iter()
+                .any(|option| option.id == *id)
+        {
+            self.category_mode = CategoryMode::Auto;
+        }
         self.context.manual_proxy_url = manual_proxy_url;
+        self.sync_category(window, cx);
         cx.notify();
+    }
+
+    /// 把一次本机提交的保存目录记入历史（偏好关闭时不记）；尽力而为，失败只做诊断记录。
+    fn record_save_dir_history(&mut self, dir: &str, cx: &mut Context<Self>) {
+        let Some(history) = self.context.save_dir_history.as_mut() else {
+            return;
+        };
+        let Some(next) = record_save_dir(history, dir) else {
+            return;
+        };
+        let value = serde_json::Value::from(next.clone());
+        *history = next;
+        self.write_local_preference(SAVE_DIR_HISTORY_PREF, value, cx);
+    }
+
+    /// 设备本地偏好写入：尽力而为，失败只做诊断记录。
+    fn write_local_preference(
+        &self,
+        key: &'static str,
+        value: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let write = self
+            .port
+            .execute(DownloadsCommand::SetLocalPreference { key, value });
+        // 表单随后可能关窗：写入在后台执行器上跑完，不随视图释放而取消。
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(error) = write.await {
+                    eprintln!(
+                        "local preference write failed: {:?} ({:?})",
+                        error.code, error.reason
+                    );
+                }
+            })
+            .detach();
     }
 
     fn segments(&self, cx: &App) -> i32 {
@@ -938,11 +1053,19 @@ impl NewDownloadView {
                 None => tasks.push(item),
             }
         }
+        self.record_save_dir_history(&common.save_dir, cx);
+        let offered_save_dir = self.context.save_dir.clone();
         (self.on_submit)(
             NewDownloadSubmission::Tasks {
                 common: Box::new(common),
                 items: tasks,
                 captures,
+                category_route: self
+                    .context
+                    .category_route
+                    .clone()
+                    .filter(|_| self.category_mode == CategoryMode::Auto),
+                offered_save_dir,
             },
             window,
             cx,
@@ -1117,6 +1240,7 @@ impl NewDownloadView {
         if self.picking || self.is_remote() {
             return;
         }
+        self.save_dir_menu_open = false;
         self.picking = true;
         cx.notify();
         let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
@@ -1371,9 +1495,17 @@ impl NewDownloadView {
 
     /// 链接：标签行右侧显示已识别条数；多行输入下方是种子 / 文本导入入口。
     fn render_urls(&self, cx: &mut Context<Self>) -> Div {
-        let spacing = active_theme(cx).tokens().spacing;
+        let theme = active_theme(cx);
+        let spacing = theme.tokens().spacing;
         let count = self.entries.len();
         let has_text = !self.urls.read(cx).value().trim().is_empty();
+        let url_box = {
+            let tokens = theme.tokens();
+            Textarea::new(&self.urls)
+                .w_full()
+                .text_size(tokens.typography.sm.size)
+                .line_height(tokens.typography.sm.line_height)
+        };
         v_flex()
             .w_full()
             .gap(spacing.xs + spacing.xxs)
@@ -1386,7 +1518,7 @@ impl NewDownloadView {
                         this.child(field_hint(self.strings.format_url_count(count), cx))
                     }),
             )
-            .child(Self::textarea(&self.urls, px(128.), 6., cx))
+            .child(url_box)
             .when(has_text && count == 0, |this| {
                 this.child(field_error(self.strings.no_valid_url.clone(), cx))
             })
@@ -1502,7 +1634,7 @@ impl NewDownloadView {
         form_field(
             self.strings.save_dir.clone(),
             input_with_action(
-                Input::new(&self.save_dir).control(cx).w_full(),
+                self.render_save_dir_input(cx),
                 Button::new("new-download-browse")
                     .outline()
                     .icon(FluxIcon::FolderOpen)
@@ -1517,6 +1649,112 @@ impl NewDownloadView {
             None,
             cx,
         )
+    }
+
+    /// 保存目录历史（偏好关闭时为空）中除当前输入以外的目录。
+    fn save_dir_choices(&self, cx: &App) -> Vec<SharedString> {
+        let Some(history) = self.context.save_dir_history.as_deref() else {
+            return Vec::new();
+        };
+        save_dir_choices(history, &self.save_dir.read(cx).value())
+            .into_iter()
+            .map(|dir| SharedString::from(dir.to_owned()))
+            .collect()
+    }
+
+    /// 保存目录输入 + 历史下拉（迅雷式组合框）：输入框照常手输，按下输入框即在其正下方
+    /// 展开与输入框等宽的最近目录列表；点外部或选中一项收起。没有可选目录时只是普通输入框。
+    fn render_save_dir_combo(&self, cx: &mut Context<Self>) -> AnyElement {
+        let choices = self.save_dir_choices(cx);
+        let mut input = Input::new(&self.save_dir).control(cx).w_full();
+        if choices.is_empty() {
+            return input.into_any_element();
+        }
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let extended = theme.extended().clone();
+        input = input.suffix(
+            Icon::new(FluxIcon::ChevronDown)
+                .size(extended.icon.sm)
+                .text_color(tokens.colors.muted_foreground),
+        );
+        let bounds = self.save_dir_bounds.clone();
+        let open = self.save_dir_menu_open && !self.picking;
+        div()
+            .relative()
+            .w_full()
+            .child({
+                let bounds = bounds.clone();
+                // 记录组合框窗口坐标（无命中区域，不拦截鼠标）。
+                canvas(move |rect, _, _| bounds.set(rect), |_, (), _, _| {})
+                    .absolute()
+                    .size_full()
+            })
+            // 捕获阶段：输入框自身会消费按下事件，冒泡阶段收不到。
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                if event.button == MouseButton::Left && !this.save_dir_menu_open {
+                    this.save_dir_menu_open = true;
+                    cx.notify();
+                }
+            }))
+            .child(input)
+            .when(open, |this| {
+                let hover = extended.colors.row_hover;
+                let rows: Vec<_> = choices
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, dir)| {
+                        let label = dir.clone();
+                        div()
+                            .id(("new-download-save-dir-choice", index))
+                            .w_full()
+                            .px(tokens.spacing.sm)
+                            .py(tokens.spacing.xs)
+                            .rounded(tokens.radius.md)
+                            .cursor_pointer()
+                            .truncate()
+                            .hover(move |style| style.bg(hover))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                let value = dir.clone();
+                                this.save_dir
+                                    .update(cx, |input, cx| input.set_value(value, window, cx));
+                                this.save_dir_menu_open = false;
+                                cx.notify();
+                            }))
+                            .child(label)
+                    })
+                    .collect();
+                this.child(
+                    deferred(
+                        v_flex()
+                            .id("new-download-save-dir-choices")
+                            .occlude()
+                            .absolute()
+                            .top_full()
+                            .left_0()
+                            .w_full()
+                            .mt(tokens.spacing.xxs)
+                            .p(tokens.spacing.xxs)
+                            .max_h(px(SAVE_DIR_MENU_MAX_HEIGHT))
+                            .overflow_y_scroll()
+                            .popover_style(cx)
+                            .text_size(tokens.typography.sm.size)
+                            .line_height(tokens.typography.sm.line_height)
+                            .children(rows)
+                            .on_mouse_down_out(cx.listener(
+                                move |this, event: &MouseDownEvent, _, cx| {
+                                    // 按在输入框上由捕获处理保持展开，其余位置收起。
+                                    if !bounds.get().contains(&event.position) {
+                                        this.save_dir_menu_open = false;
+                                        cx.notify();
+                                    }
+                                },
+                            )),
+                    )
+                    .with_priority(1),
+                )
+            })
+            .into_any_element()
     }
 
     /// 线程数：下拉铺满字段；选「自定义」时下拉收窄定宽，右侧数字输入吃满剩余宽度。
@@ -1566,38 +1804,30 @@ impl NewDownloadView {
         form_field(self.strings.threads.clone(), control, None, cx)
     }
 
-    /// 文件名 | 线程数并排；批量隐藏文件名，全磁力隐藏线程数。线程数过高时下方展开风险提示。
-    fn render_name_threads(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let mut fields = Vec::with_capacity(2);
-        if !self.is_batch() {
-            fields.push(
-                form_field(
-                    self.strings.rename.clone(),
-                    Input::new(&self.rename).control(cx).w_full(),
-                    None,
-                    cx,
-                )
-                .into_any_element(),
-            );
-        }
-        // 分段数只对本机下载有意义；下发只带链接 / 文件名 / 保存目录。
-        let show_threads = !self.all_magnet() && !self.is_remote();
-        if show_threads {
-            fields.push(self.render_threads(cx).into_any_element());
-        }
-        if fields.is_empty() {
+    /// 文件名：独占一行（与保存目录同宽）；批量时隐藏。
+    fn render_rename(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.is_batch() {
             return None;
         }
-        let row = form_row(fields, cx);
-        if !show_threads {
-            return Some(row);
+        Some(form_field(
+            self.strings.rename.clone(),
+            Input::new(&self.rename).control(cx).w_full(),
+            None,
+            cx,
+        ))
+    }
+
+    /// 线程数独占一行；全磁力 / 下发时隐藏（分段数只对本机下载有意义）。线程数过高时下方展开风险提示。
+    fn render_threads_row(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.all_magnet() || self.is_remote() {
+            return None;
         }
         let risk = threads_risk_callout(
             "new-download-threads-risk",
             i64::from(self.segments(cx)),
             self.translator.read(cx),
         );
-        Some(v_flex().w_full().child(row).child(risk))
+        Some(v_flex().w_full().child(self.render_threads(cx)).child(risk))
     }
 
     fn render_http_auth(&self, cx: &mut Context<Self>) -> Div {
@@ -1886,7 +2116,8 @@ impl NewDownloadView {
             .child(self.render_urls(cx))
             .children(self.render_target(cx))
             .child(self.render_save_dir(cx))
-            .children(self.render_name_threads(cx))
+            .children(self.render_rename(cx))
+            .children(self.render_threads_row(cx))
             .children((!self.is_remote()).then(|| self.render_advanced(cx)))
     }
 

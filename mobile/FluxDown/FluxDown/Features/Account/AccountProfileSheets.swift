@@ -376,3 +376,93 @@ struct PasswordChangeSheet: View {
         }
     }
 }
+
+// MARK: - 注销账户
+
+struct DeleteAccountSheet: View {
+    @Environment(AppContainer.self) private var container
+    @Environment(\.dismiss) private var dismiss
+    @State private var flow: DeleteAccountFlow
+    @State private var confirming = false
+
+    init(userId: String, email: String, hasPassword: Bool?) {
+        _flow = State(initialValue: DeleteAccountFlow(userId: userId, email: email, hasPassword: hasPassword))
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Text(L("accountDeleteExplain"))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if flow.byCode {
+                    Section {
+                        VerificationCodeRows(code: $flow.code, clock: flow.clock, sending: flow.sending, locked: flow.submitting, onSend: sendCode)
+                    } header: {
+                        Text(
+                            flow.clock != nil
+                                ? L("accountDeleteCodeSubtitle", ["email": flow.email])
+                                : L("accountDeleteCodeHint", ["email": flow.email])
+                        )
+                        .textCase(nil)
+                    } footer: {
+                        if let text = flow.errorText { AccountErrorLabel(text: text) }
+                    }
+                } else {
+                    Section {
+                        AccountPasswordField(title: L("accountPasswordCurrentPlaceholder"), text: $flow.current, contentType: .password, locked: flow.submitting)
+                    } footer: {
+                        if let text = flow.errorText { AccountErrorLabel(text: text) }
+                    }
+                }
+                modeSwitch
+            }
+            .accountSheetToolbar(
+                title: L("accountDeleteTitle"),
+                confirmTitle: L("accountDeleteConfirm"),
+                canConfirm: flow.canConfirm,
+                busy: flow.submitting,
+                onCancel: { dismiss() },
+                onConfirm: { confirming = true }
+            )
+            .alert(L("accountDeleteAlertTitle"), isPresented: $confirming) {
+                Button(L("accountDeleteConfirm"), role: .destructive, action: confirm)
+                Button(L("cancel"), role: .cancel) {}
+            } message: {
+                Text(L("accountDeleteAlertMessage"))
+            }
+            .onAppear { flow.restoreIfNeeded() }
+        }
+        .presentationDetents([.large])
+    }
+
+    @ViewBuilder
+    private var modeSwitch: some View {
+        if flow.canUsePassword {
+            Section {
+                if flow.byCode {
+                    Button(L("accountPasswordUseCurrentPassword")) { flow.setMode(.password) }
+                } else {
+                    Button(L("accountPasswordUseEmailCode")) { flow.setMode(.code) }
+                }
+            }
+            .disabled(flow.submitting)
+        }
+    }
+
+    private func sendCode() {
+        Task { await flow.sendCode(container.agent) }
+    }
+
+    private func confirm() {
+        Task {
+            if await flow.submit(container.agent) {
+                container.toasts.show(text: L("accountDeleteSuccess"), tone: .success)
+                dismiss()
+            }
+        }
+    }
+}

@@ -483,7 +483,7 @@ Always handle the task being gone: render an `empty` node, not `undefined`. The 
 
 | Contribution | Desktop app (GPUI) | Web UI | Mobile apps |
 |---|---|---|---|
-| `activity` view | An entry in the activity bar, titled with the view title. | An entry in the activity bar; the page lives at `/plugins/<identity>/<viewId>` (each segment URL-encoded, so `@` becomes `%40`). The page header shows the plugin name, the view title and the `palette` commands as buttons. | Not rendered |
+| `activity` view | An entry in the activity bar, titled with the view title; its icon is the SVG declared by the manifest `icon` (the default icon when not declared). | An entry in the activity bar, with the same `icon` SVG (default icon when not declared); the page lives at `/plugins/<identity>/<viewId>` (each segment URL-encoded, so `@` becomes `%40`). The page header shows the plugin name, the view title and the `palette` commands as buttons. | Not rendered |
 | `taskDetail` view | A tab in the task detail panel and in the stand-alone task detail window. | A tab in the task detail panel. | Not rendered |
 | `settings` view | **Plugin settings** tab in the plugin's settings dialog. | Same. | Not rendered |
 | `palette` command | Command palette, as `<plugin name>: <title>`. | Button in the activity page header. | — |

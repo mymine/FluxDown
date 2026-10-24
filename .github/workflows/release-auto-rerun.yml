@@ -1,0 +1,25 @@
+name: Release Auto Rerun
+
+# 发布类流水线首轮失败、且失败全部是 Apple / 网络类瞬时错误时，自动 Re-run failed jobs 一次。
+# 判定与模式表见 .github/scripts/release_auto_rerun.py；确定性错误不重跑，第 2 次尝试起不再介入。
+on:
+  workflow_run:
+    workflows: [Release, iOS TestFlight]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  rerun:
+    name: Rerun transient failures
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rerun failed jobs when every failure is transient
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 .github/scripts/release_auto_rerun.py "${{ github.event.workflow_run.id }}"

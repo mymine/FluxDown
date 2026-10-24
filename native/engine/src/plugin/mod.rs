@@ -36,6 +36,8 @@ pub mod install;
 pub mod manager;
 pub mod manifest;
 pub mod market;
+mod package_revision;
+pub mod page_scripts;
 pub mod quickjs;
 pub mod quickjs_host;
 pub mod runtime;
@@ -50,5 +52,5 @@ pub use runtime::{
     AuthRequest, AuthResult, CancelReason, ExecutionBudget, HostCall, HostEvents, HostFuture,
     HostReply, ManifestItem, ManifestVariant, PluginBridge, PluginError, PluginEvent, PluginHost,
     PluginLogLevel, PluginTaskPort, ResolveManifest, ResolveRequest, ResolveResult, ResolveVariant,
-    ScriptRuntime, SubscriptionRequest,
+    ScriptRuntime, StartedTasks, SubscriptionRequest,
 };

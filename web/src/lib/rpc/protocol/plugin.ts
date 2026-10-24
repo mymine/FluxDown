@@ -44,6 +44,8 @@ export interface PluginViewDeclDto {
   /** 是否有可移植实现：无 `desktop` 的视图恒为 true；带 `desktop` 的仅在 manifest 显式 `portable: true` 时为 true。 */
   portable: boolean;
   desktop?: PluginDesktopEntryDto;
+  /** 视图图标 SVG 文本（daemon 加载期读入并校验）；只当单色蒙版按主题着色。未声明时缺省，用默认图标。 */
+  iconSvg?: string;
 }
 
 /** 命令贡献声明。 */
@@ -60,6 +62,17 @@ export interface PluginContributionsDto {
   commands: PluginCommandDeclDto[];
   /** 是否贡献浏览器扩展嗅探规则。 */
   sniffRules: boolean;
+  /** 浏览器页面脚本声明（授权 / 详情界面展示将在哪些网站运行脚本）。 */
+  pageScripts: PluginPageScriptDeclDto[];
+}
+
+/** 页面脚本贡献声明（manifest `contributes.pageScripts[]` 的展示字段）。 */
+export interface PluginPageScriptDeclDto {
+  id: string;
+  title: string;
+  matches: string[];
+  /** `isolated` / `main`。 */
+  world: string;
 }
 
 /** 站点默认插件条目（`daemon.plugin.siteDefaults`，按 site 排序）。 */
@@ -81,6 +94,49 @@ export interface PluginSniffRulesDto {
   sequence: number;
   epoch: string;
   pack: Record<string, unknown> | null;
+}
+
+/**
+ * 插件页面脚本索引（`daemon.plugin.pageScripts`）；sequence / epoch 语义同嗅探规则包。
+ * 源码不随索引下发，经 `daemon.plugin.pageScriptSource` 逐条拉取。
+ */
+export interface PluginPageScriptsDto {
+  sequence: number;
+  epoch: string;
+  scripts: PluginPageScriptDto[];
+}
+
+/** 页面脚本索引条目。 */
+export interface PluginPageScriptDto {
+  identity: string;
+  pluginName: string;
+  pluginVersion: string;
+  id: string;
+  title: string;
+  matches: string[];
+  excludeMatches: string[];
+  /** `document_start` / `document_end` / `document_idle`。 */
+  runAt: string;
+  /** `isolated` / `main`。 */
+  world: string;
+  allFrames: boolean;
+  /** 拼接后源码的 SHA-256 小写十六进制。 */
+  sha256: string;
+  bytes: number;
+}
+
+/** `daemon.plugin.pageScriptSource` 参数。 */
+export interface PluginPageScriptSourceParams {
+  identity: string;
+  id: string;
+}
+
+/** 单条页面脚本源码（manifest `js` 各文件以 `"\n;\n"` 拼接）。 */
+export interface PluginPageScriptSourceDto {
+  identity: string;
+  id: string;
+  sha256: string;
+  code: string;
 }
 
 /** 已安装插件视图。 */
@@ -120,6 +176,8 @@ export interface PluginDto {
   networkHosts: string[];
   /** 插件包在 daemon 主机上的绝对目录（仅已加载插件有值）。 */
   packageDir?: string;
+  /** 插件包修订号：包代码被替换（安装 / 升级 / dev 安装 / dev 重载）后变化，只做相等比较；旧 daemon 不下发。 */
+  packageRevision?: number;
 }
 
 /** 插件平台登录请求。 */

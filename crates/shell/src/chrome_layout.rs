@@ -2,11 +2,15 @@
 //!
 //! 纯数据，不依赖渲染；Web `web/src/shell/chromeLayout.ts` 逐条镜像，两端共用
 //! `crates/shell/tests/fixtures/chrome_layout_cases.json` 的用例。持久化值是
-//! `{ 区域键: [条目 id…] }` 对象；读取时按目录归一化，未知 / 重复 / 放错区域的条目被丢弃，
-//! 未摆放的条目回到默认区域末尾，因此新增条目与旧偏好天然兼容。
+//! `{ 区域键: [条目 id…], "hidden"?: [条目 id…] }` 对象；读取时按目录归一化，未知 / 重复 / 放错区域的条目被丢弃，
+//! 未摆放的条目回到默认区域末尾，因此新增条目与旧偏好天然兼容。隐藏是摆放之外的独立标记：
+//! 被隐藏的条目保留所在区域与位置（取消隐藏即回原位），固定条目（[`ChromeItemSpec::fixed`]）不可隐藏。
 
 use gpui::SharedString;
 use serde_json::{Map, Value};
+
+/// 持久化值里隐藏条目列表的键。
+const HIDDEN_KEY: &str = "hidden";
 
 /// 布局区域，按规范顺序：顶栏左 / 右、活动栏上 / 下、状态栏左 / 右。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -126,6 +130,12 @@ impl ChromeFamilies {
         rail: true,
         status: false,
     };
+    /// 页面专属的顶栏控件（搜索框、视图菜单）：只放在顶栏。
+    pub const TITLE: Self = Self {
+        title: true,
+        rail: false,
+        status: false,
+    };
 
     /// 是否包含该承载条。
     #[must_use]
@@ -149,12 +159,14 @@ impl ChromeFamilies {
     }
 }
 
-/// 布局目录中的一个条目：稳定 id、默认区域、可进入的承载条。
+/// 布局目录中的一个条目：稳定 id、默认区域、可进入的承载条、能否隐藏。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChromeItemSpec {
     pub id: SharedString,
     pub default_zone: ChromeZone,
     pub families: ChromeFamilies,
+    /// 能否被用户隐藏；固定入口（下载页、设置）为 `false`，保证始终有路回到它们。
+    pub hideable: bool,
 }
 
 impl ChromeItemSpec {
@@ -168,7 +180,15 @@ impl ChromeItemSpec {
             id: id.into(),
             default_zone,
             families,
+            hideable: true,
         }
+    }
+
+    /// 标记为固定条目：可移动，不可隐藏。
+    #[must_use]
+    pub fn fixed(mut self) -> Self {
+        self.hideable = false;
+        self
     }
 
     /// 能否放入该区域。
@@ -178,10 +198,11 @@ impl ChromeItemSpec {
     }
 }
 
-/// 六个区域各自的条目序列；每个目录条目恰好出现一次。
+/// 六个区域各自的条目序列（每个目录条目恰好出现一次）与被隐藏的条目（按目录顺序）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ChromeLayout {
     zones: [Vec<SharedString>; 6],
+    hidden: Vec<SharedString>,
 }
 
 impl ChromeLayout {
@@ -193,6 +214,7 @@ impl ChromeLayout {
 
     /// 由持久化值归一化：非对象视为未设置；按规范区域顺序保留「字符串、在目录内、未摆放、
     /// 放得下」的条目，其余跳过；最后把未摆放的条目按目录顺序追加到默认区域末尾。
+    /// `hidden` 只保留目录内可隐藏的条目，按目录顺序去重。
     #[must_use]
     pub fn from_value(stored: Option<&Value>, catalog: &[ChromeItemSpec]) -> Self {
         let mut layout = Self::default();
@@ -210,6 +232,18 @@ impl ChromeLayout {
                     }
                 }
             }
+            if let Some(hidden) = object.get(HIDDEN_KEY).and_then(Value::as_array) {
+                layout.hidden = catalog
+                    .iter()
+                    .filter(|spec| {
+                        spec.hideable
+                            && hidden
+                                .iter()
+                                .any(|entry| entry.as_str() == Some(spec.id.as_ref()))
+                    })
+                    .map(|spec| spec.id.clone())
+                    .collect();
+            }
         }
         for spec in catalog {
             if layout.zone_of(&spec.id).is_none() {
@@ -219,7 +253,7 @@ impl ChromeLayout {
         layout
     }
 
-    /// 持久化值：始终写出全部六个区域。
+    /// 持久化值：始终写出全部六个区域；有隐藏条目时再写 `hidden`。
     #[must_use]
     pub fn to_value(&self) -> Value {
         let mut object = Map::new();
@@ -230,7 +264,43 @@ impl ChromeLayout {
                 .collect();
             object.insert(zone.key().to_owned(), Value::Array(items));
         }
+        if !self.hidden.is_empty() {
+            let hidden = self
+                .hidden
+                .iter()
+                .map(|id| Value::String(id.to_string()))
+                .collect();
+            object.insert(HIDDEN_KEY.to_owned(), Value::Array(hidden));
+        }
         Value::Object(object)
+    }
+
+    /// 条目是否被隐藏。
+    #[must_use]
+    pub fn is_hidden(&self, id: &str) -> bool {
+        self.hidden.iter().any(|item| item.as_ref() == id)
+    }
+
+    /// 隐藏 / 取消隐藏 `id`；未知条目、固定条目或状态未变时不变。返回是否变化。
+    pub fn set_hidden(&mut self, catalog: &[ChromeItemSpec], id: &str, hidden: bool) -> bool {
+        let Some(spec) = catalog.iter().find(|spec| spec.id.as_ref() == id) else {
+            return false;
+        };
+        if !spec.hideable || self.is_hidden(id) == hidden {
+            return false;
+        }
+        if hidden {
+            self.hidden.push(spec.id.clone());
+            self.hidden.sort_by_key(|item| {
+                catalog
+                    .iter()
+                    .position(|spec| spec.id == *item)
+                    .unwrap_or(usize::MAX)
+            });
+        } else {
+            self.hidden.retain(|item| item.as_ref() != id);
+        }
+        true
     }
 
     /// 区域内的条目，按显示顺序。

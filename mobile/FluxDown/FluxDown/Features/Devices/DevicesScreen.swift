@@ -190,7 +190,8 @@ private struct DevicesContent: View {
     }
 
     private func presentAddDevice() {
-        pairing = PairingModel(container: container)
+        // 当前是本机主机时发现走 NWBrowser（iOS 上 Rust mDNS 不可用）；远端主机照旧用它的 agent 发现。
+        pairing = PairingModel(container: container, options: .init(agentDiscovery: !container.isLocalHost))
         sheet = .addDevice
     }
 
@@ -411,6 +412,7 @@ private struct DevicesContent: View {
     @ViewBuilder
     private func linkSection(state: HostState, readOnly: Bool) -> some View {
         let devices = DevicePresentation.sorted(link: state.linkDevices)
+        let attached = DeviceRules.attachedLinkFingerprints(cloud: state.cloudDevices, link: state.linkDevices)
         Section {
             if devices.isEmpty {
                 Text(L("linkedDevicesEmpty"))
@@ -424,7 +426,8 @@ private struct DevicesContent: View {
                         platform: device.platform,
                         online: device.online,
                         revoked: device.revoked,
-                        sameAccount: DevicePresentation.isSameAccount(device, cloud: state.cloudDevices)
+                        sameAccount: attached.contains(device.fingerprint),
+                        grantsControl: model.linkInfos.first { $0.fingerprint == device.fingerprint }?.grantsControl ?? false
                     )
                 }
                 // 解除只弹确认框：不用 `role: .destructive`（会让 List 先行移除该行而数据未变，导致行数不一致崩溃）。
@@ -631,6 +634,7 @@ private struct ConnectionStyle {
 // MARK: - 当前主机卡
 
 private struct HostCard: View {
+    @Environment(AppContainer.self) private var container
     let host: HostRef
     let connection: Connection
     let facts: HostFacts
@@ -656,9 +660,21 @@ private struct HostCard: View {
                             .foregroundStyle(style.text)
                     }
                     if case let .failed(error) = connection {
-                        Text(ErrorText.describe(error))
-                            .font(.footnote)
-                            .foregroundStyle(Color.fdStatusFailedText)
+                        if error.code == .unauthorized, case let .remote(_, _, endpoint) = host,
+                           container.linkFingerprint(ofHost: host.id) != nil
+                        {
+                            // 经局域网配对添加的主机被拒：授权已被主机侧撤销，引导重新配对（不是「更换访问密钥」）。
+                            Text(L("mobileHostRepairNeeded"))
+                                .font(.footnote)
+                                .foregroundStyle(Color.fdStatusFailedText)
+                            Button(L("mobileHostRepair")) { container.router.presentRepair(address: endpoint) }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        } else {
+                            Text(ErrorText.describe(error))
+                                .font(.footnote)
+                                .foregroundStyle(Color.fdStatusFailedText)
+                        }
                     }
                 }
             }

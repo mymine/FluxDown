@@ -20,9 +20,9 @@ use std::{
 };
 
 use fluxdown_protocol::{
-    ApplicationErrorCode, CaptureResolveParams, CreateTaskItem, CreateTaskOutcome,
-    CreateTaskRequest, DaemonCreateTasksParams, DaemonCreateTasksResult, LinkDispatchParams,
-    RemoteDispatchParams, RpcErrorData,
+    ApplicationErrorCode, CaptureResolveParams, CategoryRouteDto, CreateTaskItem,
+    CreateTaskOutcome, CreateTaskRequest, DaemonCreateTasksParams, DaemonCreateTasksResult,
+    LinkDispatchParams, RemoteDispatchParams, RpcErrorData,
 };
 use fluxdown_ui_i18n::Translator;
 
@@ -94,6 +94,10 @@ pub enum NewDownloadSubmission {
         common: Box<CreateTaskRequest>,
         items: Vec<CreateTaskItem>,
         captures: Vec<CapturedTask>,
+        /// 本机分类目录路由；`None` = 不路由（没有分类配置目录）。
+        category_route: Option<CategoryRouteDto>,
+        /// 表单初始保存目录（未做任何分类预填），用于判定用户是否改过目录。
+        offered_save_dir: String,
     },
     /// 预解析清单确认后只建一个组；捕获事务由 agent 合并并消费。
     Group {
@@ -115,6 +119,23 @@ pub enum NewDownloadSubmission {
 struct TaskBatch {
     common: CreateTaskRequest,
     items: Vec<CreateTaskItem>,
+    /// 本机分类目录路由：随整批发给 daemon，由引擎按文件名 / 类型落入分类目录。
+    category_route: Option<CategoryRouteDto>,
+}
+
+/// 表单提交的保存目录仍跟随默认（空 / 初始目录 / 某个分类目录）时，给整批挂上分类路由，
+/// 并把 `save_dir` 改为未命中分类时使用的基础目录；用户另选了目录则不路由。
+fn route_for_batch(
+    common: &mut CreateTaskRequest,
+    route: Option<CategoryRouteDto>,
+    offered_save_dir: &str,
+) -> Option<CategoryRouteDto> {
+    let route = route?;
+    if !route.follows(&common.save_dir, offered_save_dir) {
+        return None;
+    }
+    common.save_dir = route.base_dir(&common.save_dir, offered_save_dir);
+    Some(route)
 }
 
 /// 一次提交拆出的命令：分块批量建任务 + 逐条命令（计入结果），尽力而为的命令失败不影响结果。
@@ -143,6 +164,7 @@ impl NewDownloadSubmission {
                 common,
                 items,
                 captures,
+                ..
             } => {
                 (items.is_empty() || !common.start_paused)
                     && captures.iter().all(|capture| !capture.request.start_paused)
@@ -184,6 +206,7 @@ impl NewDownloadSubmission {
                 common,
                 items,
                 captures,
+                ..
             } => {
                 let source = if items.is_empty() {
                     &captures.first()?.request
@@ -213,24 +236,32 @@ impl NewDownloadSubmission {
                 common,
                 items,
                 captures,
-            } => SubmissionPlan {
-                batch: (!items.is_empty()).then_some(TaskBatch {
-                    common: *common,
-                    items,
-                }),
-                commands: captures
-                    .into_iter()
-                    .map(|capture| {
-                        DownloadsCommand::CaptureResolve(Box::new(CaptureResolveParams {
-                            transaction_id: capture.transaction_id,
-                            accepted: true,
-                            request: Some(capture.request),
-                        }))
-                    })
-                    .collect(),
-                best_effort,
-                remote: None,
-            },
+                category_route,
+                offered_save_dir,
+            } => {
+                let mut common = *common;
+                let category_route =
+                    route_for_batch(&mut common, category_route, &offered_save_dir);
+                SubmissionPlan {
+                    batch: (!items.is_empty()).then_some(TaskBatch {
+                        common,
+                        items,
+                        category_route,
+                    }),
+                    commands: captures
+                        .into_iter()
+                        .map(|capture| {
+                            DownloadsCommand::CaptureResolve(Box::new(CaptureResolveParams {
+                                transaction_id: capture.transaction_id,
+                                accepted: true,
+                                request: Some(capture.request),
+                            }))
+                        })
+                        .collect(),
+                    best_effort,
+                    remote: None,
+                }
+            }
             Self::Group {
                 request,
                 context,
@@ -768,7 +799,11 @@ async fn submit_batches<E, S, SF, P>(
     SF: Future<Output = ()>,
     P: FnMut(&SubmissionProgress),
 {
-    let TaskBatch { common, items } = batch;
+    let TaskBatch {
+        common,
+        items,
+        category_route,
+    } = batch;
     let total = items.len();
     let mut pending = items.into_iter();
     let mut remaining = total;
@@ -785,6 +820,7 @@ async fn submit_batches<E, S, SF, P>(
             batch_id: new_batch_id(),
             common: common.clone(),
             items: chunk,
+            category_route: category_route.clone(),
         };
         let base = SubmissionProgress {
             total,
@@ -1137,6 +1173,8 @@ mod tests {
                 })
                 .collect(),
             captures: Vec::new(),
+            category_route: None,
+            offered_save_dir: String::new(),
         }
     }
 
@@ -1237,6 +1275,8 @@ mod tests {
             common: Box::new(built.common),
             items: built.items,
             captures: Vec::new(),
+            category_route: None,
+            offered_save_dir: String::new(),
         };
         let sent = RefCell::new(None);
         block_on(run_submission(
@@ -1551,6 +1591,8 @@ mod tests {
                 transaction_id: "cap-1".to_owned(),
                 request: blank_request(""),
             }],
+            category_route: None,
+            offered_save_dir: String::new(),
         };
         let resolved = RefCell::new(Vec::<(String, bool)>::new());
         let report = block_on(run_submission(
@@ -1633,5 +1675,70 @@ mod tests {
         };
         assert_eq!(save_dir, &None);
         assert_eq!(queue_id, &None);
+    }
+
+    fn route() -> CategoryRouteDto {
+        CategoryRouteDto {
+            rules: vec![fluxdown_protocol::CategoryRuleDto {
+                match_mode: "extension".to_owned(),
+                extensions: vec!["mp4".to_owned()],
+                save_dir: "/data/video".to_owned(),
+                ..Default::default()
+            }],
+            other_dir: "/data/other".to_owned(),
+        }
+    }
+
+    fn routed_plan(
+        submitted: &str,
+        offered: &str,
+        route: Option<CategoryRouteDto>,
+    ) -> (Option<CategoryRouteDto>, String, Option<DownloadsCommand>) {
+        let plan = NewDownloadSubmission::Tasks {
+            common: Box::new(blank_request(submitted)),
+            items: vec![CreateTaskItem::default()],
+            captures: Vec::new(),
+            category_route: route,
+            offered_save_dir: offered.to_owned(),
+        }
+        .plan();
+        let batch = plan.batch.expect("batch");
+        let remembered = plan.best_effort.into_iter().next();
+        (batch.category_route, batch.common.save_dir, remembered)
+    }
+
+    #[test]
+    fn default_save_dir_is_routed_with_offered_base() {
+        let (route_out, save_dir, remembered) =
+            routed_plan("/downloads", "/downloads", Some(route()));
+        assert_eq!(route_out, Some(route()));
+        assert_eq!(save_dir, "/downloads");
+        // 偏好记录用户看到 / 提交的表单值。
+        assert!(matches!(
+            remembered,
+            Some(DownloadsCommand::SetLocalPreference { key: LAST_SAVE_DIR_PREF, value })
+                if value == serde_json::Value::String("/downloads".to_owned())
+        ));
+    }
+
+    #[test]
+    fn category_dir_submitted_falls_back_to_offered_base() {
+        let (route_out, save_dir, _) = routed_plan("/data/video", "/downloads", Some(route()));
+        assert_eq!(route_out, Some(route()));
+        assert_eq!(save_dir, "/downloads");
+    }
+
+    #[test]
+    fn user_picked_dir_is_not_routed() {
+        let (route_out, save_dir, _) = routed_plan("/elsewhere", "/downloads", Some(route()));
+        assert_eq!(route_out, None);
+        assert_eq!(save_dir, "/elsewhere");
+    }
+
+    #[test]
+    fn missing_categories_never_route() {
+        let (route_out, save_dir, _) = routed_plan("/downloads", "/downloads", None);
+        assert_eq!(route_out, None);
+        assert_eq!(save_dir, "/downloads");
     }
 }

@@ -94,6 +94,7 @@ struct ProtocolChannelTests {
         }
 
         func close() {}
+        func categorySaveDir(fileName _: String, url _: String) -> String? { nil }
         func createTask(_: CreateTaskRequest) async throws(HostError) -> String { "" }
         func pause(_: String) async throws(HostError) {}
         func resume(_: String) async throws(HostError) {}
@@ -155,6 +156,8 @@ struct ProtocolChannelTests {
         #expect(HostMethod.agentCloudNotifyTelegramBindStatus == "agent.cloudNotify.telegramBindStatus")
         #expect(HostMethod.agentCloudNotifySendEmailCode == "agent.cloudNotify.sendEmailCode")
         #expect(HostMethod.agentCloudNotifyVerifyEmail == "agent.cloudNotify.verifyEmail")
+        #expect(HostMethod.agentProfileSendDeleteCode == "agent.profile.sendDeleteCode")
+        #expect(HostMethod.agentProfileDeleteAccount == "agent.profile.deleteAccount")
         #expect(HostSection.agentCloudNotify == "agent.cloudNotify")
         #expect(HostCapability.agentRemoteTasks == "agent.remoteTasks")
         #expect(HostSection.all.count == 16)

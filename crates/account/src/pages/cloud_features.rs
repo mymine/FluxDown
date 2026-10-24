@@ -2,16 +2,16 @@
 //! （无独立开关，登录后自动可用，展示当前在线设备数）。
 
 use fluxdown_protocol::{CloudDevice, SyncLocalOnlyParams, SyncStatusDto};
-use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, card, tabular_numbers};
+use fluxdown_ui_components::{
+    ButtonVariant, FluxIcon, button, card, tabular_numbers, tooltip_view,
+};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::{SemanticThemeTokens, active_theme};
 use gpui::{
     App, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
     SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _,
 };
-use gpui_component::{
-    Disableable as _, Icon, IconNamed, h_flex, switch::Switch, tooltip::Tooltip, v_flex,
-};
+use gpui_component::{Disableable as _, Icon, IconNamed, h_flex, switch::Switch, v_flex};
 
 use crate::errors::{ErrorContext, sync_reason_key};
 use crate::link::now_unix_ms;
@@ -208,9 +208,7 @@ fn config_sync_row(
         } else {
             div()
                 .id("account-sync-login-required")
-                .tooltip(move |window, cx| {
-                    Tooltip::new(login_required_label.clone()).build(window, cx)
-                })
+                .tooltip(move |window, cx| tooltip_view(login_required_label.clone(), window, cx))
                 .child(switch)
                 .into_any_element()
         })

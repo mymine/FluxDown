@@ -41,12 +41,15 @@ import androidx.compose.ui.unit.dp
 import com.fluxdown.app.R
 import com.fluxdown.app.actions.LocalTaskActions
 import com.fluxdown.core.capture.TorrentFile
+import com.fluxdown.app.feature.settings.general.categoryDisplayName
+import com.fluxdown.app.feature.settings.general.categoryIcon
 import com.fluxdown.app.i18n.str
 import com.fluxdown.app.nav.SheetRoute
 import com.fluxdown.app.shell.LocalAppContainer
 import com.fluxdown.app.shell.hostState
 import com.fluxdown.app.ui.fileCategory
 import com.fluxdown.app.ui.label
+import com.fluxdown.app.ui.launchDocumentPicker
 import com.fluxdown.core.host.ImportRules
 import com.fluxdown.core.host.groupImportBatches
 import com.fluxdown.core.host.isError
@@ -131,7 +134,7 @@ private fun NewDownloadSheetImpl(visible: Boolean, route: SheetRoute.NewDownload
     val actions = LocalTaskActions.current
     val haptics = FluxTheme.haptics
     val context = LocalContext.current
-    val form = remember { NewDownloadState.create(route.prefill, container.store.state.value, route.external) }
+    val form = remember { NewDownloadState.create(route.prefill, container.store.state.value, route.external, route.targetId) }
     LaunchedEffect(route) {
         // 打开期间的后续唤起追加进同一表单（批量协议唤起逐条到达）
         route.external?.let(form::addExternal)
@@ -381,10 +384,14 @@ private fun NewDownloadContent(
     val clipboardEmpty = str(R.string.mobileClipboardEmpty)
     val pasted = str(R.string.mobilePasted)
     val importNone = str(R.string.importTxtNoUrls)
+    val noFilePicker = str(R.string.mobileNoFilePicker)
     val importFound = str(R.string.importTxtFound)
     val noEntries = form.entries.isEmpty()
     val hasText = form.urlText.isNotBlank()
     val busy = form.submitting
+    // 重命名 / 首条链接变化 → 自动模式下按预测目录跟随（用户手改过目录则不覆盖）
+    val predictedDir = form.predictedDir()
+    LaunchedEffect(predictedDir) { form.syncAuto() }
 
     val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
@@ -485,7 +492,7 @@ private fun NewDownloadContent(
             )
             FluxButton(
                 str(R.string.importTxtFile),
-                { importLauncher.launch(arrayOf("text/*", "application/octet-stream")) },
+                { launchDocumentPicker(overlays, noFilePicker) { importLauncher.launch(arrayOf("text/*", "application/octet-stream")) } },
                 size = ButtonSize.Sm,
                 icon = FluxIcons.FileText,
                 fullWidth = true,
@@ -493,7 +500,7 @@ private fun NewDownloadContent(
             )
             FluxButton(
                 str(R.string.openTorrentFile),
-                { torrentLauncher.launch(arrayOf(TorrentFile.MIME_TYPE, "application/octet-stream")) },
+                { launchDocumentPicker(overlays, noFilePicker) { torrentLauncher.launch(arrayOf(TorrentFile.MIME_TYPE, "application/octet-stream")) } },
                 size = ButtonSize.Sm,
                 icon = FluxIcons.FileUp,
                 fullWidth = true,
@@ -554,6 +561,11 @@ private fun NewDownloadContent(
             // 下发只带链接 / 文件名 / 保存目录：线程、队列与高级选项只对当前主机有意义（同 iOS / GPUI）
             RemoteDestination(form, target, enabled = !busy)
             return@Column
+        }
+
+        // 分类：仅在存在可路由的分类目录时显示（隐藏时行为与此前一致）
+        if (form.categoryOptions.isNotEmpty()) {
+            CategorySelect(form, enabled = !busy, remoteHost = remoteHost)
         }
 
         // 保存目录
@@ -743,6 +755,82 @@ private fun TargetSelect(
             selected.isCloud -> FluxIcons.Cloud
             else -> FluxIcons.Wifi
         },
+        items = items,
+        enabled = enabled,
+    )
+}
+
+/**
+ * 「分类」选择：自动（按文件名跟随）/ 不分类 / 各已配置目录的分类；窄屏单独一行，样式同表单内其它选择行。
+ * 本机目录按存储卷友好显示（`/storage/emulated/0/…` → 「内部存储 › …」，同保存目录行），远端主机的路径
+ * （如 Windows `D:\下载\…`）原样显示；均单行中间省略。
+ */
+@Composable
+private fun CategorySelect(form: NewDownloadState, enabled: Boolean, remoteHost: Boolean) {
+    val context = LocalContext.current
+    val shownDirs = remember(form.categoryOptions, remoteHost) {
+        form.categoryOptions.associate { option ->
+            option.id to if (remoteHost) option.saveDir else com.fluxdown.app.ui.friendlyLocalPath(context, option.saveDir)
+        }
+    }
+    val mode = form.mode
+    val matched = form.autoMatched()
+    val auto = str(R.string.saveDirCategoryAuto)
+    val none = str(R.string.saveDirCategoryNone)
+    val items = buildList {
+        add(
+            FluxMenuItem.Action(
+                label = auto,
+                onClick = { form.selectMode(SaveDirMode.Auto) },
+                icon = FluxIcons.Folders,
+                hint = str(R.string.saveDirCategoryAutoDesc),
+                checked = mode == SaveDirMode.Auto,
+            ),
+        )
+        add(
+            FluxMenuItem.Action(
+                label = none,
+                onClick = { form.selectMode(SaveDirMode.None) },
+                icon = FluxIcons.FolderOpen,
+                hint = str(R.string.saveDirCategoryNoneDesc),
+                checked = mode == SaveDirMode.None,
+            ),
+        )
+        add(FluxMenuItem.Divider)
+        form.categoryOptions.forEach { option ->
+            add(
+                FluxMenuItem.Action(
+                    label = categoryDisplayName(context, option),
+                    onClick = { form.selectMode(SaveDirMode.Category(option.id)) },
+                    icon = categoryIcon(option.icon),
+                    hint = shownDirs[option.id] ?: option.saveDir,
+                    hintIsPath = true,
+                    checked = mode == SaveDirMode.Category(option.id),
+                ),
+            )
+        }
+    }
+    val selected = (mode as? SaveDirMode.Category)?.let { m -> form.categoryOptions.firstOrNull { it.id == m.id } }
+    val value = when (mode) {
+        SaveDirMode.Auto -> matched?.let { str(R.string.saveDirCategoryAutoMatched, "name" to categoryDisplayName(context, it)) } ?: auto
+        SaveDirMode.None -> none
+        is SaveDirMode.Category -> selected?.let { categoryDisplayName(context, it) } ?: auto
+    }
+    val icon = when (mode) {
+        SaveDirMode.Auto -> matched?.let { categoryIcon(it.icon) } ?: FluxIcons.Folders
+        SaveDirMode.None -> FluxIcons.FolderOpen
+        is SaveDirMode.Category -> selected?.let { categoryIcon(it.icon) } ?: FluxIcons.Folders
+    }
+    MenuSelect(
+        value = value,
+        label = str(R.string.saveDirCategory),
+        hint = when (mode) {
+            SaveDirMode.Auto -> str(R.string.saveDirCategoryAutoDesc)
+            SaveDirMode.None -> str(R.string.saveDirCategoryNoneDesc)
+            // 所选分类的目录已显示在下方「保存目录」行
+            is SaveDirMode.Category -> null
+        },
+        leadingIcon = icon,
         items = items,
         enabled = enabled,
     )

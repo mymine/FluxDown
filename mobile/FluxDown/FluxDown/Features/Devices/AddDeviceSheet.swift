@@ -8,6 +8,9 @@ import UIKit
 ///
 /// 配对状态机 `PairingModel` 由呈现方持有（每次呈现新建一个），并在 sheet 的 `onDismiss` 里调用 `dismissed()` 收尾：
 /// 不能靠视图的 `onDisappear`——入站确认的全屏 cover 盖上来时下面的视图也会触发它。
+///
+/// 操作的是**当前主机**的 agent：当前是远端主机时页面显示主机名；当前是本机主机（带 `agent.deviceLink`、无 `agent.gateway`）时
+/// 没有「本机配对码」区（本机不监听），发现走 `PairingModel.browser`（NWBrowser，iOS 上 Rust mDNS 不可用），只能由本机发起。
 struct AddDeviceSheet: View {
     let model: PairingModel
     /// 未登录时点「登录」：由呈现方关闭本 sheet 后再呈现登录 sheet。
@@ -29,8 +32,6 @@ private struct AddDeviceContent: View {
     let model: PairingModel
     @State private var sections = AgentSections()
     @State private var tab: Tab?
-    @State private var celebrate = false
-    @ScaledMetric(relativeTo: .largeTitle) private var doneIcon: CGFloat = 56
     @FocusState private var focus: Field?
 
     let requestLogin: () -> Void
@@ -41,10 +42,14 @@ private struct AddDeviceContent: View {
         let state = container.store.state
         let accountCap = state.has(HostCapability.agentAuth)
         let linkCap = state.has(HostCapability.agentDeviceLink)
+        // 内嵌本机主机的 hello 仍带 `agent.gateway` 能力，但它不监听：操作本机主机时一律视为无网关（不显示本机配对码区）。
+        let gatewayCap = state.has(HostCapability.agentGateway) && !container.isLocalHost
         let session = accountCap ? sections.session(state) : nil
         let defaultTab: Tab = (session != nil || !linkCap) ? .account : .local
         let current: Tab = linkCap ? (accountCap ? (tab ?? defaultTab) : .local) : .account
         let requestIds = sections.pairingRequests(state).map(\.sessionId)
+        // 无网关（本机主机）= 不监听：不申请本机配对码，固定按「未开启局域网」处理。
+        let lanAccess: LinkRules.LanAccess = gatewayCap ? sections.lanAccess(state) : .disabled
         NavigationStack {
             List {
                 if accountCap, linkCap, model.step == .form {
@@ -66,7 +71,7 @@ private struct AddDeviceContent: View {
                 case .account:
                     accountContent(session: session)
                 case .local:
-                    localContent(model: $model, state: state)
+                    localContent(model: $model, state: state, gatewayCap: gatewayCap)
                 }
             }
             .listStyle(.insetGrouped)
@@ -80,16 +85,17 @@ private struct AddDeviceContent: View {
                     Spacer()
                     if focus == .code {
                         Button(L("localPairingConnect")) { connect() }
+                            .disabled(state.isReadOnly)
                     }
                 }
             }
-            .safeAreaInset(edge: .bottom) { verifyBar }
+            .safeAreaInset(edge: .bottom) { PairingVerifyBar(model: model) }
             .scrollDismissesKeyboard(.interactively)
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .linkPairingPrompts()
-        .onChange(of: sections.lanAccess(state), initial: true) { _, access in
+        .onChange(of: lanAccess, initial: true) { _, access in
             model.setLan(access)
         }
         .onChange(of: current == .local, initial: true) { _, isLocal in
@@ -129,52 +135,38 @@ private struct AddDeviceContent: View {
     // MARK: 直连页签
 
     @ViewBuilder
-    private func localContent(model: Bindable<PairingModel>, state: HostState) -> some View {
+    private func localContent(model: Bindable<PairingModel>, state: HostState, gatewayCap: Bool) -> some View {
         switch model.wrappedValue.step {
         case .form:
-            formContent(model: model, state: state)
+            formContent(model: model, state: state, gatewayCap: gatewayCap)
         case let .verify(verify), let .finishing(verify):
-            verifyContent(verify, finishing: model.wrappedValue.step != .verify(verify), message: model.wrappedValue.message)
+            PairingVerifySection(
+                verify: verify,
+                finishing: model.wrappedValue.step != .verify(verify),
+                message: model.wrappedValue.message,
+                waitingText: L("localPairingWaitingPeer"),
+                hint: L("localPairingSasHint")
+            )
         case let .done(name):
-            Section {
-                VStack(spacing: 12) {
-                    Image(systemName: FluxSymbol.success)
-                        .font(.system(size: doneIcon))
-                        .foregroundStyle(Color.fdStatusSeeding)
-                        .symbolEffect(.bounce, value: celebrate)
-                        .accessibilityHidden(true)
-                    Text(L("localPairingPaired", ["device": name]))
-                        .font(.headline)
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-                .onAppear { celebrate = true }
-            }
-            Section {
-                Button(L("close")) { dismiss() }
-            }
+            PairingDoneSection(text: L("localPairingPaired", ["device": name])) { dismiss() }
         case .rejected:
-            Section {
-                Banner(text: L("errReasonPairingRejected"), tone: .warning, systemImage: "hand.raised.fill", slim: true)
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets())
-            }
-            Section {
-                Button(L("back")) { model.wrappedValue.backToForm() }
-            }
+            PairingRejectedSection { model.wrappedValue.backToForm() }
         }
     }
 
     @ViewBuilder
-    private func formContent(model: Bindable<PairingModel>, state: HostState) -> some View {
-        let paired = state.linkDevices.filter { !$0.revoked }.map {
-            LinkDeviceInfo(fingerprint: $0.fingerprint, name: $0.name, platform: $0.platform, online: $0.online)
+    private func formContent(model: Bindable<PairingModel>, state: HostState, gatewayCap: Bool) -> some View {
+        let paired = state.linkDevices.map {
+            LinkDeviceInfo(fingerprint: $0.fingerprint, name: $0.name, platform: $0.platform, online: $0.online, revoked: $0.revoked)
         }
-        let lan = sections.lanAccess(state)
-        let entries = LinkRules.discoveredEntries(sections.discovered(state), paired: paired)
+        let lan: LinkRules.LanAccess = gatewayCap ? sections.lanAccess(state) : .disabled
         let readOnly = state.isReadOnly
         Section {
+            if !container.isLocalHost {
+                // 操作的是当前（远端）主机而不是这台手机：写明是哪台主机，免得配错设备。
+                Label(L("mobileDiagSectionHost", ["name": container.host.localizedName]), systemImage: FluxSymbol.remoteHost)
+                    .font(.subheadline.weight(.medium))
+            }
             Text(L("localPairingHint"))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
@@ -183,15 +175,28 @@ private struct AddDeviceContent: View {
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets())
             }
-            if lan != .active {
+            if gatewayCap, lan != .active {
                 // 本机局域网未生效：仍允许发起，但只能单向（对端无法回连本机）。
                 Banner(text: L("localPairingOneWayHint"), tone: .warning, systemImage: FluxSymbol.offline, slim: true)
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets())
             }
         }
-        OwnCodeSection(model: model.wrappedValue, lan: lan, openLanSettings: openLanSettings)
-        discoveredSection(model: model, entries: entries)
+        if gatewayCap {
+            OwnCodeSection(model: model.wrappedValue, lan: lan, openLanSettings: openLanSettings)
+        } else if container.isLocalHost {
+            Section {
+                Text(L("mobileAddDeviceNoGatewayHint"))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        if model.wrappedValue.usesAgentDiscovery {
+            discoveredSection(model: model, entries: LinkRules.discoveredEntries(sections.discovered(state), paired: paired))
+        } else {
+            browsedSection(model: model, entries: LanDiscovery.entries(model.wrappedValue.browser.adverts, paired: paired))
+        }
         manualSection(model: model, readOnly: readOnly)
         Section {} footer: {
             Text(L("mobileAddDeviceForeground"))
@@ -204,17 +209,12 @@ private struct AddDeviceContent: View {
         container.router.showSettings(.api)
     }
 
+    /// 发现列表（agent 的 mDNS 分区，远端主机）。
     private func discoveredSection(model: Bindable<PairingModel>, entries: [LinkRules.DiscoveredEntry]) -> some View {
-        let searching = entries.isEmpty && model.wrappedValue.searching
+        let searching = entries.isEmpty && model.wrappedValue.isSearching
         return Section {
             if searching {
-                HStack(spacing: 12) {
-                    ProgressView()
-                    Text(L("localPairingDiscovering"))
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-                .accessibilityElement(children: .combine)
+                searchingRow
             } else if entries.isEmpty {
                 Text(L("localPairingNoDevices"))
                     .font(.subheadline)
@@ -225,22 +225,17 @@ private struct AddDeviceContent: View {
                     model.wrappedValue.address = entry.address
                     focus = .code
                 } label: {
-                    DiscoveredPeerRow(entry: entry, selected: model.wrappedValue.address == entry.address)
+                    PairingPeerRow(
+                        name: entry.name,
+                        platform: entry.platform,
+                        detail: entry.address,
+                        paired: entry.paired,
+                        selected: model.wrappedValue.address == entry.address
+                    )
                 }
                 .disabled(entry.paired)
             }
-            Button {
-                model.wrappedValue.rescan()
-            } label: {
-                HStack {
-                    Label(L("localPairingRetryScan"), systemImage: FluxSymbol.retry)
-                    if model.wrappedValue.scanning {
-                        Spacer()
-                        ProgressView()
-                    }
-                }
-            }
-            .disabled(model.wrappedValue.scanning)
+            rescanButton(model: model)
             if let error = model.wrappedValue.discoveryError {
                 Label(error, systemImage: FluxSymbol.failure)
                     .font(.footnote)
@@ -249,6 +244,77 @@ private struct AddDeviceContent: View {
         } header: {
             if !entries.isEmpty { Text(L("localPairingNearbyTitle")) }
         }
+    }
+
+    /// 发现列表（NWBrowser，本机主机）：点选时才把 Bonjour 服务解析成 IPv4 `host:port`。
+    private func browsedSection(model: Bindable<PairingModel>, entries: [LanDiscovery.Entry]) -> some View {
+        let browser = model.wrappedValue.browser
+        let searching = entries.isEmpty && model.wrappedValue.isSearching
+        return Section {
+            if searching {
+                searchingRow
+            } else if entries.isEmpty {
+                Text(L("localPairingNoDevices"))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(entries) { entry in
+                let resolved = browser.resolved[entry.id]
+                Button {
+                    Task {
+                        if let address = await browser.resolve(entry) {
+                            model.wrappedValue.address = address
+                            focus = .code
+                        } else {
+                            model.wrappedValue.showMessage(L("errReasonPairingPeerUnreachable"))
+                        }
+                    }
+                } label: {
+                    PairingPeerRow(
+                        name: entry.name,
+                        platform: entry.platform,
+                        detail: resolved,
+                        paired: entry.paired,
+                        selected: resolved != nil && model.wrappedValue.address == resolved,
+                        busy: browser.resolvingId == entry.id
+                    )
+                }
+                .disabled(entry.paired || browser.resolvingId != nil)
+            }
+            rescanButton(model: model)
+            if let failure = browser.failure {
+                Label(failure, systemImage: FluxSymbol.failure)
+                    .font(.footnote)
+                    .foregroundStyle(Color.fdStatusFailedText)
+            }
+        } header: {
+            if !entries.isEmpty { Text(L("localPairingNearbyTitle")) }
+        }
+    }
+
+    private var searchingRow: some View {
+        HStack(spacing: 12) {
+            ProgressView()
+            Text(L("localPairingDiscovering"))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func rescanButton(model: Bindable<PairingModel>) -> some View {
+        Button {
+            model.wrappedValue.rescan()
+        } label: {
+            HStack {
+                Label(L("localPairingRetryScan"), systemImage: FluxSymbol.retry)
+                if model.wrappedValue.scanning {
+                    Spacer()
+                    ProgressView()
+                }
+            }
+        }
+        .disabled(model.wrappedValue.scanning)
     }
 
     @ViewBuilder
@@ -309,142 +375,12 @@ private struct AddDeviceContent: View {
         focus = nil
         Task { await model.begin() }
     }
-
-    // MARK: SAS 核对
-
-    @ViewBuilder
-    private func verifyContent(_ verify: PairingModel.Verify, finishing: Bool, message: String?) -> some View {
-        Section {
-            VStack(spacing: 16) {
-                Text(L("localPairingSasTitle"))
-                    .font(.headline)
-                SasDigitsView(sas: verify.sas, size: 48)
-                Text(verify.peerName)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                if finishing {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                        Text(L("localPairingWaitingPeer"))
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    .accessibilityElement(children: .combine)
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 8)
-        } footer: {
-            Text(L("localPairingSasHint"))
-        }
-        if let message {
-            Section {
-                Banner(text: message, tone: .error, systemImage: FluxSymbol.failure, slim: true)
-                    .listRowBackground(Color.clear)
-                    .listRowInsets(EdgeInsets())
-            }
-        }
-    }
-
-    /// 核对页的底部操作（浮动功能控件，系统玻璃按钮）：拒绝 / 确认配对。
-    @ViewBuilder
-    private var verifyBar: some View {
-        let step = model.step
-        let pending: Bool = switch step {
-        case .verify, .finishing: true
-        default: false
-        }
-        if pending {
-            let finishing: Bool = if case .finishing = step { true } else { false }
-            if finishing {
-                Button {
-                    model.cancelFinishing()
-                } label: {
-                    Text(L("cancel"))
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.glass)
-                .controlSize(.large)
-                .padding(.horizontal, 20)
-                .padding(.vertical, 8)
-            } else {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 12) { rejectButton(disabled: false); confirmButton(disabled: false) }
-                    VStack(spacing: 12) { confirmButton(disabled: false); rejectButton(disabled: false) }
-                }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 8)
-            }
-        }
-    }
-
-    private func rejectButton(disabled: Bool) -> some View {
-        Button(role: .destructive) {
-            Task { await model.finish(accept: false) }
-        } label: {
-            Text(L("localPairingReject"))
-                .frame(maxWidth: .infinity)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .buttonStyle(.glass)
-        .controlSize(.large)
-        .disabled(disabled)
-    }
-
-    private func confirmButton(disabled: Bool) -> some View {
-        Button {
-            Task { await model.finish(accept: true) }
-        } label: {
-            Text(L("localPairingConfirm"))
-                .frame(maxWidth: .infinity)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .buttonStyle(.glassProminent)
-        .controlSize(.large)
-        .disabled(disabled)
-    }
-}
-
-// MARK: - 发现的设备行
-
-private struct DiscoveredPeerRow: View {
-    let entry: LinkRules.DiscoveredEntry
-    let selected: Bool
-
-    var body: some View {
-        HStack(spacing: 12) {
-            GlyphTile(systemImage: DevicePresentation.symbol(platform: entry.platform), tint: .secondary, size: 36)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(entry.name)
-                    .font(.body)
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                Text([DevicePresentation.label(platform: entry.platform), entry.address].compactMap { $0 }.joined(separator: " · "))
-                    .font(.footnote.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-            }
-            Spacer(minLength: 8)
-            if entry.paired {
-                StatusBadge(text: L("localDevicePairedTag"), tone: .neutral)
-            } else if selected {
-                Image(systemName: FluxSymbol.done)
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(.tint)
-                    .accessibilityHidden(true)
-            }
-        }
-        .contentShape(Rectangle())
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-    }
 }
 
 // MARK: - 本机配对码
 
 /// 本机配对码卡：大号分组数字 + 倒计时 + 复制 / 换一个 + 可连接地址。展示宿主返回的真实结果；
-/// 内嵌的本机宿主通常没有 TCP 网关（无地址），此时如实说明，申请失败则显示宿主错误。
+/// 申请失败则显示宿主错误。只在主机带 `agent.gateway` 时出现（手机本机主机无网关，不监听，不显示本区）。
 private struct OwnCodeSection: View {
     @Environment(AppContainer.self) private var container
     let model: PairingModel
@@ -514,7 +450,7 @@ private struct OwnCodeSection: View {
                 .textSelection(.enabled)
                 .accessibilityLabel(L("localPairingMyCodeTitle"))
                 .accessibilityValue(own.code.map(String.init).joined(separator: " "))
-            countdown(own)
+            countdown
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 20) { copyButton(own); refreshButton }
                 VStack(alignment: .leading, spacing: 8) { copyButton(own); refreshButton }
@@ -525,12 +461,13 @@ private struct OwnCodeSection: View {
         .sensoryFeedback(.success, trigger: copyTick)
     }
 
-    private func countdown(_ own: LinkPairingCodeDto) -> some View {
+    /// 倒计时按「收到配对码的本机时刻 + ttlMs」算（`PairingModel.ownDeadlineMs`），不受主机与本机时钟偏差影响。
+    private var countdown: some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
-            let seconds = LinkRules.secondsUntil(expiresAtUnixMs: own.expiresAtUnixMs, nowMs: AccountText.nowMs())
+            let seconds = LinkRules.secondsUntil(expiresAtUnixMs: model.ownDeadlineMs, nowMs: AccountText.nowMs())
             HStack(spacing: 8) {
                 CountdownRing(
-                    deadline: Date(timeIntervalSince1970: Double(own.expiresAtUnixMs) / 1000),
+                    deadline: Date(timeIntervalSince1970: Double(model.ownDeadlineMs) / 1000),
                     total: model.ownTotal,
                     label: { L("localDeviceCodeRemaining", ["seconds": $0]) }
                 )

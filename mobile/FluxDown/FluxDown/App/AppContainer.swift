@@ -80,21 +80,37 @@ final class AppContainer {
         }
     }
 
-    /// 保存远端主机：先真实连接并拿到首个快照（鉴权 / 协议 / 可达性），通过后把访问密钥存入钥匙串。
-    func addRemoteHost(name: String, endpoint: String, accessKey: String) async -> Result<HostRef, HostError> {
+    /// 保存远端主机：先真实连接并拿到首个快照（鉴权 / 协议 / 可达性），通过后把凭据存入钥匙串。
+    ///
+    /// `linkFingerprint` 非空 = 局域网配对得到的设备控制凭据（`accessKey` 是该凭据）：同一指纹已保存过的主机
+    /// 原地更新凭据与地址（重新配对不会新增重复主机），且它正是当前主机时立即用新凭据重开会话。
+    func addRemoteHost(
+        name: String,
+        endpoint: String,
+        accessKey: String,
+        linkFingerprint: String? = nil
+    ) async -> Result<HostRef, HostError> {
         let url = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         let key = accessKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !url.isEmpty, !key.isEmpty else {
             return .failure(HostError(.invalidArgument, message: "endpoint and access key are required"))
         }
-        do {
+        do throws(HostError) {
             let probe = try await FluxBridge.openRemote(endpoint: url, accessKey: key)
             defer { probe.close() }
             try await Self.awaitFirstSnapshot(probe)
             let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
             let display = trimmedName.isEmpty ? Self.displayHost(url) : trimmedName
-            let ref = try hostRepo.add(name: display, endpoint: url, accessKey: key)
+            let ref: HostRef
+            if let linkFingerprint, let existing = hostRepo.remote(linkFingerprint: linkFingerprint) {
+                ref = try hostRepo.updateCredential(id: existing.id, endpoint: url, accessKey: key)
+            } else {
+                ref = try hostRepo.add(name: display, endpoint: url, accessKey: key, linkFingerprint: linkFingerprint)
+            }
             hosts = [localRef] + hostRepo.remotes
+            if ref.id == host.id, linkFingerprint != nil {
+                if case let .failure(error) = await reopenCurrent(ref) { throw error }
+            }
             return .success(ref)
         } catch {
             log.warning("add remote host failed: \(String(describing: error), privacy: .public)")
@@ -108,13 +124,19 @@ final class AppContainer {
         guard case let .remote(id, _, _) = host else {
             return .failure(HostError(.invalidArgument, message: "current host is local"))
         }
+        // 经局域网配对的主机用的是设备专属控制凭据：访问密钥怎么改都不影响它，不能用访问密钥覆盖它。
+        if hostRepo.linkFingerprint(id: id) != nil { return .success(()) }
         do throws(HostError) {
             try hostRepo.updateAccessKey(id: id, key: key)
         } catch {
             return .failure(error)
         }
-        let ref = host
-        return await withCheckedContinuation { continuation in
+        return await reopenCurrent(host)
+    }
+
+    /// 用 `ref` 重开会话并接管为当前主机（凭据 / 地址已写入仓库之后）。
+    private func reopenCurrent(_ ref: HostRef) async -> Result<Void, HostError> {
+        await withCheckedContinuation { continuation in
             serialized { container in
                 switch await container.open(ref) {
                 case let .success(session):
@@ -128,6 +150,8 @@ final class AppContainer {
     }
 
     /// 删除已保存的远端主机；正在使用时先回到本机。本机不可删除。
+    /// 经局域网配对添加的主机（带 `linkFingerprint`）同时对本机主机尽力调用 `agent.link.remove`，
+    /// 让主机侧撤销这台手机的控制授权；失败只记日志（主机离线时手机侧仍然删除，主机侧可手动解除）。
     func removeHost(id: String) async -> Result<Void, HostError> {
         guard id != HostRef.localId else { return .success(()) }
         return await withCheckedContinuation { continuation in
@@ -138,14 +162,42 @@ final class AppContainer {
                     case let .failure(error): container.adopt(container.localRef, UnavailableSession(error))
                     }
                 }
+                let fingerprint = container.hostRepo.linkFingerprint(id: id)
                 do throws(HostError) {
                     try container.hostRepo.remove(id: id)
                     container.hosts = [container.localRef] + container.hostRepo.remotes
                     continuation.resume(returning: .success(()))
                 } catch {
                     continuation.resume(returning: .failure(error))
+                    return
+                }
+                if let fingerprint {
+                    Task { [weak container] in await container?.revokeLinkPairing(fingerprint: fingerprint) }
                 }
             }
+        }
+    }
+
+    /// 主机侧的配对记录指纹（经局域网配对添加的主机）；访问密钥主机 = nil。
+    func linkFingerprint(ofHost id: String) -> String? { hostRepo.linkFingerprint(id: id) }
+
+    /// 本机主机的独立会话（配对用，与当前连着哪台主机无关；本机主机进程内唯一，多个会话共享它）。
+    /// 调用方用完必须 `close()`。
+    func openLocalSession() async -> Result<any HostSession, HostError> {
+        await open(localRef)
+    }
+
+    private func revokeLinkPairing(fingerprint: String) async {
+        switch await open(localRef) {
+        case let .success(session):
+            defer { session.close() }
+            do throws(HostError) {
+                try await AgentAPI(session: session).linkRemove(fingerprint: fingerprint)
+            } catch {
+                log.warning("revoke link pairing failed: \(error.description, privacy: .public)")
+            }
+        case let .failure(error):
+            log.warning("revoke link pairing: local host unavailable: \(error.description, privacy: .public)")
         }
     }
 
@@ -287,6 +339,7 @@ nonisolated final class UnavailableSession: HostSession {
 
     func close() {}
 
+    func categorySaveDir(fileName: String, url: String) -> String? { nil }
     func createTask(_ request: CreateTaskRequest) async throws(HostError) -> String { throw error }
     func pause(_ taskId: String) async throws(HostError) { throw error }
     func resume(_ taskId: String) async throws(HostError) { throw error }

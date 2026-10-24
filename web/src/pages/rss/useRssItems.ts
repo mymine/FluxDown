@@ -9,9 +9,9 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useT } from '../../i18n'
-import { rpc, shallowEqual, useDaemon, useServiceEvents } from '../../lib/rpc'
+import { rpc, shallowEqual, tablesLoading, useDaemon, useServiceEvents } from '../../lib/rpc'
 import type { EventFrame, RssItemDto } from '../../lib/rpc'
-import { encodeTaskState } from './format'
+import { TASK_STATE_UNKNOWN, encodeTaskState } from './format'
 import type { LinkedTaskStates } from './format'
 
 const EMPTY_ITEMS: readonly RssItemDto[] = []
@@ -102,6 +102,11 @@ export function useRssItems(sourceId: string, stale: boolean): RssItemsState {
     (daemon) => {
       if (linkedIds.size === 0) return EMPTY_TASKS
       const out: Record<string, number> = {}
+      // 任务表载入期间 `tasks` 不完整：「找不到任务」不代表被删，标记为未知。
+      if (tablesLoading(daemon)) {
+        for (const id of linkedIds) out[id] = TASK_STATE_UNKNOWN
+        return out
+      }
       for (const task of daemon.tasks) {
         if (linkedIds.has(task.taskId)) out[task.taskId] = encodeTaskState(task.status, task.fileMissing)
       }

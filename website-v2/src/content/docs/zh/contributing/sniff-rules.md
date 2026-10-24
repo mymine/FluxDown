@@ -234,7 +234,7 @@ node fluxdown-sniff-rules/scripts/check-source.mjs --file sniff-rules.json --rep
 | --- | --- | --- |
 | `classifyResponse` | `[{ url, pageUrl, size, attachment, mime?, status?, resourceType?, headers? }]`（`size` 与 `attachment` 必填；`size` 为 `-1` 或 `0` 表示未知；`headers` 是对象） | `{ decision: "resource", type, confidence?, rule: { id, version, tier } }`、`{ decision: "ignore", rule }` 或 `{ decision: "none" }` |
 | `classify` | `[url, mime?]` | 资源类型，如 `"video"` |
-| `isIgnored` | `[url, pageUrl, attachment]` | 命中的规则引用 `{ id, version, tier }`，或 `null` |
+| `isIgnored` | `[url, pageUrl, attachment, mime?]`（传 `mime` 时按 MIME 的 `exclude` 与 `classifyResponse` 一致生效） | 命中的规则引用 `{ id, version, tier }`，或 `null` |
 | `dedupeKey` | `[url, pageUrl]` | 用于判重的归一化地址字符串 |
 | `fileExtension` | `[url, pageUrl]` | 扩展名（`"zip"`），或 `""` |
 | `trackKind` | `[{ url, pageUrl, filename?, mime? }]` | `"video"`、`"audio"` 或 `null` |

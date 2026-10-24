@@ -1,5 +1,8 @@
 package com.fluxdown.app.update
 
+import android.content.ActivityNotFoundException
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -25,7 +28,9 @@ import com.fluxdown.fluxui.overlay.LocalFluxOverlays
  * 应用更新的全局提示（壳层根部挂一次）：
  * - 有新版本且未被跳过：App 内 toast 一次（按版本去重，附「跳过此版本」）；
  * - 启动对账发现刚升级完成：toast「已更新到 vX」；
- * - 安装会中断本机下载：确认对话框（确认才继续安装）。
+ * - 安装会中断本机下载：确认对话框（确认才继续安装）；
+ * - 交接安装程序：只在界面可见时拉起（后台收集暂停，回到前台再拉起，不会被系统的后台启动限制静默拦截），
+ *   安装程序界面返回即回报 [AppUpdateController.onInstallerClosed]（安装成功时进程已被系统替换，不会走到这里）。
  */
 @Composable
 internal fun UpdateEffects() {
@@ -38,6 +43,10 @@ internal fun UpdateEffects() {
     val status by controller.status.collectAsStateWithLifecycle()
     val interrupt by controller.interrupt.collectAsStateWithLifecycle()
     val installed by controller.installedVersion.collectAsStateWithLifecycle()
+    val handoff by controller.handoff.collectAsStateWithLifecycle()
+    val installerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        controller.onInstallerClosed()
+    }
     val latestOverlays by rememberUpdatedState(overlays)
     val latestResources by rememberUpdatedState(resources)
 
@@ -82,5 +91,15 @@ internal fun UpdateEffects() {
                 onDismiss = { controller.dismissInterrupt() },
             ),
         )
+    }
+
+    LaunchedEffect(handoff) {
+        val request = handoff ?: return@LaunchedEffect
+        controller.consumeHandoff(request)
+        try {
+            installerLauncher.launch(request.intent)
+        } catch (e: ActivityNotFoundException) {
+            controller.onInstallerUnavailable(e.message.orEmpty())
+        }
     }
 }

@@ -62,7 +62,10 @@ pub fn install(cx: &mut App) {
             }
             _ => {}
         },
-        SessionSignal::Stale | SessionSignal::Fatal(_) | SessionSignal::ServiceStopped => {}
+        SessionSignal::Stale
+        | SessionSignal::Fatal(_)
+        | SessionSignal::ServiceStopped
+        | SessionSignal::ServiceFailed(_) => {}
     })
     .detach();
 }

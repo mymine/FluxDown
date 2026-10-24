@@ -40,7 +40,7 @@ This installs the portable build and keeps your `settings.json` across upgrades.
 - **DMG** — `FluxDown-<version>-macos-<arch>.dmg` (`arm64` for Apple Silicon, `x64` for Intel). Open it and drag FluxDown into **Applications**.
 - **Portable** — `FluxDown-<version>-macos-<arch>.tar.gz`. Extract it and run the app bundle directly.
 
-The build isn't notarized, so Gatekeeper blocks the first launch with an "unidentified developer" warning. Right-click (or Control-click) the app and choose **Open**, or approve it under **System Settings → Privacy & Security → Open Anyway**.
+Both are signed with an Apple Developer ID and notarized by Apple, so FluxDown opens without any Gatekeeper warning.
 
 ## Linux
 

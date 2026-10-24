@@ -150,9 +150,12 @@ function classify(name: string, t: T): { group: string; sub: string } {
     if (fnos) return { group: "NAS", sub: `fnOS ${fnos[1]}` };
     return { group: "Server", sub: platLabel || name };
   }
-  if (n.startsWith("luci-app-fluxdown_") && n.endsWith(".ipk")) return { group: "NAS", sub: "OpenWrt LuCI" };
-  if (n.startsWith("fluxdown-server_") && n.endsWith(".ipk")) {
-    return { group: "NAS", sub: `OpenWrt ${/_([a-z0-9_-]+)\.ipk$/.exec(n)?.[1] ?? ""}`.trim() };
+  const openwrt = /\.(ipk|apk)$/.exec(n);
+  if (openwrt && n.startsWith("luci-app-fluxdown_")) {
+    return { group: "NAS", sub: `OpenWrt LuCI ${openwrt[1]}` };
+  }
+  if (openwrt && n.startsWith("fluxdown-server_")) {
+    return { group: "NAS", sub: `OpenWrt ${/_([a-z0-9_-]+)\.(?:ipk|apk)$/.exec(n)?.[1] ?? ""} ${openwrt[1]}`.replace(/ +/g, " ") };
   }
   const abi = /-android-([a-z0-9_-]+)\.apk$/.exec(n);
   if (abi) return { group: "Android", sub: `${abi[1]} APK` };
@@ -170,7 +173,8 @@ function classify(name: string, t: T): { group: string; sub: string } {
   if (n.endsWith(".pkg.tar.zst")) return { group: "Linux", sub: "Arch Linux" };
   if (n.endsWith(".rpm")) return { group: "Linux", sub: t.asset.rpm };
   if (/-linux-(x64|arm64)\.tar\.gz$/.test(n)) return { group: "Linux", sub: `${arch} ${t.asset.archive}` };
-  if (n.endsWith("-chrome.zip") || n.endsWith("-extension.zip")) return { group: "extension", sub: "Chrome / Edge" };
+  if (n.endsWith("-chrome.crx")) return { group: "extension", sub: `Chrome ${t.asset.storeSigned}` };
+  if (n.endsWith("-chrome.zip") || n.endsWith("-extension.zip")) return { group: "extension", sub: `Chrome / Edge ${t.asset.unpacked}` };
   if (n.endsWith("-firefox.xpi")) return { group: "extension", sub: "Firefox" };
   if (n.endsWith("-firefox-unsigned.zip")) return { group: "extension", sub: `Firefox ${t.asset.unsigned}` };
   return { group: "other", sub: name };

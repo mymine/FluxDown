@@ -1,7 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
-#if FULL_P2P
+#if FULL_FLAVOR
 
 /// 做种时长行：数字 + 单位菜单（分钟 / 小时 / 天）+ ± 步进。
 ///

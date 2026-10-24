@@ -15,7 +15,7 @@ type NumberConfirm = Rc<dyn Fn(i64, &mut App)>;
 use fluxdown_protocol::ApplicationErrorCode;
 use fluxdown_ui_components::{
     ControlExt as _, DialogIntent, FluxIcon, dialog_footer, dialog_title, field_hint, form,
-    form_field, tabular_numbers, toolbar_action_button,
+    form_field, tabular_numbers, toolbar_action_button, tooltip_view,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -29,13 +29,16 @@ use gpui_component::{
     h_flex,
     input::{Input, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
-    tooltip::Tooltip,
 };
 
 use crate::{
     components::task_table::ToolbarCommand,
-    controller::DownloadsCommand,
-    model::{format_bytes, shutdown::ShutdownRequest},
+    controller::{DownloadsCommand, SPEED_LIMIT_RECENT_PREF, UPLOAD_LIMIT_RECENT_PREF},
+    model::{
+        format_bytes,
+        shutdown::ShutdownRequest,
+        speed_limit_recent::{push_recent, read_speed_limit_recent},
+    },
     pages::downloads::DownloadView,
 };
 
@@ -129,6 +132,8 @@ struct SpeedLimitControl {
     title_key: &'static str,
     /// `speed_limit_bytes` 或 `upload_limit_bytes`（字节/秒）。
     config_key: &'static str,
+    /// 最近自定义值的本机偏好键（KB/s 整数数组）。
+    recent_pref: &'static str,
 }
 
 const DOWNLOAD_LIMIT: SpeedLimitControl = SpeedLimitControl {
@@ -136,6 +141,7 @@ const DOWNLOAD_LIMIT: SpeedLimitControl = SpeedLimitControl {
     icon: FluxIcon::ArrowDown,
     title_key: "speedLimitTitle",
     config_key: "speed_limit_bytes",
+    recent_pref: SPEED_LIMIT_RECENT_PREF,
 };
 
 const UPLOAD_LIMIT: SpeedLimitControl = SpeedLimitControl {
@@ -143,6 +149,7 @@ const UPLOAD_LIMIT: SpeedLimitControl = SpeedLimitControl {
     icon: FluxIcon::ArrowUp,
     title_key: "uploadLimit",
     config_key: "upload_limit_bytes",
+    recent_pref: UPLOAD_LIMIT_RECENT_PREF,
 };
 
 /// 紧凑摆放的悬浮提示：标题 + 当前值。
@@ -245,6 +252,52 @@ fn apply_speed_limit(view: WeakEntity<DownloadView>, key: &'static str, value: i
     };
 }
 
+/// 自定义 / 最近值生效：写限速并把该值记入最近列表。
+fn apply_custom_speed_limit(
+    view: WeakEntity<DownloadView>,
+    key: &'static str,
+    recent_pref: &'static str,
+    kbps: i64,
+    cx: &mut App,
+) {
+    let Ok(()) = view.update(cx, |this, cx| {
+        this.execute_config_patch(key, kb_to_bytes(kbps), cx);
+        let recent = read_speed_limit_recent(this.controller.preference(recent_pref));
+        if let Some(next) = push_recent(&recent, kbps) {
+            this.execute_status_config_command(
+                DownloadsCommand::SetLocalPreference {
+                    key: recent_pref,
+                    value: serde_json::Value::from(next),
+                },
+                cx,
+            );
+        }
+    }) else {
+        // 视图已释放，结束这次回调而不再更新状态。
+        return;
+    };
+}
+
+/// 清除最近自定义值（写 null，与保存目录历史清空同口径）。
+fn clear_speed_limit_recent(
+    view: WeakEntity<DownloadView>,
+    recent_pref: &'static str,
+    cx: &mut App,
+) {
+    let Ok(()) = view.update(cx, |this, cx| {
+        this.execute_status_config_command(
+            DownloadsCommand::SetLocalPreference {
+                key: recent_pref,
+                value: serde_json::Value::Null,
+            },
+            cx,
+        );
+    }) else {
+        // 视图已释放，结束这次回调而不再更新状态。
+        return;
+    };
+}
+
 /// 数字输入弹窗文案：自定义限速（KB/s）与自定义关机延迟（分钟）复用。
 #[derive(Clone)]
 struct NumberPrompt {
@@ -271,9 +324,16 @@ fn open_number_prompt(
     cx: &mut App,
     prompt: NumberPrompt,
     min: i64,
+    initial: Option<i64>,
     on_confirm: NumberConfirm,
 ) {
-    let input = cx.new(|cx| InputState::new(window, cx));
+    let input = cx.new(|cx| {
+        let state = InputState::new(window, cx);
+        match initial {
+            Some(value) => state.default_value(value.to_string()),
+            None => state,
+        }
+    });
     let dialog_input = input.clone();
     window.open_dialog(cx, move |dialog, _, cx| {
         let content_input = dialog_input.clone();
@@ -368,7 +428,8 @@ impl DownloadView {
         .detach();
     }
 
-    /// 下载 / 上传限速控件：图标 + 当前值的幽灵按钮，点开自动收起的菜单（预设 + 自定义）。
+    /// 下载 / 上传限速控件：图标 + 当前值的幽灵按钮，点开自动收起的菜单
+    /// （关闭 + 预设 + 最近自定义 + 自定义… + 清除最近）。
     /// 紧凑摆放只留图标，当前值并入悬浮提示。
     fn render_speed_limit_control(
         &self,
@@ -382,6 +443,7 @@ impl DownloadView {
             icon,
             title_key,
             config_key,
+            recent_pref,
         } = *control;
         let translator = self.translator.read(cx);
         let value = self
@@ -396,7 +458,20 @@ impl DownloadView {
             SharedString::from(format!("{}/s", format_bytes(value as u64)))
         };
         let title = SharedString::from(translator.text(title_key).to_owned());
+        let recent = read_speed_limit_recent(self.controller.preference(recent_pref));
+        let custom_current =
+            value > 0 && !SPEED_PRESETS_MB.iter().any(|mb| mb_to_bytes(*mb) == value);
+        let current_kbps = custom_current.then(|| (value / 1024).max(1));
         let custom_label = SharedString::from(translator.text("speedLimitCustom").to_owned());
+        let custom_item_label = if custom_current {
+            SharedString::from(translator.text_with(
+                "speedLimitCustomWithValue",
+                &[("value", &format!("{}/s", format_bytes(value as u64)))],
+            ))
+        } else {
+            custom_label.clone()
+        };
+        let clear_label = SharedString::from(translator.text("speedLimitClearRecent").to_owned());
         let desc_key = if config_key == "upload_limit_bytes" {
             "uploadLimitDesc"
         } else {
@@ -436,10 +511,8 @@ impl DownloadView {
                             move |_, _, cx| apply_speed_limit(view.clone(), config_key, 0, cx)
                         }),
                 );
-                let mut preset_hit = value <= 0;
                 for mb in SPEED_PRESETS_MB {
                     let bytes = mb_to_bytes(mb);
-                    preset_hit |= bytes == value;
                     menu = menu.item(
                         PopupMenuItem::new(SharedString::from(format!("{mb} MB/s")))
                             .checked(bytes == value)
@@ -451,9 +524,34 @@ impl DownloadView {
                             }),
                     );
                 }
-                menu.separator().item(
-                    PopupMenuItem::new(custom_label.clone())
-                        .checked(!preset_hit)
+                let mut recent_hit = false;
+                for kbps in recent.iter().copied() {
+                    let bytes = kb_to_bytes(kbps);
+                    let checked = bytes == value;
+                    recent_hit |= checked;
+                    menu = menu.item(
+                        PopupMenuItem::new(SharedString::from(format!(
+                            "{}/s",
+                            format_bytes(bytes as u64)
+                        )))
+                        .checked(checked)
+                        .on_click({
+                            let view = view.clone();
+                            move |_, _, cx| {
+                                apply_custom_speed_limit(
+                                    view.clone(),
+                                    config_key,
+                                    recent_pref,
+                                    kbps,
+                                    cx,
+                                );
+                            }
+                        }),
+                    );
+                }
+                menu = menu.separator().item(
+                    PopupMenuItem::new(custom_item_label.clone())
+                        .checked(custom_current && !recent_hit)
                         .on_click({
                             let view = view.clone();
                             let prompt = prompt.clone();
@@ -464,18 +562,27 @@ impl DownloadView {
                                     cx,
                                     prompt.clone(),
                                     0,
+                                    current_kbps,
                                     Rc::new(move |kb, cx| {
-                                        apply_speed_limit(
+                                        apply_custom_speed_limit(
                                             view.clone(),
                                             config_key,
-                                            kb_to_bytes(kb),
+                                            recent_pref,
+                                            kb,
                                             cx,
                                         );
                                     }),
                                 );
                             }
                         }),
-                )
+                );
+                if !recent.is_empty() {
+                    menu = menu.item(PopupMenuItem::new(clear_label.clone()).on_click({
+                        let view = view.clone();
+                        move |_, _, cx| clear_speed_limit_recent(view.clone(), recent_pref, cx)
+                    }));
+                }
+                menu
             })
             .into_any_element()
     }
@@ -597,6 +704,7 @@ impl DownloadView {
                                     prompt.clone(),
                                     // 0 分钟等同立即关机，「立即」是独立菜单项；自定义必须 ≥ 1。
                                     1,
+                                    None,
                                     Rc::new(move |minutes, cx| {
                                         shutdown(
                                             ShutdownRequest::ArmAfter(minutes_to_duration(minutes)),
@@ -658,7 +766,7 @@ impl DownloadView {
         div()
             .id(SharedString::from(format!("{id}-tooltip")))
             .flex_none()
-            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
+            .tooltip(move |window, cx| tooltip_view(tooltip_label.clone(), window, cx))
             .child(button)
             .into_any_element()
     }

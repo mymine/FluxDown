@@ -1,7 +1,7 @@
 //! 账户能力状态：登录会话、云设备、局域网配对与配置同步的快照/事件应用，
 //! 以及需要一次性提示的状态转换（会话被结束、新的入站配对请求）。
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use fluxdown_protocol::{
@@ -36,7 +36,7 @@ pub struct AccountController {
     lan_active: bool,
     stale: bool,
     /// 已经提示过的入站配对请求，避免重连快照重复弹窗。
-    seen_requests: BTreeSet<String>,
+    seen_requests: BTreeMap<String, i64>,
 }
 
 impl AccountController {
@@ -54,7 +54,7 @@ impl AccountController {
             lan_enabled: false,
             lan_active: false,
             stale: true,
-            seen_requests: BTreeSet::new(),
+            seen_requests: BTreeMap::new(),
         }
     }
 
@@ -140,19 +140,31 @@ impl AccountController {
     }
 
     /// 已存在的入站请求集合里首次出现的 ID；同时丢弃已消失请求的记录。
+    /// 首次看到时记下本机截止时刻（收到时刻 + `ttlMs`），之后不再随快照重放而变。
     fn take_new_requests(&mut self) -> Vec<String> {
-        self.seen_requests.retain(|id| {
+        self.seen_requests.retain(|id, _| {
             self.pairing_requests
                 .iter()
                 .any(|request| &request.session_id == id)
         });
+        let now = crate::link::now_unix_ms();
         let mut fresh = Vec::new();
         for request in &self.pairing_requests {
-            if self.seen_requests.insert(request.session_id.clone()) {
+            if !self.seen_requests.contains_key(&request.session_id) {
+                let deadline =
+                    crate::link::local_deadline_ms(request.ttl_ms, request.expires_at_unix_ms, now);
+                self.seen_requests
+                    .insert(request.session_id.clone(), deadline);
                 fresh.push(request.session_id.clone());
             }
         }
         fresh
+    }
+
+    /// 入站请求的本机截止时刻（Unix 毫秒）；请求不存在时为 `None`。
+    #[must_use]
+    pub fn pairing_deadline_ms(&self, session_id: &str) -> Option<i64> {
+        self.seen_requests.get(session_id).copied()
     }
 
     pub fn mark_stale(&mut self) {
@@ -320,6 +332,8 @@ mod tests {
             peer_fingerprint: "fp".to_owned(),
             peer_platform: None,
             sas: "123456".to_owned(),
+            requests_control: false,
+            ttl_ms: 0,
             expires_at_unix_ms: 0,
         }
     }

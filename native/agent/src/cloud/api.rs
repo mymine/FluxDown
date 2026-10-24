@@ -157,6 +157,57 @@ impl CloudApi {
             .await
     }
 
+    /// 插件市场收藏概览：公开计数始终拉取；已登录时再拉本人收藏。
+    /// 已登录判定读本机凭据；本人收藏请求失败（含 401）按错误返回，不静默降级。
+    pub async fn plugin_favorites(
+        &self,
+    ) -> Result<fluxdown_protocol::PluginFavoritesDto, CloudError> {
+        let counts: FavoriteCountsBody = self
+            .client
+            .public::<Value, _>(Method::GET, "/api/v1/plugins/favorites/counts", None)
+            .await?;
+        let signed_in = self.client.current_user_id().await.is_some();
+        let mine = if signed_in {
+            let body: FavoriteMineBody = self
+                .client
+                .authenticated_epoch::<Value, _>(
+                    Method::GET,
+                    "/api/v1/plugins/favorites",
+                    None,
+                    self.request_epoch(),
+                )
+                .await?;
+            body.plugin_ids
+        } else {
+            Vec::new()
+        };
+        Ok(fluxdown_protocol::PluginFavoritesDto {
+            counts: counts.counts,
+            mine,
+            signed_in,
+        })
+    }
+
+    /// 收藏 / 取消收藏单个插件（需登录）。
+    pub async fn set_plugin_favorite(
+        &self,
+        request: fluxdown_protocol::PluginFavoriteSetRequest,
+    ) -> Result<fluxdown_protocol::PluginFavoriteResultDto, CloudError> {
+        let method = if request.favorited {
+            Method::PUT
+        } else {
+            Method::DELETE
+        };
+        self.client
+            .authenticated_epoch::<Value, _>(
+                method,
+                &format!("/api/v1/plugins/favorites/{}", encode(&request.plugin_id)),
+                None,
+                self.request_epoch(),
+            )
+            .await
+    }
+
     pub async fn create_order<P: Serialize>(&self, body: &P) -> Result<Value, CloudError> {
         self.authed(Method::POST, "/api/v1/orders", Some(body))
             .await
@@ -521,6 +572,21 @@ impl CloudApi {
             .authenticated_epoch(method, path, body, self.request_epoch())
             .await
     }
+}
+
+/// `GET /plugins/favorites/counts` 响应。
+#[derive(serde::Deserialize)]
+struct FavoriteCountsBody {
+    #[serde(default)]
+    counts: std::collections::BTreeMap<String, u64>,
+}
+
+/// `GET /plugins/favorites` 响应。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FavoriteMineBody {
+    #[serde(default)]
+    plugin_ids: Vec<String>,
 }
 
 /// `POST /notifications/events` 响应：逐条结果与最新额度用量。

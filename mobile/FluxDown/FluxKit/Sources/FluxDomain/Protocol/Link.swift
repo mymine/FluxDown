@@ -22,11 +22,16 @@ public struct LinkDeviceInfo: Sendable, Hashable, Identifiable, Codable {
     public var cloudDeviceId: String?
     /// 对端已解除配对：拒绝其入站请求、不可再下发，只能删除。
     public var revoked: Bool
+    /// 响应方侧：该对端已获批控制**本机**（它是以「请求完全控制」发起并经本机用户批准的）。
+    public var grantsControl: Bool
+    /// 发起方侧：本机可控制该对端（本机以「请求完全控制」发起并配对完成）；可向本机 agent 申请控制凭据。
+    public var controllable: Bool
 
     public init(
         fingerprint: String, name: String, platform: String? = nil, online: Bool = false, pairedAt: Int64 = 0,
         lastSeenAt: Int64 = 0, defaultSaveDir: String? = nil, pathStyle: PathStyle? = nil,
-        customName: String? = nil, appVersion: String? = nil, cloudDeviceId: String? = nil, revoked: Bool = false
+        customName: String? = nil, appVersion: String? = nil, cloudDeviceId: String? = nil, revoked: Bool = false,
+        grantsControl: Bool = false, controllable: Bool = false
     ) {
         self.fingerprint = fingerprint
         self.name = name
@@ -40,6 +45,8 @@ public struct LinkDeviceInfo: Sendable, Hashable, Identifiable, Codable {
         self.appVersion = appVersion
         self.cloudDeviceId = cloudDeviceId
         self.revoked = revoked
+        self.grantsControl = grantsControl
+        self.controllable = controllable
     }
 
     public var id: String { fingerprint }
@@ -60,6 +67,8 @@ public struct LinkDeviceInfo: Sendable, Hashable, Identifiable, Codable {
         appVersion = try c.decodeIfPresent(String.self, forKey: .appVersion)
         cloudDeviceId = try c.decodeIfPresent(String.self, forKey: .cloudDeviceId)
         revoked = try c.decodeIfPresent(Bool.self, forKey: .revoked) ?? false
+        grantsControl = try c.decodeIfPresent(Bool.self, forKey: .grantsControl) ?? false
+        controllable = try c.decodeIfPresent(Bool.self, forKey: .controllable) ?? false
     }
 }
 
@@ -115,10 +124,14 @@ public struct LinkPairingRequestDto: Sendable, Hashable, Identifiable, Codable {
     /// 双方肉眼核对的短认证串（6 位数字）。
     public var sas: String
     public var expiresAtUnixMs: Int64
+    /// 对端请求完全控制本机（批准后它可用设备凭据连本机 `/rpc`）。
+    public var requestsControl: Bool
+    /// 生成 DTO 时刻的剩余毫秒（旧主机缺失）；过期以「收到时刻 + ttlMs」计算。
+    public var ttlMs: Int64?
 
     public init(
         sessionId: String, peerName: String, peerFingerprint: String, peerPlatform: String? = nil, sas: String,
-        expiresAtUnixMs: Int64
+        expiresAtUnixMs: Int64, requestsControl: Bool = false, ttlMs: Int64? = nil
     ) {
         self.sessionId = sessionId
         self.peerName = peerName
@@ -126,6 +139,20 @@ public struct LinkPairingRequestDto: Sendable, Hashable, Identifiable, Codable {
         self.peerPlatform = peerPlatform
         self.sas = sas
         self.expiresAtUnixMs = expiresAtUnixMs
+        self.requestsControl = requestsControl
+        self.ttlMs = ttlMs
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try c.decode(String.self, forKey: .sessionId)
+        peerName = try c.decode(String.self, forKey: .peerName)
+        peerFingerprint = try c.decode(String.self, forKey: .peerFingerprint)
+        peerPlatform = try c.decodeIfPresent(String.self, forKey: .peerPlatform)
+        sas = try c.decode(String.self, forKey: .sas)
+        expiresAtUnixMs = try c.decode(Int64.self, forKey: .expiresAtUnixMs)
+        requestsControl = try c.decodeIfPresent(Bool.self, forKey: .requestsControl) ?? false
+        ttlMs = try c.decodeIfPresent(Int64.self, forKey: .ttlMs)
     }
 
     public var id: String { sessionId }
@@ -139,14 +166,27 @@ public struct LinkPairingCodeDto: Sendable, Hashable, Codable {
     public var addresses: [String]
     public var fingerprint: String
     public var deviceName: String
+    /// 生成 DTO 时刻的剩余毫秒（旧主机缺失）；倒计时以「收到时刻 + ttlMs」计算，见 ``LinkRules/deadlineMs(ttlMs:expiresAtUnixMs:receivedAtMs:)``。
+    public var ttlMs: Int64?
 
-    public init(code: String, expiresAtUnixMs: Int64, addresses: [String] = [], fingerprint: String = "", deviceName: String = "") {
+    public init(
+        code: String, expiresAtUnixMs: Int64, addresses: [String] = [], fingerprint: String = "", deviceName: String = "",
+        ttlMs: Int64? = nil
+    ) {
         self.code = code
         self.expiresAtUnixMs = expiresAtUnixMs
         self.addresses = addresses
         self.fingerprint = fingerprint
         self.deviceName = deviceName
+        self.ttlMs = ttlMs
     }
+}
+
+/// `agent.link.stopPairing` 参数：带 `code` 时只有它仍是当前配对码才作废（多客户端互不干扰）。
+public struct LinkStopPairingParams: Sendable, Hashable, Codable {
+    public var code: String
+
+    public init(code: String) { self.code = code }
 }
 
 public struct LinkDiscoveryParams: Sendable, Hashable, Codable {
@@ -166,10 +206,29 @@ public struct LinkAddressParams: Sendable, Hashable, Codable {
 public struct LinkPairBeginParams: Sendable, Hashable, Codable {
     public var address: String
     public var code: String
+    /// 请求完全控制对端（手机「添加主机」配对）；为 false 时不写入 wire，行为与旧版完全一致。
+    public var requestControl: Bool
 
-    public init(address: String, code: String) {
+    private enum CodingKeys: String, CodingKey { case address, code, requestControl }
+
+    public init(address: String, code: String, requestControl: Bool = false) {
         self.address = address
         self.code = code
+        self.requestControl = requestControl
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        address = try c.decode(String.self, forKey: .address)
+        code = try c.decode(String.self, forKey: .code)
+        requestControl = try c.decodeIfPresent(Bool.self, forKey: .requestControl) ?? false
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(address, forKey: .address)
+        try c.encode(code, forKey: .code)
+        if requestControl { try c.encode(true, forKey: .requestControl) }
     }
 }
 
@@ -224,6 +283,13 @@ public struct LinkDeviceParams: Sendable, Hashable, Codable {
     public var fingerprint: String
 
     public init(fingerprint: String) { self.fingerprint = fingerprint }
+}
+
+/// `agent.link.controlCredential` 结果：设备专属控制凭据（`fdl1.…`），作为远程主机的访问凭据走 `/rpc` Bearer。
+public struct LinkControlCredentialDto: Sendable, Hashable, Codable {
+    public var token: String
+
+    public init(token: String) { self.token = token }
 }
 
 /// `agent.link.dispatch` 参数：把下载直接下发到已配对的局域网设备。
@@ -320,12 +386,12 @@ public enum LinkRules {
     }
 
     /// 校验并规整 `pairBegin` 输入：地址原样交给 agent 解析，配对码去掉空白 / 连字符后必须是 6 位数字。
-    public static func validate(address: String, code: String) -> Result<LinkPairBeginParams, InputError> {
+    public static func validate(address: String, code: String, requestControl: Bool = false) -> Result<LinkPairBeginParams, InputError> {
         let address = address.trimmingCharacters(in: .whitespacesAndNewlines)
         guard isManualAddressValid(address) else { return .failure(.addressMissing) }
         let code = String(code.filter { !$0.isWhitespace && $0 != "-" })
         guard isPairingCodeComplete(code) else { return .failure(.codeIncomplete) }
-        return .success(LinkPairBeginParams(address: address, code: code))
+        return .success(LinkPairBeginParams(address: address, code: code, requestControl: requestControl))
     }
 
     /// 发现列表里的一台设备（已去重、标注是否已配对）。
@@ -342,7 +408,8 @@ public enum LinkRules {
 
     /// 发现快照 → 列表：已配对标记、同一地址只保留一条、按名称（不区分大小写）排序。
     public static func discoveredEntries(_ peers: [LinkDiscoveredPeer], paired: [LinkDeviceInfo]) -> [DiscoveredEntry] {
-        let known = Set(paired.map(\.fingerprint))
+        // 已被对端解除（revoked）的设备不算已配对：允许在发现列表里重新配对。
+        let known = Set(paired.filter { !$0.revoked }.map(\.fingerprint))
         var seen = Set<String>()
         var entries: [DiscoveredEntry] = []
         for peer in peers {
@@ -357,6 +424,23 @@ public enum LinkRules {
             ))
         }
         return entries.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// 过期时刻（本机 Unix 毫秒）：有 `ttlMs`（生成 DTO 时刻的剩余毫秒）就以「收到 DTO 的本机时刻 + ttlMs」为准——
+    /// 免疫主机与本机的时钟偏差；`ttlMs` 缺失（旧主机）才回退主机时钟的 `expiresAtUnixMs`。
+    public static func deadlineMs(ttlMs: Int64?, expiresAtUnixMs: Int64, receivedAtMs: Int64) -> Int64 {
+        // 主机把「缺失」序列化成 0（旧主机无该字段）：按缺失处理，回退主机时钟。
+        guard let ttlMs, ttlMs > 0 else { return expiresAtUnixMs }
+        let sum = receivedAtMs.addingReportingOverflow(ttlMs)
+        return sum.overflow ? Int64.max : sum.partialValue
+    }
+
+    /// 配对错误是否表示对端不支持「请求完全控制」（旧版本 / 协议不匹配）。
+    public static func isControlUnsupported(_ error: HostError) -> Bool {
+        switch error.reason {
+        case "pairingVersionMismatch"?, "peerOutdated"?: true
+        default: false
+        }
     }
 
     /// 配对码 / 入站请求距离过期还剩多少秒（向上取整，已过期为 0）。

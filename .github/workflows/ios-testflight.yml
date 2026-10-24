@@ -9,7 +9,7 @@
 #     upload=false 只做 altool --validate-app 演练，不消耗构建号、不出现在 TestFlight。
 #   - 被 test-package.yml（target=ios / all）以 workflow_call 复用，可指定构建 ref。
 # 构建号 = UTC 时间 YYYYMMDD.HHMMSS：跨 workflow / 重跑都唯一且递增（run_number 各 workflow 独立计数会撞号）。
-# 只出商店构建（store flavor：核心 build-core.sh --flavor store = --no-default-features，App 不定义 FULL_P2P）；
+# 只出商店构建（store flavor：核心 build-core.sh --flavor store = --no-default-features，App 不定义 FULL_FLAVOR）；
 # 侧载未签名 IPA（full flavor）见 ios-sideload.yml。
 # Secrets：IOS_DIST_CERT_P12_BASE64 / IOS_DIST_CERT_PASSWORD / IOS_APPSTORE_PROFILE_BASE64
 #          APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64（与 macOS 公证共用）/ FLUXCLOUD_BASE_URL
@@ -17,7 +17,7 @@
 name: iOS TestFlight
 run-name: >-
   ${{ inputs.version != ''
-  && format('iOS TestFlight {0}{1}', inputs.version, inputs.upload && '' || '（仅校验）')
+  && format('iOS TestFlight {0}{1}', inputs.version, !inputs.upload && '（仅校验）' || '')
   || format('iOS TestFlight {0}', github.ref_name) }}
 on:
   push:
@@ -123,10 +123,34 @@ jobs:
             echo "whats_new=${WHATS_NEW:-FluxDown $VERSION}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Select newest Xcode
+      - name: Select newest non-beta Xcode
+        # App Store Connect 只收正式版 / RC 构建，beta Xcode 的包上传报 altool 90534（v0.6.0 即因此失败）。
+        # 不能按目录名排序：镜像里 Xcode_27.2.app 是指向 Xcode_27.2_beta_2.app 的符号链接，RC 目录叫
+        # Xcode_27.1_Release_Candidate.app。按解析后的真实路径与 version.plist 判定：beta 构建号形如 27B5028f
+        # （字母后是 5 开头的四位数 + 小写字母），正式版 / RC 不是（27A266a、27A9275、27B48）。没有非 beta 即失败。
+        # 逻辑内联在 workflow 里：test-package.yml 以 workflow_call 复用本文件构建任意历史 ref，不能依赖被检出的脚本。
+        # ios-sideload.yml 同名步骤与此逐字一致。
         run: |
-          XCODE=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
-          sudo xcode-select -s "$XCODE/Contents/Developer"
+          candidates=""
+          for app in /Applications/Xcode*.app; do
+            real="$(cd "$app" && pwd -P)"
+            plist="$real/Contents/version.plist"
+            [ -f "$plist" ] || continue
+            version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+            build="$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$plist")"
+            if [[ "$build" =~ ^[0-9]+[A-Z]5[0-9]{3}[a-z]$ ]] || [[ "$(basename "$real" | tr '[:upper:]' '[:lower:]')" == *beta* ]]; then
+              echo "skip beta: $real ($version $build)"
+              continue
+            fi
+            candidates+="$version $build $real"$'\n'
+          done
+          best="$(printf '%s' "$candidates" | sort -u -V | tail -n 1)"
+          if [ -z "$best" ]; then
+            echo "::error::镜像上没有非 beta 的 Xcode（App Store Connect 拒收 beta 构建）"
+            exit 1
+          fi
+          echo "selected: $best"
+          sudo xcode-select -s "${best#* * }/Contents/Developer"
           xcodebuild -version
 
       - name: Setup Rust toolchain

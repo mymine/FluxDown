@@ -8,10 +8,11 @@ import type { JSX } from "preact";
 import { useCallback, useEffect, useRef, useState } from "preact/hooks";
 import { browser } from "wxt/browser";
 import type { TabView } from "@/background/protocol";
-import { checkFluxDownAvailable } from "@/utils/download-dispatch";
+import { sendAction } from "@/utils/messaging";
 import { exportConnectionDiagnostics } from "@/utils/connection-diagnostics";
 import { loadSettings, saveSettings } from "@/utils/settings";
 import { Button } from "@/ui/components/Button";
+import { HostAccessNotice } from "@/ui/components/HostAccessNotice";
 import { Icon } from "@/ui/components/Icon";
 import { IconButton } from "@/ui/components/IconButton";
 import { Tabs, type TabItem } from "@/ui/components/Tabs";
@@ -27,6 +28,7 @@ import { useThemeAttr } from "@/ui/theme";
 import "@/ui/theme/tokens.css";
 import "@/ui/theme/base.css";
 import "./popup.css";
+import { PageScriptsHint } from "./PageScriptsHint";
 
 /** 摘要中除「当前播放」外最多显示的行数。 */
 const SUMMARY_EXTRA_ROWS = 5;
@@ -41,7 +43,8 @@ interface DailyStats {
 }
 
 /**
- * 头部连接状态。探活复用 download-dispatch，与实际下载路由判定一致。
+ * 头部连接状态：与侧边栏同取 background 的 getHostStatus（下载实际走的共享 NMH 连接 / 远程路由），
+ * 两处显示同一事实。
  * 并发守卫：连续触发刷新时只让最后一次的结果落到 UI（epoch 递增，旧结果丢弃）。
  */
 function useConnection(): { state: ConnectionState; refresh: () => void } {
@@ -51,12 +54,12 @@ function useConnection(): { state: ConnectionState; refresh: () => void } {
   const refresh = useCallback(() => {
     const epoch = ++epochRef.current;
     setState("checking");
-    checkFluxDownAvailable()
+    sendAction<"getHostStatus">({ action: "getHostStatus" })
+      .then((status) => status.connected)
       .catch(() => false)
       .then((available) => {
         if (epoch !== epochRef.current) return;
         setState(available ? "connected" : "disconnected");
-        if (available) browser.runtime.sendMessage({ action: "appConfirmedUp" }).catch(() => {});
       });
   }, []);
 
@@ -206,6 +209,9 @@ export function PopupApp(): JSX.Element {
           <Toggle checked={enabled} onChange={setEnabled} label={switchLabel} />
         </div>
       </header>
+
+      <HostAccessNotice />
+      <PageScriptsHint />
 
       {siteHost ? (
         <div class="pp-site">

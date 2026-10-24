@@ -79,7 +79,7 @@ impl PluginManager {
         arg_json: String,
         file_root: Option<PathBuf>,
     ) -> Result<Option<String>, PluginError> {
-        let (manifest, streak, source) = {
+        let (manifest, streak, source, dev_mode) = {
             let snapshot = self.plugins.read().await.clone();
             let Some(p) = snapshot
                 .iter()
@@ -90,7 +90,7 @@ impl PluginManager {
                 )));
             };
             let source = p.intercept_source().await;
-            (p.manifest.clone(), p.timeout_streak.clone(), source)
+            (p.manifest.clone(), p.timeout_streak.clone(), source, p.dev)
         };
         let Some(source) = source else {
             return Err(PluginError::Runtime(format!(
@@ -147,6 +147,7 @@ impl PluginManager {
             ffmpeg_root: if finalize { file_root } else { None },
             ytdlp_permitted,
             auth_permitted: manifest.has_permission(PERMISSION_AUTH),
+            private_network_allowed: dev_mode,
         };
         let result = self
             .runtime

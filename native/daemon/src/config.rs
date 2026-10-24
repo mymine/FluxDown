@@ -15,6 +15,11 @@ pub const DEFAULT_DAEMON_BIND: &str = "127.0.0.1:17801";
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
     pub bind_addr: SocketAddr,
+    /// 仅在 `FLUXDOWN_DAEMON_BIND` 未设置（使用默认地址）时为真：默认端口被占用或被系统保留时
+    /// 回退到系统分配的 loopback 端口。显式地址始终严格。
+    pub bind_fallback: bool,
+    /// 是否发布 `daemon-endpoint.json`（独立进程为真，嵌入式为假）。
+    pub publish_endpoint: bool,
     pub data_dir_override: Option<PathBuf>,
     pub database_url: Option<String>,
     pub token_file_override: Option<PathBuf>,
@@ -42,16 +47,11 @@ pub enum ConfigError {
 impl DaemonConfig {
     /// 从环境读取配置并拒绝非 loopback 绑定。
     pub fn from_env() -> Result<Self, ConfigError> {
-        let bind_text = std::env::var("FLUXDOWN_DAEMON_BIND")
-            .unwrap_or_else(|_| DEFAULT_DAEMON_BIND.to_owned());
-        let bind_addr = bind_text
-            .parse::<SocketAddr>()
-            .map_err(|error| ConfigError::InvalidBind(error.to_string()))?;
-        if !bind_addr.ip().is_loopback() {
-            return Err(ConfigError::NonLoopback(bind_addr.ip()));
-        }
+        let (bind_addr, bind_fallback) = resolve_bind(std::env::var("FLUXDOWN_DAEMON_BIND"))?;
         Ok(Self {
             bind_addr,
+            bind_fallback,
+            publish_endpoint: true,
             data_dir_override: std::env::var_os("FLUXDOWN_DATA_DIR").map(PathBuf::from),
             database_url: std::env::var("FLUXDOWN_DATABASE_URL")
                 .ok()
@@ -73,6 +73,8 @@ impl DaemonConfig {
     pub fn embedded(data_dir: PathBuf, save_dir_seed: Option<String>) -> Self {
         Self {
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            bind_fallback: false,
+            publish_endpoint: false,
             data_dir_override: Some(data_dir),
             database_url: None,
             token_file_override: None,
@@ -82,6 +84,28 @@ impl DaemonConfig {
             demo_url: None,
         }
     }
+}
+
+/// 解析 `FLUXDOWN_DAEMON_BIND`：未设置时用默认地址并允许端口回退；显式设置则严格 loopback、不回退。
+fn resolve_bind(
+    value: Result<String, std::env::VarError>,
+) -> Result<(SocketAddr, bool), ConfigError> {
+    let (text, fallback) = match value {
+        Ok(text) => (text, false),
+        Err(std::env::VarError::NotPresent) => (DEFAULT_DAEMON_BIND.to_owned(), true),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::InvalidBind(
+                "value is not valid Unicode".to_owned(),
+            ));
+        }
+    };
+    let addr = text
+        .parse::<SocketAddr>()
+        .map_err(|error| ConfigError::InvalidBind(error.to_string()))?;
+    if !addr.ip().is_loopback() {
+        return Err(ConfigError::NonLoopback(addr.ip()));
+    }
+    Ok((addr, fallback))
 }
 
 /// 演示模式 URL：`FLUXDOWN_DEMO_URL` 优先；否则 `FLUXDOWN_DEMO` 为真值时用内置演示文件
@@ -298,6 +322,40 @@ mod tests {
         let blank =
             super::DaemonConfig::embedded(std::path::PathBuf::from("data"), Some(" ".into()));
         assert!(blank.save_dir_seed.is_none());
+    }
+
+    #[test]
+    fn unset_bind_uses_default_with_fallback_while_explicit_bind_is_strict() {
+        use std::env::VarError;
+        let (addr, fallback) =
+            super::resolve_bind(Err(VarError::NotPresent)).expect("default bind");
+        assert_eq!(addr.to_string(), super::DEFAULT_DAEMON_BIND);
+        assert!(fallback);
+
+        let (addr, fallback) =
+            super::resolve_bind(Ok("127.0.0.1:17801".to_owned())).expect("explicit bind");
+        assert_eq!(addr.port(), 17801);
+        assert!(!fallback, "an explicit address must never fall back");
+
+        assert!(matches!(
+            super::resolve_bind(Ok("0.0.0.0:17801".to_owned())),
+            Err(ConfigError::NonLoopback(_))
+        ));
+        assert!(matches!(
+            super::resolve_bind(Ok("not-an-address".to_owned())),
+            Err(ConfigError::InvalidBind(_))
+        ));
+        assert!(matches!(
+            super::resolve_bind(Err(VarError::NotUnicode(std::ffi::OsString::from("x")))),
+            Err(ConfigError::InvalidBind(_))
+        ));
+    }
+
+    #[test]
+    fn embedded_config_never_falls_back_or_publishes_an_endpoint() {
+        let config = super::DaemonConfig::embedded(std::path::PathBuf::from("data"), None);
+        assert!(!config.bind_fallback);
+        assert!(!config.publish_endpoint);
     }
 
     #[test]

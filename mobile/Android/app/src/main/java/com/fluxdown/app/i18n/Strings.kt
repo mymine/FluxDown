@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.annotation.StringRes
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.res.stringResource
+import com.fluxdown.app.R
+import com.fluxdown.core.model.TaskErrorMessage
 
 /**
  * 文案来自仓库根 `assets/i18n/{en,zh}.json`（构建期生成 `R.string.<camelCaseKey>`）。
@@ -20,3 +22,16 @@ fun String.fill(vararg args: Pair<String, Any?>): String {
 fun str(@StringRes id: Int, vararg args: Pair<String, Any?>): String = stringResource(id).fill(*args)
 
 fun Context.str(@StringRes id: Int, vararg args: Pair<String, Any?>): String = getString(id).fill(*args)
+
+private fun TaskErrorMessage.stringRes(): Int = when (this) {
+    TaskErrorMessage.PostOnlyEndpoint -> R.string.taskErrorPostOnlyEndpoint
+    TaskErrorMessage.PostOnlyResume -> R.string.taskErrorPostOnlyResume
+}
+
+/** 引擎稳定错误文案 → 本地化文本；其余原样返回。 */
+fun Context.localizedTaskError(raw: String): String =
+    TaskErrorMessage.match(raw)?.let { getString(it.stringRes()) } ?: raw
+
+@Composable
+fun localizedTaskError(raw: String): String =
+    TaskErrorMessage.match(raw)?.let { stringResource(it.stringRes()) } ?: raw

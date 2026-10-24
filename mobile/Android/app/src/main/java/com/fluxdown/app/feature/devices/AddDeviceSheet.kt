@@ -2,6 +2,7 @@ package com.fluxdown.app.feature.devices
 
 import android.content.ClipData
 import android.content.ClipboardManager
+import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -119,7 +120,12 @@ private fun AddDeviceSheetImpl(visible: Boolean, onDismiss: () -> Unit) {
     val session = remember(sessionRaw, accountCap) {
         if (accountCap) AgentSessionDto.fromJson(Json.parseOrNull(sessionRaw)) else null
     }
-    val lan = remember(gatewayRaw) { LinkLan.of(Json.parseOrNull(gatewayRaw)?.let { GatewayStatusDto.fromJson(it) }) }
+    // 本机嵌入主机不监听任何端口（虽然它的 hello 仍带 `agent.gateway`）：别人连不上本机，不存在「本机配对码」，
+    // 也没有可前往的「API 服务」设置——按无网关处理，视图只给发起方向的提示。远端主机按 `lanActive` 三态。
+    val hasGateway = gatewayCap && hostRef !is HostRef.Local
+    val lan = remember(gatewayRaw, hasGateway) {
+        if (!hasGateway) LinkLan.Disabled else LinkLan.of(Json.parseOrNull(gatewayRaw)?.let { GatewayStatusDto.fromJson(it) })
+    }
     val requestIds = remember(requestsRaw) {
         LinkPairingRequest.listFromJson(Json.parseOrNull(requestsRaw)).mapTo(HashSet()) { it.sessionId }
     }
@@ -131,9 +137,9 @@ private fun AddDeviceSheetImpl(visible: Boolean, onDismiss: () -> Unit) {
         PairingModel(
             scope = container.appScope,
             api = LinkApi(container.session),
-            onPaired = { name ->
+            onPaired = { paired ->
                 haptics.confirm()
-                overlays.toast(context.str(R.string.localPairingPaired, "device" to name), FluxToastKind.Success, FluxIcons.CircleCheck)
+                overlays.toast(context.str(R.string.localPairingPaired, "device" to paired.name), FluxToastKind.Success, FluxIcons.CircleCheck)
             },
             onFailure = { haptics.reject() },
         )
@@ -149,6 +155,8 @@ private fun AddDeviceSheetImpl(visible: Boolean, onDismiss: () -> Unit) {
     LaunchedEffect(visible) { if (!visible) model.dismissed() }
     LaunchedEffect(requestIds) { if (local) model.onIncomingRequests(requestIds) }
     DisposableEffect(model) { onDispose { model.dismissed() } }
+    // 对本机主机的发现跑在本机进程里：期间持有 MulticastLock（远端主机在它自己的网络上发现，与本机 Wi-Fi 无关）
+    HoldMulticastLock(active = visible && local && hostRef is HostRef.Local)
 
     val step = model.step
     val title = str(R.string.addDeviceEntry)
@@ -168,7 +176,7 @@ private fun AddDeviceSheetImpl(visible: Boolean, onDismiss: () -> Unit) {
         onDismissRequest = onDismiss,
         detent = FluxSheetDetent.Full,
         title = title,
-        header = { FluxSheetHeader(title = title, onClose = onDismiss) },
+        header = { FluxSheetHeader(title = title, subtitle = (hostRef as? HostRef.Remote)?.displayName, onClose = onDismiss) },
         footer = if (local && (step is PairingModel.Step.Check || step is PairingModel.Step.Finishing)) {
             { VerifyFooter(model, step) }
         } else {
@@ -193,6 +201,7 @@ private fun AddDeviceSheetImpl(visible: Boolean, onDismiss: () -> Unit) {
                     model = model,
                     entries = entries,
                     lan = lan,
+                    hasGateway = hasGateway,
                     readOnly = readOnly,
                     canOpenLanSettings = hostRef is HostRef.Remote && gatewayCap,
                     onOpenLanSettings = ::openLanSettings,
@@ -237,13 +246,14 @@ private fun LocalContent(
     model: PairingModel,
     entries: List<LinkRules.DiscoveredEntry>,
     lan: LinkLan,
+    hasGateway: Boolean,
     readOnly: Boolean,
     canOpenLanSettings: Boolean,
     onOpenLanSettings: () -> Unit,
     onClose: () -> Unit,
 ) {
     when (val step = model.step) {
-        PairingModel.Step.Form -> FormContent(model, entries, lan, readOnly, canOpenLanSettings, onOpenLanSettings)
+        PairingModel.Step.Form -> FormContent(model, entries, lan, hasGateway, readOnly, canOpenLanSettings, onOpenLanSettings)
         is PairingModel.Step.Check -> VerifyContent(step.verify, finishing = false, message = model.message)
         is PairingModel.Step.Finishing -> VerifyContent(step.verify, finishing = true, message = model.message)
         is PairingModel.Step.Done -> {
@@ -270,15 +280,20 @@ private fun FormContent(
     model: PairingModel,
     entries: List<LinkRules.DiscoveredEntry>,
     lan: LinkLan,
+    hasGateway: Boolean,
     readOnly: Boolean,
     canOpenLanSettings: Boolean,
     onOpenLanSettings: () -> Unit,
 ) {
     AccountHint(str(R.string.localPairingHint))
     if (readOnly) FluxBanner(str(R.string.localServiceDisconnected), kind = FluxBannerKind.Warn, slim = true)
-    // 本机局域网未生效：仍允许发起，但只能单向（对端无法回连本机）
-    if (lan != LinkLan.Active) FluxBanner(str(R.string.localPairingOneWayHint), kind = FluxBannerKind.Warn, slim = true)
-    OwnCodeSection(model, lan, canOpenLanSettings, onOpenLanSettings)
+    if (hasGateway) {
+        // 本机局域网未生效：仍允许发起，但只能单向（对端无法回连本机）
+        if (lan != LinkLan.Active) FluxBanner(str(R.string.localPairingOneWayHint), kind = FluxBannerKind.Warn, slim = true)
+        OwnCodeSection(model, lan, canOpenLanSettings, onOpenLanSettings)
+    } else {
+        AccountHint(str(R.string.mobileAddDeviceNoGatewayHint))
+    }
     DiscoveredSection(model, entries)
     ManualSection(model, readOnly)
     FluxSectionFoot(str(R.string.mobileAddDeviceForeground))
@@ -494,7 +509,7 @@ private fun ManualSection(model: PairingModel, readOnly: Boolean) {
             hint = str(R.string.localPairingCodeHint),
             mono = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
-            keyboardActions = KeyboardActions(onDone = { model.begin() }),
+            keyboardActions = KeyboardActions(onDone = { if (!readOnly) model.begin() }),
         )
         model.message?.let { AccountErrorLabel(pairingIssueText(it)) }
         FluxButton(
@@ -511,7 +526,14 @@ private fun ManualSection(model: PairingModel, readOnly: Boolean) {
 // ── SAS 核对 ────────────────────────────────────────────────────────────
 
 @Composable
-private fun VerifyContent(verify: PairingModel.Verify, finishing: Boolean, message: PairingIssue?) {
+internal fun VerifyContent(
+    verify: PairingModel.Verify,
+    finishing: Boolean,
+    message: PairingIssue?,
+    @StringRes hintRes: Int = R.string.localPairingSasHint,
+    @StringRes waitingRes: Int = R.string.localPairingWaitingPeer,
+    issueText: @Composable (PairingIssue) -> String = { pairingIssueText(it) },
+) {
     Column(Modifier.fillMaxWidth().padding(vertical = 8.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(16.dp)) {
         FluxText(str(R.string.localPairingSasTitle), style = FluxTheme.type.h1, color = FluxTheme.colors.ink, modifier = Modifier.fillMaxWidth(), maxLines = 2)
         SasDigits(verify.sas)
@@ -525,17 +547,17 @@ private fun VerifyContent(verify: PairingModel.Verify, finishing: Boolean, messa
         if (finishing) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FluxSpinner(size = 18.dp)
-                FluxText(str(R.string.localPairingWaitingPeer), style = FluxTheme.type.sm, color = FluxTheme.colors.inkMuted)
+                FluxText(str(waitingRes), style = FluxTheme.type.sm, color = FluxTheme.colors.inkMuted)
             }
         }
     }
-    AccountHint(str(R.string.localPairingSasHint))
-    message?.let { FluxBanner(pairingIssueText(it), kind = FluxBannerKind.Error, slim = true) }
+    AccountHint(str(hintRes))
+    message?.let { FluxBanner(issueText(it), kind = FluxBannerKind.Error, slim = true) }
 }
 
 /** 核对页底部操作：核对中 = 拒绝 / 确认配对；等待对方确认 = 取消（回到表单并放弃等待）。 */
 @Composable
-private fun VerifyFooter(model: PairingModel, step: PairingModel.Step) {
+internal fun VerifyFooter(model: PairingModel, step: PairingModel.Step) {
     FluxSheetFooter {
         if (step is PairingModel.Step.Finishing) {
             FluxButton(str(R.string.cancel), model::cancelFinishing, variant = ButtonVariant.Secondary, modifier = Modifier.weight(1f))
@@ -544,12 +566,14 @@ private fun VerifyFooter(model: PairingModel, step: PairingModel.Step) {
                 str(R.string.localPairingReject),
                 onClick = { model.finish(accept = false) },
                 variant = ButtonVariant.Danger,
+                enabled = !model.deciding,
                 modifier = Modifier.weight(1f),
             )
             FluxButton(
                 str(R.string.localPairingConfirm),
                 onClick = { model.finish(accept = true) },
                 variant = ButtonVariant.Primary,
+                enabled = !model.deciding,
                 modifier = Modifier.weight(1f),
             )
         }
@@ -565,7 +589,7 @@ internal fun pairingErrorText(error: HostException): String {
 }
 
 @Composable
-private fun pairingIssueText(issue: PairingIssue): String = when (issue) {
+internal fun pairingIssueText(issue: PairingIssue): String = when (issue) {
     is PairingIssue.Input -> str(
         if (issue.error == LinkRules.InputError.AddressMissing) R.string.localPairingHostRequired else R.string.localPairingCodeIncomplete,
     )

@@ -396,6 +396,43 @@ pub(crate) fn confirm_unpair(
     });
 }
 
+/// 按指纹打开直连设备重命名（下载页侧栏入口）；设备已不在名册则不动作。
+pub fn open_link_rename_by_fingerprint(
+    host: &Entity<AccountHost>,
+    fingerprint: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(device) = linked_device(host, fingerprint, cx) {
+        open_link_rename(host, &device, window, cx);
+    }
+}
+
+/// 按指纹打开解除配对确认（下载页侧栏入口）；设备已不在名册则不动作。
+pub fn confirm_unpair_by_fingerprint(
+    host: &Entity<AccountHost>,
+    fingerprint: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(device) = linked_device(host, fingerprint, cx) {
+        confirm_unpair(host, &device, window, cx);
+    }
+}
+
+fn linked_device(
+    host: &Entity<AccountHost>,
+    fingerprint: &str,
+    cx: &App,
+) -> Option<LinkDeviceInfo> {
+    host.read(cx)
+        .controller
+        .linked_devices()
+        .iter()
+        .find(|device| device.fingerprint == fingerprint)
+        .cloned()
+}
+
 // ───────────────────────── 详情 ─────────────────────────
 
 pub(crate) fn open_detail(

@@ -21,11 +21,12 @@ import {
   Trash2,
   Zap,
 } from 'lucide-react'
-import type { QueueDto } from '../../../lib/rpc'
+import type { GroupDto, QueueDto } from '../../../lib/rpc'
 import { runPluginCommand } from '../../plugins/commands'
 import type { PluginCommandRef } from '../../plugins/contributions'
 import type { MenuEntry } from '../../../ui'
 import {
+  canOpenGroupFolder,
   canOpenTaskFile,
   canRedownload,
   canRevealTaskFile,
@@ -41,6 +42,7 @@ import {
   isPluginRetryError,
   moveViewsToQueue,
   openTaskFile,
+  openGroupFolder,
   pauseGroup,
   pauseViews,
   redownloadViews,
@@ -53,8 +55,10 @@ import {
 } from '../model/actions'
 import { remoteCan } from '../model/batchPlan'
 import { canChangeSegments, canChangeUrl, canVerifyIntegrity } from '../model/taskEdit'
+import { canPause, canResumeSeeding } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
-import type { GroupSummary } from '../state'
+import { anyActive, anyResumable } from '../model/groupTree'
+import type { GroupCounts } from '../model/groupTree'
 import { openChangeSegments, openChangeUrl, openGroupDetail, openRename } from '../dialogs'
 
 type Translate = (key: string, params?: Record<string, string | number>) => string
@@ -103,10 +107,10 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
   const only = views.length === 1 ? views[0] : undefined
   const allLocal = views.every((view) => view.source === 'local')
 
-  if (views.some((view) => view.state !== 'completed' && view.state !== 'downloading' && remoteCan(view, 'resume'))) {
+  if (views.some((view) => (view.state !== 'completed' ? view.state !== 'downloading' : canResumeSeeding(view)) && remoteCan(view, 'resume'))) {
     entries.push({ type: 'item', key: 'resume', label: t('resume'), icon: Play, onSelect: () => void resumeViews(views) })
   }
-  if (views.some((view) => (view.state === 'downloading' || view.state === 'pending') && remoteCan(view, 'pause'))) {
+  if (views.some((view) => canPause(view) && remoteCan(view, 'pause'))) {
     entries.push({ type: 'item', key: 'pause', label: t('pause'), icon: Pause, onSelect: () => void pauseViews(views) })
   }
   if (only) {
@@ -120,12 +124,14 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
       })
     }
     if (only.source === 'local') {
+      // 已完成 / 失败的任务不会处于 Boost；残留标记也只显示「优先下载」，点击给出提示。
+      const ended = only.state === 'completed' || only.state === 'failed'
       entries.push({
         type: 'item',
         key: 'boost',
-        label: only.boosted ? t('cancelBoost') : t('boostDownload'),
+        label: only.boosted && !ended ? t('cancelBoost') : t('boostDownload'),
         icon: Zap,
-        onSelect: () => void toggleBoost(only.taskId),
+        onSelect: () => void toggleBoost(only),
       })
     }
   }
@@ -249,36 +255,50 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
   return entries
 }
 
-/** 分组头右键菜单；`groupId` 为空（未分组桶）不显示菜单。 */
+/**
+ * 任务组「文件夹行」右键菜单：用全组成员（不受侧栏筛选 / 搜索影响）判定可用项。
+ * `counts` 为全组计数；`allViews` 在「打开组文件夹」「重试失败项」点击时才取。
+ */
 export function buildGroupMenu(
   t: Translate,
-  groupId: string,
-  summary: GroupSummary | undefined,
-  allViews: readonly DownloadTaskView[],
+  group: GroupDto,
+  name: string,
+  counts: GroupCounts | undefined,
+  allViews: () => readonly DownloadTaskView[],
 ): MenuEntry[] {
-  if (groupId === '') return []
-  const hasFailed = allViews.some((view) => view.source === 'local' && view.groupId === groupId && view.state === 'failed')
-  const name = summary?.name ?? groupId
-  const entries: MenuEntry[] = [
-    { type: 'item', key: 'pause-all', label: t('groupPauseAll'), icon: Pause, onSelect: () => void pauseGroup(groupId) },
-    { type: 'item', key: 'resume-all', label: t('groupResumeAll'), icon: Play, onSelect: () => void resumeGroup(groupId) },
-  ]
-  if (hasFailed) {
+  const groupId = group.groupId
+  const entries: MenuEntry[] = []
+  if (counts !== undefined && anyActive(counts)) {
+    entries.push({ type: 'item', key: 'pause-all', label: t('groupPauseAll'), icon: Pause, onSelect: () => void pauseGroup(groupId) })
+  }
+  if (counts !== undefined && anyResumable(counts)) {
+    entries.push({ type: 'item', key: 'resume-all', label: t('groupResumeAll'), icon: Play, onSelect: () => void resumeGroup(groupId) })
+  }
+  if (counts !== undefined && counts.failed > 0) {
     entries.push({
       type: 'item',
       key: 'retry-failed',
       label: t('groupRetryFailed'),
       icon: RotateCw,
-      onSelect: () => void retryFailedInGroup(allViews, groupId),
+      onSelect: () => void retryFailedInGroup(allViews(), groupId),
     })
   }
-  if (summary && summary.originUrl !== '') {
+  if (canOpenGroupFolder()) {
+    entries.push({
+      type: 'item',
+      key: 'open-folder',
+      label: t('groupOpenFolder'),
+      icon: FolderOpen,
+      onSelect: () => void openGroupFolder(allViews(), groupId, group.saveDir),
+    })
+  }
+  if (group.sourceUrl !== '') {
     entries.push({
       type: 'item',
       key: 'copy-source',
       label: t('groupCopySourceLink'),
       icon: Copy,
-      onSelect: () => copySourceLink(summary.originUrl),
+      onSelect: () => copySourceLink(group.sourceUrl),
     })
   }
   entries.push({ type: 'separator', key: 'sep-delete' })

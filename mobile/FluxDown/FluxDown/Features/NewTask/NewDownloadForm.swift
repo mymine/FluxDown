@@ -100,6 +100,10 @@ final class NewDownloadForm {
     /// 远端保存目录（与 `saveDir` 各自保留，来回切换目标不互相覆盖）；空 = 目标设备默认目录。
     var remoteSaveDir = ""
     let advanced = AdvancedState()
+    /// 「分类」选择器状态（自动 / 不分类 / 固定到某分类）；转移规则见 ``SaveDirCategoryState``。
+    private(set) var categoryState: SaveDirCategoryState
+    /// 第一条链接预测出的分类目录（nil = 未命中）；只用于触发器的「已匹配」文案。
+    private(set) var predictedCategoryDir: String?
 
     @ObservationIgnored private let initialSaveDir: String
     @ObservationIgnored private let initialQueueId: String
@@ -116,6 +120,7 @@ final class NewDownloadForm {
         saveDir = dir
         queueId = queue
         initialSaveDir = dir
+        categoryState = SaveDirCategoryState(initialDir: dir)
         initialQueueId = queue
         threadMode = segments <= 0 ? .auto : (threadPresets.contains(segments) ? .preset : .custom)
         presetThreads = threadPresets.contains(segments) ? segments : 8
@@ -133,6 +138,37 @@ final class NewDownloadForm {
     }
 
     var saveDirValid: Bool { isValidSaveDir(saveDir) }
+
+    /// 分类预测的输入签名（第一条链接的文件名 + 链接）；变化时重新预测并按「自动」规则跟随目录。
+    var categoryPredictionKey: String {
+        guard let first = entries.first else { return "" }
+        return SaveDirCategoryState.predictionName(rename: rename, entryFileName: first.fileName) + "\n" + first.url
+    }
+
+    /// 预测第一条链接命中的分类目录（Rust `route_save_dir`，与建任务时同一套匹配）。
+    private func predictCategoryDir(session: any HostSession) -> String? {
+        guard let first = entries.first else { return nil }
+        let name = SaveDirCategoryState.predictionName(rename: rename, entryFileName: first.fileName)
+        return session.categorySaveDir(fileName: name, url: first.url)
+    }
+
+    /// 预测输入变化（含打开表单）：重算预测并按「自动」规则决定是否改写目录框。
+    func followCategory(session: any HostSession) {
+        let predicted = predictCategoryDir(session: session)
+        predictedCategoryDir = predicted
+        if let dir = categoryState.follow(dir: saveDir, offered: initialSaveDir, predicted: predicted) {
+            saveDir = dir
+        }
+    }
+
+    /// 用户在下拉里选了新模式：目录框立即改写（切回「自动」按当前输入重算）。
+    func selectCategory(_ mode: SaveDirCategoryMode, options: [CustomCategoryDto], session: any HostSession) {
+        let predicted = predictCategoryDir(session: session)
+        predictedCategoryDir = predicted
+        if let dir = categoryState.select(mode, offered: initialSaveDir, options: options, predicted: predicted) {
+            saveDir = dir
+        }
+    }
 
     /// 有未提交内容：关闭前需要确认。
     var isDirty: Bool {
@@ -208,11 +244,13 @@ final class NewDownloadForm {
                 headers: headers,
                 httpUser: authOk ? adv.httpUser.trimmingCharacters(in: .whitespacesAndNewlines) : "",
                 httpPassword: authOk ? adv.httpPassword : "",
-                saveSiteAuth: authOk && adv.saveSiteAuth
+                saveSiteAuth: authOk && adv.saveSiteAuth,
+                offeredSaveDir: categoryState.offeredSaveDir(initial: initialSaveDir)
             )
         }
     }
 
+    #if FULL_FLAVOR
     /// 清单（任务组）的组级选项：沿用表单里的线程 / Cookie / UA / 代理 / 请求头 / TLS 设置。
     func manifestBase(queue: String, manualProxy: String) -> ManifestBaseOptions {
         let adv = advanced
@@ -228,6 +266,7 @@ final class NewDownloadForm {
             ignoreTls: adv.ignoreTls
         )
     }
+    #endif
 
     /// 放弃进行中的清单预解析（用户取消 / 关闭 Sheet）。
     func cancelProbe() {

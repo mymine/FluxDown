@@ -199,6 +199,7 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   bool('dedup_same_url', 'false'),
   oneOf('file_exists_behavior', 'rename', FILE_EXISTS_BEHAVIORS),
   oneOf('file_missing_action', 'keep', FILE_MISSING_ACTIONS),
+  int('completed_record_retention_days', '0', 0, 3650),
   bool('idle_file_scan', 'false'),
   text('global_user_agent'),
   text('default_queue_id'),

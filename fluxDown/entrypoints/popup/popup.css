@@ -58,6 +58,19 @@ body {
 /* ===== 站点栏 / 页签 ===== */
 .pp-site { padding: 8px 12px 0; flex-shrink: 0; max-height: 50%; overflow-y: auto; }
 .pp-tabs { padding: 0 8px; margin-top: 4px; }
+.pp-ps-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 6px 12px 0;
+  padding: 6px 10px;
+  border-radius: var(--fd-radius-sm);
+  background: var(--fd-warning-muted);
+  color: var(--fd-warning);
+  font-size: 12px;
+  flex-shrink: 0;
+}
 
 /* ===== 内容：仅当前页签区域滚动 ===== */
 .pp-content {

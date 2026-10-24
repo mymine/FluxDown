@@ -269,7 +269,7 @@ public struct DispatchTarget: Sendable, Hashable, Identifiable {
             deviceId: record.deviceId,
             name: record.name,
             online: attached.map { DeviceRules.combineOnline(cloudOnline, $0.online) } ?? cloudOnline,
-            defaultSaveDir: record.defaultSaveDir ?? attached?.defaultSaveDir,
+            defaultSaveDir: Self.nonBlank(record.defaultSaveDir) ?? attached?.defaultSaveDir,
             pathStyle: record.effectivePathStyle ?? attached?.effectivePathStyle,
             linkFingerprint: attached?.fingerprint,
             linkOnline: attached?.online
@@ -286,6 +286,11 @@ public struct DispatchTarget: Sendable, Hashable, Identifiable {
             defaultSaveDir: info.defaultSaveDir,
             pathStyle: info.effectivePathStyle
         )
+    }
+
+    private static func nonBlank(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// 选择键：`cloud:<deviceId>` / `link:<fingerprint>`（挂接条目用 `cloud:`；同 GPUI `DispatchTarget::to_pref`）。
@@ -383,9 +388,10 @@ extension DeviceRules {
         return targets
     }
 
-    /// 侧栏「设备」区 / 设备筛选：只列云条目（含挂接）；独立直连条目是一次性投递，没有任务视图。
-    public static func sidebarTargets(_ targets: [DispatchTarget]) -> [DispatchTarget] {
-        targets.filter(\.isCloud)
+    /// 与同账号云设备合并为一条的直连记录指纹（`dispatchTargets` 的实际挂接结果；revoked / 本机 / 不在名册 / 已挂接的都不算）。
+    /// 同 Android `DeviceRules.attachedLinkFingerprints`。
+    public static func attachedLinkFingerprints(cloud: [CloudDevice], link: [LinkDevice]) -> Set<String> {
+        Set(dispatchTargets(cloud: cloud, link: link, cloudPresenceKnown: false, localReady: false).compactMap(\.linkFingerprint))
     }
 
     /// 解析选择 / 持久化 id：`link:<fp>` 已挂接到某云条目时解析为该云条目；找不到返回 nil。

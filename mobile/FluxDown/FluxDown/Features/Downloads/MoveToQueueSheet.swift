@@ -35,7 +35,7 @@ struct MoveToQueueSheet: View {
                                     .accessibilityHidden(true)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(queue.displayName).foregroundStyle(.primary)
-                                    Text(subtitle(queue, count: counts[key] ?? 0))
+                                    Text(subtitle(queue, count: state.tasksLoading ? nil : counts[key] ?? 0))
                                         .font(.footnote)
                                         .foregroundStyle(.secondary)
                                         .monospacedDigit()
@@ -68,8 +68,10 @@ struct MoveToQueueSheet: View {
         .presentationDragIndicator(.visible)
     }
 
-    private func subtitle(_ queue: TaskQueue, count: Int) -> String {
+    private func subtitle(_ queue: TaskQueue, count: Int?) -> String {
         let state = L(queue.isRunning ? "queueRunningBadge" : "queueStoppedBadge")
+        // 任务表分页载入中数量未知：只显示运行状态。
+        guard let count else { return state }
         return state + " · " + L("nTasks", ["n": count])
     }
 

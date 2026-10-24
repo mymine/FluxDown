@@ -118,11 +118,15 @@ describe('应付与价格区', () => {
     expect(payableMinor(plan('y', 9900, { campaign: campaign(4900) }), 1000)).toBe(3900)
   })
   test('价格区：抵扣 > 活动 > 普通', () => {
-    expect(priceDisplay(max, 2000)).toEqual({ payable: 4000, strike: 6000, creditApplied: true, stageLabel: null })
+    expect(priceDisplay(max, 'available', 2000)).toEqual({ payable: 4000, strike: 6000, creditApplied: true, stageLabel: null })
     const promo = plan('y', 9900, { campaign: campaign(4900) })
-    expect(priceDisplay(promo, 0)).toEqual({ payable: 4900, strike: 9900, creditApplied: false, stageLabel: '早鸟' })
-    expect(priceDisplay(promo, 1000)).toEqual({ payable: 3900, strike: 4900, creditApplied: true, stageLabel: null })
-    expect(priceDisplay(max, 0)).toEqual({ payable: 6000, strike: null, creditApplied: false, stageLabel: null })
+    expect(priceDisplay(promo, 'available', 0)).toEqual({ payable: 4900, strike: 9900, creditApplied: false, stageLabel: '早鸟' })
+    expect(priceDisplay(promo, 'available', 1000)).toEqual({ payable: 3900, strike: 4900, creditApplied: true, stageLabel: null })
+    expect(priceDisplay(max, 'available', 0)).toEqual({ payable: 6000, strike: null, creditApplied: false, stageLabel: null })
+    // 当前 / 不可选套餐不套用抵扣：显示原本价格。
+    for (const state of ['current', 'tierBlocked', 'creditBlocked'] as const) {
+      expect(priceDisplay(max, state, 2000)).toEqual({ payable: 6000, strike: null, creditApplied: false, stageLabel: null })
+    }
   })
   test('活动进度与截止日期', () => {
     expect(campaignProgress(plan('y', 9900, { campaign: campaign(4900) }))).toEqual({ sold: 40, quota: 100, ratio: 0.4 })

@@ -106,6 +106,14 @@ flux.rpc.handle("stats", async () => {
 
 flux.rpc.handle("echo", (args) => ({ youSent: args, at: now() }));
 
+// 页面脚本（`page/hello.js`）经 `fluxdown.invoke("pageHello")` 调用；必须显式 `page: true` 才对网页暴露。
+// ctx.caller 为 "page"，ctx.pageUrl 是调用方页面地址（来自网页环境，按不可信输入处理）。
+flux.rpc.handle(
+  "pageHello",
+  (args, ctx) => ({ greeting: "hello from feature-demo", echo: args, caller: ctx && ctx.caller, at: now() }),
+  { page: true },
+);
+
 // ---------------------------------------------------------------------------
 // 视图：演示面板（活动栏）
 // ---------------------------------------------------------------------------

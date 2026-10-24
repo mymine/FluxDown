@@ -19,6 +19,8 @@ public enum TaskStatus: Int32, Sendable, Hashable, CaseIterable {
 
     /// 活跃 = 下载中或准备中（与 `event.rs` 的 `matches!(status, 1 | 5)` 一致）。
     public var isActive: Bool { self == .downloading || self == .preparing }
+    /// 运行时（分段图 / 传输读数）仍有可见用途：完成任务不保留（与 `event.rs` 的 `runtime_retained` 一致）。
+    public var retainsRuntime: Bool { self != .completed }
 }
 
 /// `TaskDto.seedingStatus`（0–8）。
@@ -148,6 +150,36 @@ public struct DownloadTask: Sendable, Hashable, Identifiable {
     public var progress: Double? {
         guard totalBytes > 0 else { return nil }
         return min(max(Double(downloadedBytes) / Double(totalBytes), 0), 1)
+    }
+
+    /// 本机 BT 任务正在做种（含排队等做种槽位）：已完成且 seedingStatus ∈ {1, 8}。可暂停（停止做种）。
+    public var isSeeding: Bool {
+        status == .completed && (seedingStatus == .seeding || seedingStatus == .queuedForSlot)
+    }
+
+    /// 已完成且做种已停止（2...7）、文件仍在 → 可恢复做种。其他已完成任务不可恢复（#935）。
+    public var canResumeSeeding: Bool {
+        guard status == .completed, !fileMissing else { return false }
+        switch seedingStatus {
+        case .ratioReached, .timeReached, .userStopped, .taskDeleted, .sessionReleased, .inactiveStop: return true
+        case .none, .seeding, .queuedForSlot, .unknown: return false
+        }
+    }
+
+    /// 「全部继续」可恢复的做种任务：用户手动停止（4）且文件仍在。
+    public var isUserStoppedSeed: Bool {
+        status == .completed && seedingStatus == .userStopped && !fileMissing
+    }
+}
+
+extension Sequence<DownloadTask> {
+    /// 存在可暂停的做种任务（「全部暂停」可用；纯做种主机不算「全部已暂停」）。
+    public var hasSeeding: Bool { contains { $0.isSeeding } }
+
+    /// 活动条「全部暂停 ↔ 全部恢复」切换：没有运行 / 排队 / 做种，且存在可恢复任务（暂停 / 失败 / 用户停止的做种）。
+    public func isAllPaused(active: Int, pending: Int) -> Bool {
+        guard active == 0, pending == 0, !hasSeeding else { return false }
+        return contains { $0.status == .paused || $0.status == .failed || $0.isUserStoppedSeed }
     }
 }
 

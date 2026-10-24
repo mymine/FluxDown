@@ -253,6 +253,24 @@ export interface CloudReferralValidateResult {
   reason: string | null;
 }
 
+/** 插件市场收藏概览：`counts` 仅含收藏数大于 0 的插件；未登录时 `mine` 为空。 */
+export interface PluginFavoritesDto {
+  counts: Record<string, number>;
+  mine: string[];
+  signedIn: boolean;
+}
+
+export interface PluginFavoriteSetRequest {
+  pluginId: string;
+  favorited: boolean;
+}
+
+export interface PluginFavoriteResultDto {
+  pluginId: string;
+  favorited: boolean;
+  count: number;
+}
+
 // ── 跨设备任务 ──
 
 /** 远端任务状态；未识别的值 Rust 端解析为 `unknown`（不接单、不控制）。 */
@@ -300,6 +318,10 @@ export interface LinkDeviceInfo {
   appVersion?: string;
   /** 对端登录云账号时自报的云设备 id（用于与云设备合并）。 */
   cloudDeviceId?: string;
+  /** 该对端可控制本机（本机批准过其「请求控制」配对）。 */
+  grantsControl?: boolean;
+  /** 本机可控制该对端。 */
+  controllable?: boolean;
   /** 对端已解除配对。 */
   revoked: boolean;
 }
@@ -324,13 +346,19 @@ export interface LinkPairingRequestDto {
   peerPlatform?: string | null;
   /** 双方肉眼核对的短认证串。 */
   sas: string;
+  /** 对端请求「完全控制」本机（批准后其可远程控制本机）；旧版省略。 */
+  requestsControl?: boolean;
   expiresAtUnixMs: number;
+  /** 生成 DTO 时刻的剩余毫秒；旧主机省略。 */
+  ttlMs?: number;
 }
 
 /** 本机当前展示的局域网配对码。 */
 export interface LinkPairingCodeDto {
   code: string;
   expiresAtUnixMs: number;
+  /** 生成 DTO 时刻的剩余毫秒；客户端以收到时刻 + ttlMs 倒计时（免疫时钟偏差），旧主机省略。 */
+  ttlMs?: number;
   /** 空数组 = 网关仅监听 127.0.0.1，需开启局域网访问。 */
   addresses: string[];
   fingerprint: string;
@@ -347,6 +375,10 @@ export interface LinkPairBeginResponse {
 export interface LinkPairFinishResponse {
   paired: boolean;
   device?: LinkDeviceInfo;
+}
+
+export interface LinkControlCredentialDto {
+  token: string;
 }
 
 // ── 网关 / 外壳 / 电源 / 同步 / 偏好 ──
@@ -449,6 +481,24 @@ export interface CustomCategoryDto {
   isBuiltin: boolean;
   builtinType: string | null;
   saveDir: string;
+}
+
+/** 分类目录路由（`CategoryRouteDto`）：外部捕获未指定保存目录时随 `daemon.task.create` 交给 daemon。 */
+export interface CategoryRouteDto {
+  /** 可见普通分类（按 `position`），只保留影响落点的条目。 */
+  rules: CategoryRuleDto[];
+  /** 「其他」分类的目录；缺省 = 不兜底。 */
+  otherDir?: string;
+}
+
+/** `CategoryRouteDto.rules` 的单条普通分类。 */
+export interface CategoryRuleDto {
+  /** `extension` | `regex`。 */
+  matchMode: string;
+  extensions?: string[];
+  regexPattern?: string;
+  /** 缺省 = 不改变落点，只阻止「其他」兜底。 */
+  saveDir?: string;
 }
 
 // ── 外部捕获 ──

@@ -1,8 +1,8 @@
-//! 插件详情对话框：已安装插件与市场条目共用（manifest 级信息 + 权限 + 使用须知）。
+//! 插件详情对话框：已安装插件与市场条目共用（manifest 级信息 + 权限 + 页面脚本 + 使用须知）。
 
 use std::rc::Rc;
 
-use fluxdown_protocol::{MarketEntryDto, PluginDto};
+use fluxdown_protocol::{MarketEntryDto, PluginDto, PluginPageScriptDeclDto};
 use fluxdown_ui_components::{ControlExt as _, dialog_scroll_body, tabular_numbers};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -34,6 +34,8 @@ pub struct PluginDetail {
     /// `standard|elevated|full`；空串按 standard。
     pub risk: String,
     pub network_hosts: Vec<String>,
+    /// 插件声明的页面脚本（标题 + 匹配站点）；市场条目不携带。
+    pub page_scripts: Vec<PluginPageScriptDeclDto>,
 }
 
 impl PluginDetail {
@@ -48,6 +50,7 @@ impl PluginDetail {
             permissions: plugin.permissions.clone(),
             risk: plugin.risk.clone(),
             network_hosts: plugin.network_hosts.clone(),
+            page_scripts: plugin.contributions.page_scripts.clone(),
             ..Self::default()
         }
     }
@@ -72,6 +75,7 @@ impl PluginDetail {
             yanked_label: yanked_label(translator, &entry.yanked),
             risk: crate::market::risk_of(&entry.permissions).to_owned(),
             network_hosts: entry.network_hosts.clone(),
+            page_scripts: Vec::new(),
         }
     }
 }
@@ -121,6 +125,10 @@ pub fn permission_label(translator: &Translator, permission: &str) -> (String, S
         "intercept" => (
             translator.text("pluginPermInterceptName").to_owned(),
             translator.text("pluginPermInterceptDesc").to_owned(),
+        ),
+        "pageScripts" => (
+            translator.text("pluginPermPageScriptsName").to_owned(),
+            translator.text("pluginPermPageScriptsDesc").to_owned(),
         ),
         other => (
             other.to_owned(),
@@ -307,6 +315,11 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
             .child(section_title(text("pluginDetailPermissions")))
             .children(permissions);
     }
+    if !detail.page_scripts.is_empty() {
+        content = content
+            .child(section_title(text("pluginConsentPageScripts")))
+            .children(page_script_rows(&detail.page_scripts, frame));
+    }
     if !detail.network_hosts.is_empty() {
         content = content
             .child(section_title(text("pluginConsentNetworkHosts")))
@@ -320,4 +333,18 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
     content
         .child(section_title(text("pluginDetailUsage")))
         .child(ui::meta_text(text("pluginDetailUsageBody"), frame))
+}
+
+/// 页面脚本行：标题 + 匹配站点（逗号分隔）；详情与授权对话框共用。
+pub fn page_script_rows(scripts: &[PluginPageScriptDeclDto], frame: Frame<'_>) -> Vec<gpui::Div> {
+    scripts
+        .iter()
+        .map(|script| {
+            v_flex()
+                .w_full()
+                .gap(frame.tokens.spacing.xxs)
+                .child(ui::title_text(script.title.clone(), frame))
+                .child(ui::meta_text(script.matches.join(", "), frame))
+        })
+        .collect()
 }

@@ -1,9 +1,9 @@
 {
   "catalog": [
-    { "id": "home", "defaultZone": "railTop", "families": ["rail", "title", "status"] },
+    { "id": "home", "defaultZone": "railTop", "families": ["rail", "title", "status"], "fixed": true },
     { "id": "feed", "defaultZone": "railTop", "families": ["rail", "title", "status"] },
     { "id": "avatar", "defaultZone": "railBottom", "families": ["rail", "title"] },
-    { "id": "gear", "defaultZone": "railBottom", "families": ["rail", "title", "status"] },
+    { "id": "gear", "defaultZone": "railBottom", "families": ["rail", "title", "status"], "fixed": true },
     { "id": "speed", "defaultZone": "statusLeading", "families": ["title", "status"] },
     { "id": "pause", "defaultZone": "statusLeading", "families": ["rail", "title", "status"] },
     { "id": "limit", "defaultZone": "statusTrailing", "families": ["rail", "title", "status"] },
@@ -101,6 +101,44 @@
         "titleLeading": ["home", "feed"],
         "titleTrailing": [],
         "railTop": [],
+        "railBottom": ["avatar", "gear"],
+        "statusLeading": ["speed", "pause"],
+        "statusTrailing": ["limit", "disk"]
+      }
+    },
+    {
+      "name": "hidden keeps known hideable items once in catalog order and drops fixed, unknown and non-string entries",
+      "stored": { "hidden": ["disk", "home", "ghost", 7, "speed", "disk"] },
+      "expected": {
+        "titleLeading": [],
+        "titleTrailing": [],
+        "railTop": ["home", "feed"],
+        "railBottom": ["avatar", "gear"],
+        "statusLeading": ["speed", "pause"],
+        "statusTrailing": ["limit", "disk"],
+        "hidden": ["speed", "disk"]
+      }
+    },
+    {
+      "name": "hidden items keep their placement",
+      "stored": { "titleTrailing": ["limit"], "hidden": ["limit"] },
+      "expected": {
+        "titleLeading": [],
+        "titleTrailing": ["limit"],
+        "railTop": ["home", "feed"],
+        "railBottom": ["avatar", "gear"],
+        "statusLeading": ["speed", "pause"],
+        "statusTrailing": ["disk"],
+        "hidden": ["limit"]
+      }
+    },
+    {
+      "name": "a non-array hidden value is ignored and an empty hidden list is omitted",
+      "stored": { "hidden": "speed" },
+      "expected": {
+        "titleLeading": [],
+        "titleTrailing": [],
+        "railTop": ["home", "feed"],
         "railBottom": ["avatar", "gear"],
         "statusLeading": ["speed", "pause"],
         "statusTrailing": ["limit", "disk"]
@@ -224,6 +262,95 @@
       "name": "appending the last item of a zone to the same zone changes nothing",
       "stored": null,
       "move": { "id": "feed", "zone": "railTop", "target": null },
+      "changed": false,
+      "expected": {
+        "titleLeading": [],
+        "titleTrailing": [],
+        "railTop": ["home", "feed"],
+        "railBottom": ["avatar", "gear"],
+        "statusLeading": ["speed", "pause"],
+        "statusTrailing": ["limit", "disk"]
+      }
+    },
+    {
+      "name": "moving a hidden item keeps it hidden",
+      "stored": { "hidden": ["pause"] },
+      "move": { "id": "pause", "zone": "titleLeading", "target": null },
+      "changed": true,
+      "expected": {
+        "titleLeading": ["pause"],
+        "titleTrailing": [],
+        "railTop": ["home", "feed"],
+        "railBottom": ["avatar", "gear"],
+        "statusLeading": ["speed"],
+        "statusTrailing": ["limit", "disk"],
+        "hidden": ["pause"]
+      }
+    }
+  ],
+  "visibility": [
+    {
+      "name": "hiding inserts in catalog order",
+      "stored": { "hidden": ["disk"] },
+      "set": { "id": "feed", "hidden": true },
+      "changed": true,
+      "expected": {
+        "titleLeading": [],
+        "titleTrailing": [],
+        "railTop": ["home", "feed"],
+        "railBottom": ["avatar", "gear"],
+        "statusLeading": ["speed", "pause"],
+        "statusTrailing": ["limit", "disk"],
+        "hidden": ["feed", "disk"]
+      }
+    },
+    {
+      "name": "showing the last hidden item omits the hidden list",
+      "stored": { "hidden": ["disk"] },
+      "set": { "id": "disk", "hidden": false },
+      "changed": true,
+      "expected": {
+        "titleLeading": [],
+        "titleTrailing": [],
+        "railTop": ["home", "feed"],
+        "railBottom": ["avatar", "gear"],
+        "statusLeading": ["speed", "pause"],
+        "statusTrailing": ["limit", "disk"]
+      }
+    },
+    {
+      "name": "fixed items cannot be hidden",
+      "stored": null,
+      "set": { "id": "gear", "hidden": true },
+      "changed": false,
+      "expected": {
+        "titleLeading": [],
+        "titleTrailing": [],
+        "railTop": ["home", "feed"],
+        "railBottom": ["avatar", "gear"],
+        "statusLeading": ["speed", "pause"],
+        "statusTrailing": ["limit", "disk"]
+      }
+    },
+    {
+      "name": "hiding an already hidden item changes nothing",
+      "stored": { "hidden": ["speed"] },
+      "set": { "id": "speed", "hidden": true },
+      "changed": false,
+      "expected": {
+        "titleLeading": [],
+        "titleTrailing": [],
+        "railTop": ["home", "feed"],
+        "railBottom": ["avatar", "gear"],
+        "statusLeading": ["speed", "pause"],
+        "statusTrailing": ["limit", "disk"],
+        "hidden": ["speed"]
+      }
+    },
+    {
+      "name": "unknown items cannot be hidden",
+      "stored": null,
+      "set": { "id": "ghost", "hidden": true },
       "changed": false,
       "expected": {
         "titleLeading": [],

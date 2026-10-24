@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { CHROME_LAYOUT_KEY, getChromeLayout, moveChromeItem, resetChromeLayout } from './chromeStore'
+import { CHROME_LAYOUT_KEY, getChromeLayout, moveChromeItem, resetChromeLayout, setChromeItemHidden } from './chromeStore'
 
 class MemoryStorage {
   private readonly data = new Map<string, string>()
@@ -18,7 +18,7 @@ class MemoryStorage {
 const local = new MemoryStorage()
 Object.assign(globalThis, { localStorage: local })
 
-const stored = () => JSON.parse(local.getItem(CHROME_LAYOUT_KEY) ?? 'null') as Record<string, string[]>
+const stored = () => JSON.parse(local.getItem(CHROME_LAYOUT_KEY) ?? 'null') as Record<string, string[] | undefined>
 
 describe('chromeStore', () => {
   test('默认布局复现改造前的结构', () => {
@@ -43,5 +43,28 @@ describe('chromeStore', () => {
     resetChromeLayout()
     expect(stored().titleTrailing).toEqual([])
     expect(stored().statusTrailing).toEqual(['downloadLimit', 'uploadLimit', 'proxy', 'diskFree'])
+  })
+
+  test('隐藏 / 显示立即持久化，hidden 仅在非空时写入；位置不变，移动保留隐藏', () => {
+    expect(stored().hidden).toBeUndefined()
+    expect(setChromeItemHidden('rss', true)).toBe(true)
+    expect(setChromeItemHidden('rss', true)).toBe(false)
+    expect(stored().hidden).toEqual(['rss'])
+    expect(stored().railTop).toEqual(['downloads', 'rss', 'webhooks'])
+    expect(moveChromeItem('rss', 'titleLeading', null)).toBe(true)
+    expect(stored().hidden).toEqual(['rss'])
+    expect(setChromeItemHidden('rss', false)).toBe(true)
+    expect(stored().hidden).toBeUndefined()
+  })
+
+  test('固定条目与未知条目不能隐藏；重置清除隐藏', () => {
+    expect(setChromeItemHidden('downloads', true)).toBe(false)
+    expect(setChromeItemHidden('settings', true)).toBe(false)
+    expect(setChromeItemHidden('ghost', true)).toBe(false)
+    expect(setChromeItemHidden('proxy', true)).toBe(true)
+    expect(getChromeLayout().hidden).toEqual(['proxy'])
+    resetChromeLayout()
+    expect(getChromeLayout().hidden).toEqual([])
+    expect(stored().hidden).toBeUndefined()
   })
 })

@@ -573,6 +573,8 @@ object AccountRules {
         "cloudUnreachable" -> if (context == AccountErrorContext.Sync) "cloudSyncErrorNetwork" else "accountErrorNetwork"
         "pairingCodeInvalid" -> "errReasonPairingCodeInvalid"
         "pairingSessionExpired" -> "errReasonPairingSessionExpired"
+        "pairingTimeout" -> "errReasonPairingTimeout"
+        "peerClockSkew" -> "errReasonPeerClockSkew"
         "pairingPeerUnreachable" -> "errReasonPairingPeerUnreachable"
         "pairingNotFluxDown" -> "errReasonPairingNotFluxDown"
         "pairingThrottled" -> "errReasonPairingThrottled"
@@ -611,10 +613,8 @@ object AccountRules {
                 else -> if (network) return "accountErrorNetwork"
             }
             AccountErrorContext.Sync -> if (network) return "cloudSyncErrorNetwork"
-            AccountErrorContext.Pairing -> when (error.code) {
-                HostErrorCode.InvalidArgument -> return "localPairingAddressInvalid"
-                else -> if (network) return "errReasonPairingPeerUnreachable"
-            }
+            // 不带 reason 的 Unavailable 是本机服务 / 连接断开，不是「无法连接对端地址」（对端不可达由 reason pairingPeerUnreachable 表达）。
+            AccountErrorContext.Pairing -> if (error.code == HostErrorCode.InvalidArgument) return "localPairingAddressInvalid"
             AccountErrorContext.General -> Unit
         }
         return genericKey(error.code)

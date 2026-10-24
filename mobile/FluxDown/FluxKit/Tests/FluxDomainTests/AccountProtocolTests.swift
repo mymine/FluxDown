@@ -178,7 +178,11 @@ struct AccountProtocolTests {
         #expect(AccountRules.errorKey(HostError(.unsupported), context: .register) == "accountErrorRegistrationClosed")
         #expect(AccountRules.errorKey(HostError(.unavailable, retryable: true), context: .login) == "accountErrorNetwork")
         #expect(AccountRules.errorKey(HostError(.unavailable, retryable: true), context: .sync) == "cloudSyncErrorNetwork")
-        #expect(AccountRules.errorKey(HostError(.unavailable, retryable: true), context: .pairing) == "errReasonPairingPeerUnreachable")
+        // 不带 reason 的 unavailable：本机服务问题，不显示「无法连接对端地址」。
+        #expect(AccountRules.errorKey(HostError(.unavailable, retryable: true), context: .pairing) == "localServiceDisconnected")
+        #expect(AccountRules.errorKey(HostError(.unavailable, reason: "pairingPeerUnreachable"), context: .pairing) == "errReasonPairingPeerUnreachable")
+        #expect(AccountRules.errorKey(HostError(.timeout, reason: "pairingTimeout"), context: .pairing) == "errReasonPairingTimeout")
+        #expect(AccountRules.errorKey(HostError(.unauthorized, reason: "peerClockSkew"), context: .pairing) == "errReasonPeerClockSkew")
         #expect(AccountRules.errorKey(HostError(.invalidArgument), context: .pairing) == "localPairingAddressInvalid")
         #expect(AccountRules.errorKey(HostError(.timeout)) == "localServiceDisconnected")
         #expect(AccountRules.errorKey(HostError(.conflict)) == "localServiceConflict")

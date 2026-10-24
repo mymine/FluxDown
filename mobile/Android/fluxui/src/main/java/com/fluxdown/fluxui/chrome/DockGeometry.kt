@@ -2,17 +2,20 @@ package com.fluxdown.fluxui.chrome
 
 import kotlin.math.roundToInt
 
-internal fun dockWidth(available: Int, reservedEnd: Int, height: Int, mini: Float): Int {
-    val collapsed = height.coerceAtMost(available)
-    val expanded = (available - reservedEnd).coerceIn(collapsed, available)
-    val progress = mini.coerceIn(0f, 1f)
-    return (expanded * (1.0 - progress) + collapsed * progress).roundToInt()
+/** 坞本体宽：容器宽 − 右侧预留（新建球 + 间距），不小于坞高（极窄容器时取容器宽）。 */
+internal fun dockWidth(available: Int, reservedEnd: Int, height: Int): Int {
+    val floor = height.coerceAtMost(available)
+    return (available - reservedEnd).coerceIn(floor, available)
 }
 
-internal fun dockLabelFits(innerWidth: Int, itemSize: Int, preferredWidths: IntArray, index: Int, labelHeight: Int): Boolean =
-    labelHeight <= itemSize && preferredWidths[index] <= innerWidth - itemSize * (preferredWidths.size - 1)
+/**
+ * 标签是否能整体排在图标下方：最高的标签 + 图标 + 间距不超过项高。
+ * 任一标签放不下（大字体）时整坞改为仅图标，避免各项高低不一。
+ */
+internal fun dockLabelsFit(itemHeight: Int, iconSize: Int, gap: Int, labelHeights: IntArray): Boolean =
+    labelHeights.all { iconSize + gap + it <= itemHeight }
 
-/** Pixel bounds shared by tab placement and the indicator; all coordinates are inner-dock relative. */
+/** 各项等分内宽；指示器按选中权重在实际项边界间插值。所有坐标相对坞内边距。 */
 internal class DockGeometry(itemCount: Int) {
     val starts = IntArray(itemCount)
     val widths = IntArray(itemCount)
@@ -28,53 +31,24 @@ internal class DockGeometry(itemCount: Int) {
     fun indicatorLeft(rtl: Boolean): Int =
         if (rtl) innerWidth - indicatorStart - indicatorWidth else indicatorStart
 
-    fun update(
-        innerWidth: Int,
-        expandedInnerWidth: Int,
-        minimumItemWidth: Int,
-        preferredWidths: IntArray,
-        selection: FloatArray,
-        selected: Int,
-        iconOnly: Boolean,
-        mini: Float,
-    ) {
+    fun update(innerWidth: Int, selection: FloatArray, selected: Int) {
         this.innerWidth = innerWidth
         val count = widths.size
-        val collapse = mini.coerceIn(0f, 1f).toDouble()
-        var weightSum = 0.0
-        for (value in selection) weightSum += value.coerceIn(0f, 1f)
-        val interpolatedWidth = expandedInnerWidth * (1.0 - collapse) + minimumItemWidth * collapse
-        var cumulative = 0.0
         var cursor = 0
         for (i in 0 until count) {
-            var expanded = 0.0
-            for (j in 0 until count) {
-                val weight = if (weightSum > 0.0) selection[j].coerceIn(0f, 1f) / weightSum
-                    else if (j == selected) 1.0 else 0.0
-                val selectedWidth = if (iconOnly || count == 1) expandedInnerWidth.toDouble() / count
-                    else preferredWidths[j].coerceIn(
-                        minimumItemWidth.coerceAtMost(expandedInnerWidth / count),
-                        (expandedInnerWidth - minimumItemWidth * (count - 1)).coerceAtLeast(expandedInnerWidth / count),
-                    ).toDouble()
-                val width = if (i == j || count == 1) selectedWidth
-                    else (expandedInnerWidth - selectedWidth) / (count - 1)
-                expanded += width * weight
-            }
-            val collapsed = if (i == selected) minimumItemWidth.toDouble() else 0.0
-            val width = expanded * (1.0 - collapse) + collapsed * collapse
-            cumulative += if (interpolatedWidth > 0.0) width * innerWidth / interpolatedWidth else 0.0
-            // Round cumulative edges rather than each width: even fractional densities leave no tail pixel.
-            val end = if (i == count - 1) innerWidth else cumulative.roundToInt().coerceIn(cursor, innerWidth)
+            // 取整累计边界而非逐项宽度：小数密度下也不会留尾像素。
+            val end = if (i == count - 1) innerWidth else ((i + 1).toDouble() * innerWidth / count).roundToInt().coerceIn(cursor, innerWidth)
             starts[i] = cursor
             widths[i] = end - cursor
             cursor = end
         }
+        var weightSum = 0.0
+        for (value in selection) weightSum += value.coerceIn(0f, 1f)
         var indicatorLeft = 0.0
         var indicatorRight = 0.0
         for (i in 0 until count) {
-            val selectionWeight = if (weightSum > 0.0) selection[i].coerceIn(0f, 1f) / weightSum
+            val weight = if (weightSum > 0.0) selection[i].coerceIn(0f, 1f) / weightSum
                 else if (i == selected) 1.0 else 0.0
-            val weight = selectionWeight * (1.0 - collapse) + if (i == selected) collapse else 0.0
             indicatorLeft += starts[i] * weight
             indicatorRight += (starts[i] + widths[i]) * weight
         }

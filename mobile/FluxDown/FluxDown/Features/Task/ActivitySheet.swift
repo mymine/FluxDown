@@ -64,7 +64,7 @@ struct ActivitySheet: View {
                 }
             }
             .toolbar {
-                controls(running: state.stats.activeTasks + state.stats.pendingTasks > 0, readOnly: readOnly)
+                controls(running: state.stats.activeTasks + state.stats.pendingTasks > 0 || state.tasks.hasSeeding, readOnly: readOnly)
             }
         }
         .presentationDetents(typeSize.isAccessibilitySize ? [.large] : [Self.mediumDetent, .large])

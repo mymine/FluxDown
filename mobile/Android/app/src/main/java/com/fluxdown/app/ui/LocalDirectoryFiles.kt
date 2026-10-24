@@ -103,6 +103,20 @@ internal fun prepareLocalDirectory(path: String): String {
     }
 }
 
+/**
+ * Prepares every distinct non-blank directory in [paths] (see [prepareLocalDirectory]) so folders exist before
+ * any download lands there; returns the paths that could not be created or written, in input order.
+ */
+internal fun prepareLocalDirectories(paths: List<String>): List<String> =
+    paths.map { it.trim() }.filter { it.isNotEmpty() }.distinct().filter { path ->
+        try {
+            prepareLocalDirectory(path)
+            false
+        } catch (_: IOException) {
+            true
+        }
+    }
+
 /** Path components, rather than string prefixes, define shared-storage membership. */
 internal fun isPathInStorageRoot(path: String, root: File): Boolean {
     val directory = File(path)

@@ -21,7 +21,7 @@ description: >-
 
 ## 0. 授权边界
 
-用户调用本 skill 处理某个 PR，即对**该 PR** 授权以下动作，无需再逐项征询（`AGENTS.md` §6 按动作计授权，此处一次性列明）：
+用户调用本 skill 处理某个 PR，即对**该 PR** 授权以下动作，无需再逐项征询（`.omp/RULES.md` 按动作计授权，此处一次性列明）：
 
 - 在 `.worktrees/pr-<N>` 内 commit；经 `$S push` 快进推回 PR head 分支。
 - 在 PR 下发评论 / review（approve、request changes）；方向错误时关闭 PR。
@@ -72,7 +72,7 @@ Rust 构建复用主目录 target 免全量编译：worktree 内每条 cargo 命
 
 ### 完整性
 - 测试：新行为、边界、回归有测试且能抓住真实 bug；无测源码文本 / mock 回显 / 只测不 panic 的伪测试。
-- 镜像契约（`AGENTS.md` §5）逐项核对：改了一侧没改另一侧即不完整（RSS filter 三份、排序/来源构成 Web 镜像、webhook 事件名、protocol ↔ `web/src/lib/rpc/protocol`、UniFFI DTO ↔ Kotlin/Swift 等）。
+- 镜像契约（`AGENTS.md` §5 索引的 `.omp/rules/mirror-*.md`，按改动文件命中各规则 `globs` 逐条核对）：改了一侧没改另一侧即不完整（RSS filter、排序/来源构成 Web 镜像、webhook 事件名、protocol ↔ `web/src/lib/rpc/protocol`、UniFFI DTO ↔ Kotlin/Swift 等）。
 - i18n：新增文案 en + zh 基线对齐（`assets/i18n/{en,zh}.json`），无硬编码文案；社区语言不碰。
 - API 改动重生成 `website-v2/public/openapi.json`；架构/契约变化同步 `.omp/knowledge/*`。
 - lint 红线：非测试 `unwrap`/`expect`、静默忽错、`todo!`、通配 import、新增 `unsafe`（`rule://no-unsafe-in-rust`）、用 `allow` 消音。
@@ -96,7 +96,7 @@ flowchart TD
 
 |级别|判定（满足任一）|处置|
 |---|---|---|
-|**拒绝**（方向）|违反产品决策/红线：恢复已退役的 Flutter/hub 工程、改动冻结的 `native/server`、新增遥测点或采集下载信息、下载页侧栏独立「分类」分区、与既有功能重复、不该进本项目的范围；架构方向错（绕过 `fluxdown_engine`/protocol 边界、在 UI 里实现引擎逻辑）；可疑/恶意代码|`gh pr comment <N> --body-file -` 说明原因与可接受的替代方向，再 `gh pr close <N>`|
+|**拒绝**（方向）|违反产品决策/红线：恢复已退役的 Flutter/hub 工程或已移除的旧 headless 宿主 `native/server`、新增遥测点或采集下载信息、下载页侧栏独立「分类」分区、与既有功能重复、不该进本项目的范围；架构方向错（绕过 `fluxdown_engine`/protocol 边界、在 UI 里实现引擎逻辑）；可疑/恶意代码|`gh pr comment <N> --body-file -` 说明原因与可接受的替代方向，再 `gh pr close <N>`|
 |**退回**（实现）|核心逻辑错误、需重写主体、有多种修法需作者取舍、需作者补信息（复现、平台实测）、安全问题要重设计、夹带无关改动需拆分、修复量超直修阈值|`gh pr review <N> --request-changes --body-file -`，不代修，结束 review|
 |**直修**|PR 方向与主体实现确认正确，问题属机械性或局部：fmt/clippy、与 main 的冲突、缺几条测试、i18n 漏 zh/en、镜像契约漏同步、openapi 未重生成、局部边界 bug、`{e:#}`、`unwrap→?`、漏 `no_console_window`、调试残留、文档坐标|自己修，推回 PR 分支，合并|
 |**建议**（nit）|风格偏好、可选优化，不影响正确性|写进评论，不阻塞合并、不代改|
@@ -118,7 +118,7 @@ flowchart TD
 
 |改动路径|命令（cwd = worktree）|
 |---|---|
-|任何 Rust|`cargo fmt --check && cargo clippy --workspace --exclude fluxdown_server --all-targets -- -D warnings`|
+|任何 Rust|`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings`|
 |`native/engine`|`cargo nextest run -p fluxdown_engine <filter>`；插件相关加 `--features plugins,components`|
 |`native/{api,protocol,daemon,engine_protocol,link,logfile,cli}`|`cargo nextest run -p <crate>`；API 改动跑 `gen_openapi` 后确认无漂移|
 |`native/agent` / `native/mobile` / `crates/*`|`cargo nextest run -p <crate>`|

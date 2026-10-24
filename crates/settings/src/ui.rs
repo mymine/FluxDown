@@ -3,6 +3,7 @@
 //! 视觉规则与全客户端一致（见 `fluxdown_ui_components::kit`）：
 //! - 分组卡片 = surface + hairline 描边 + `radius.lg`，行间 hairline 分隔，不加阴影；
 //! - 组标题 caption MEDIUM + 三级文字色；行标题 `typography.sm`，说明 `typography.xs` 二级文字色；
+//!   说明只占一行，超出时截断，完整内容收进标题旁信息图标的悬浮提示；
 //! - 右侧控件一律统一档 [`fluxdown_ui_theme::CONTROL_HEIGHT`]（28）：按钮 / 输入走 `ControlExt::control`，下拉为
 //!   outline + caret，数字输入同高；横排行最小行高 = `density.control` + [`ROW_MIN_PADDING`]；
 //!   宽度只用 [`INPUT_WIDTH`] / [`INPUT_WIDE_WIDTH`] / [`NUMBER_WIDTH`] / [`DROPDOWN_MIN_WIDTH`] 四档（均为 100% 基准值，经 `text_extent` 随字号缩放；数字旁的单位下拉用
@@ -14,13 +15,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use fluxdown_ui_components::{
-    ButtonVariant, ControlExt as _, FluxIcon, card, dialog_scroll_body, dialog_title,
+    ButtonVariant, ControlExt as _, FluxIcon, card, dialog_scroll_body, dialog_title, tooltip_view,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, Div, ElementId, FontWeight, InteractiveElement as _,
     IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Window, div, prelude::FluentBuilder as _, px,
+    Window, canvas, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable as _, Icon, WindowExt as _,
@@ -29,14 +30,13 @@ use gpui_component::{
     input::{Input, InputEvent, InputState, NumberInput, NumberInputEvent, StepAction},
     menu::{DropdownMenu as _, PopupMenuItem},
     switch::Switch,
-    tooltip::Tooltip,
     v_flex,
 };
 
 /// 行内文本输入框宽度档位。
 pub(crate) const INPUT_WIDTH: f32 = 240.;
-/// 行内数字输入框宽度档位。
-pub(crate) const NUMBER_WIDTH: f32 = 132.;
+/// 行内数字输入框宽度档位：与下拉最小宽同档，同页数字与下拉右侧对齐、宽度一致。
+pub(crate) const NUMBER_WIDTH: f32 = DROPDOWN_MIN_WIDTH;
 /// 行内下拉按钮的最小宽度档位（文案更长时自然撑开）。
 pub(crate) const DROPDOWN_MIN_WIDTH: f32 = 160.;
 /// 数字输入旁单位下拉（KB/s、MB/s…）的固定宽度。
@@ -377,7 +377,7 @@ fn open_explain_dialog(explain: Explain, window: &mut Window, cx: &mut App) {
 pub(crate) struct SettingsRow {
     pub(crate) title: SharedString,
     pub(crate) description: Option<SharedString>,
-    /// 标题旁的信息图标；悬浮显示完整说明（描述过长时的补充展开）。
+    /// 补充说明；与超出一行的描述一起收进标题旁信息图标的悬浮提示。
     help: Option<SharedString>,
     /// 标题旁的「?」入口；点击打开完整说明对话框。
     explain: Option<Explain>,
@@ -462,7 +462,7 @@ impl SettingsRow {
         self
     }
 
-    /// 标题旁附加一个信息图标；悬浮显示 `text`（描述过长时用于展开完整说明）。
+    /// 补充说明：标题旁显示信息图标，悬浮提示展示（与超出一行的描述合并）。
     #[must_use]
     pub(crate) fn help(mut self, text: impl Into<SharedString>) -> Self {
         self.help = Some(text.into());
@@ -555,6 +555,23 @@ impl SettingsRow {
             .control
             .clone()
             .map(|control| render_control(&control, disabled, &key, self.vertical, window, cx));
+        // 描述只占一行：超出时截断，完整内容收进标题旁信息图标的悬浮提示。
+        // 是否超出由描述容器 prepaint 时实测（取决于窗口宽度与控件宽度），只在变化时回写。
+        let overflow = self.description.as_ref().map(|_| {
+            window.use_keyed_state(
+                ElementId::from(SharedString::from(format!("{key}-desc-overflow"))),
+                cx,
+                |_, _| false,
+            )
+        });
+        let overflows = overflow.as_ref().is_some_and(|state| *state.read(cx));
+        let details: Vec<SharedString> = self
+            .description
+            .clone()
+            .filter(|_| overflows)
+            .into_iter()
+            .chain(self.help.clone())
+            .collect();
         let label = v_flex()
             .gap(tokens.spacing.xxs)
             .min_w_0()
@@ -564,14 +581,21 @@ impl SettingsRow {
                     .items_center()
                     .gap(tokens.spacing.xs)
                     .child(body_text(cx).child(self.title.clone()));
-                if let Some(help) = self.help.clone() {
+                if !details.is_empty() {
+                    let text = SharedString::from(
+                        details
+                            .iter()
+                            .map(SharedString::as_ref)
+                            .collect::<Vec<_>>()
+                            .join("\n\n"),
+                    );
                     title_row = title_row.child(
                         div()
-                            .id(ElementId::from(SharedString::from(format!("{key}-help"))))
+                            .id(ElementId::from(SharedString::from(format!("{key}-info"))))
                             .flex()
+                            .flex_none()
                             .items_center()
-                            .cursor_pointer()
-                            .tooltip(move |window, cx| Tooltip::new(help.clone()).build(window, cx))
+                            .tooltip(move |window, cx| tooltip_view(text.clone(), window, cx))
                             .child(
                                 Icon::new(FluxIcon::Info)
                                     .size(extended.icon.sm)
@@ -604,7 +628,7 @@ impl SettingsRow {
                                     .border_color(tokens.colors.foreground)
                                     .text_color(tokens.colors.foreground)
                             })
-                            .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+                            .tooltip(move |window, cx| tooltip_view(hint.clone(), window, cx))
                             .on_click(move |_, window, cx| {
                                 open_explain_dialog(explain.clone(), window, cx);
                             })
@@ -613,9 +637,37 @@ impl SettingsRow {
                 }
                 title_row
             })
-            .when_some(self.description.clone(), |this, description| {
-                this.child(meta_text(cx).child(description))
-            });
+            .when_some(
+                self.description.clone().zip(overflow),
+                |this, (description, state)| {
+                    this.child(
+                        meta_text(cx)
+                            .relative()
+                            .truncate()
+                            .child(description.clone())
+                            .child(
+                                canvas(
+                                    move |bounds, window, cx| {
+                                        let overflow = description_overflows(
+                                            &description,
+                                            bounds.size.width,
+                                            window,
+                                        );
+                                        if *state.read(cx) != overflow {
+                                            state.update(cx, |value, cx| {
+                                                *value = overflow;
+                                                cx.notify();
+                                            });
+                                        }
+                                    },
+                                    |_, (), _, _| {},
+                                )
+                                .absolute()
+                                .size_full(),
+                            ),
+                    )
+                },
+            );
 
         let footer = self
             .footer
@@ -647,6 +699,24 @@ impl SettingsRow {
         }
         row
     }
+}
+
+/// 描述按当前文字样式排成单行时是否超出 `available`（含换行符一律视为超出）。
+fn description_overflows(
+    description: &SharedString,
+    available: gpui::Pixels,
+    window: &Window,
+) -> bool {
+    if description.contains('\n') {
+        return true;
+    }
+    let style = window.text_style();
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let run = style.to_run(description.len());
+    let line = window
+        .text_system()
+        .shape_line(description.clone(), font_size, &[run], None);
+    line.width > available
 }
 
 fn render_control(

@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use fluxdown_protocol::method::SYSTEM_SNAPSHOT;
-use fluxdown_protocol::{RpcRequest, ServiceHello, ServiceRole};
+use fluxdown_protocol::method::{SYSTEM_SNAPSHOT, SYSTEM_TASK_PAGE};
+use fluxdown_protocol::{RpcRequest, ServiceHello, ServiceRole, TablePage, TableSection};
 use serde_json::{Value, json};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -18,7 +18,7 @@ use crate::error::FluxError;
 use crate::link::{
     Caller, CloseInfo, ConnectFailure, Connector, Established, EventSource, LinkEvent,
 };
-use crate::projection::fixtures::{daemon_frame, snapshot, task};
+use crate::projection::fixtures::{EPOCH, daemon_frame, header, snapshot, task};
 use crate::session::{HostSession, open_session};
 
 /// 记录命令并按方法名返回预置应答的调用端。
@@ -28,6 +28,9 @@ pub(crate) struct Recorder {
     replies: Mutex<HashMap<String, Result<Value, FluxError>>>,
     snapshot_calls: AtomicUsize,
     snapshot_replies: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<Result<Value, FluxError>>>>,
+    /// `system.taskPage` 的脚本化应答（按调用顺序消费）与收到的请求参数。
+    page_replies: tokio::sync::Mutex<Option<mpsc::UnboundedReceiver<Result<Value, FluxError>>>>,
+    page_requests: Mutex<Vec<Value>>,
 }
 
 impl Recorder {
@@ -38,7 +41,15 @@ impl Recorder {
             .insert(method.to_owned(), reply);
     }
 
-    /// 除 `system.snapshot` 外按序记录的 `(method, params)`。
+    /// 收到的 `system.taskPage` 请求参数（按序）。
+    pub(crate) fn page_requests(&self) -> Vec<Value> {
+        self.page_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 除 `system.snapshot` / `system.taskPage` 外按序记录的 `(method, params)`。
     pub(crate) fn calls(&self) -> Vec<(String, Value)> {
         self.calls
             .lock()
@@ -56,6 +67,21 @@ struct MockCaller(Arc<Recorder>);
 #[async_trait]
 impl Caller for MockCaller {
     async fn call(&self, method: &str, params: Option<Value>) -> Result<Value, FluxError> {
+        if method == SYSTEM_TASK_PAGE {
+            self.0
+                .page_requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(params.unwrap_or(Value::Null));
+            let mut replies = self.0.page_replies.lock().await;
+            return match replies.as_mut() {
+                Some(receiver) => receiver
+                    .recv()
+                    .await
+                    .unwrap_or_else(|| Err(FluxError::transport("page script ended"))),
+                None => Err(FluxError::transport("no page script")),
+            };
+        }
         if method == SYSTEM_SNAPSHOT {
             self.0.snapshot_calls.fetch_add(1, Ordering::SeqCst);
             let mut replies = self.0.snapshot_replies.lock().await;
@@ -98,6 +124,7 @@ impl EventSource for MockEvents {
 pub(crate) struct LinkHandle {
     pub events: mpsc::UnboundedSender<LinkEvent>,
     pub snapshots: mpsc::UnboundedSender<Result<Value, FluxError>>,
+    pub pages: mpsc::UnboundedSender<Result<Value, FluxError>>,
     pub recorder: Arc<Recorder>,
 }
 
@@ -112,6 +139,46 @@ impl LinkHandle {
         let tasks = task_ids.iter().map(|id| task(id, 1)).collect();
         let value = serde_json::to_value(snapshot(sequence, tasks)).expect("snapshot json");
         self.snapshots.send(Ok(value)).expect("driver alive");
+    }
+
+    /// 快照头：任务表 / 队列位置表尚未载入（`taskTotal` / `queueTotal`），表经 `system.taskPage` 拉取。
+    pub(crate) fn send_header(&self, sequence: u64, task_total: u64, queue_total: Option<u64>) {
+        let value =
+            serde_json::to_value(header(sequence, task_total, queue_total)).expect("header json");
+        self.snapshots.send(Ok(value)).expect("driver alive");
+    }
+
+    /// 下一次 `system.taskPage` 的应答：任务页。
+    pub(crate) fn send_task_page(&self, total: u64, task_ids: &[&str], next_cursor: Option<&str>) {
+        let page = TablePage {
+            epoch: EPOCH.to_owned(),
+            sequence: 0,
+            section: TableSection::Tasks,
+            total,
+            tasks: task_ids.iter().map(|id| task(id, 1)).collect(),
+            queue: Vec::new(),
+            next_cursor: next_cursor.map(str::to_owned),
+        };
+        self.send_page_value(&page);
+    }
+
+    /// 下一次 `system.taskPage` 的应答：任意 epoch 的任务页（epoch 变化用例）。
+    pub(crate) fn send_task_page_in_epoch(&self, epoch: &str, task_ids: &[&str]) {
+        let page = TablePage {
+            epoch: epoch.to_owned(),
+            sequence: 0,
+            section: TableSection::Tasks,
+            total: u64::try_from(task_ids.len()).unwrap_or(u64::MAX),
+            tasks: task_ids.iter().map(|id| task(id, 1)).collect(),
+            queue: Vec::new(),
+            next_cursor: None,
+        };
+        self.send_page_value(&page);
+    }
+
+    fn send_page_value(&self, page: &TablePage) {
+        let value = serde_json::to_value(page).expect("page json");
+        self.pages.send(Ok(value)).expect("driver alive");
     }
 
     pub(crate) fn close(&self, info: CloseInfo) {
@@ -146,6 +213,12 @@ pub(crate) fn mock_link(hello: ServiceHello) -> (MockLink, LinkHandle) {
         .try_lock()
         .expect("fresh recorder")
         .replace(snapshots_rx);
+    let (pages_tx, pages_rx) = mpsc::unbounded_channel();
+    recorder
+        .page_replies
+        .try_lock()
+        .expect("fresh recorder")
+        .replace(pages_rx);
     (
         MockLink {
             hello,
@@ -155,6 +228,7 @@ pub(crate) fn mock_link(hello: ServiceHello) -> (MockLink, LinkHandle) {
         LinkHandle {
             events: events_tx,
             snapshots: snapshots_tx,
+            pages: pages_tx,
             recorder,
         },
     )

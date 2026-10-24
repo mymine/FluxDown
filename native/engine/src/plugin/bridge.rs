@@ -267,6 +267,9 @@ struct BridgeNet {
     client: reqwest::Client,
     /// 认证请求专用 client：认证档案里的自定义 headers 不能跨 origin 跟随重定向。
     auth_client: reqwest::Client,
+    /// 开发模式插件专用：无 SSRF 守卫、直连（见 [`build_dev_client`]）。
+    dev_client: reqwest::Client,
+    dev_auth_client: reqwest::Client,
     /// yt-dlp 子进程用 `--proxy` URL。`None` = 直连，不注入 `--proxy`。#401
     ytdlp_proxy_url: Option<String>,
 }
@@ -277,6 +280,8 @@ impl BridgeNet {
         Ok(Self {
             client: build_guarded_client(endpoint.as_ref(), false, "守卫")?,
             auth_client: build_guarded_client(endpoint.as_ref(), true, "认证守卫")?,
+            dev_client: build_dev_client(false, "开发模式")?,
+            dev_auth_client: build_dev_client(true, "开发模式认证")?,
             ytdlp_proxy_url: endpoint.map(|endpoint| endpoint.url),
         })
     }
@@ -340,9 +345,27 @@ fn build_guarded_client(
     same_origin_redirects_only: bool,
     label: &str,
 ) -> Result<reqwest::Client, PluginError> {
+    build_client(proxy, same_origin_redirects_only, false, label)
+}
+
+/// 开发模式插件用 client：不挂 `GuardResolver`、重定向不拦截非公网 IP，
+/// 且一律直连不走代理（取舍：代理会把 localhost / 私网地址发给代理出口，
+/// 开发联调目标几乎都是本机或局域网服务）。超时、最大跳数、认证同源跳转规则保留。
+fn build_dev_client(
+    same_origin_redirects_only: bool,
+    label: &str,
+) -> Result<reqwest::Client, PluginError> {
+    build_client(None, same_origin_redirects_only, true, label)
+}
+
+fn build_client(
+    proxy: Option<&crate::egress::ProxyEndpoint>,
+    same_origin_redirects_only: bool,
+    allow_private: bool,
+    label: &str,
+) -> Result<reqwest::Client, PluginError> {
     let mut builder = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
-        .dns_resolver(Arc::new(GuardResolver))
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error(GuardError::TooManyRedirects);
@@ -355,7 +378,7 @@ fn build_guarded_client(
             {
                 return attempt.stop();
             }
-            if let Some(host) = attempt.url().host_str() {
+            if !allow_private && let Some(host) = attempt.url().host_str() {
                 let trimmed = host.trim_matches(|c| c == '[' || c == ']');
                 if let Ok(ip) = trimmed.parse::<IpAddr>()
                     && !is_globally_routable_unicast(ip)
@@ -365,6 +388,9 @@ fn build_guarded_client(
             }
             attempt.follow()
         }));
+    if !allow_private {
+        builder = builder.dns_resolver(Arc::new(GuardResolver));
+    }
 
     // 无显式代理时必须 no_proxy：否则 reqwest 会静默继承环境/系统代理，请求改由
     // 代理解析主机名，GuardResolver 的 DNS 级内网过滤随之失效。
@@ -425,7 +451,9 @@ impl PluginBridge for EngineBridge {
             ));
         }
         // 字面量 IP 前置校验（挡 hyper-util 对字面量 IP 的短路）。
-        if let Some(host) = parsed.host_str() {
+        if !req.private_network_allowed
+            && let Some(host) = parsed.host_str()
+        {
             let trimmed = host.trim_matches(|c| c == '[' || c == ']');
             if let Ok(ip) = trimmed.parse::<IpAddr>()
                 && !is_globally_routable_unicast(ip)
@@ -500,11 +528,12 @@ impl PluginBridge for EngineBridge {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|_| PluginError::InvalidOutput(format!("HTTP method 非法: {}", req.method)))?;
         let net = self.net();
-        let client = if auth_applied {
-            &net.auth_client
+        let (client, auth_client) = if req.private_network_allowed {
+            (&net.dev_client, &net.dev_auth_client)
         } else {
-            &net.client
+            (&net.client, &net.auth_client)
         };
+        let client = if auth_applied { auth_client } else { client };
         let mut rb = client.request(method, parsed);
         for (k, v) in &req.headers {
             if let (Ok(name), Ok(value)) = (
@@ -1786,6 +1815,71 @@ mod tests {
             0o600
         );
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// 起一个只应答一次的本地 HTTP 服务，返回其端口。
+    fn serve_once() -> Result<u16, Box<dyn std::error::Error>> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                if stream.read(&mut buf).is_ok()
+                    && stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .is_err()
+                {
+                    eprintln!("serve_once: write failed");
+                }
+            }
+        });
+        Ok(port)
+    }
+
+    async fn test_bridge() -> Result<super::EngineBridge, Box<dyn std::error::Error>> {
+        let db = crate::db::Db::connect("sqlite::memory:").await?;
+        let (retry_tx, _retry_rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok(super::EngineBridge::new(
+            db,
+            &crate::proxy_config::ProxyConfig::default(),
+            retry_tx,
+            std::env::temp_dir(),
+        )?)
+    }
+
+    #[tokio::test]
+    async fn fetch_loopback_blocked_for_regular_plugin() -> Result<(), Box<dyn std::error::Error>> {
+        use super::PluginBridge;
+        let bridge = test_bridge().await?;
+        let req = crate::plugin::runtime::BridgeHttpRequest {
+            url: "http://127.0.0.1:9/".to_string(),
+            ..Default::default()
+        };
+        let err = bridge
+            .http_request("acme@regular", req)
+            .await
+            .expect_err("loopback must be blocked");
+        assert!(err.to_string().contains("blocked: non-routable IP"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetch_loopback_allowed_for_dev_plugin() -> Result<(), Box<dyn std::error::Error>> {
+        use super::PluginBridge;
+        let port = serve_once()?;
+        let bridge = test_bridge().await?;
+        let req = crate::plugin::runtime::BridgeHttpRequest {
+            url: format!("http://127.0.0.1:{port}/"),
+            private_network_allowed: true,
+            ..Default::default()
+        };
+        let resp = bridge.http_request("acme@dev", req).await?;
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, "ok");
         Ok(())
     }
 

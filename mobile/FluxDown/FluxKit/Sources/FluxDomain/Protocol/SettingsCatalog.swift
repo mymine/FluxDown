@@ -95,6 +95,7 @@ public enum SettingsCatalog {
         daemon("dedup_same_url", .bool, "false"),
         daemon("file_exists_behavior", .choice(fileExistsBehaviors), "rename"),
         daemon("file_missing_action", .choice(fileMissingActions), "keep"),
+        daemon("completed_record_retention_days", .integer(min: 0, max: 3650), "0"),
         daemon("idle_file_scan", .bool, "false"),
         daemon("global_user_agent", .text, ""),
         daemon("default_queue_id", .text, ""),

@@ -79,7 +79,7 @@ fun HostSwitchSheet(visible: Boolean, onDismiss: () -> Unit) {
             FluxSheetFooter {
                 FluxButton(
                     text = stringResource(R.string.mobileHostAdd),
-                    onClick = { nav.openSheet(SheetRoute.AddHost) },
+                    onClick = { nav.openSheet(SheetRoute.AddHost()) },
                     variant = ButtonVariant.Secondary,
                     icon = FluxIcons.Plus,
                     fullWidth = true,

@@ -6,12 +6,12 @@ import type { ErrorReason } from './error';
 export interface TaskNoticeDto {
   /** 事件唯一 ID（UUID v4），云端按 `(user, deliveryId)` 幂等去重。 */
   deliveryId: string;
-  /** `task.created` / `task.started` / `task.completed` / `task.failed` / `task.paused` / `queue.drained`。 */
+  /** `task.created` / `task.started` / `task.completed` / `task.failed` / `task.paused` / `queue.started` / `queue.drained`。 */
   event: string;
   timestampMs: number;
   queueId: string;
   queueName: string;
-  /** `queue.drained` 为 null/缺省，其余事件必有。 */
+  /** `queue.started` / `queue.drained` 为 null/缺省，其余事件必有。 */
   task?: TaskNoticeTaskDto | null;
 }
 

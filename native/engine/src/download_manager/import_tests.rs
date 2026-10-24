@@ -763,3 +763,117 @@ async fn dedicated_clients_are_cached_by_policy_and_bounded() {
         "an overflowing cache restarts instead of growing"
     );
 }
+
+#[tokio::test]
+async fn queue_head_dequeue_publishes_only_removed_ids_after_the_first_full_table() {
+    let (_db, mut manager, sink) = fixture().await;
+    occupy_five_slots(&mut manager);
+    let mut ids = Vec::new();
+    for index in 0..6 {
+        ids.push(manager.create_task(spec(index)).await.expect("queued task"));
+    }
+    sink.take();
+    manager.flush_queue_positions();
+    let first = sink.take();
+    let [EngineEvent::QueuePositionsChanged(full)] = first.as_slice() else {
+        panic!("the first publish is one full table");
+    };
+    assert!(full.windows(2).all(|pair| pair[0].order < pair[1].order));
+    let tail_order = full[5].order;
+
+    manager.pending_queue.pop_front();
+    manager.queue_positions_dirty = true;
+    manager.flush_queue_positions();
+    let events = sink.take();
+    let [EngineEvent::QueueOrderChanged { removed, added }] = events.as_slice() else {
+        panic!("a head dequeue publishes one incremental event");
+    };
+    assert_eq!(removed, &[ids[0].clone()]);
+    assert!(added.is_empty());
+
+    let extra = manager.create_task(spec(6)).await.expect("tail append");
+    sink.take();
+    manager.flush_queue_positions();
+    let events = sink.take();
+    let [EngineEvent::QueueOrderChanged { removed, added }] = events.as_slice() else {
+        panic!("a tail append publishes one incremental event");
+    };
+    assert!(removed.is_empty());
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0].task_id, extra);
+    assert!(added[0].order > tail_order);
+}
+
+#[tokio::test]
+async fn bulk_queued_import_probes_at_most_the_window_and_small_imports_probe_every_task() {
+    let (_db, mut manager, _sink) = fixture().await;
+    occupy_five_slots(&mut manager);
+    // 占满闸门：已发起的探测全部停在排队等许可，在途数即为发起数。
+    let permits = manager
+        .probe_gate
+        .clone()
+        .acquire_many_owned(META_PROBE_CONCURRENCY as u32)
+        .await
+        .expect("hold every permit");
+    for index in 0..3 {
+        manager
+            .create_task(NewTaskSpec {
+                hint_file_size: 0,
+                ..spec(index)
+            })
+            .await
+            .expect("small import");
+    }
+    assert_eq!(
+        manager
+            .probes_outstanding
+            .load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "a handful of tasks keeps the probe-per-task behaviour"
+    );
+    for index in 3..(super::META_PROBE_WINDOW + 40) {
+        manager
+            .create_task(NewTaskSpec {
+                hint_file_size: 0,
+                ..spec(index)
+            })
+            .await
+            .expect("bulk import");
+    }
+    assert_eq!(
+        manager
+            .probes_outstanding
+            .load(std::sync::atomic::Ordering::Relaxed),
+        super::META_PROBE_WINDOW,
+        "only the head of the queue is probed"
+    );
+    drop(permits);
+}
+
+#[tokio::test]
+async fn bulk_paused_import_keeps_in_flight_probes_within_the_window() {
+    let (_db, mut manager, _sink) = fixture().await;
+    let permits = manager
+        .probe_gate
+        .clone()
+        .acquire_many_owned(META_PROBE_CONCURRENCY as u32)
+        .await
+        .expect("hold every permit");
+    for index in 0..(super::META_PROBE_WINDOW + 40) {
+        manager
+            .create_task(NewTaskSpec {
+                hint_file_size: 0,
+                start_paused: true,
+                ..spec(index)
+            })
+            .await
+            .expect("paused import");
+    }
+    assert_eq!(
+        manager
+            .probes_outstanding
+            .load(std::sync::atomic::Ordering::Relaxed),
+        super::META_PROBE_WINDOW
+    );
+    drop(permits);
+}

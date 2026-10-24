@@ -181,6 +181,17 @@ impl Node {
     }
 
     async fn start_with(label: &str, reachable: bool) -> Node {
+        let advertise = if reachable {
+            vec!["127.0.0.1".to_owned()]
+        } else {
+            Vec::new()
+        };
+        Self::start_custom(label, reachable, advertise).await
+    }
+
+    /// `wildcard`：网关监听通配地址；`advertise`：自报地址覆盖条目。两者独立，才能构造「只监听
+    /// 回环、但配置了覆盖地址（反代 / 端口映射）」的节点。
+    async fn start_custom(label: &str, wildcard: bool, advertise: Vec<String>) -> Node {
         let dir = std::env::temp_dir().join(format!(
             "fluxdown-link-test-{label}-{}",
             uuid::Uuid::new_v4().simple()
@@ -201,7 +212,7 @@ impl Node {
         let tasks = Arc::new(RecordingTasks::default());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let bound = if reachable {
+        let bound = if wildcard {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port())
         } else {
             addr
@@ -215,11 +226,7 @@ impl Node {
             server_mode: false,
             network: LinkNetworkOptions {
                 mdns: false,
-                advertise: if reachable {
-                    vec!["127.0.0.1".to_owned()]
-                } else {
-                    Vec::new()
-                },
+                advertise,
             },
         });
         service.start().await.unwrap();
@@ -276,7 +283,7 @@ async fn pair(responder: &Node, initiator: &Node) {
     let code = responder.service.pairing_code().await.unwrap();
     let begin = initiator
         .service
-        .pair_begin(&responder.address(), &code.code)
+        .pair_begin(&responder.address(), &code.code, false)
         .await
         .unwrap();
     let request = wait_for("incoming pairing request", || {
@@ -501,7 +508,7 @@ async fn pairs_over_real_http_exchanges_info_and_dispatches() {
 
     let begin = initiator
         .service
-        .pair_begin(&responder.address(), &code.code)
+        .pair_begin(&responder.address(), &code.code, false)
         .await
         .unwrap();
     assert_eq!(begin.peer_fingerprint, responder.fingerprint());
@@ -677,7 +684,7 @@ async fn wrong_code_is_reported_as_invalid_code_not_as_a_network_problem() {
     };
     let error = initiator
         .service
-        .pair_begin(&responder.address(), wrong)
+        .pair_begin(&responder.address(), wrong, false)
         .await
         .unwrap_err();
     assert!(matches!(error, LinkOpError::Link(LinkError::InvalidCode)));
@@ -704,7 +711,7 @@ async fn pairing_aborts_before_reveal_when_peer_identity_differs_from_the_probed
     let code = responder.service.pairing_code().await.unwrap();
     let error = initiator
         .service
-        .pair_begin(&proxy, &code.code)
+        .pair_begin(&proxy, &code.code, false)
         .await
         .unwrap_err();
     assert!(
@@ -741,7 +748,7 @@ async fn old_protocol_peers_are_rejected_with_an_explicit_version_error() {
     let (addr, _) = raw_server(rejection).await;
     let error = initiator
         .service
-        .pair_begin(&addr.to_string(), "123456")
+        .pair_begin(&addr.to_string(), "123456", false)
         .await
         .unwrap_err();
     assert!(
@@ -764,7 +771,7 @@ async fn old_protocol_peers_are_rejected_with_an_explicit_version_error() {
     let (addr, _) = raw_server(legacy_reply).await;
     let error = initiator
         .service
-        .pair_begin(&addr.to_string(), "123456")
+        .pair_begin(&addr.to_string(), "123456", false)
         .await
         .unwrap_err();
     assert!(
@@ -797,7 +804,7 @@ async fn old_protocol_peers_are_rejected_with_an_explicit_version_error() {
     ));
     initiator
         .service
-        .pair_begin(&responder.address(), &code.code)
+        .pair_begin(&responder.address(), &code.code, false)
         .await
         .expect("the pairing code must survive a version-mismatched hello");
 }
@@ -810,7 +817,7 @@ async fn proxy_400_html_maps_to_not_fluxdown_and_uses_the_base_path() {
     // https 反代通常挂在子路径下：请求必须落在 `<base>/api/v1/link/...`。
     let error = initiator
         .service
-        .pair_begin(&format!("http://{addr}/fluxdown/"), "123456")
+        .pair_begin(&format!("http://{addr}/fluxdown/"), "123456", false)
         .await
         .unwrap_err();
     assert!(
@@ -852,7 +859,7 @@ async fn unreachable_and_bad_addresses_are_distinguished() {
     };
     let error = initiator
         .service
-        .pair_begin(&closed.to_string(), "123456")
+        .pair_begin(&closed.to_string(), "123456", false)
         .await
         .unwrap_err();
     let data = rpc_error(&error, ErrorContext::Pairing);
@@ -863,7 +870,7 @@ async fn unreachable_and_bad_addresses_are_distinguished() {
     let (plain, _) = raw_server(NGINX_400).await;
     let error = initiator
         .service
-        .pair_begin(&format!("https://{plain}"), "123456")
+        .pair_begin(&format!("https://{plain}"), "123456", false)
         .await
         .unwrap_err();
     assert!(
@@ -874,7 +881,7 @@ async fn unreachable_and_bad_addresses_are_distinguished() {
     // 地址本身非法 → 参数错误并指明字段。
     let error = initiator
         .service
-        .pair_begin("ftp://nas.local", "123456")
+        .pair_begin("ftp://nas.local", "123456", false)
         .await
         .unwrap_err();
     let data = rpc_error(&error, ErrorContext::Pairing);
@@ -923,7 +930,7 @@ async fn rpc_dispatch_maps_methods_and_errors() {
     let peer = Node::start("laptop").await;
     let error = peer
         .service
-        .pair_begin(&node.address(), code["code"].as_str().unwrap())
+        .pair_begin(&node.address(), code["code"].as_str().unwrap(), false)
         .await
         .unwrap_err();
     assert!(matches!(error, LinkOpError::Link(LinkError::InvalidCode)));
@@ -1093,6 +1100,13 @@ async fn ping_advertises_the_link_protocol_version() {
     assert_eq!(json["linkProtocol"], fluxdown_link::LINK_PROTOCOL_VERSION);
     assert_eq!(json["linkProtocol"], 2);
     assert_eq!(json["linkFingerprint"], node.fingerprint());
+    // 声明支持「请求控制」的配对：发起方据此预检，旧版对端没有该字段。
+    assert_eq!(json["linkControl"], fluxdown_link::LINK_CONTROL_VERSION);
+    assert_eq!(json["linkControl"], 1);
+    assert_eq!(
+        node.service.api_ping_info().unwrap().link_control,
+        fluxdown_link::LINK_CONTROL_VERSION
+    );
     assert_eq!(
         node.service.api_ping_info().unwrap().link_protocol,
         fluxdown_link::LINK_PROTOCOL_VERSION
@@ -1460,4 +1474,388 @@ async fn two_devices_pair_dispatch_follow_identity_changes_and_unpair() {
         .dispatch(&alpha_fp, "https://example.com/e.bin", None, None)
         .await
         .unwrap();
+}
+
+// ── 设备控制：请求 → 批准 → 凭据 ────────────────────────────────────────────
+
+/// 同 [`pair`]，但发起方请求「完全控制」；返回响应端弹窗里看到的请求与发起方得到的设备视图。
+async fn pair_requesting_control(
+    responder: &Node,
+    initiator: &Node,
+) -> (
+    fluxdown_protocol::LinkPairingRequestDto,
+    fluxdown_protocol::LinkDeviceInfo,
+) {
+    let code = responder.service.pairing_code().await.unwrap();
+    let begin = initiator
+        .service
+        .pair_begin(&responder.address(), &code.code, true)
+        .await
+        .unwrap();
+    let request = wait_for("incoming pairing request", || {
+        responder
+            .events
+            .inspect(|snapshot| snapshot.link_pairing_requests.first().cloned())
+    })
+    .await;
+    let finisher = {
+        let service = initiator.service.clone();
+        let token = begin.token.clone();
+        tokio::spawn(async move { service.pair_finish(&token, true).await })
+    };
+    responder
+        .service
+        .approve(&request.session_id, true)
+        .unwrap();
+    let device = finisher.await.unwrap().unwrap().expect("paired");
+    let initiator_fp = initiator.fingerprint();
+    wait_for("responder roster entry", || {
+        responder
+            .events
+            .inspect(|snapshot| {
+                snapshot
+                    .linked_devices
+                    .iter()
+                    .any(|device| device.fingerprint == initiator_fp)
+            })
+            .then_some(())
+    })
+    .await;
+    (request, device)
+}
+
+#[tokio::test]
+async fn control_request_is_announced_granted_and_turned_into_a_credential() {
+    let host = Node::start("nas").await;
+    let phone = Node::start("phone").await;
+    let roster_changes = host.service.subscribe_roster();
+
+    let (request, device) = pair_requesting_control(&host, &phone).await;
+    // 响应端弹窗要能警示「请求完全控制」；相对 TTL 随请求一起给出。
+    assert!(request.requests_control);
+    assert!(request.ttl_ms > 0 && request.ttl_ms <= 60_000);
+    // 发起方得到「本机可控制」的设备；响应端的名册里该设备被授权控制本机。
+    assert!(device.controllable && !device.grants_control);
+    let host_view = host
+        .events
+        .inspect(|snapshot| snapshot.linked_devices.clone());
+    assert_eq!(host_view.len(), 1);
+    assert!(host_view[0].grants_control && !host_view[0].controllable);
+    assert!(
+        roster_changes.has_changed().unwrap(),
+        "pairing must bump the roster epoch"
+    );
+
+    // 发起方签发凭据，主机校验通过并指回发起方；密钥相同的伪造 / 篡改凭据一律拒绝。
+    let host_fp = host.fingerprint();
+    let phone_fp = phone.fingerprint();
+    let token = phone
+        .service
+        .control_credential(&host_fp)
+        .await
+        .unwrap()
+        .token;
+    assert!(token.starts_with(&format!("fdl1.{phone_fp}.")));
+    assert_eq!(
+        host.service.verify_control_credential(&token).await,
+        Some(phone_fp.clone())
+    );
+    let mut tampered = token.clone();
+    tampered.pop();
+    tampered.push('x');
+    assert_eq!(
+        host.service.verify_control_credential(&tampered).await,
+        None
+    );
+    assert_eq!(
+        host.service
+            .verify_control_credential("not-a-credential")
+            .await,
+        None
+    );
+
+    // 同一指纹重新配对且这次不请求控制：授权消失，旧凭据（link_secret 也变了）立即失效。
+    pair(&host, &phone).await;
+    assert_eq!(host.service.verify_control_credential(&token).await, None);
+    assert!(matches!(
+        phone.service.control_credential(&host_fp).await,
+        Err(LinkOpError::Link(LinkError::NotPaired))
+    ));
+    let data = rpc_error(
+        &phone
+            .service
+            .control_credential(&host_fp)
+            .await
+            .unwrap_err(),
+        ErrorContext::Peer,
+    );
+    assert_eq!(data.reason, Some(ErrorReason::PeerNotPaired));
+}
+
+#[tokio::test]
+async fn plain_pairing_grants_nothing_and_yields_no_usable_credential() {
+    let host = Node::start("nas").await;
+    let phone = Node::start("phone").await;
+    let code = host.service.pairing_code().await.unwrap();
+    let begin = phone
+        .service
+        .pair_begin(&host.address(), &code.code, false)
+        .await
+        .unwrap();
+    let request = wait_for("incoming pairing request", || {
+        host.events
+            .inspect(|snapshot| snapshot.link_pairing_requests.first().cloned())
+    })
+    .await;
+    assert!(!request.requests_control);
+    let finisher = {
+        let service = phone.service.clone();
+        let token = begin.token.clone();
+        tokio::spawn(async move { service.pair_finish(&token, true).await })
+    };
+    host.service.approve(&request.session_id, true).unwrap();
+    let device = finisher.await.unwrap().unwrap().expect("paired");
+    assert!(!device.controllable && !device.grants_control);
+
+    // 发起方没有可签发的凭据；就算它用共享的链路密钥手工拼一个，主机也不认（未授权控制）。
+    let host_fp = host.fingerprint();
+    let phone_fp = phone.fingerprint();
+    assert!(matches!(
+        phone.service.control_credential(&host_fp).await,
+        Err(LinkOpError::Link(LinkError::NotPaired))
+    ));
+    let secret = phone
+        .service
+        .manager()
+        .unwrap()
+        .get_device(&host_fp)
+        .await
+        .unwrap()
+        .unwrap()
+        .link_secret;
+    let hand_made =
+        fluxdown_link::crypto::control_credential(&secret, &phone_fp, &host_fp).unwrap();
+    wait_for("responder roster entry", || {
+        host.events
+            .inspect(|snapshot| (!snapshot.linked_devices.is_empty()).then_some(()))
+    })
+    .await;
+    assert_eq!(
+        host.service.verify_control_credential(&hand_made).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn requesting_control_from_a_peer_without_the_capability_is_a_version_mismatch() {
+    let phone = Node::start("phone").await;
+    // 旧版对端：`/ping` 有 `linkProtocol` 却没有 `linkControl`。
+    let legacy = http_json(
+        "200 OK",
+        &serde_json::json!({
+            "success": true,
+            "app": "FluxDown",
+            "linkFingerprint": "ab".repeat(32),
+            "linkProtocol": 2,
+        })
+        .to_string(),
+    );
+    let (legacy_addr, seen) = raw_server(legacy).await;
+    let error = phone
+        .service
+        .pair_begin(&legacy_addr.to_string(), "123456", true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, LinkOpError::Link(LinkError::UnsupportedVersion)),
+        "{error:?}"
+    );
+    assert_eq!(
+        rpc_error(&error, ErrorContext::Pairing).reason,
+        Some(ErrorReason::PairingVersionMismatch)
+    );
+    // 只探测了 `/ping`，没有发出 hello。
+    let requests = seen.lock().unwrap().clone();
+    assert!(
+        requests.iter().all(|request| request.contains("/ping")),
+        "{requests:?}"
+    );
+}
+
+// ── 相对 TTL（ttlMs）────────────────────────────────────────────────────────
+
+fn unix_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn pairing_code_carries_the_remaining_lifetime_in_milliseconds() {
+    let node = Node::start("nas").await;
+    let code = node.service.pairing_code().await.unwrap();
+    assert_eq!(code.ttl_ms, fluxdown_link::pairing::CODE_TTL_SECS * 1000);
+    // 绝对时刻仍然保留（旧客户端依赖它）。
+    assert!(code.expires_at_unix_ms > unix_ms());
+}
+
+#[tokio::test]
+async fn pairing_request_ttl_is_recomputed_for_every_published_snapshot() {
+    let node = Node::start("nas").await;
+    let request = |session: &str, expires_in_ms: i64| fluxdown_protocol::LinkPairingRequestDto {
+        session_id: session.to_owned(),
+        peer_name: "phone".to_owned(),
+        peer_fingerprint: "ab".repeat(32),
+        peer_platform: None,
+        sas: "123456".to_owned(),
+        expires_at_unix_ms: unix_ms() + expires_in_ms,
+        // 存着的值是建请求时的旧值：快照必须按取快照时刻重算。
+        ttl_ms: 999_999,
+        requests_control: false,
+    };
+    node.events
+        .publish(fluxdown_protocol::AgentEvent::LinkPairingRequestsChanged(
+            vec![request("live", 5_000), request("expired", -1_000)],
+        ));
+    for snapshot in [node.events.snapshot(), node.events.wire_snapshot()] {
+        let fluxdown_protocol::SnapshotBody::Agent(body) = snapshot.body else {
+            panic!("agent snapshot expected");
+        };
+        let ttl = |session: &str| {
+            body.link_pairing_requests
+                .iter()
+                .find(|request| request.session_id == session)
+                .unwrap()
+                .ttl_ms
+        };
+        assert!(ttl("live") > 0 && ttl("live") <= 5_000, "{}", ttl("live"));
+        assert_eq!(ttl("expired"), 0);
+    }
+}
+
+#[tokio::test]
+async fn stop_pairing_with_a_code_only_revokes_that_code() {
+    let host = Node::start("nas").await;
+    let phone = Node::start("phone").await;
+    let stale = host.service.pairing_code().await.unwrap();
+    // 另一个客户端刷新出了新码；第一个客户端关闭自己的面板时带着旧码：新码不受影响。
+    let current = host.service.pairing_code().await.unwrap();
+    assert_ne!(stale.code, current.code, "极小概率随机撞码，重跑即可");
+    host.service.stop_pairing(Some(&stale.code)).unwrap();
+    let begin = phone
+        .service
+        .pair_begin(&host.address(), &current.code, false)
+        .await
+        .expect("the current code must survive a stale stopPairing");
+    phone
+        .service
+        .pair_finish(&begin.token, false)
+        .await
+        .unwrap();
+
+    // 带当前码：作废；不带码：无条件作废（旧行为）。
+    for stop in [
+        serde_json::json!({ "code": "PLACEHOLDER" }),
+        serde_json::json!({}),
+    ] {
+        let fresh = host.service.pairing_code().await.unwrap();
+        let mut params = stop;
+        if params.get("code").is_some() {
+            params["code"] = serde_json::json!(fresh.code);
+        }
+        host.service
+            .rpc(
+                fluxdown_protocol::method::AGENT_LINK_STOP_PAIRING,
+                Some(params),
+            )
+            .await
+            .unwrap();
+        let error = phone
+            .service
+            .pair_begin(&host.address(), &fresh.code, false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, LinkOpError::Link(LinkError::InvalidCode)),
+            "{error:?}"
+        );
+    }
+    // 没有参数对象同样可用（旧客户端）。
+    let fresh = host.service.pairing_code().await.unwrap();
+    host.service
+        .rpc(fluxdown_protocol::method::AGENT_LINK_STOP_PAIRING, None)
+        .await
+        .unwrap();
+    assert!(
+        phone
+            .service
+            .pair_begin(&host.address(), &fresh.code, false)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn an_advertise_override_makes_a_loopback_bound_node_reachable() {
+    use fluxdown_link::LinkStorage;
+
+    // 只监听回环（反代 / 端口映射 / 容器内部端口），但配置了对外自报地址。
+    let plain = Node::start("plain").await;
+    let code = plain.service.pairing_code().await.unwrap();
+    assert!(
+        code.addresses.is_empty(),
+        "without an override a loopback-only node has nothing to advertise"
+    );
+
+    let behind_proxy = Node::start_custom("proxied", false, vec!["10.9.8.7".to_owned()]).await;
+    let code = behind_proxy.service.pairing_code().await.unwrap();
+    assert_eq!(
+        code.addresses,
+        vec![format!("http://10.9.8.7:{}", behind_proxy.addr.port())],
+        "the override is what peers are told to dial"
+    );
+
+    // 配对时向对端自报的回连地址也用覆盖值：对端存下的候选就是它。
+    let responder = Node::start("nas").await;
+    let responder_code = responder.service.pairing_code().await.unwrap();
+    let begin = behind_proxy
+        .service
+        .pair_begin(&responder.address(), &responder_code.code, false)
+        .await
+        .unwrap();
+    let request = wait_for("incoming pairing request", || {
+        responder
+            .events
+            .inspect(|snapshot| snapshot.link_pairing_requests.first().cloned())
+    })
+    .await;
+    let finisher = {
+        let service = behind_proxy.service.clone();
+        let token = begin.token.clone();
+        tokio::spawn(async move { service.pair_finish(&token, true).await })
+    };
+    responder
+        .service
+        .approve(&request.session_id, true)
+        .unwrap();
+    finisher.await.unwrap().unwrap().expect("paired");
+    let storage = super::AgentLinkStorage::new(responder.state.clone(), responder.store.clone());
+    let stored = wait_for("responder roster entry", || {
+        futures_util::FutureExt::now_or_never(storage.get(&behind_proxy.fingerprint()))
+            .and_then(Result::ok)
+            .flatten()
+    })
+    .await;
+    assert_eq!(
+        stored
+            .candidates
+            .iter()
+            .map(|c| c.address.as_str())
+            .collect::<Vec<_>>(),
+        vec![format!("10.9.8.7:{}", behind_proxy.addr.port())]
+    );
 }

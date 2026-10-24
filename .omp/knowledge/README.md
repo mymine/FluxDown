@@ -26,6 +26,7 @@
 | `clients.md` | GPUI 桌面、原生 Android/iOS、旧数据与主题兼容、扩展、用户脚本、Web SPA、官网 |
 | `ops.md` | 日志系统、发布与 CI、设计文档实现状态 |
 | `extension-points.md` | 「要加 X 改哪里」全表 |
+| `pitfalls.md` | 踩坑清单：按领域分节的已验证约束（现象 + 代码坐标 / 回归测试）；改某领域前先读对应小节 |
 
 ---
 
@@ -73,7 +74,7 @@ flowchart TB
 
 **要点**：
 - `fluxdown_api` 只依赖 `&dyn ApiHost`，不碰引擎——同一套 HTTP 面（脚本接管 + aria2 JSON-RPC（POST 与 WS）+ MCP + `/api/v1` 管理 + OpenAPI）可服务任意宿主。
-- 生产链路：GPUI 桌面与 headless 共用 agent + daemon（`AgentApiHost` 将 HTTP 操作转发给 daemon；daemon 的 `actor.rs` 独占引擎）；原生 Android/iOS 经 `native/mobile` 复用进程内 agent + daemon 或远端 `/rpc`。持有引擎的 actor **必须** drain `resolve_rx`（off-actor 插件解析回流）与 `plugin_retry_rx`，否则命中 resolver 的下载会永久挂起。`native/server` 已冻结。
+- 生产链路：GPUI 桌面与 headless 共用 agent + daemon（`AgentApiHost` 将 HTTP 操作转发给 daemon；daemon 的 `actor.rs` 独占引擎）；原生 Android/iOS 经 `native/mobile` 复用进程内 agent + daemon 或远端 `/rpc`。持有引擎的 actor **必须** drain `resolve_rx`（off-actor 插件解析回流）与 `plugin_retry_rx`，否则命中 resolver 的下载会永久挂起。
 - 客户端捕获汇入 agent 的同一捕获/确认队列：扩展经 NMH IPC，用户脚本经 `:17800/download`，桌面经 `/rpc` 提交；不是所有前端都经过 HTTP `/download`。
 - **并发模型**: current_thread tokio actor 串行化写；每个下载 spawn 独立 task + CancellationToken；插件 resolve 永不阻塞 actor（off-actor spawn + 通道回流）。
 
@@ -107,7 +108,7 @@ flowchart TB
 - `native/agent` 是可选但常驻的官方客户端后端：独占 FluxCloud Token、配置同步、设备协同和远程任务状态机；官方 UI 默认只连接 agent。
 - `native/protocol` 是 daemon、agent 与 GPUI / React Web SPA 等客户端共享的 wire 层，服务角色、握手、JSON-RPC 方法/事件与 DTO 都以实际协议目录为准，不为 UI 建立第二套 DTO。
 - `native/link`（`fluxdown_link`）是局域网直连（L1）协议本体：身份、配对（SAS）、mDNS 发现、直连传输、地址解析（`http(s)://host[:port][/base]`），持久化经 `LinkStorage` trait 注入，agent 使用自身状态文件。不依赖引擎、数据库或 UI。
-- 当前发行路径：PC = GPUI → agent + daemon，headless / NAS 同用 agent + daemon；原生移动端经 `native/mobile` 复用同一服务边界。Android 正式发布用 `ANDROID_NATIVE_*` 签名，不能覆盖旧 Flutter APK；共享 assets 与当前客户端的旧数据/主题兼容保留。`native/server` 已冻结（不构建/不发布/不改）。
+- 当前发行路径：PC = GPUI → agent + daemon，headless / NAS 同用 agent + daemon；原生移动端经 `native/mobile` 复用同一服务边界。Android 正式发布用 `ANDROID_NATIVE_*` 签名，不能覆盖旧 Flutter APK；共享 assets 与当前客户端的旧数据/主题兼容保留。
 
 ---
 
@@ -132,7 +133,6 @@ FluxDown/
 │   ├── daemon/         `fluxdown_daemon`：桌面/headless 的纯下载常驻核心
 │   ├── agent/          `fluxdown_agent`：桌面/headless 的云功能与官方 UI Gateway
 │   ├── link/           `fluxdown_link`：局域网直连 L1 协议（配对 / mDNS / 直连传输），由 agent 承载
-│   ├── server/         `fluxdown_server`：**已冻结**的旧 headless 宿主（不构建/不发布），由 `agent --server` + `daemon` 取代
 │   ├── mobile/         `fluxdown_mobile`：原生移动端 UniFFI 核心（进程内 daemon + agent 嵌入 / 远端 `/rpc`）——见 `clients.md`「原生移动端」
 │   ├── cli/            `fluxdown_cli`：二进制 `fluxdown`——见 `hosts-and-api.md`「宿主与客户端 crate」
 │   └── nmh/            Native Messaging Host 中继二进制

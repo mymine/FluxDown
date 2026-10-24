@@ -305,12 +305,27 @@ private struct ApiServiceContent: View {
 
 /// 主机地址派生（`http(s)://host:port`；`ws(s)` 视同）。
 enum ApiAddress {
+    /// 主机 HTTP 根：`http(s)://host:port`（`ws(s)` 视同，路径 / 查询丢弃）。
+    static func baseURL(_ endpoint: String) -> URL? {
+        guard var components = URLComponents(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+        switch components.scheme?.lowercased() {
+        case "ws": components.scheme = "http"
+        case "wss": components.scheme = "https"
+        case "http", "https": break
+        default: return nil
+        }
+        components.path = ""
+        components.query = nil
+        components.fragment = nil
+        return components.url
+    }
+
     static func base(_ endpoint: String) -> String? {
-        PluginBlobUploader.baseURL(endpoint)?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        baseURL(endpoint)?.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
     static func port(_ endpoint: String) -> Int? {
-        PluginBlobUploader.baseURL(endpoint)?.port
+        baseURL(endpoint)?.port
     }
 }
 

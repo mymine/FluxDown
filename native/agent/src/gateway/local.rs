@@ -10,17 +10,19 @@ use fluxdown_protocol::{
     ApplicationErrorCode, EventFrame, RequestId, RpcErrorData, RpcErrorObject, RpcRequest,
     RpcResponse, ServiceHello, ServiceRole, validate_first_request,
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use super::session_auth::SessionContext;
 use super::{GatewayService, RequestLanes, declares_selection_ui};
+use crate::event_pump::{EventPump, EventReader, MAX_PENDING_FRAMES, PumpEnd};
 
 type Waiters = Mutex<HashMap<RequestId, oneshot::Sender<RpcResponse>>>;
 
 /// 进程内事件流的终止原因。
 #[derive(Debug, thiserror::Error)]
 pub enum LocalEventError {
-    /// 消费速度落后于事件产生，已有 `skipped` 帧被丢弃：调用方必须用新的连接重新取快照。
+    /// 消费速度落后于事件产生（或合并后积压超限），事件流中断：调用方必须用新的连接重新取快照。
     #[error("local event stream lagged behind by {skipped} frames")]
     Lagged { skipped: u64 },
     /// agent 已关闭，不会再有事件。
@@ -38,7 +40,9 @@ pub struct LocalConnection {
     lanes: Option<RequestLanes>,
     waiters: Arc<Waiters>,
     next_id: AtomicI64,
-    events: tokio::sync::Mutex<broadcast::Receiver<EventFrame>>,
+    events: EventReader,
+    /// 持有广播接收任务；丢弃连接即中止。
+    _pump: EventPump,
     cancel: CancellationToken,
     ui_client: bool,
     snapshot_ready: AtomicBool,
@@ -60,7 +64,9 @@ impl GatewayService {
         if ui_client {
             self.ui_connected().await;
         }
-        let (events, lanes, responses) = self.open_session(true);
+        let (receiver, lanes, responses) = self.open_session(&SessionContext::local(true));
+        let mut pump = EventPump::new();
+        pump.attach(receiver, MAX_PENDING_FRAMES);
         let waiters = Arc::new(Waiters::default());
         tokio::spawn(route_responses(responses, Arc::clone(&waiters)));
         Ok(LocalConnection {
@@ -69,7 +75,8 @@ impl GatewayService {
             lanes: Some(lanes),
             waiters,
             next_id: AtomicI64::new(1),
-            events: tokio::sync::Mutex::new(events),
+            events: pump.reader(),
+            _pump: pump,
             cancel,
             ui_client,
             snapshot_ready: AtomicBool::new(false),
@@ -117,15 +124,19 @@ impl LocalConnection {
         }
     }
 
-    /// 下一帧事件（等价于 `service.event` 通知）。`Lagged` 后必须重新 `connect` 取快照。
+    /// 下一帧事件（等价于 `service.event` 通知）。宿主消费得慢时，积压的进度类事件按实体合并
+    /// （帧的 `previous` 声明覆盖区间，用 [`judge_frame`](fluxdown_protocol::judge_frame) 判定）；
+    /// 合并后仍积压超限或广播落后时返回 `Lagged`，必须重新 `connect` 取快照。
     pub async fn next_event(&self) -> Result<EventFrame, LocalEventError> {
-        let mut events = self.events.lock().await;
         tokio::select! {
             biased;
             () = self.cancel.cancelled() => Err(LocalEventError::Closed),
-            frame = events.recv() => frame.map_err(|error| match error {
-                broadcast::error::RecvError::Lagged(skipped) => LocalEventError::Lagged { skipped },
-                broadcast::error::RecvError::Closed => LocalEventError::Closed,
+            frame = self.events.next() => frame.map_err(|end| match end {
+                PumpEnd::Lagged { skipped } => LocalEventError::Lagged { skipped },
+                PumpEnd::Overflow { pending } => LocalEventError::Lagged {
+                    skipped: u64::try_from(pending).unwrap_or(u64::MAX),
+                },
+                PumpEnd::Closed => LocalEventError::Closed,
             }),
         }
     }

@@ -9,7 +9,7 @@
 // 运行时无关：调用、睡眠、取消信号都由调用方注入，便于单测。
 
 import { RpcError } from '../../../lib/rpc/error'
-import type { CreateTaskRequest, DaemonCreateTasksParams, DaemonCreateTasksResult, CreateTaskItem, RpcErrorData } from '../../../lib/rpc/protocol'
+import type { CategoryRouteDto, CreateTaskRequest, DaemonCreateTasksParams, DaemonCreateTasksResult, CreateTaskItem, RpcErrorData } from '../../../lib/rpc/protocol'
 import { randomUuid } from '../../../lib/uuid'
 
 /** 每次 `createMany` 的条目数（协议上限 512 的一半）。 */
@@ -52,6 +52,8 @@ export interface ImportReport {
 export interface ImportOptions {
   common: CreateTaskRequest
   items: readonly CreateTaskItem[]
+  /** 分类目录路由，随每块 `daemon.task.createMany` 下发。 */
+  categoryRoute?: CategoryRouteDto | null
   call: (params: DaemonCreateTasksParams) => Promise<DaemonCreateTasksResult>
   sleep: (ms: number) => Promise<void>
   signal?: AbortSignal
@@ -154,7 +156,12 @@ export async function runImport(options: ImportOptions): Promise<ImportReport> {
     const length = Math.min(IMPORT_CHUNK_SIZE, total - position)
     const start = position
     position += length
-    const params: DaemonCreateTasksParams = { batchId: newBatchId(), common, items: items.slice(start, position) as CreateTaskItem[] }
+    const params: DaemonCreateTasksParams = {
+      batchId: newBatchId(),
+      common,
+      items: items.slice(start, position) as CreateTaskItem[],
+      ...(options.categoryRoute ? { categoryRoute: options.categoryRoute } : {}),
+    }
     const base = { total, done: report.succeeded + report.failed, failed: report.failed }
     const end = await submitChunk(params, options, (retry) => options.onProgress?.({ ...base, retry }))
     let stop = false

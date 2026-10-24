@@ -76,7 +76,7 @@ struct TaskDetailGeneralPage: View {
         if task.status == .failed, !task.errorMessage.isEmpty {
             KeyValueRow(
                 key: L("infoError"),
-                value: task.errorMessage,
+                value: TaskErrorMessage.displayText(task.errorMessage),
                 monospaced: true,
                 copyable: true,
                 tone: .failure,
@@ -253,9 +253,11 @@ struct TaskDetailSpeedPage: View {
                 if let transfers = runtime.activeTransfers {
                     KeyValueRow(key: L("detailActiveTransfers"), value: String(transfers), monospaced: true)
                 }
+                #if FULL_FLAVOR
                 if task.protocol == .bt, let peers = runtime.connectedPeers {
                     KeyValueRow(key: L("detailConnectedPeers"), value: String(peers), monospaced: true)
                 }
+                #endif
             }
         }
 
@@ -422,6 +424,7 @@ private struct TaskSegmentRow: View {
     }
 }
 
+#if FULL_FLAVOR
 // MARK: - 做种（仅 BT）
 
 struct TaskDetailSeedingPage: View {
@@ -470,6 +473,7 @@ struct TaskDetailSeedingPage: View {
         }
     }
 }
+#endif
 
 // MARK: - 高级
 

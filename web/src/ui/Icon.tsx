@@ -30,3 +30,26 @@ export function Icon({
     />
   )
 }
+
+/** 以 CSS 蒙版渲染的单色图标（如插件声明的 SVG）：只取图形 alpha，颜色随 `currentColor`。 */
+export function MaskIcon({ mask, size = 'lg', className }: { mask: string; size?: IconSize; className?: string }) {
+  const dimension = DIMENSION[size]
+  return (
+    <span
+      aria-hidden
+      className={cn('inline-block shrink-0 bg-current', className)}
+      style={{
+        width: dimension,
+        height: dimension,
+        maskImage: mask,
+        WebkitMaskImage: mask,
+        maskSize: 'contain',
+        WebkitMaskSize: 'contain',
+        maskRepeat: 'no-repeat',
+        WebkitMaskRepeat: 'no-repeat',
+        maskPosition: 'center',
+        WebkitMaskPosition: 'center',
+      }}
+    />
+  )
+}

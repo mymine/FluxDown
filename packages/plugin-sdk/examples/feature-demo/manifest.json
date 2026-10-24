@@ -42,7 +42,17 @@
       { "id": "toggle-selected", "title": "暂停/继续所选任务", "palette": true, "taskMenu": true },
       { "id": "inspect", "title": "查看任务信息", "taskMenu": true }
     ],
-    "sniffRules": "rules.json"
+    "sniffRules": "rules.json",
+    "pageScripts": [
+      {
+        "id": "page-hello",
+        "title": "页面脚本演示",
+        "matches": ["https://httpbin.org/*"],
+        "js": ["page/hello.js"],
+        "runAt": "document_idle",
+        "world": "isolated"
+      }
+    ]
   },
   "settings": [
     { "key": "greeting", "title": "问候语", "type": "string", "default": "你好" },
@@ -60,5 +70,5 @@
     { "key": "toastOnDone", "title": "任务完成时弹通知", "type": "boolean", "default": "true" },
     { "key": "tickSeconds", "title": "面板计时间隔（秒）", "type": "number", "min": 1, "max": 60, "default": "2" }
   ],
-  "permissions": ["tasks", "browserRules", "desktop", "background"]
+  "permissions": ["tasks", "browserRules", "desktop", "background", "pageScripts"]
 }

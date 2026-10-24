@@ -55,6 +55,22 @@ class LocalDirectoryFilesTest {
     }
 
     @Test
+    fun batchPreparationCreatesEveryCategoryFolderAndReportsOnlyFailures() {
+        val base = temporary.newFolder("Download")
+        val blocker = File(base, "Other")
+        blocker.writeText("a file named like the folder")
+        val video = File(base, "Video").path
+        val archive = File(base, "Archive").path
+
+        val failed = prepareLocalDirectories(listOf("", video, " $video ", archive, blocker.path))
+
+        assertEquals(listOf(blocker.path), failed)
+        assertTrue(File(video).isDirectory)
+        assertTrue(File(archive).isDirectory)
+        assertEquals("a file named like the folder", blocker.readText())
+    }
+
+    @Test
     fun rejectsBlankRelativeAndInvalidPaths() {
         for (path in listOf("", "  ", "Download", "../Download", "/invalid\u0000path")) {
             assertIOException { prepareLocalDirectory(path) }

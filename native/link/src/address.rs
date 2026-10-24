@@ -35,10 +35,13 @@ impl Scheme {
         }
     }
 
-    fn default_port(self) -> u16 {
+    /// 解析时「未写端口」得到的端口（见模块文档）；只有它能在 [`PeerAddress::authority`] 里省略，
+    /// 否则重新解析会得到另一个端口。`http` 的解析默认值是 17800 而不是 URL 惯例的 80，所以
+    /// `http` 恒写出端口，`https` 只省略 443。
+    fn omittable_port(self) -> Option<u16> {
         match self {
-            Scheme::Http => 80,
-            Scheme::Https => DEFAULT_HTTPS_PORT,
+            Scheme::Http => None,
+            Scheme::Https => Some(DEFAULT_HTTPS_PORT),
         }
     }
 }
@@ -154,7 +157,7 @@ impl PeerAddress {
         } else {
             self.host.clone()
         };
-        if self.port == self.scheme.default_port() {
+        if self.scheme.omittable_port() == Some(self.port) {
             host
         } else {
             format!("{host}:{}", self.port)
@@ -299,7 +302,30 @@ mod tests {
     fn explicit_default_http_port_80_is_not_mistaken_for_17800() {
         let a = parse("http://example.com:80");
         assert_eq!(a.port(), 80);
-        assert_eq!(a.base_url(), "http://example.com");
+        // 端口 80 必须写出来：省略后重新解析会变成 17800。
+        assert_eq!(a.base_url(), "http://example.com:80");
+        assert_eq!(parse(&a.base_url()), a);
+    }
+
+    #[test]
+    fn base_urls_round_trip_for_every_scheme_port_and_base_path() {
+        for input in [
+            "http://nas.lan:80/fluxdown",
+            "http://nas.lan:17800",
+            "http://nas.lan:8080/a/b",
+            "https://nas.lan",
+            "https://nas.lan:443/fluxdown",
+            "https://nas.lan:8443",
+            "http://[fe80::1]:80",
+        ] {
+            let address = parse(input);
+            assert_eq!(parse(&address.base_url()), address, "{input}");
+        }
+        assert_eq!(
+            parse("http://nas.lan:80/fluxdown").base_url(),
+            "http://nas.lan:80/fluxdown"
+        );
+        assert_eq!(parse("https://nas.lan:443").base_url(), "https://nas.lan");
     }
 
     #[test]

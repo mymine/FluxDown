@@ -32,8 +32,15 @@ export const WEBHOOK_EVENTS = [
   { wire: 'task.completed', labelKey: 'webhookEventCompleted' },
   { wire: 'task.failed', labelKey: 'webhookEventFailed' },
   { wire: 'task.paused', labelKey: 'webhookEventPaused' },
+  { wire: 'queue.started', labelKey: 'webhookEventQueueStarted' },
   { wire: 'queue.drained', labelKey: 'webhookEventQueueDrained' },
 ] as const
+
+/** 仅本机 webhook 可订阅、FluxCloud 不认识的事件（agent 上报前也会丢弃）。 */
+const LOCAL_ONLY_EVENTS: readonly string[] = ['queue.started']
+
+/** 云端推送渠道可订阅的事件：`WEBHOOK_EVENTS` 去掉本机专属事件，保持原顺序。 */
+export const CLOUD_EVENTS = WEBHOOK_EVENTS.filter((event) => !LOCAL_ONLY_EVENTS.includes(event.wire))
 
 const str = (value: unknown): string => (typeof value === 'string' ? value : '')
 const bool = (value: unknown, fallback: boolean): boolean => (typeof value === 'boolean' ? value : fallback)

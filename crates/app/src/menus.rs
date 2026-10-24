@@ -1,8 +1,12 @@
 //! 应用菜单（macOS 原生 / Windows·Linux 标题栏菜单栏）、全局键位与应用级动作处理。
 
+use std::collections::BTreeMap;
+
 use fluxdown_ui_downloads::actions as dl;
 use fluxdown_ui_i18n::Translator;
-use gpui::{App, Entity, Menu, MenuItem, SharedString, Window};
+use fluxdown_ui_shell::ShellView;
+use gpui::{App, Context, Entity, Global, Menu, MenuItem, SharedString, Window};
+use gpui_component::{GlobalState, menu::AppMenuBar};
 
 use crate::{
     actions::{
@@ -15,6 +19,15 @@ use crate::{
 };
 
 const WEBSITE_URL: &str = "https://fluxdown.com";
+
+/// 设备本地偏好：Windows / Linux 标题栏是否显示应用菜单栏（缺省隐藏）。不在云同步目录内，
+/// 写入走 `sync:false`，只影响本机；macOS 走原生菜单，不读此键。
+pub(crate) const SHOW_MENU_BAR_PREF: &str = "ui.show_menu_bar";
+
+/// Windows / Linux 标题栏菜单栏实体（所有主窗口共用；macOS 不创建）。
+struct TitleMenuBar(Entity<AppMenuBar>);
+
+impl Global for TitleMenuBar {}
 
 fn t(translator: &Translator, key: &str) -> SharedString {
     SharedString::from(translator.text(key).to_owned())
@@ -119,9 +132,14 @@ pub fn build_menus(translator: &Translator) -> Vec<Menu> {
     menus
 }
 
-/// 装配原生菜单（macOS 菜单栏）；翻译变化时重建。Windows / Linux 标题栏不渲染应用菜单。
+/// 装配应用菜单：macOS 原生菜单栏；Windows / Linux 另建标题栏菜单栏（是否显示由
+/// [`SHOW_MENU_BAR_PREF`] 决定）。翻译变化时重建。
 pub fn install(cx: &mut App, translator: &Entity<Translator>) {
     apply_menus(translator, cx);
+    if !cfg!(target_os = "macos") {
+        let bar = AppMenuBar::new(cx);
+        cx.set_global(TitleMenuBar(bar));
+    }
     cx.observe(translator, move |translator, cx| {
         apply_menus(&translator, cx);
     })
@@ -131,6 +149,37 @@ pub fn install(cx: &mut App, translator: &Entity<Translator>) {
 pub(crate) fn apply_menus(translator: &Entity<Translator>, cx: &mut App) {
     let translator = translator.read(cx).clone();
     cx.set_menus(build_menus(&translator));
+    if cfg!(target_os = "macos") {
+        return;
+    }
+    GlobalState::global_mut(cx).set_app_menus(
+        build_menus(&translator)
+            .into_iter()
+            .map(Menu::owned)
+            .collect(),
+    );
+    if let Some(TitleMenuBar(bar)) = cx.try_global::<TitleMenuBar>() {
+        bar.clone().update(cx, |bar, cx| bar.reload(cx));
+    }
+}
+
+/// 偏好 → 标题栏菜单栏可见性；幂等，窗口创建与每次偏好变化都走这里。
+pub(crate) fn apply_menu_bar_visibility(
+    shell: &mut ShellView,
+    preferences: &BTreeMap<String, serde_json::Value>,
+    cx: &mut Context<ShellView>,
+) {
+    let visible = preferences
+        .get(SHOW_MENU_BAR_PREF)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let bar = visible
+        .then(|| {
+            cx.try_global::<TitleMenuBar>()
+                .map(|TitleMenuBar(bar)| bar.clone())
+        })
+        .flatten();
+    shell.set_menu_bar(bar, cx);
 }
 
 /// 应用级动作（不依赖具体窗口）。窗口级动作作用于当前活动窗口。

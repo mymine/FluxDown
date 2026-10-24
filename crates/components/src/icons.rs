@@ -78,6 +78,7 @@ flux_icons! {
     FilePlay => "file-play",
     FileText => "file-text",
     Film => "film",
+    Folder => "folder",
     FolderOpen => "folder-open",
     Folders => "folders",
     Gamepad2 => "gamepad-2",

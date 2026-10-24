@@ -25,11 +25,13 @@ private struct TaskDetailLoader: View {
     var body: some View {
         let state = container.store.state
         let model = TaskDetailModel(state: state, taskId: taskId)
-        let closing = seen && model == nil
+        // 任务表分页载入中查不到任务不代表已被删除：显示加载态，不触发「已不存在」自动返回。
+        let loading = state.tasksLoading || (state.connection == .connecting && state.tasks.isEmpty)
+        let closing = seen && model == nil && !loading
         Group {
             if let model {
                 TaskDetailPage(model: model)
-            } else if state.connection == .connecting && state.tasks.isEmpty {
+            } else if loading {
                 ProgressView(L("pluginCommonLoading"))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .navigationTitle(L("detail"))
@@ -64,13 +66,19 @@ private struct TaskDetailLoader: View {
 }
 
 private nonisolated enum DetailPage: Hashable, CaseIterable {
-    case general, speed, seeding, log, advanced
+    case general, speed
+    #if FULL_FLAVOR
+    case seeding
+    #endif
+    case log, advanced
 
     var title: String {
         switch self {
         case .general: L("detailTabGeneral")
         case .speed: L("detailTabSpeed")
+        #if FULL_FLAVOR
         case .seeding: L("tabSeeding")
+        #endif
         case .log: L("detailTabLog")
         case .advanced: L("detailTabAdvanced")
         }
@@ -87,20 +95,27 @@ private struct TaskDetailPage: View {
     @State private var page: DetailPage = .general
     /// 英雄区滚出后，导航栏内联标题淡入文件名。
     @State private var titleVisible = false
+    #if FULL_FLAVOR
     /// 「忽略插件重试」确认（插件失败的任务）。
     @State private var confirmingIgnoreRetry = false
+    #endif
 
     private var task: DownloadTask { model.task }
 
-    /// 页签：「做种」仅 BT；「日志」所有协议都有。
+    /// 页签：「做种」仅 BT（store 不含做种）；「日志」所有协议都有。
     private var pages: [DetailPage] {
-        task.protocol == .bt ? [.general, .speed, .seeding, .log, .advanced] : [.general, .speed, .log, .advanced]
+        #if FULL_FLAVOR
+        if task.protocol == .bt { return [.general, .speed, .seeding, .log, .advanced] }
+        #endif
+        return [.general, .speed, .log, .advanced]
     }
 
+    #if FULL_FLAVOR
     /// 失败且错误以插件前缀开头：提供「忽略插件重试」。
     private var isPluginFailure: Bool {
         PluginFailure.isIgnorable(status: task.status, errorMessage: task.errorMessage)
     }
+    #endif
 
     private var currentPage: DetailPage { pages.contains(page) ? page : .general }
 
@@ -114,7 +129,9 @@ private struct TaskDetailPage: View {
             switch currentPage {
             case .general: TaskDetailGeneralPage(model: model)
             case .speed: TaskDetailSpeedPage(model: model)
+            #if FULL_FLAVOR
             case .seeding: TaskDetailSeedingPage(model: model)
+            #endif
             case .log: TaskActivityLogPage(taskId: task.taskId)
             case .advanced: TaskDetailAdvancedPage(model: model)
             }
@@ -132,12 +149,14 @@ private struct TaskDetailPage: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarVisibility(sizeClass == .compact ? .hidden : .automatic, for: .tabBar)
         .toolbar { toolbarContent }
+        #if FULL_FLAVOR
         .alert(L("taskIgnorePluginRetryTitle"), isPresented: $confirmingIgnoreRetry) {
             Button(L("cancel"), role: .cancel) {}
             Button(L("taskIgnorePluginRetry")) { ignorePluginRetry() }
         } message: {
             Text(L("taskIgnorePluginRetryMsg"))
         }
+        #endif
         .suppressesBottomAccessory("taskDetail", when: sizeClass == .compact || primaryAction != nil || secondaryAction != nil)
     }
 
@@ -165,17 +184,20 @@ private struct TaskDetailPage: View {
     }
 
     private var failedBannerAction: BannerAction? {
+        #if FULL_FLAVOR
         if isPluginFailure {
             return BannerAction(title: L("taskIgnorePluginRetry")) { confirmingIgnoreRetry = true }
         }
+        #endif
         return task.protocol == .bt ? nil : BannerAction(title: L("mobileChangeUrl")) { actions.changeUrl(task) }
     }
 
     private var errorText: String {
-        let line = TaskDetailFormat.firstLine(task.errorMessage)
+        let line = TaskDetailFormat.firstLine(TaskErrorMessage.displayText(task.errorMessage))
         return line.isEmpty ? L("subtitleError") : line
     }
 
+    #if FULL_FLAVOR
     /// `daemon.plugin.ignoreRetry`：跳过插件，用原始链接重试。
     private func ignorePluginRetry() {
         let id = task.taskId
@@ -185,6 +207,7 @@ private struct TaskDetailPage: View {
             try await session.callVoid(HostMethod.daemonPluginIgnoreRetry, params: TaskIdParams(taskId: id))
         }
     }
+    #endif
 
     // MARK: 分页器（吸顶于导航栏下，系统分段控件）
 
@@ -213,6 +236,7 @@ private struct TaskDetailPage: View {
                 Label(L("mobileShareLink"), systemImage: FluxSymbol.share)
             }
             Menu {
+                #if FULL_FLAVOR
                 if isPluginFailure {
                     Button {
                         confirmingIgnoreRetry = true
@@ -221,6 +245,7 @@ private struct TaskDetailPage: View {
                     }
                     Divider()
                 }
+                #endif
                 TaskMenuItems(task: task, boosted: model.boosted)
             } label: {
                 Label(L("moreActions"), systemImage: FluxSymbol.more)
@@ -476,7 +501,7 @@ private struct TaskDetailHero: View {
             parts.append("\(L("infoSpeed")) \(Format.speedOrZero(model.speedDown).description)")
             if let eta = model.etaSeconds { parts.append("\(L("infoRemaining")) \(TaskDetailText.eta(eta))") }
         } else if visual == .failed {
-            let line = TaskDetailFormat.firstLine(task.errorMessage)
+            let line = TaskDetailFormat.firstLine(TaskErrorMessage.displayText(task.errorMessage))
             if !line.isEmpty { parts.append(line) }
         } else if visual == .seeding {
             parts.append("\(L("mobileUploadChip")) \(Format.speedOrZero(model.speedUp).description)")

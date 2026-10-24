@@ -9,6 +9,7 @@ import android.os.PowerManager
 import android.os.Process
 import androidx.annotation.RequiresApi
 import android.util.Log
+import com.fluxdown.app.update.ApkInstaller
 import java.io.File
 import java.io.IOException
 import java.io.PrintWriter
@@ -30,8 +31,8 @@ private const val EXIT_REASONS_MAX = 32
 
 /**
  * Android 宿主侧诊断：Rust 引擎日志之外，记录进程层面的事实——前台服务启停 / 被拒 / 超时、
- * Kotlin 未捕获异常，以及系统给出的历史进程退出原因（`ApplicationExitInfo`，Android 11+）。
- * 用于区分「后台消失」是内存回收、冻结、崩溃、前台服务超时还是厂商系统清理。
+ * 应用更新交给哪个安装程序及其返回、Kotlin 未捕获异常，以及系统给出的历史进程退出原因（`ApplicationExitInfo`，Android 11+）。
+ * 用于区分「后台消失」是内存回收、冻结、崩溃、前台服务超时还是厂商系统清理，以及更新为何没装上。
  *
  * 只写应用私有目录 `noBackupFilesDir/diagnostics/`，随日志导出打包为 `android/` 目录，不上传。
  */
@@ -126,6 +127,8 @@ object AppDiagnostics {
         appendLine("device: ${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE})")
         appendLine("rom: ${Build.DISPLAY} / ${Build.FINGERPRINT}")
         appendLine("android: ${Build.VERSION.RELEASE} (sdk ${Build.VERSION.SDK_INT})")
+        // 应用更新交给「打开 APK」的默认处理者：区分系统安装器 / 用户设定的第三方安装程序 / 未设默认（选择器）
+        appendLine("apkInstaller: ${ApkInstaller.defaultHandler(context)}")
         val am = context.getSystemService(ActivityManager::class.java)
         val power = context.getSystemService(PowerManager::class.java)
         appendLine("batteryOptimizationIgnored: ${power?.isIgnoringBatteryOptimizations(pkg)}")

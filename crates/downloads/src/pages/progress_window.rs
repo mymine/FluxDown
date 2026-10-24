@@ -14,9 +14,11 @@ mod completions;
 pub use completions::COMPLETION_WINDOW_LIMIT;
 use completions::CompletedTasks;
 
-use fluxdown_protocol::{AgentEvent, AgentSnapshot, DaemonEvent, ServiceEvent, TaskRuntimeDto};
+use fluxdown_protocol::{
+    AgentEvent, AgentSnapshot, DaemonEvent, ServiceEvent, TaskRuntimeDto, WsServerMsg,
+};
 use fluxdown_ui_components::{
-    ControlExt as _, FluxIcon, IconControlExt as _, card, check_row, tabular_numbers,
+    BusyExt as _, ControlExt as _, FluxIcon, IconControlExt as _, card, check_row, tabular_numbers,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -89,6 +91,15 @@ pub enum ProgressWindowEvent {
     OpenMainWindow,
 }
 
+/// 交给系统打开的对象，对应完成视图的两个按钮。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandOffKind {
+    /// 打开文件。
+    File,
+    /// 打开所在文件夹。
+    Folder,
+}
+
 pub struct ProgressWindowView {
     task_id: String,
     controller: DownloadsController,
@@ -100,8 +111,9 @@ pub struct ProgressWindowView {
     parts_expanded: bool,
     completed: Option<CompletedTasks>,
     closed: bool,
-    /// 打开文件 / 所在文件夹的命令执行中：期间两个按钮禁用，重复点击不会把同一文件打开多次。
-    handing_off: bool,
+    /// 执行中的打开命令（打开文件 / 所在文件夹）：被点的按钮显示进行中，另一个禁用，重复点击
+    /// 不会把同一文件打开多次。
+    handing_off: Option<HandOffKind>,
     /// 会关窗的交接中执行打开命令的任务，等宿主取走（见 [`ProgressWindowEvent::HandOffStarted`]）。
     hand_off_task: Option<Task<()>>,
     /// 删除确认框里「同时删除已下载的文件」的勾选状态（每次打开确认框重置为不删）。
@@ -137,7 +149,7 @@ impl ProgressWindowView {
             parts_expanded: false,
             completed: None,
             closed: false,
-            handing_off: false,
+            handing_off: None,
             hand_off_task: None,
             delete_files: false,
             last_error: None,
@@ -190,6 +202,11 @@ impl ProgressWindowView {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        // 任务表分页载入期间行集合只是占位：行不在不代表任务已被删除 / 完成集合已失效。
+        if self.controller.tables_loading() {
+            cx.notify();
+            return;
+        }
         if !self.refresh_completed() {
             self.close(cx);
             return;
@@ -231,9 +248,29 @@ impl ProgressWindowView {
         if let ServiceEvent::Agent(AgentEvent::DaemonConnectionChanged(connected)) = event {
             self.last_error = (!connected).then(|| self.strings.disconnected.clone());
         }
-        if self.controller.apply_event(event) {
+        let relevant = self.event_concerns_window(event);
+        // 控制器照常应用（完成集合随时要查任意任务），但与本窗口无关的单任务事件不重绘。
+        if self.controller.apply_event(event) && relevant {
             self.refresh(cx);
         }
+    }
+
+    /// 单任务的高频事件（进度 / 运行态 / 元数据 / 任务变更）只在涉及本窗口的任务（或完成集合里
+    /// 的任务）时才需要重绘；其余事件一律视为相关。
+    fn event_concerns_window(&self, event: &ServiceEvent) -> bool {
+        let ServiceEvent::Agent(AgentEvent::Daemon(event)) = event else {
+            return true;
+        };
+        let task_id = match event {
+            DaemonEvent::TaskChanged(task) => &task.task_id,
+            DaemonEvent::TaskRuntimeChanged(runtime) => &runtime.task_id,
+            DaemonEvent::Engine(
+                WsServerMsg::TaskProgress { task_id, .. }
+                | WsServerMsg::TaskMetaProbed { task_id, .. },
+            ) => task_id,
+            _ => return true,
+        };
+        *task_id == self.task_id || self.contains_completed(task_id)
     }
 
     pub fn mark_stale(&mut self, cx: &mut Context<Self>) {
@@ -279,11 +316,17 @@ impl ProgressWindowView {
     /// 把任务产物 / 所在文件夹交给系统打开；成功后该项处理完毕（规则同 [`Self::run`]）。
     /// 会关窗时点击即请宿主等打开的程序接管前台，不等打开命令返回：Windows 上它要等系统打开
     /// 调用返回，可能比对方出现在前台还晚。
-    fn hand_off(&mut self, command: DownloadsCommand, task_id: String, cx: &mut Context<Self>) {
-        if self.closed || self.handing_off {
+    fn hand_off(
+        &mut self,
+        kind: HandOffKind,
+        command: DownloadsCommand,
+        task_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.closed || self.handing_off.is_some() {
             return;
         }
-        self.handing_off = true;
+        self.handing_off = Some(kind);
         let closes = !self.keeps_window_after(&task_id);
         if closes {
             cx.emit(ProgressWindowEvent::HandOffStarted);
@@ -294,7 +337,7 @@ impl ProgressWindowView {
             let failed = future.await.is_err();
 
             let Ok(()) = this.update(cx, |this, cx| {
-                this.handing_off = false;
+                this.handing_off = None;
                 cx.notify();
                 if this.closed {
                     return;
@@ -435,6 +478,7 @@ impl ProgressWindowView {
 
     fn open_file(&mut self, task_id: String, cx: &mut Context<Self>) {
         self.hand_off(
+            HandOffKind::File,
             DownloadsCommand::OpenTask {
                 task_id: task_id.clone(),
             },
@@ -445,6 +489,7 @@ impl ProgressWindowView {
 
     fn reveal(&mut self, task_id: String, cx: &mut Context<Self>) {
         self.hand_off(
+            HandOffKind::Folder,
             DownloadsCommand::RevealTask {
                 task_id: task_id.clone(),
             },
@@ -587,7 +632,10 @@ impl ProgressWindowView {
                                             .flex_none()
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(task_status_color(row, cx))
-                                            .child(self.strings.task_status_text(row)),
+                                            .child(
+                                                self.strings
+                                                    .task_status_text(row, self.controller.store()),
+                                            ),
                                     )
                                     .child(
                                         div()
@@ -684,7 +732,9 @@ impl ProgressWindowView {
                 |this| {
                     this.child(Self::render_error(
                         0,
-                        SharedString::from(row.error_message.clone()),
+                        SharedString::from(
+                            self.strings.task_error_text(&row.error_message).to_owned(),
+                        ),
                         cx,
                     ))
                 },
@@ -1137,6 +1187,9 @@ impl ProgressWindowView {
     fn render_completed_footer(&self, missing: bool, cx: &mut Context<Self>) -> AnyElement {
         let folder_id = self.task_id.clone();
         let file_id = self.task_id.clone();
+        // 被点的按钮转圈表示正在打开（进行中本身拦截点击，不再置灰），另一个禁用。
+        let busy = |kind| self.handing_off == Some(kind);
+        let blocked = |kind| self.handing_off.is_some_and(|current| current != kind);
         Self::footer(cx)
             .justify_end()
             .child(div().flex_1().child(self.render_delete_button(cx)))
@@ -1147,7 +1200,8 @@ impl ProgressWindowView {
                     .control(cx)
                     .icon(FluxIcon::FolderOpen)
                     .label(self.strings.open_folder.clone())
-                    .disabled(self.handing_off)
+                    .busy(busy(HandOffKind::Folder))
+                    .disabled(blocked(HandOffKind::Folder))
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.reveal(folder_id.clone(), cx)),
                     ),
@@ -1158,7 +1212,8 @@ impl ProgressWindowView {
                     .control(cx)
                     .icon(FluxIcon::File)
                     .label(self.strings.open_file.clone())
-                    .disabled(missing || self.handing_off)
+                    .busy(busy(HandOffKind::File))
+                    .disabled(missing || blocked(HandOffKind::File))
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.open_file(file_id.clone(), cx)),
                     ),
@@ -1243,7 +1298,7 @@ mod tests {
         use gpui::{AppContext as _, Entity, TestApp};
         use serde_json::json;
 
-        use super::super::{ProgressWindowEvent, ProgressWindowView};
+        use super::super::{HandOffKind, ProgressWindowEvent, ProgressWindowView};
         use crate::controller::{DownloadsCommand, DownloadsPort, DownloadsResult, PortFuture};
 
         /// 打开命令立即返回给定结果，并记录执行次数。
@@ -1343,8 +1398,9 @@ mod tests {
             app.update(|cx| {
                 view.update(cx, |view, cx| {
                     view.open_file("a".to_owned(), cx);
-                    // 执行中再次点击被忽略，同一文件不会打开两次。
+                    // 执行中再次点击被忽略，同一文件不会打开两次，进行中的仍是先点的按钮。
                     view.reveal("a".to_owned(), cx);
+                    assert_eq!(view.handing_off, Some(HandOffKind::File));
                 });
             });
             // 宿主要保活的命令任务可取走一次。
@@ -1367,7 +1423,7 @@ mod tests {
             assert_eq!(*seen.borrow(), [Seen::Started, Seen::Aborted]);
             app.read(|cx| {
                 let view = view.read(cx);
-                assert!(!view.handing_off && !view.closed && view.last_error.is_some());
+                assert!(view.handing_off.is_none() && !view.closed && view.last_error.is_some());
             });
             app.update(|cx| view.update(cx, |view, cx| view.open_file("a".to_owned(), cx)));
             assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1386,7 +1442,7 @@ mod tests {
             assert!(seen.borrow().is_empty());
             app.read(|cx| {
                 let view = view.read(cx);
-                assert!(!view.closed && !view.handing_off);
+                assert!(!view.closed && view.handing_off.is_none());
                 assert_eq!(view.task_id(), "b");
             });
         }

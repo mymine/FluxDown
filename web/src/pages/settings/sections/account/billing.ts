@@ -65,7 +65,9 @@ export interface PriceDisplay {
   stageLabel: string | null
 }
 
-export function priceDisplay(plan: CloudPlan, creditMinor: number): PriceDisplay {
+/** 抵扣额只作用于可购买（available）卡片：当前 / 不可选套餐用已付金额去减会把「已付」误显示成「已抵扣」。 */
+export function priceDisplay(plan: CloudPlan, state: PlanCardState, creditMinor: number): PriceDisplay {
+  if (state !== 'available') creditMinor = 0
   const payable = payableMinor(plan, creditMinor)
   if (creditMinor > 0) return { payable, strike: effectivePriceMinor(plan), creditApplied: true, stageLabel: null }
   if (plan.campaign) {

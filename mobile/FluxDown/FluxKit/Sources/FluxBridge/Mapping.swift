@@ -95,6 +95,10 @@ extension TaskRuntimeDto {
     }
 }
 
+extension QueueOrderDto {
+    var domain: QueueOrderEntry { QueueOrderEntry(taskId: taskId, order: order) }
+}
+
 extension QueueDto {
     var domain: TaskQueue {
         TaskQueue(
@@ -312,9 +316,11 @@ extension HostSnapshotDto {
             info: info.domain,
             daemonConnected: daemonConnected,
             tasks: tasks.map(\.domain),
+            tasksLoading: tasksLoading,
+            taskTotal: taskTotal,
             runtime: Dictionary(runtime.map { ($0.taskId, $0.domain) }, uniquingKeysWith: { _, last in last }),
             queues: queues.map(\.domain),
-            queuePositions: queuePositions,
+            queueOrder: queueOrder.map(\.domain),
             groups: groups.map(\.domain),
             stats: stats.domain,
             priorityTaskId: priorityTaskId,
@@ -350,7 +356,8 @@ extension HostEventDto {
             ))
         case let .taskRuntimeChanged(runtime): .taskRuntimeChanged(runtime.domain)
         case let .queuesChanged(queues): .queuesChanged(queues.map(\.domain))
-        case let .queuePositionsChanged(positions): .queuePositionsChanged(positions)
+        case let .queuePositionsChanged(order): .queuePositionsChanged(order.map(\.domain))
+        case let .queueOrderChanged(removed, added): .queueOrderChanged(removed: removed, added: added.map(\.domain))
         case let .groupsChanged(groups): .groupsChanged(groups.map(\.domain))
         case let .fileMissingChanged(updates): .fileMissingChanged(updates)
         case let .priorityTaskChanged(taskId): .priorityTaskChanged(taskId: taskId)
@@ -398,7 +405,9 @@ extension CreateTaskRequest {
             headers: headers,
             httpUser: httpUser,
             httpPassword: httpPassword,
-            saveSiteAuth: saveSiteAuth
+            saveSiteAuth: saveSiteAuth,
+            unattended: false,
+            offeredSaveDir: offeredSaveDir
         )
     }
 }

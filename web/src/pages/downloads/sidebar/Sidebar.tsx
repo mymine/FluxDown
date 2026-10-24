@@ -2,6 +2,7 @@
 
 import { useNavigate } from '@tanstack/react-router'
 import {
+  ArrowUpFromLine,
   ChevronRight,
   CircleAlert,
   CircleArrowDown,
@@ -9,6 +10,7 @@ import {
   CirclePause,
   Cpu,
   Globe,
+  Link2,
   Plus,
   Layers,
   Rows3,
@@ -22,16 +24,18 @@ import { categoryIconByKey } from '../../../lib/category-icons'
 import { cn } from '../../../lib/cn'
 import { LATER_QUEUE_ID, MAIN_QUEUE_ID, rpc, useAgent, useConnection, usePref, usePrefBool } from '../../../lib/rpc'
 import { cloudPresenceKnown } from '../../../lib/cloud-presence'
-import type { CustomCategoryDto, QueueDto } from '../../../lib/rpc'
+import type { CustomCategoryDto, LinkDeviceInfo, QueueDto } from '../../../lib/rpc'
 import { ContextMenuArea, Icon, confirmDialog } from '../../../ui'
 import { toastRpcError } from '../../../lib/rpcToast'
 import type { MenuEntry } from '../../../ui'
-import { openQueueManager } from '../dialogs'
-import { mergeDevices, sidebarDevices } from '../model/devices'
-import { LOCAL_DEVICE, SIDEBAR_SECTION_PREFS, STATUS_FILTERS, filterMatches, sameSelection } from '../model/filters'
+import { openNewDownload, openQueueManager } from '../dialogs'
+import { SidebarCounts } from '../model/counts'
+import { mergeDevices } from '../model/devices'
+import type { DeviceEntry } from '../model/devices'
+import { LOCAL_DEVICE, SIDEBAR_SECTION_PREFS, STATUS_FILTERS, sameSelection } from '../model/filters'
 import type { DownloadFilter, DownloadStatusFilter, SidebarSelection } from '../model/filters'
-import type { DownloadTaskView } from '../model/task'
 import { categoryLabel, useDownloads } from '../state'
+import { RenameLinkDialog, confirmRemoveLinkDevice } from '../../settings/sections/account/PairedDevicesCard'
 
 type Section = 'status' | 'queues' | 'devices'
 
@@ -39,6 +43,7 @@ const STATUS_ICON: Record<DownloadStatusFilter, LucideIcon> = {
   all: Layers,
   incomplete: CircleArrowDown,
   completed: CircleCheck,
+  seeding: ArrowUpFromLine,
   failed: CircleAlert,
   paused: CirclePause,
 }
@@ -47,6 +52,7 @@ const STATUS_LABEL_KEY: Record<DownloadStatusFilter, string> = {
   all: 'tabAll',
   incomplete: 'statusIncomplete',
   completed: 'statusCompleted',
+  seeding: 'statusSeeding',
   failed: 'tabError',
   paused: 'statusPaused',
 }
@@ -62,20 +68,6 @@ const ROW =
 
 function hideSection(key: string) {
   rpc.agent.preferences.patch({ values: { [key]: false } }).catch(toastRpcError)
-}
-
-/** 仅在计数相关字段（与进度无关）变化时才换新数组引用；进度帧沿用旧引用。 */
-function useStableViews(views: readonly DownloadTaskView[]): readonly DownloadTaskView[] {
-  const signature = views
-    .map((view) => `${view.key}|${view.state}|${view.queueId}|${view.toDevice}|${view.name}|${view.url}|${view.saveDir}`)
-    .join('\n')
-  const [stable, setStable] = useState(views)
-  const [seen, setSeen] = useState(signature)
-  if (seen !== signature) {
-    setSeen(signature)
-    setStable(views)
-  }
-  return stable
 }
 
 /** 可折叠容器（CSS grid 行高过渡，对应 GPUI 折叠动画）。 */
@@ -185,7 +177,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const t = useT()
   const navigate = useNavigate()
   const d = useDownloads()
-  const { views, categories, queues, cloudDevices, linkedDevices, sidebarSelection: current } = d
+  const { categories, queues, cloudDevices, linkedDevices, sidebarSelection: current } = d
   const cloudConnection = useAgent((snapshot) => snapshot.cloudConnection, undefined)
   const localReady = useConnection().phase === 'ready'
   const cloudReady = cloudPresenceKnown(cloudConnection, localReady)
@@ -198,48 +190,29 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const showCategory = usePrefBool(SIDEBAR_SECTION_PREFS.category, true)
   const loggedIn = useAgent((snapshot) => snapshot.session !== null && snapshot.session !== undefined, false)
   const devicesPref = usePref<unknown>(SIDEBAR_SECTION_PREFS.devices)
-  // 设备区三态：显式设置按值；未设置时有任何设备才显示。
-  const sidebarEntries = useMemo(
-    () => sidebarDevices(mergeDevices(cloudDevices, linkedDevices, { cloud: cloudReady, local: localReady })),
+  // 其他设备 = 云其他设备（含挂接直连）+ 独立直连；云条目可选中筛选任务，独立直连只作为「下载到」入口。
+  const otherEntries = useMemo(
+    () => mergeDevices(cloudDevices, linkedDevices, { cloud: cloudReady, local: localReady }),
     [cloudDevices, linkedDevices, cloudReady, localReady],
   )
+  const cloudEntries = useMemo(() => otherEntries.filter((entry) => entry.kind === 'cloud'), [otherEntries])
+  const linkEntries = useMemo(() => otherEntries.filter((entry) => entry.kind === 'link'), [otherEntries])
+  const [renamingLink, setRenamingLink] = useState<LinkDeviceInfo | null>(null)
+  // 设备区三态：显式设置按值；未设置时登录或有任何其他设备才显示。
   const showDevices =
-    typeof devicesPref === 'boolean' ? devicesPref : loggedIn || sidebarEntries.length > 0
+    typeof devicesPref === 'boolean' ? devicesPref : loggedIn || otherEntries.length > 0
 
   const categoryEntries = useMemo<CustomCategoryDto[]>(
     () => categories.visible().map((rule) => rule.dto).filter((dto) => dto.builtinType !== 'all'),
     [categories],
   )
 
-  // 计数只取决于与进度无关的字段；进度帧每帧产出新的 views 数组，这里在签名不变时沿用
-  // 上一个数组引用，使下面的 useMemo 不按帧对全部任务 × 全部过滤器重算。
-  const stableViews = useStableViews(views)
-  const counts = useMemo(() => {
-    const views = stableViews
-    const filterCounts = new Map<string, number>()
-    const queueCounts = new Map<string, number>()
-    const deviceCounts = new Map<string, number>()
-    const bump = (map: Map<string, number>, key: string) => map.set(key, (map.get(key) ?? 0) + 1)
-    const filters: DownloadFilter[] = []
-    for (const status of STATUS_FILTERS) {
-      filters.push({ status, category: null })
-      for (const dto of categoryEntries) filters.push({ status, category: dto.id })
-    }
-    for (const view of views) {
-      if (view.source === 'local') {
-        bump(queueCounts, view.queueId)
-        bump(deviceCounts, LOCAL_DEVICE)
-      } else {
-        bump(deviceCounts, view.toDevice)
-      }
-      for (const filter of filters) {
-        if (filterMatches(filter, view, categories)) bump(filterCounts, `${filter.status}|${filter.category ?? ''}`)
-      }
-    }
-    return { filterCounts, queueCounts, deviceCounts }
-  }, [stableViews, categories, categoryEntries])
+  // 计数由行引擎随任务增删改增量维护（只有计数相关字段变化才换新对象），这里不再扫描全表。
+  // 任务表载入期间本地任务不完整：计数一律按空集（徽标不显示），不展示半份数字。
+  const emptyCounts = useMemo(() => new SidebarCounts([], categories), [categories])
+  const counts = d.tasksLoading ? emptyCounts : d.counts
 
-  const filterCount = (filter: DownloadFilter) => counts.filterCounts.get(`${filter.status}|${filter.category ?? ''}`) ?? 0
+  const filterCount = (filter: DownloadFilter) => counts.filter(filter)
 
   const select = (selection: SidebarSelection) => {
     d.setSidebarSelection(selection)
@@ -297,12 +270,33 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
 
   const devices: { id: string; label: string; online: boolean | null }[] = [
     { id: LOCAL_DEVICE, label: t('thisDevice'), online: true },
-    ...sidebarEntries.map((device) => ({
+    ...cloudEntries.map((device) => ({
       id: device.id,
       label: device.name,
       online: device.online,
     })),
   ]
+
+  const downloadToLink = (device: DeviceEntry) => {
+    onNavigate?.()
+    openNewDownload({ target: `link:${device.id}` })
+  }
+
+  const linkMenu = (device: DeviceEntry): MenuEntry[] => {
+    const info = linkedDevices.find((item) => item.fingerprint === device.id)
+    const entries: MenuEntry[] = [
+      { type: 'item', key: 'download', label: t('deviceDownloadToThis'), onSelect: () => downloadToLink(device) },
+    ]
+    if (info) {
+      entries.push(
+        { type: 'item', key: 'rename', label: t('linkedDeviceRename'), onSelect: () => setRenamingLink(info) },
+        { type: 'separator', key: 'sep' },
+        { type: 'item', key: 'unpair', label: t('localDeviceUnpair'), destructive: true, onSelect: () => void confirmRemoveLinkDevice(t, info) },
+      )
+    }
+    return entries
+  }
+
   const openAddDevice = () => {
     onNavigate?.()
     void navigate({ to: '/settings/$category', params: { category: 'account' } })
@@ -424,7 +418,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
                   selected={isSelected(selection)}
                   label={label}
                   icon={Rows3}
-                  count={counts.queueCounts.get(queue.queueId) ?? 0}
+                  count={counts.queue(queue.queueId)}
                   dot={queue.isRunning}
                   onClick={() => select(selection)}
                 />
@@ -449,12 +443,24 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
                 selected={isSelected(selection)}
                 label={device.online === null ? `${device.label} · ${t('devicePresenceUnknown')}` : device.label}
                 icon={device.id === LOCAL_DEVICE ? Cpu : Globe}
-                count={counts.deviceCounts.get(device.id) ?? 0}
+                count={counts.device(device.id)}
                 dot={device.online === true && device.id !== LOCAL_DEVICE}
                 onClick={() => select(selection)}
               />
             )
           })}
+          {linkEntries.map((device) => (
+            <ContextMenuArea key={device.id} entries={() => linkMenu(device)} title={device.name}>
+              <NavRow
+                selected={false}
+                label={device.online === null ? `${device.name} · ${t('devicePresenceUnknown')}` : device.name}
+                icon={Link2}
+                count={0}
+                dot={device.online === true}
+                onClick={() => downloadToLink(device)}
+              />
+            </ContextMenuArea>
+          ))}
           <NavRow
             selected={false}
             label={t('addDeviceEntry')}
@@ -470,6 +476,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   return (
     <nav className="flex h-full w-full min-w-0 flex-col gap-3 overflow-y-auto overflow-x-hidden bg-chrome px-2 pt-2 pb-safe">
       {sections}
+      {renamingLink ? <RenameLinkDialog device={renamingLink} onClose={() => setRenamingLink(null)} /> : null}
     </nav>
   )
 }

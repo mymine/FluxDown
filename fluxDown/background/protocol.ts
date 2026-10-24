@@ -23,6 +23,7 @@ import type {
   ResourceType,
 } from "@/utils/resource-types";
 import type { SiteProfileFields } from "@/utils/site-profiles";
+import type { PageScriptSourceResult, PageScriptsActionResult, PageScriptsStatus } from "./page-scripts/model";
 
 // ===== 媒体元素 =====
 
@@ -136,6 +137,12 @@ export interface HostCapabilities {
   pluginRulesSequence: number;
   /** 桌面端 plugin 层实例标识（数据库重置后改变）；旧桌面端 / 无插件时缺省或 null。 */
   pluginRulesEpoch?: string | null;
+  /** 桌面端支持的 NMH 动作（`capabilities.actions`）；旧桌面端为空。含 `page_scripts` 才支持页面脚本。 */
+  actions: string[];
+  /** 页面脚本索引序号；桌面端 daemon 不支持 / 查询失败 / epoch 为空时为 null。 */
+  pageScriptsSequence: number | null;
+  /** 页面脚本索引 epoch（数据库重置后改变）；与序号同时为 null 或同时有值。 */
+  pageScriptsEpoch: string | null;
 }
 
 /** 本地已存的规则包（storage.local `fluxdown_rule_packs`）；只放包本身，同步元信息见 {@link StoredSyncMeta}。 */
@@ -355,6 +362,19 @@ export interface MessageMap {
   /** 规则全文（列表只带精简字段）；不存在或被隐藏（发布构建的内置规则）时为 null。 */
   ruleGet: { req: { id: string }; res: SniffRuleV1 | null };
   rulesSyncStatus: { req: Record<never, never>; res: RuleSyncStatus };
+  /**
+   * 页面脚本状态。`refresh`：none = 只读缓存；stale = 缓存超过 1 分钟才同步；force = 立即同步（选项页打开 / 手动重新检查）。
+   * 只接受扩展页发来的消息。
+   */
+  pageScriptsStatus: { req: { refresh?: "none" | "stale" | "force" }; res: PageScriptsStatus };
+  /** 首次启用某插件的页面脚本（选项页确认对话框 + 已请求到 `userScripts` 权限之后调用）。 */
+  pageScriptsApprove: { req: { identity: string }; res: PageScriptsActionResult };
+  /** 停用并移除：注销全部脚本、删令牌与批准记录。 */
+  pageScriptsRevoke: { req: { identity: string }; res: PageScriptsActionResult };
+  /** 「查看源码」：按需从桌面端拉取并校验 sha256，只读展示，不落 storage。 */
+  pageScriptsSource: { req: { identity: string; id: string }; res: PageScriptSourceResult };
+  /** 页面内「浏览器下载」提示卡的「在文件夹中显示」；只放行该标签页收到过提示的下载。 */
+  showBrowserDownload: { req: { downloadId: number }; res: { ok: boolean } };
 }
 
 export type MessageAction = keyof MessageMap;
@@ -368,7 +388,20 @@ export type ContentMessage =
   | { action: "getPageCharset" }
   | { action: "collectLinks" }
   /** 探测顶层帧 sensor 是否存活；应答 {@link ProbeReply} 并随后全量重发元素状态。 */
-  | { action: "probe" };
+  | { action: "probe" }
+  | BrowserDownloadNotice;
+
+/**
+ * 浏览器自己下载的文件的页内提示（下载 UI 被本扩展隐藏时）：started → done / failed。
+ * 只发给顶层帧；应答 `{ ok: true }` 表示已显示，否则 background 退回系统通知。
+ */
+export interface BrowserDownloadNotice {
+  action: "browserDownload";
+  phase: "started" | "done" | "failed";
+  downloadId: number;
+  /** 文件名（failed 时为空）。 */
+  name: string;
+}
 
 export interface ProbeReply {
   sid: string;

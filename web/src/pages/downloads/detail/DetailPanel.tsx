@@ -10,6 +10,7 @@ import { GeneralTab } from './GeneralTab'
 import { LogTab } from './LogTab'
 import { SeedingTab } from './SeedingTab'
 import { SpeedTab } from './SpeedTab'
+import { GroupOverview } from './GroupOverview'
 import { useSpeedHistory } from './useSpeedHistory'
 import type { DownloadTaskView } from '../model/task'
 
@@ -55,7 +56,7 @@ function TaskDetail({ view }: { view: DownloadTaskView }) {
 /** 任务详情面板：docked = 带标题栏（切换位置 / 关闭）；sheet = 仅内容（Sheet 自带标题与关闭）。 */
 export function DetailPanel({ mode }: { mode: 'docked' | 'sheet' }) {
   const t = useT()
-  const { detailTaskId, byKey, closeDetail, prefs, updatePrefs } = useDownloads()
+  const { detailTaskId, byKey, closeDetail, prefs, updatePrefs, overviewGroupId } = useDownloads()
   const view = detailTaskId ? byKey.get(`l:${detailTaskId}`) : undefined
   const right = prefs.detail_placement === 'right'
   const nextPlacement = right ? 'bottom' : 'right'
@@ -83,7 +84,9 @@ export function DetailPanel({ mode }: { mode: 'docked' | 'sheet' }) {
           </Tooltip>
         </div>
       ) : null}
-      {view ? (
+      {overviewGroupId !== null ? (
+        <GroupOverview key={overviewGroupId} groupId={overviewGroupId} />
+      ) : view ? (
         <TaskDetail key={view.taskId} view={view} />
       ) : (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6">

@@ -38,7 +38,7 @@ struct NetworkPage: View {
                 Section {
                     modeRow(mode)
                 } footer: {
-                    #if FULL_P2P
+                    #if FULL_FLAVOR
                     Text(L("proxyBtNote"))
                     #endif
                 }

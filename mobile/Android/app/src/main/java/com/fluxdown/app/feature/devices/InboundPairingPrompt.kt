@@ -32,6 +32,10 @@ import com.fluxdown.core.protocol.HostSection
 import com.fluxdown.core.protocol.Json
 import com.fluxdown.core.protocol.LinkPairingRequest
 import com.fluxdown.core.protocol.LinkRules
+import com.fluxdown.fluxui.controls.FluxTag
+import com.fluxdown.fluxui.controls.Tone
+import com.fluxdown.fluxui.overlay.FluxBanner
+import com.fluxdown.fluxui.overlay.FluxBannerKind
 import com.fluxdown.fluxui.controls.ButtonVariant
 import com.fluxdown.fluxui.controls.FluxButton
 import com.fluxdown.fluxui.icons.FluxIcons
@@ -193,7 +197,7 @@ private fun PromptSheet(request: LinkPairingRequest, visible: Boolean, queued: I
                             modifier = Modifier.weight(1f),
                         )
                         FluxButton(
-                            str(R.string.incomingPairingAccept),
+                            str(if (request.requestsControl) R.string.linkControlApprove else R.string.incomingPairingAccept),
                             onClick = { onRespond(true, false) },
                             variant = ButtonVariant.Primary,
                             modifier = Modifier.weight(1f),
@@ -220,6 +224,10 @@ private fun PromptSheet(request: LinkPairingRequest, visible: Boolean, queued: I
                 modifier = Modifier.fillMaxWidth(),
             )
             SasDigits(request.sas)
+            if (request.requestsControl) {
+                FluxTag(str(R.string.linkControlRequestTag), tone = Tone.Coral)
+                FluxBanner(str(R.string.linkControlRequestWarning), kind = FluxBannerKind.Warn)
+            }
         }
     }
 }

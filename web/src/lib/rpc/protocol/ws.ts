@@ -2,7 +2,7 @@
 // JSON 形态：`{"type":"taskProgress","taskId":"…",…}`（`type` 判别 + 扁平 camelCase 字段）。
 
 import type { BtFileDto, HlsQualityOptionDto, ResolveVariantOptionDto } from './selection';
-import type { GroupDto, QueueDto, QueuePositionDto } from './queue';
+import type { GroupDto, QueueDto, QueueOrderEntryDto, QueuePositionDto } from './queue';
 import type { RssItemDto, RssSourceDto } from './rss';
 import type { TaskDto } from './task';
 import type { WebhookDeliveryDto } from './webhook';
@@ -102,6 +102,11 @@ export type WsServerMsg =
   /** 自动代理链路决策落定；`route` 同 `TaskDto.autoRoute`，恒非空。 */
   | { type: 'taskRouteChanged'; taskId: string; route: string }
   | { type: 'queuePositionsChanged'; positions: QueuePositionDto[] }
+  /**
+   * 队列顺序增量：先移除 `removed`，再按 `order` 插入 / 更新 `added`（同 id 多次以最后一项为准），
+   * 结果按键升序，`position` = 名次（语义同 Rust `apply_queue_order`）。
+   */
+  | { type: 'queueOrderChanged'; removed: string[]; added: QueueOrderEntryDto[] }
   | { type: 'fileMissingChanged'; updates: FileMissingUpdateDto[] }
   /** Boost 优先任务变化。 */
   | { type: 'priorityTaskChanged'; priorityTaskId: string; autoPausedCount: number }

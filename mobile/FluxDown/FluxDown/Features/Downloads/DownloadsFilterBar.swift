@@ -57,14 +57,16 @@ struct DownloadsFilterBar: View {
     }
 
     private var scopeItems: [ScopeItem<StatusFolder>] {
-        StatusFolder.allCases.map { folder in
+        // 任务表分页载入中：计数是半份列表算出来的，不显示（nil）。
+        let loaded = model.list.loaded
+        return StatusFolder.visible.map { folder in
             let count = model.facets.count(folder)
             let tone: ScopeCountTone = switch folder {
             case .active: .accent
             case .failed: count > 0 ? .failure : .secondary
             default: .secondary
             }
-            return ScopeItem(id: folder, title: folder.title, count: count, countTone: tone)
+            return ScopeItem(id: folder, title: folder.title, count: loaded ? count : nil, countTone: tone)
         }
     }
 
@@ -144,6 +146,8 @@ struct DownloadsFilterBar: View {
 
     private func queueMenuTitle(_ facet: QueueFacet) -> String {
         let state = L(facet.queue.isRunning ? "queueRunningBadge" : "queueStoppedBadge")
+        // 任务表分页载入中：队列任务数是半份列表算出来的，不显示。
+        guard model.list.loaded else { return "\(facet.queue.displayName) · \(state)" }
         return "\(facet.queue.displayName) · \(state) · \(L("nTasks", ["n": facet.count]))"
     }
 

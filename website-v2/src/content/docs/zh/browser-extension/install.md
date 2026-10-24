@@ -3,7 +3,7 @@ title: 安装扩展
 description: 为 Chrome 或 Firefox 安装 FluxDown 浏览器扩展,并与桌面客户端建立连接。
 section: browser-extension
 order: 1
-sourceHash: "2487a358d7f8"
+sourceHash: "5f9e74c62032"
 ---
 
 FluxDown 浏览器扩展接管 Chrome、Firefox 的下载流程,把匹配到的下载转交给 FluxDown 桌面客户端,交由其多线程高速下载。扩展本身不具备下载能力——必须先安装[桌面客户端](/docs/zh/getting-started/installation/)并至少启动过一次。两者的安装顺序不影响使用:无论先装哪一个,后装的一方都会自动找到对方。
@@ -24,23 +24,32 @@ FluxDown 浏览器扩展接管 Chrome、Firefox 的下载流程,把匹配到的�
 2. 点击**添加到 Firefox**,再在权限提示中点击**添加**。
 3. 需要 Firefox 140 及以上版本;若安装按钮呈灰色不可点,先升级 Firefox。
 
-## 手动安装 GitHub Release 构建版
+## 离线安装:商店签名安装包(自动更新)
 
-如果你想抢先用上尚未上架商店的新版本,或所在组织只允许安装经过人工审核的扩展,可以用这种方式。
+适用于打不开商店页面本身的情况。每个稳定版在 Chrome 网上应用店审核通过后,都会补上 `FluxDown-<版本号>-chrome.crx`,因此最新的安装包可能比最新版本晚几天。它就是 Chrome 网上应用店分发的那个 `.crx`:同一个扩展,同一份签名。
 
-**Chrome(及其他 Chromium 内核浏览器):**
+**Chrome(以及 Brave、Vivaldi 等):**
 
-1. 从[最新 GitHub Release](https://github.com/zerx-lab/fluxdown/releases/latest) 下载 `FluxDown-<版本号>-chrome.zip`,解压到一个会长期保留的目录——Chrome 直接从该目录加载扩展,而不是从 zip 本身加载。
+1. 从[下载页](/zh/download/#extension-signed)或 [GitHub Release](https://github.com/zerx-lab/fluxdown/releases) 下载 `FluxDown-<版本号>-chrome.crx`。若 Chrome 提示无法从该网站添加扩展,改为右键下载链接 →**链接另存为**。
 2. 打开 `chrome://extensions`,开启右上角的**开发者模式**。
-3. 点击**加载已解压的扩展程序**,选择解压出来的目录。
-4. 这种手动加载方式与商店版扩展的身份完全一致,与桌面客户端的连接方式也完全相同,无需额外配置。
+3. 把 `.crx` 拖进页面,确认**添加扩展程序**。
+4. 装好后可以关闭开发者模式。Chrome 把它当作商店安装的扩展,会**自动更新**——前提是浏览器能访问 Google 的更新服务。
 
 **Firefox:**
 
-Release 中的 Firefox 构建是经过签名的 `FluxDown-<版本号>-firefox.xpi`,普通(非开发者版)Firefox 无需任何额外设置即可安装:
+Release 中还有经过 Mozilla 签名的 `FluxDown-<版本号>-firefox.xpi`,普通(非开发者版)Firefox 无需任何额外设置即可安装:
 
 1. 从同一个 Release 下载 `FluxDown-<版本号>-firefox.xpi`。
 2. 打开 `about:addons`,点击齿轮图标 → **从文件安装附加组件…**,选中下载好的 `.xpi` 文件。
+
+## 最后手段:开发者模式解压包(不会自动更新)
+
+> **浏览器永远不会更新解压加载的扩展。** 每出一个新版本,都要重新下载、覆盖原文件夹,再在 `chrome://extensions` 点**重新加载**。只在商店和签名安装包都用不了时使用。
+
+1. 从[最新 GitHub Release](https://github.com/zerx-lab/fluxdown/releases/latest) 下载 `FluxDown-<版本号>-chrome.zip`,解压到一个会长期保留的目录——Chrome 直接从该目录加载扩展,而不是从 zip 本身加载。
+2. 打开 `chrome://extensions`,开启右上角的**开发者模式**,并保持开启。
+3. 点击**加载已解压的扩展程序**,选择解压出来的目录。
+4. 解压包与商店版扩展的身份完全一致,与桌面客户端的连接方式也完全相同,无需额外配置。
 
 <!-- TODO(screenshot): chrome://extensions 页面,已开启开发者模式,"加载已解压的扩展程序"按钮可见 -->
 

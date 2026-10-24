@@ -4,7 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxdown_protocol::{AgentSnapshot, SnapshotBody};
+use fluxdown_protocol::{
+    AgentEvent, AgentSnapshot, DaemonEvent, EventFrame, ServiceEvent, SnapshotBody, TaskDto,
+    WsServerMsg,
+};
 use tokio::sync::broadcast;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +26,8 @@ pub struct BackgroundEffects {
     events: AgentEventHub,
     notifier: Arc<Notifier>,
     action_text: NoticeText,
+    /// agent 自己播放「下载完成」提示音（桌面宿主）；为真且该提示音已启用时，完成通知静音。
+    completion_sound_owned: bool,
     #[cfg(feature = "desktop")]
     translator: Option<fluxdown_ui_i18n::Translator>,
 }
@@ -47,6 +52,7 @@ impl BackgroundEffects {
             events,
             notifier,
             action_text: NoticeText::default(),
+            completion_sound_owned: false,
             #[cfg(feature = "desktop")]
             translator: match fluxdown_ui_i18n::I18nCatalog::load_embedded() {
                 Ok(catalog) => {
@@ -60,20 +66,26 @@ impl BackgroundEffects {
         }
     }
 
+    /// 声明本宿主会播放「下载完成」提示音（见 [`crate::sound`]）：用户启用后完成通知改为静音，避免双重声音。
+    #[must_use]
+    pub fn with_completion_sound(mut self, owned: bool) -> Self {
+        self.completion_sound_owned = owned;
+        self
+    }
+
     pub async fn run(mut self, cancel: CancellationToken) {
         let (mut receiver, snapshot) = self.events.subscribe_and_snapshot();
         let mut awake = AwakeState::default();
         let mut pending = PendingCompletions::default();
-        let mut statuses = {
+        let mut tracker = TaskTracker::default();
+        {
             let initial = agent_snapshot(snapshot);
-            reconcile_awake(should_keep_awake(&initial), &mut awake).await;
-            initial
-                .daemon
-                .tasks
-                .iter()
-                .map(|task| (task.task_id.clone(), task.status))
-                .collect::<HashMap<_, _>>()
-        };
+            // 空镜像上的整表登记不会产生完成通知。
+            tracker.rebuild(&initial);
+            let hold = preference_bool(&initial, KEEP_AWAKE_PREF, KEEP_AWAKE_DEFAULT)
+                && tracker.has_active();
+            reconcile_awake(hold, &mut awake).await;
+        }
         loop {
             let flush_at = pending.flush_at;
             let flush = async move {
@@ -86,27 +98,28 @@ impl BackgroundEffects {
                 _ = cancel.cancelled() => return,
                 () = flush => self.flush(&mut pending),
                 event = receiver.recv() => {
-                    match event {
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                            if let Ok(frame) = &event {
-                                self.notify_rss_auto_downloads(frame);
-                            }
-                            // 每个进度帧都会走到这里：只在锁内提取所需字段，不克隆整份快照。
-                            let (completed, should_hold, locale) = self.events.inspect(|snapshot| {
-                                let completed = take_new_completions(snapshot, &mut statuses);
-                                let locale = if completed.is_empty() {
-                                    None
-                                } else {
-                                    locale_preference(snapshot)
-                                };
-                                (completed, should_keep_awake(snapshot), locale)
-                            });
-                            if !completed.is_empty() {
-                                pending.push(completed, locale, Instant::now());
-                            }
-                            reconcile_awake(should_hold, &mut awake).await;
+                    let frame = match &event {
+                        Ok(frame) => {
+                            self.notify_rss_auto_downloads(frame);
+                            Some(frame)
                         }
+                        // 本接收端自己落后：丢了帧，任务表整表对账一次。
+                        Err(broadcast::error::RecvError::Lagged(_)) => None,
                         Err(broadcast::error::RecvError::Closed) => return,
+                    };
+                    let change = frame.map_or(Change::Rebuild, |frame| change_for(frame, &tracker));
+                    if matches!(change, Change::None) {
+                        continue;
+                    }
+                    // 锁内只做与帧内任务数成正比的工作，不克隆也不扫描整份快照。
+                    let observed = self
+                        .events
+                        .inspect(|snapshot| observe(&mut tracker, snapshot, change));
+                    if !observed.completed.is_empty() {
+                        pending.push(observed.completed, observed.locale, Instant::now());
+                    }
+                    if let Some(hold) = observed.hold {
+                        reconcile_awake(hold, &mut awake).await;
                     }
                 }
             }
@@ -168,6 +181,10 @@ impl BackgroundEffects {
         if !self.events.inspect(notify_on_complete) {
             return;
         }
+        let silent = self.completion_sound_owned
+            && self.events.inspect(|snapshot| {
+                crate::sound::setting(snapshot, crate::sound::SoundKind::TaskCompleted).is_enabled()
+            });
         let open_file = self.action_text.text("openFile", batch.locale.as_deref());
         let open_folder = self.action_text.text("openFolder", batch.locale.as_deref());
         let Some((title, body)) = self.completion_notice(&batch.file_names, batch.locale) else {
@@ -175,7 +192,14 @@ impl BackgroundEffects {
         };
         let notifier = Arc::clone(&self.notifier);
         tokio::task::spawn_blocking(move || {
-            notifier.show_completion(&title, &body, batch.last_path, open_file, open_folder);
+            notifier.show_completion(
+                &title,
+                &body,
+                batch.last_path,
+                open_file,
+                open_folder,
+                silent,
+            );
         });
     }
 
@@ -259,45 +283,189 @@ struct CompletedFile {
     path: Option<std::path::PathBuf>,
 }
 
-/// 用最新任务状态原地刷新 `statuses`，返回本次新转为完成（status 3）且需要
-/// 通知的文件及最终路径。首次出现的任务只登记不通知；已删除的任务从表中剔除。
-fn take_new_completions(
-    snapshot: &AgentSnapshot,
-    statuses: &mut HashMap<String, i32>,
-) -> Vec<CompletedFile> {
-    let enabled = notify_on_complete(snapshot);
-    let tasks = &snapshot.daemon.tasks;
-    let mut completed = Vec::new();
-    for task in tasks {
-        match statuses.get_mut(&task.task_id) {
-            Some(previous) => {
-                if enabled && task.status == 3 && *previous != 3 {
-                    completed.push(CompletedFile {
-                        name: task.file_name.clone(),
-                        path: completion_path(&task.save_dir, &task.file_name),
-                    });
-                }
-                *previous = task.status;
-            }
-            None => {
-                statuses.insert(task.task_id.clone(), task.status);
-            }
-        }
-    }
-    // 上面的循环保证 statuses ⊇ 当前任务；只有发生删除时长度才会更大。
-    if statuses.len() != tasks.len() {
-        statuses.retain(|task_id, _| tasks.iter().any(|task| task.task_id == *task_id));
-    }
-    completed
+fn is_active(status: i32) -> bool {
+    matches!(status, 1 | 5)
 }
 
-fn should_keep_awake(snapshot: &AgentSnapshot) -> bool {
-    preference_bool(snapshot, KEEP_AWAKE_PREF, KEEP_AWAKE_DEFAULT)
-        && snapshot
-            .daemon
-            .tasks
-            .iter()
-            .any(|task| matches!(task.status, 1 | 5))
+/// 一帧里受影响的任务 id。
+#[derive(Clone, Copy)]
+enum TaskIds<'a> {
+    One(&'a str),
+    Tasks(&'a [TaskDto]),
+    Ids(&'a [String]),
+}
+
+impl TaskIds<'_> {
+    fn for_each(self, mut visit: impl FnMut(&str)) {
+        match self {
+            Self::One(id) => visit(id),
+            Self::Tasks(tasks) => tasks.iter().for_each(|task| visit(&task.task_id)),
+            Self::Ids(ids) => ids.iter().for_each(|id| visit(id)),
+        }
+    }
+}
+
+/// 一帧对本模块关心的状态（任务状态集 / 保持唤醒偏好）的影响。
+#[derive(Clone, Copy)]
+enum Change<'a> {
+    /// 无关：不读快照、不拿 hub 锁。
+    None,
+    /// 偏好变更（保持唤醒开关）。
+    Preferences,
+    /// 只触及这些任务。
+    Tasks(TaskIds<'a>),
+    /// 任务表被整体替换（快照替换 / 重连）或本接收端落后：整表对账一次。
+    Rebuild,
+}
+
+/// 分类一帧。覆盖 `apply_daemon_event` 里所有会增删任务或改写 `status` 的事件；高频的
+/// `TaskProgress` 在状态与镜像一致（或任务未知）时不需要读快照。
+fn change_for<'a>(frame: &'a EventFrame, tracker: &TaskTracker) -> Change<'a> {
+    let event = match &frame.event {
+        ServiceEvent::Daemon(event) | ServiceEvent::Agent(AgentEvent::Daemon(event)) => event,
+        ServiceEvent::Agent(AgentEvent::DaemonSnapshotReplaced(_)) => return Change::Rebuild,
+        ServiceEvent::Agent(AgentEvent::PreferencesChanged(_)) => return Change::Preferences,
+        ServiceEvent::Agent(_) => return Change::None,
+    };
+    match event {
+        DaemonEvent::SnapshotReplaced(_)
+        | DaemonEvent::TablesReloading { tasks: Some(_), .. }
+        | DaemonEvent::Engine(WsServerMsg::TasksSnapshot { .. }) => Change::Rebuild,
+        DaemonEvent::TaskChanged(task) => Change::Tasks(TaskIds::One(&task.task_id)),
+        DaemonEvent::TasksChanged(tasks) => Change::Tasks(TaskIds::Tasks(tasks)),
+        DaemonEvent::TaskDeleted { task_id } => Change::Tasks(TaskIds::One(task_id)),
+        DaemonEvent::TasksDeleted { task_ids } => Change::Tasks(TaskIds::Ids(task_ids)),
+        DaemonEvent::Engine(WsServerMsg::TaskProgress {
+            task_id,
+            status,
+            error_message,
+            ..
+        }) => {
+            let deleted = *status == 4 && error_message == "deleted";
+            match tracker.statuses.get(task_id) {
+                Some(known) if deleted || known != status => Change::Tasks(TaskIds::One(task_id)),
+                _ => Change::None,
+            }
+        }
+        _ => Change::None,
+    }
+}
+
+/// 任务状态镜像：只在受影响的任务上增量更新，并维护活跃（status 1|5）任务计数——
+/// 每帧都全表扫描会让持锁时间随任务数线性增长（几万任务导入时拖垮整条事件链）。
+#[derive(Default)]
+struct TaskTracker {
+    statuses: HashMap<String, i32>,
+    active: usize,
+}
+
+impl TaskTracker {
+    fn has_active(&self) -> bool {
+        self.active > 0
+    }
+
+    /// 用整张任务表重建镜像，返回相对旧镜像新转为完成（status 3）且需要通知的文件。
+    /// 首次出现的任务只登记不通知；已不在表中的任务被剔除。
+    fn rebuild(&mut self, snapshot: &AgentSnapshot) -> Vec<CompletedFile> {
+        let enabled = notify_on_complete(snapshot);
+        let tasks = &snapshot.daemon.tasks;
+        let mut statuses = HashMap::with_capacity(tasks.len());
+        let mut completed = Vec::new();
+        for task in tasks {
+            if enabled
+                && task.status == 3
+                && self
+                    .statuses
+                    .get(&task.task_id)
+                    .is_some_and(|previous| *previous != 3)
+            {
+                completed.push(completed_file(task));
+            }
+            statuses.insert(task.task_id.clone(), task.status);
+        }
+        self.active = statuses
+            .values()
+            .filter(|status| is_active(**status))
+            .count();
+        self.statuses = statuses;
+        completed
+    }
+
+    /// 只按 `ids` 以快照里的最新状态刷新镜像：存在则登记 / 更新（跃迁到完成时通知），
+    /// 不存在则剔除。耗时与 `ids` 个数成正比，与任务总数无关。
+    fn refresh(&mut self, snapshot: &AgentSnapshot, ids: TaskIds<'_>) -> Vec<CompletedFile> {
+        let enabled = notify_on_complete(snapshot);
+        let mut completed = Vec::new();
+        ids.for_each(|id| match snapshot.daemon.task(id) {
+            Some(task) => match self.statuses.get_mut(id) {
+                Some(previous) => {
+                    if enabled && task.status == 3 && *previous != 3 {
+                        completed.push(completed_file(task));
+                    }
+                    match (is_active(*previous), is_active(task.status)) {
+                        (false, true) => self.active += 1,
+                        (true, false) => self.active = self.active.saturating_sub(1),
+                        _ => {}
+                    }
+                    *previous = task.status;
+                }
+                None => {
+                    self.statuses.insert(task.task_id.clone(), task.status);
+                    if is_active(task.status) {
+                        self.active += 1;
+                    }
+                }
+            },
+            None => {
+                if let Some(previous) = self.statuses.remove(id)
+                    && is_active(previous)
+                {
+                    self.active = self.active.saturating_sub(1);
+                }
+            }
+        });
+        completed
+    }
+}
+
+fn completed_file(task: &TaskDto) -> CompletedFile {
+    CompletedFile {
+        name: task.file_name.clone(),
+        path: completion_path(&task.save_dir, &task.file_name),
+    }
+}
+
+/// 一次观察的结果。
+struct Observation {
+    completed: Vec<CompletedFile>,
+    /// 有完成通知时的界面语言偏好。
+    locale: Option<String>,
+    /// 需要重新协调「保持唤醒」时的目标状态；`None` = 与上次相比没有变化可能。
+    hold: Option<bool>,
+}
+
+/// 在 hub 锁内按帧影响更新镜像，工作量与帧内任务数成正比。
+fn observe(tracker: &mut TaskTracker, snapshot: &AgentSnapshot, change: Change<'_>) -> Observation {
+    let had_active = tracker.has_active();
+    let completed = match change {
+        Change::None | Change::Preferences => Vec::new(),
+        Change::Tasks(ids) => tracker.refresh(snapshot, ids),
+        Change::Rebuild => tracker.rebuild(snapshot),
+    };
+    let reevaluate = matches!(change, Change::Preferences | Change::Rebuild)
+        || had_active != tracker.has_active();
+    let locale = if completed.is_empty() {
+        None
+    } else {
+        locale_preference(snapshot)
+    };
+    Observation {
+        completed,
+        locale,
+        hold: reevaluate.then(|| {
+            preference_bool(snapshot, KEEP_AWAKE_PREF, KEEP_AWAKE_DEFAULT) && tracker.has_active()
+        }),
+    }
 }
 
 /// 保持唤醒状态：`failed` 记住本次「应持有」区间内的获取失败（无 logind 等环境），
@@ -382,10 +550,12 @@ mod tests {
     use fluxdown_protocol::{AgentPreferencesDto, AgentSnapshot, TaskDto};
     use serde_json::json;
 
+    use fluxdown_protocol::{AgentEvent, DaemonEvent, EventFrame, ServiceEvent, WsServerMsg};
+
     use super::{
-        CompletedFile, KEEP_AWAKE_DEFAULT, KEEP_AWAKE_PREF, NOTIFY_DEBOUNCE, NOTIFY_MAX_WAIT,
-        PendingCompletions, locale_preference, notify_on_complete, preference_bool,
-        take_new_completions,
+        Change, CompletedFile, KEEP_AWAKE_DEFAULT, KEEP_AWAKE_PREF, NOTIFY_DEBOUNCE,
+        NOTIFY_MAX_WAIT, PendingCompletions, TaskTracker, change_for, locale_preference,
+        notify_on_complete, observe, preference_bool,
     };
 
     #[test]
@@ -462,33 +632,30 @@ mod tests {
     }
 
     #[test]
-    fn completions_fire_once_per_transition_and_forget_deleted_tasks()
+    fn rebuild_notifies_new_completions_once_and_forgets_deleted_tasks()
     -> Result<(), serde_json::Error> {
         let mut snapshot = AgentSnapshot::default();
         snapshot
             .preferences
             .values
             .insert("download.notify_on_complete".to_owned(), json!(true));
-        let mut statuses = HashMap::new();
+        let mut tracker = TaskTracker::default();
+        let mut rebuild = |snapshot: &AgentSnapshot| tracker.rebuild(snapshot);
 
         // 首次出现的任务（含已完成的）只登记，不通知。
         snapshot.daemon.tasks = vec![task("a", 1)?, task("b", 3)?];
-        assert!(take_new_completions(&snapshot, &mut statuses).is_empty());
+        assert!(rebuild(&snapshot).is_empty());
 
-        // a 从下载中转为完成：恰好通知一次，重复帧不再通知。
+        // a 从下载中转为完成：恰好通知一次，重复对账不再通知。
         snapshot.daemon.tasks = vec![task("a", 3)?, task("b", 3)?];
-        assert_eq!(
-            take_new_completions(&snapshot, &mut statuses),
-            [completed("a.bin")]
-        );
-        assert!(take_new_completions(&snapshot, &mut statuses).is_empty());
+        assert_eq!(rebuild(&snapshot), [completed("a.bin")]);
+        assert!(rebuild(&snapshot).is_empty());
 
         // b 被删除后以同 id 重新出现并直接是完成态：视为新任务，不通知。
         snapshot.daemon.tasks = vec![task("a", 3)?];
-        assert!(take_new_completions(&snapshot, &mut statuses).is_empty());
-        assert!(!statuses.contains_key("b"));
+        assert!(rebuild(&snapshot).is_empty());
         snapshot.daemon.tasks = vec![task("a", 3)?, task("b", 3)?];
-        assert!(take_new_completions(&snapshot, &mut statuses).is_empty());
+        assert!(rebuild(&snapshot).is_empty());
 
         // 关闭通知开关后，跃迁仍被记录但不产生通知。
         snapshot
@@ -496,10 +663,164 @@ mod tests {
             .values
             .insert("download.notify_on_complete".to_owned(), json!(false));
         snapshot.daemon.tasks = vec![task("a", 1)?, task("b", 3)?];
-        assert!(take_new_completions(&snapshot, &mut statuses).is_empty());
+        assert!(rebuild(&snapshot).is_empty());
         snapshot.daemon.tasks = vec![task("a", 3)?, task("b", 3)?];
-        assert!(take_new_completions(&snapshot, &mut statuses).is_empty());
-        assert_eq!(statuses.get("a"), Some(&3));
+        assert!(rebuild(&snapshot).is_empty());
+        assert_eq!(tracker.statuses.get("a"), Some(&3));
+        Ok(())
+    }
+
+    fn progress_frame(task_id: &str, status: i32, error_message: &str) -> EventFrame {
+        EventFrame {
+            epoch: "epoch".to_owned(),
+            sequence: 1,
+            previous: None,
+            event: ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::Engine(
+                WsServerMsg::TaskProgress {
+                    task_id: task_id.to_owned(),
+                    status,
+                    downloaded_bytes: 0,
+                    total_bytes: 100,
+                    speed: 0,
+                    file_name: String::new(),
+                    save_dir: String::new(),
+                    upload_speed: 0,
+                    url: String::new(),
+                    error_message: error_message.to_owned(),
+                    uploaded_bytes: 0,
+                    seeding_status: 0,
+                    seeding_message: String::new(),
+                    seeding_time_secs: 0,
+                },
+            ))),
+        }
+    }
+
+    fn daemon_frame(event: DaemonEvent) -> EventFrame {
+        EventFrame {
+            epoch: "epoch".to_owned(),
+            sequence: 1,
+            previous: None,
+            event: ServiceEvent::Agent(AgentEvent::Daemon(event)),
+        }
+    }
+
+    /// 按帧增量维护的镜像，在任何帧序列之后都与整表对账（旧实现的逐帧全表扫描）等价：
+    /// 完成通知、任务集与「是否有 status 1|5 的任务」一致。
+    #[test]
+    fn incremental_updates_match_a_full_scan_after_every_frame() -> Result<(), serde_json::Error> {
+        let mut snapshot = AgentSnapshot::default();
+        snapshot.daemon.tasks = vec![task("a", 0)?, task("b", 1)?, task("c", 3)?];
+        let mut tracker = TaskTracker::default();
+        assert!(tracker.rebuild(&snapshot).is_empty());
+
+        let frames = [
+            // 任务 a 开始下载，b 完成（通知），已知任务重复进度（不碰快照）。
+            (progress_frame("a", 1, ""), vec![]),
+            (progress_frame("b", 3, ""), vec!["b.bin"]),
+            (progress_frame("b", 3, ""), vec![]),
+            // 未知任务的进度不进入任务集。
+            (progress_frame("ghost", 3, ""), vec![]),
+            // 批量新增：新任务只登记；已存在的 a 完成（通知）。
+            (
+                daemon_frame(DaemonEvent::TasksChanged(vec![
+                    task("a", 3)?,
+                    task("d", 5)?,
+                    task("e", 3)?,
+                ])),
+                vec!["a.bin"],
+            ),
+            // 删除：进度帧里的 deleted 标记与 TaskDeleted / TasksDeleted。
+            (progress_frame("d", 4, "deleted"), vec![]),
+            (
+                daemon_frame(DaemonEvent::TaskDeleted {
+                    task_id: "e".to_owned(),
+                }),
+                vec![],
+            ),
+            (
+                daemon_frame(DaemonEvent::TasksDeleted {
+                    task_ids: vec!["a".to_owned(), "nope".to_owned()],
+                }),
+                vec![],
+            ),
+            // 删除后同 id 以完成态重新出现：视为新任务，不通知。
+            (
+                daemon_frame(DaemonEvent::TaskChanged(task("a", 3)?)),
+                vec![],
+            ),
+            (
+                daemon_frame(DaemonEvent::TaskChanged(task("a", 1)?)),
+                vec![],
+            ),
+            (progress_frame("a", 3, ""), vec!["a.bin"]),
+        ];
+        for (frame, expected) in frames {
+            let change = change_for(&frame, &tracker);
+            fluxdown_protocol::apply_agent_event(
+                &mut snapshot,
+                match &frame.event {
+                    ServiceEvent::Agent(event) => event,
+                    ServiceEvent::Daemon(_) => unreachable!("agent frames only"),
+                },
+            );
+            let observed = observe(&mut tracker, &snapshot, change);
+            let names: Vec<_> = observed
+                .completed
+                .iter()
+                .map(|file| file.name.as_str())
+                .collect();
+            assert_eq!(names, expected);
+
+            let table: HashMap<_, _> = snapshot
+                .daemon
+                .tasks
+                .iter()
+                .map(|task| (task.task_id.clone(), task.status))
+                .collect();
+            assert_eq!(tracker.statuses, table);
+            assert_eq!(
+                tracker.has_active(),
+                snapshot
+                    .daemon
+                    .tasks
+                    .iter()
+                    .any(|task| matches!(task.status, 1 | 5))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn keep_awake_is_only_reevaluated_on_relevant_changes() -> Result<(), serde_json::Error> {
+        let mut snapshot = AgentSnapshot::default();
+        snapshot
+            .preferences
+            .values
+            .insert("download.keep_awake".to_owned(), json!(true));
+        snapshot.daemon.tasks = vec![task("a", 0)?];
+        let mut tracker = TaskTracker::default();
+        let initial = observe(&mut tracker, &snapshot, Change::Rebuild);
+        assert_eq!(initial.hold, Some(false));
+
+        // 状态不变的进度帧不需要读快照，也不触发重新评估。
+        let idle = progress_frame("a", 0, "");
+        assert!(matches!(change_for(&idle, &tracker), Change::None));
+
+        snapshot.daemon.tasks = vec![task("a", 1)?];
+        let started = progress_frame("a", 1, "");
+        let change = change_for(&started, &tracker);
+        assert_eq!(observe(&mut tracker, &snapshot, change).hold, Some(true));
+
+        // 活跃数没有变化的任务变更不重新评估；偏好变更总是重新评估。
+        snapshot.daemon.tasks = vec![task("a", 5)?];
+        let still_active = progress_frame("a", 5, "");
+        let change = change_for(&still_active, &tracker);
+        assert_eq!(observe(&mut tracker, &snapshot, change).hold, None);
+        assert_eq!(
+            observe(&mut tracker, &snapshot, Change::Preferences).hold,
+            Some(true)
+        );
         Ok(())
     }
 

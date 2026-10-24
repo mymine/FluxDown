@@ -164,6 +164,7 @@ impl NewDownloadView {
         if self.manifest.is_none() {
             return;
         }
+        self.record_save_dir_history(&request.save_dir, cx);
         let port = self.port.clone();
         let timer = cx.background_executor().clone();
         let submission = NewDownloadSubmission::Group {

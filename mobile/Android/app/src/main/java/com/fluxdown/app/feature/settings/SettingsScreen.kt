@@ -40,7 +40,6 @@ import com.fluxdown.app.feature.devices.localizedSubtitle
 import com.fluxdown.app.feature.settings.bt.btReadout
 import com.fluxdown.app.feature.settings.bt.ed2kReadout
 import com.fluxdown.app.feature.settings.diagnostics.diagnosticsReadout
-import com.fluxdown.app.feature.settings.general.generalReadout
 import com.fluxdown.app.feature.settings.general.notifyReadout
 import com.fluxdown.app.feature.settings.network.networkReadout
 import com.fluxdown.app.i18n.str
@@ -52,6 +51,7 @@ import com.fluxdown.app.shell.LocalAppContainer
 import com.fluxdown.app.shell.hostState
 import com.fluxdown.core.format.Format
 import com.fluxdown.core.model.HostRef
+import com.fluxdown.core.protocol.CustomCategoryDto
 import com.fluxdown.core.protocol.HostSection
 import com.fluxdown.core.protocol.SettingsForm
 import com.fluxdown.core.protocol.preferences
@@ -98,7 +98,6 @@ fun SettingsScreen() {
     val listState = rememberLazyListState()
     val gate = rememberFlowInGate()
     val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
-    DockMiniOnScroll(listState, nav)
     val version = remember(context) { context.appVersionName() }
     var query by rememberSaveable { mutableStateOf("") }
 
@@ -120,7 +119,7 @@ fun SettingsScreen() {
 
     @Composable
     fun readout(page: SettingsPage): String? = when (page) {
-        SettingsPage.General -> generalReadout(ctx)
+        SettingsPage.General -> null
         SettingsPage.Appearance -> appearanceReadout(appearance)
         SettingsPage.Notify -> notifyReadout(ctx)
         SettingsPage.Download -> downloadReadout(ctx, isLocal)
@@ -321,7 +320,7 @@ private fun downloadReadout(ctx: SettingsSearchContext, isLocal: Boolean): Strin
     val dir = if (isLocal) "" else config["default_save_dir"].orEmpty().trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\')
     val concurrent = config["max_concurrent_tasks"]
     val limit = config["speed_limit_bytes"]?.toLongOrNull() ?: 0L
-    val parts = ArrayList<String>(3)
+    val parts = ArrayList<String>(4)
     when {
         dir.isNotEmpty() && concurrent != null ->
             parts += str(R.string.mobileSettingsReadoutDownload, "dir" to dir, "n" to concurrent)
@@ -329,6 +328,9 @@ private fun downloadReadout(ctx: SettingsSearchContext, isLocal: Boolean): Strin
         dir.isNotEmpty() -> parts += dir
     }
     Format.speed(limit)?.let { parts += str(R.string.mobileSettingsReadoutLimit, "speed" to it.toString()) }
+    ctx.form.pref(CustomCategoryDto.PREFERENCE_KEY)?.let {
+        parts += str(R.string.mobileGeneralReadoutCategories, "n" to CustomCategoryDto.fromPreference(it).size)
+    }
     return parts.joinToString(" · ")
 }
 

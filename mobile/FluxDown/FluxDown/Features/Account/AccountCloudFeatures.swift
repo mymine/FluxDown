@@ -22,7 +22,7 @@ struct AccountCloudFeatures: View {
 
     /// 同步范围分组；store 构建不展示 P2P 两组（主机上的取值不受影响）。
     private static var syncGroups: [SyncGroup] {
-        #if FULL_P2P
+        #if FULL_FLAVOR
         return SyncRules.groups
         #else
         return SyncRules.groups.filter { $0.id != .bt && $0.id != .ed2k }

@@ -25,6 +25,8 @@ pub(crate) struct CategoryRule {
 #[derive(Default)]
 pub(crate) struct CategoryIndex {
     rules: Vec<CategoryRule>,
+    /// 与 `rules` 一一对应：该规则是否是其分类 id 的首条（重复 id 只认首条）。
+    first_with_id: Vec<bool>,
 }
 
 impl CategoryIndex {
@@ -33,7 +35,7 @@ impl CategoryIndex {
     }
 
     pub(crate) fn from_dtos(dtos: Vec<CustomCategoryDto>) -> Self {
-        let rules = dtos
+        let rules: Vec<CategoryRule> = dtos
             .into_iter()
             .map(|dto| {
                 let matcher = match (dto.builtin_type.as_deref(), dto.match_mode.as_str()) {
@@ -61,7 +63,15 @@ impl CategoryIndex {
                 CategoryRule { dto, matcher }
             })
             .collect();
-        Self { rules }
+        let mut seen = HashSet::with_capacity(rules.len());
+        let first_with_id = rules
+            .iter()
+            .map(|rule| seen.insert(rule.dto.id.as_str()))
+            .collect();
+        Self {
+            rules,
+            first_with_id,
+        }
     }
 
     pub(crate) fn rules(&self) -> &[CategoryRule] {
@@ -120,13 +130,10 @@ impl CategoryIndex {
     ) {
         let mut specific_hit = false;
         let mut other_ids: Vec<&'a str> = Vec::new();
-        for (index, rule) in self.rules.iter().enumerate() {
+        for (rule, first_with_id) in self.rules.iter().zip(&self.first_with_id) {
             let is_other = matches!(rule.matcher, Matcher::Other);
             let hit = !is_other && Self::rule_matches(rule, task);
             specific_hit |= hit && !matches!(rule.matcher, Matcher::All);
-            let first_with_id = !self.rules[..index]
-                .iter()
-                .any(|earlier| earlier.dto.id == rule.dto.id);
             if !first_with_id {
                 continue;
             }

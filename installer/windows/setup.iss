@@ -152,12 +152,16 @@ const
   { Uninstall key of an all-users (administrative mode) install; the GUID must
     match [Setup] AppId, Inno appends "_is1". }
   LegacyUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{B7E3F2A1-5C4D-4E8F-9A6B-1D2E3F4A5B6C}_is1';
+  { Upper bound for the legacy uninstaller to finish after it was started. }
+  LegacyUninstallTimeoutMs = 60000;
 
 var
   { Per-user integrations owned by a removed all-users install; recreated
     against the new install dir once its files are in place (RemoveLegacyAllUsersInstall). }
   LegacyAutostart, LegacyTorrentAssoc, LegacyDesktopIcon: Boolean;
   LegacyFluxdownScheme, LegacyEd2kScheme, LegacyMagnetScheme: Boolean;
+  { Directory of the all-users install found in HKLM ('' when none). }
+  LegacyAllUsersDir: String;
 
 function DesktopIconAlreadyExists: Boolean;
 begin
@@ -278,7 +282,30 @@ end;
   uninstaller — the one elevation left — after snapshotting the per-user
   integrations that uninstaller deletes (CurUninstallStepChanged), so
   RestoreLegacyIntegrations can recreate them against the new install dir. NMH needs no
-  snapshot: its keys go missing and the new agent re-registers on first launch. }
+  snapshot: its keys go missing and the new agent re-registers on first launch.
+
+  The legacy copy counts as removed once no UI entry point (GPUI desktop or
+  Flutter exe) is left in its directory, not once the HKLM uninstall key is gone:
+  Inno deletes that key last, and a slow or interrupted second uninstall phase
+  used to abort setup after the old files were already deleted, leaving the
+  user with no FluxDown at all (#912). Leftover agent/daemon files are
+  unreachable by then (the uninstaller drops their shortcuts, Run value and
+  handlers first), and a stale key is skipped on the next run. Setup aborts
+  only while the old copy can still be launched, so the user always keeps one
+  working install. }
+function LegacyLaunchable(const Dir: String): Boolean;
+begin
+  Result := FileExists(Dir + '\{#MyAppExeName}') or FileExists(Dir + '\{#LegacyExeName}');
+end;
+
+function LegacyFilesLeft(const Dir: String): Boolean;
+begin
+  Result := LegacyLaunchable(Dir)
+    or FileExists(Dir + '\{#MyAgentExeName}')
+    or FileExists(Dir + '\fluxdownd.exe')
+    or FileExists(Dir + '\fluxdown_nmh.exe');
+end;
+
 function RemoveLegacyAllUsersInstall: String;
 var
   UninstallString, UninstallExe, LegacyDir, LegacyDesktop: String;
@@ -289,6 +316,7 @@ begin
     Exit;
   UninstallExe := RemoveQuotes(UninstallString);
   LegacyDir := ExtractFileDir(UninstallExe);
+  LegacyAllUsersDir := LegacyDir;
   LegacyDesktop := LegacyDir + '\{#MyAppExeName}';
   LegacyAutostart := AutostartTargets(LegacyDir + '\{#MyAgentExeName}');
   LegacyTorrentAssoc := TorrentAssociationTargets(LegacyDesktop);
@@ -296,10 +324,20 @@ begin
   LegacyEd2kScheme := ProtocolHandlerTargets('ed2k', LegacyDesktop);
   LegacyMagnetScheme := ProtocolHandlerTargets('magnet', LegacyDesktop);
   LegacyDesktopIcon := FileExists(ExpandConstant('{commondesktop}\{#MyAppName}.lnk'));
-  { Files already removed by hand: only a stale HKLM entry is left, nothing can
-    still run from there. }
-  if not FileExists(UninstallExe) then
+  { Already removed (by hand or by an earlier, interrupted run): only a stale
+    HKLM entry or unreachable leftovers remain, so no elevation is needed. }
+  if not LegacyLaunchable(LegacyDir) then
+  begin
+    Log('Legacy all-users install in ' + LegacyDir + ' is already removed; skipping its uninstaller.');
     Exit;
+  end;
+  { Uninstaller deleted but the program left in place: nothing can remove it
+    without admin rights, so install alongside it rather than block updates. }
+  if not FileExists(UninstallExe) then
+  begin
+    Log('Legacy all-users install in ' + LegacyDir + ' has no uninstaller; installing alongside it.');
+    Exit;
+  end;
 
   if SuppressibleMsgBox(FmtMessage(CustomMessage('LegacyAllUsersFound'), [LegacyDir]),
     mbInformation, MB_OKCANCEL, IDOK) <> IDOK then
@@ -311,19 +349,59 @@ begin
   if not ShellExec('runas', UninstallExe, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '',
     SW_HIDE, ewWaitUntilTerminated, ErrorCode) then
   begin
+    Log(Format('Legacy uninstaller could not be started (error %d).', [ErrorCode]));
     Result := FmtMessage(CustomMessage('LegacyAllUsersRemoveFailed'), [LegacyDir]);
     Exit;
   end;
-  { The uninstaller's first phase waits for its second phase; the bounded wait
-    only guards against the uninstall key being deleted last. }
+  { The first uninstall phase may return before the second phase is done;
+    wait (bounded) until both the files and the uninstall key are gone. }
   Waited := 0;
-  while RegKeyExists(HKLM, LegacyUninstallKey) and (Waited < 10000) do
+  while (LegacyFilesLeft(LegacyDir) or RegKeyExists(HKLM, LegacyUninstallKey))
+    and (Waited < LegacyUninstallTimeoutMs) do
   begin
     Sleep(250);
     Waited := Waited + 250;
   end;
-  if RegKeyExists(HKLM, LegacyUninstallKey) then
+  if LegacyLaunchable(LegacyDir) then
+  begin
+    Log(Format('Legacy uninstaller exited with code %d, but %s is still launchable after %d ms.', [ErrorCode, LegacyDir, Waited]));
     Result := FmtMessage(CustomMessage('LegacyAllUsersRemoveFailed'), [LegacyDir]);
+    Exit;
+  end;
+  if LegacyFilesLeft(LegacyDir) or RegKeyExists(HKLM, LegacyUninstallKey) then
+    Log('Legacy install in ' + LegacyDir + ' can no longer be launched; continuing despite leftover files or uninstall key.')
+  else
+    Log('Legacy all-users install in ' + LegacyDir + ' removed.');
+end;
+
+{ PrepareToInstall force-kills every FluxDown process before the legacy
+  migration. When that migration aborts a silent (auto-)update, nothing would
+  bring the app back: the agent that started setup has already exited. Start
+  whichever install is still there so the user is not left without FluxDown. }
+procedure RelaunchAfterAbortedUpdate;
+var
+  ResultCode: Integer;
+  Exe, Params: String;
+begin
+  Params := '--relaunch';
+  Exe := ExpandConstant('{app}\{#MyAppExeName}');
+  if not FileExists(Exe) and (LegacyAllUsersDir <> '') then
+    Exe := LegacyAllUsersDir + '\{#MyAppExeName}';
+  if not FileExists(Exe) and (LegacyAllUsersDir <> '') then
+  begin
+    { Flutter-era client: no GPUI launch flags. }
+    Exe := LegacyAllUsersDir + '\{#LegacyExeName}';
+    Params := '';
+  end;
+  if not FileExists(Exe) then
+  begin
+    Log('No FluxDown executable left to relaunch after the aborted update.');
+    Exit;
+  end;
+  if ExecAsOriginalUser(Exe, Params, '', SW_SHOWNORMAL, ewNoWait, ResultCode) then
+    Log('Relaunched ' + Exe + ' after the aborted update.')
+  else
+    Log(Format('Could not relaunch %s after the aborted update (error %d).', [Exe, ResultCode]));
 end;
 
 procedure RestoreLegacyIntegrations;
@@ -381,6 +459,8 @@ begin
   { Small delay to ensure file locks are released }
   Sleep(500);
   Result := RemoveLegacyAllUsersInstall;
+  if (Result <> '') and WizardSilent then
+    RelaunchAfterAbortedUpdate;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

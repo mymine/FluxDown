@@ -12,12 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fluxdown_protocol::{
-    AgentEvent, AgentSnapshot, DaemonEvent, EventFrame, RpcErrorData, ServiceEvent, Snapshot,
-    SnapshotBody, accepted_runtime_status, apply_agent_event,
+    AgentEvent, AgentSnapshot, DaemonEvent, EventFrame, FrameVerdict, RpcErrorData, ServiceEvent,
+    Snapshot, SnapshotBody, accepted_runtime_status, apply_agent_event, judge_frame,
 };
 use gpui::{App, Context, Entity, EventEmitter};
 
-use crate::agent_client::{AgentClient, AgentClientEvent};
+use crate::agent_client::{AgentClient, AgentClientEvent, TablesLoaded};
+use crate::service_failure::ServiceFailure;
 
 /// 断线（含启动时尚未连上）多久仍未恢复才告知视图。本机回环重连与热启动首个快照都远低于此值。
 const OFFLINE_NOTICE_GRACE: Duration = Duration::from_millis(800);
@@ -38,6 +39,8 @@ pub enum SessionSignal {
     Fatal(RpcErrorData),
     /// agent 已完全退出（`system.shutdown`）：界面应随之退出。
     ServiceStopped,
+    /// agent 无法被拉起或反复启动即退出：界面应展示原因；视图随之进入只读态。
+    ServiceFailed(Arc<ServiceFailure>),
 }
 
 /// agent 会话状态：最近一次全量快照与连接健康度。
@@ -81,6 +84,14 @@ impl AgentSession {
     #[must_use]
     pub fn agent_snapshot(&self) -> Option<&AgentSnapshot> {
         self.latest.as_deref().and_then(agent_body)
+    }
+
+    /// 任务表 / 队列位置表仍在分页载入：投影里的 `tasks` 只是占位，不是完整列表，调用方
+    /// 不得据它推断「任务不存在 / 已删除 / 全部」。
+    #[must_use]
+    pub fn tables_loading(&self) -> bool {
+        self.agent_snapshot()
+            .is_some_and(|body| body.daemon.tables_loading())
     }
 
     /// 已可呈现界面：拿到快照，或已确认离线（宽限已过 / 不可恢复），不必再等。
@@ -127,6 +138,21 @@ impl AgentSession {
                     }
                 }
                 AgentClientEvent::Stale => self.go_stale(cx),
+                AgentClientEvent::TablesLoaded(loaded) => {
+                    let installed = self
+                        .latest
+                        .as_mut()
+                        .is_some_and(|snapshot| install_tables(Arc::make_mut(snapshot), *loaded));
+                    match self.latest.as_ref() {
+                        Some(snapshot) if installed => {
+                            if !self.stale {
+                                cx.emit(SessionSignal::Snapshot(Arc::clone(snapshot)));
+                            }
+                        }
+                        // 载入的表与会话投影对不上（epoch / 游标不符）：投影不可信，等重连。
+                        _ => self.go_stale(cx),
+                    }
+                }
                 // 冷启动的首连：尚未拿到过快照、也未宣告离线时放宽一次宽限（重连期间的重新拉起
                 // 不放宽；反复拉起也只放宽一次）。
                 AgentClientEvent::ServiceStarting => {
@@ -145,6 +171,10 @@ impl AgentSession {
                 AgentClientEvent::ServiceStopped => {
                     self.notify_offline_now();
                     cx.emit(SessionSignal::ServiceStopped);
+                }
+                AgentClientEvent::ServiceFailed(failure) => {
+                    self.notify_offline_now();
+                    cx.emit(SessionSignal::ServiceFailed(Arc::new(failure)));
                 }
             }
         }
@@ -224,7 +254,10 @@ pub fn attach<V: SessionConsumer>(session: &Entity<AgentSession>, view: &Entity<
                     view.replace_snapshot(body, cx);
                 }
             }
-            SessionSignal::Stale | SessionSignal::Fatal(_) | SessionSignal::ServiceStopped => {
+            SessionSignal::Stale
+            | SessionSignal::Fatal(_)
+            | SessionSignal::ServiceStopped
+            | SessionSignal::ServiceFailed(_) => {
                 view.mark_stale(cx);
             }
         })
@@ -242,16 +275,13 @@ pub fn attach<V: SessionConsumer>(session: &Entity<AgentSession>, view: &Entity<
     }
 }
 
-/// 严格连续地把帧并入同一 epoch 的快照；旧帧不可倒灌，缺口不可静默跳过。
+/// 把帧并入同一 epoch 的快照：旧帧（含快照已覆盖的）不可倒灌，缺口不可静默跳过；合并帧的
+/// 覆盖区间可以越过快照游标，按 [`judge_frame`] 判定。
 fn apply_frame(snapshot: &mut Snapshot, frame: &mut EventFrame) -> Result<bool, ()> {
-    if snapshot.epoch != frame.epoch {
-        return Err(());
-    }
-    if frame.sequence <= snapshot.sequence {
-        return Ok(false);
-    }
-    if frame.sequence != snapshot.sequence.saturating_add(1) {
-        return Err(());
+    match judge_frame(&snapshot.epoch, snapshot.sequence, frame) {
+        FrameVerdict::Skip => return Ok(false),
+        FrameVerdict::Resync => return Err(()),
+        FrameVerdict::Accept => {}
     }
     let (SnapshotBody::Agent(body), ServiceEvent::Agent(event)) =
         (&mut snapshot.body, &frame.event)
@@ -274,6 +304,24 @@ fn apply_frame(snapshot: &mut Snapshot, frame: &mut EventFrame) -> Result<bool, 
     }
     snapshot.sequence = frame.sequence;
     Ok(deliver)
+}
+
+/// 把分页载入完成的表装入会话投影（与 [`AgentClientEvent::TablesLoaded`] 配对）。载入期间不
+/// 应用任何帧，所以投影游标必须仍是基准帧；对不上返回 `false`。
+fn install_tables(snapshot: &mut Snapshot, loaded: TablesLoaded) -> bool {
+    if snapshot.epoch != loaded.epoch || snapshot.sequence != loaded.sequence {
+        return false;
+    }
+    let SnapshotBody::Agent(body) = &mut snapshot.body else {
+        return false;
+    };
+    if let Some(tasks) = loaded.tasks {
+        body.daemon.install_tasks(tasks);
+    }
+    if let Some(queue) = loaded.queue {
+        body.daemon.install_queue(queue);
+    }
+    true
 }
 
 macro_rules! forward_consumer {
@@ -313,12 +361,14 @@ mod tests {
         AgentEvent, DaemonEvent, EventFrame, ServiceEvent, Snapshot, SnapshotBody, TaskRuntimeDto,
     };
 
-    use super::apply_frame;
+    use super::{apply_frame, install_tables};
+    use crate::agent_client::TablesLoaded;
 
     fn runtime_frame(epoch: &str, sequence: u64, active: u32) -> EventFrame {
         EventFrame {
             epoch: epoch.to_owned(),
             sequence,
+            previous: None,
             event: ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::TaskRuntimeChanged(
                 TaskRuntimeDto {
                     task_id: "task".into(),
@@ -383,10 +433,11 @@ mod tests {
         };
         assert_eq!(body.daemon.task_runtime["task"].active_transfers, Some(3));
         let mut complete = body.daemon.tasks[0].clone();
-        complete.status = 3;
+        complete.status = 4;
         let mut terminal = EventFrame {
             epoch: "a".into(),
             sequence: 8,
+            previous: None,
             event: ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::TaskChanged(complete))),
         };
         assert_eq!(apply_frame(&mut snapshot, &mut terminal), Ok(true));
@@ -425,12 +476,13 @@ mod tests {
             panic!("agent snapshot")
         };
         let mut complete = body.daemon.tasks[0].clone();
-        complete.status = 3;
+        complete.status = 2;
         let mut added = complete.clone();
         added.task_id = "added".into();
         let mut batch = EventFrame {
             epoch: "a".into(),
             sequence: 7,
+            previous: None,
             event: ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::TasksChanged(vec![
                 complete, added,
             ]))),
@@ -448,5 +500,144 @@ mod tests {
             panic!("runtime event")
         };
         assert_eq!(runtime.active_transfers, Some(0));
+    }
+
+    #[test]
+    fn completed_task_drops_runtime_and_late_frames_are_not_delivered() {
+        let mut snapshot = source_snapshot("a", 5);
+        assert_eq!(
+            apply_frame(&mut snapshot, &mut runtime_frame("a", 6, 3)),
+            Ok(true)
+        );
+        let SnapshotBody::Agent(body) = &snapshot.body else {
+            panic!("agent snapshot")
+        };
+        let mut complete = body.daemon.tasks[0].clone();
+        complete.status = 3;
+        let mut terminal = EventFrame {
+            epoch: "a".into(),
+            sequence: 7,
+            previous: None,
+            event: ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::TaskChanged(complete))),
+        };
+        assert_eq!(apply_frame(&mut snapshot, &mut terminal), Ok(true));
+        let SnapshotBody::Agent(body) = &snapshot.body else {
+            panic!("agent snapshot")
+        };
+        assert!(body.daemon.task_runtime.is_empty());
+        assert_eq!(
+            apply_frame(&mut snapshot, &mut runtime_frame("a", 8, 4)),
+            Ok(false)
+        );
+        let SnapshotBody::Agent(body) = &snapshot.body else {
+            panic!("agent snapshot")
+        };
+        assert!(body.daemon.task_runtime.is_empty());
+    }
+
+    #[test]
+    fn coalesced_frame_overlapping_the_cursor_applies_but_a_gap_still_resyncs() {
+        let mut snapshot = source_snapshot("a", 5);
+        // 覆盖 (3, 8]，快照已含 4..=5：区间越过游标仍接受，游标推进到 8。
+        let mut merged = runtime_frame("a", 8, 3);
+        merged.previous = Some(3);
+        assert_eq!(apply_frame(&mut snapshot, &mut merged), Ok(true));
+        assert_eq!(snapshot.sequence, 8);
+        // 覆盖 (9, 12]：与游标 8 之间缺 9。
+        let mut gapped = runtime_frame("a", 12, 1);
+        gapped.previous = Some(9);
+        assert_eq!(apply_frame(&mut snapshot, &mut gapped), Err(()));
+        assert_eq!(snapshot.sequence, 8);
+    }
+
+    fn task_fixture(id: &str) -> fluxdown_protocol::TaskDto {
+        serde_json::from_value(serde_json::json!({
+            "taskId": id, "url": "https://example.com/x", "fileName": "x", "saveDir": "/tmp",
+            "status": 1, "downloadedBytes": 0, "totalBytes": 100, "createdAt": "1"
+        }))
+        .expect("task fixture")
+    }
+
+    fn daemon_event_frame(sequence: u64, event: DaemonEvent) -> EventFrame {
+        EventFrame {
+            epoch: "a".to_owned(),
+            sequence,
+            previous: None,
+            event: ServiceEvent::Agent(AgentEvent::Daemon(event)),
+        }
+    }
+
+    /// 重载宣告让投影进入加载态（空表不被当成完整表）；表装入前游标对不上的载入被拒绝，
+    /// 装入后加载态解除、其后的帧照常折叠。
+    #[test]
+    fn reload_announcement_keeps_projection_loading_until_matching_tables_install() {
+        let mut snapshot = source_snapshot("a", 5);
+        let mut reloading = daemon_event_frame(
+            6,
+            DaemonEvent::TablesReloading {
+                tasks: Some(3),
+                queue: None,
+            },
+        );
+        assert_eq!(apply_frame(&mut snapshot, &mut reloading), Ok(true));
+        let SnapshotBody::Agent(body) = &snapshot.body else {
+            panic!("agent snapshot")
+        };
+        assert!(body.daemon.tables_loading());
+        assert!(body.daemon.tasks.is_empty());
+        assert_eq!(body.daemon.task_count(), 3);
+
+        let wrong_cursor = TablesLoaded {
+            epoch: "a".to_owned(),
+            sequence: 5,
+            tasks: Some(vec![task_fixture("x")]),
+            queue: None,
+        };
+        assert!(!install_tables(&mut snapshot, wrong_cursor));
+        let wrong_epoch = TablesLoaded {
+            epoch: "b".to_owned(),
+            sequence: 6,
+            tasks: Some(vec![task_fixture("x")]),
+            queue: None,
+        };
+        assert!(!install_tables(&mut snapshot, wrong_epoch));
+        let SnapshotBody::Agent(body) = &snapshot.body else {
+            panic!("agent snapshot")
+        };
+        assert!(
+            body.daemon.tables_loading(),
+            "rejected tables must not clear the loading state"
+        );
+
+        let loaded = TablesLoaded {
+            epoch: "a".to_owned(),
+            sequence: 6,
+            tasks: Some(vec![
+                task_fixture("a"),
+                task_fixture("b"),
+                task_fixture("c"),
+            ]),
+            queue: None,
+        };
+        assert!(install_tables(&mut snapshot, loaded));
+        let mut later = daemon_event_frame(
+            7,
+            DaemonEvent::TaskDeleted {
+                task_id: "b".to_owned(),
+            },
+        );
+        assert_eq!(apply_frame(&mut snapshot, &mut later), Ok(true));
+        let SnapshotBody::Agent(body) = &snapshot.body else {
+            panic!("agent snapshot")
+        };
+        assert!(!body.daemon.tables_loading());
+        let mut ids: Vec<_> = body
+            .daemon
+            .tasks
+            .iter()
+            .map(|task| task.task_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["a", "c"]);
     }
 }

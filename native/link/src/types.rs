@@ -155,6 +155,14 @@ pub struct PeerRecord {
     /// 重新配对同一设备会覆盖记录并清除该标记。
     #[serde(default)]
     pub revoked: bool,
+    /// 响应方侧：该对端被本机授权可经 `/rpc` 完全控制**本机**（hello 带 `request_control` 且本机
+    /// 用户批准）。重新配对取本次结果，不沿用旧记录。
+    #[serde(default)]
+    pub grants_control: bool,
+    /// 发起方侧：本机可控制该对端（本机以 `request_control` 发起且配对完成）。重新配对取本次结果，
+    /// 不沿用旧记录。
+    #[serde(default)]
+    pub controllable: bool,
 }
 
 impl PeerRecord {

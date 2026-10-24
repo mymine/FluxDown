@@ -42,7 +42,8 @@ private struct SettingsEffectsModifier: ViewModifier {
         let keepAwake = SettingsEffects.keepAwakeWanted(
             preferences: state.preferences,
             isLocalHost: container.isLocalHost,
-            hasActiveDownloads: state.tasks.contains { $0.status.isActive },
+            // 任务表分页载入中 `tasks` 是空占位，活跃数改取运行时统计。
+            hasActiveDownloads: state.tasksLoading ? state.stats.activeTasks > 0 : state.tasks.contains { $0.status.isActive },
             isForeground: scenePhase == .active
         )
         content

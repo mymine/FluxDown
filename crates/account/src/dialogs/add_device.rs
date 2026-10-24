@@ -32,8 +32,8 @@ use crate::host::AccountHost;
 use std::sync::Arc;
 
 use crate::link::{
-    DiscoveredEntry, PairFlow, discovered_entries, group_sas, now_unix_ms, seconds_until,
-    validate_pair_input,
+    DiscoveredEntry, PairFlow, discovered_entries, group_sas, local_deadline_ms, now_unix_ms,
+    seconds_until, validate_pair_input,
 };
 use crate::verification::spawn_ticker;
 use crate::{AccountCommand, AccountPort, PortFuture, t, t_with};
@@ -83,6 +83,8 @@ struct AddDeviceDialog {
     /// 直连页已开启发现 / 配对广播（关闭时需要收回）。
     direct_started: bool,
     own_code: Option<LinkPairingCodeDto>,
+    /// 本机码的本机截止时刻（收到时刻 + ttlMs；免疫主机时钟偏差）。
+    own_code_deadline_ms: i64,
     own_code_busy: bool,
     own_code_error: Option<SharedString>,
     flow: PairFlow,
@@ -142,6 +144,7 @@ impl AddDeviceDialog {
             code_input: cx.new(|cx| InputState::new(window, cx).placeholder(code_placeholder)),
             direct_started: false,
             own_code: None,
+            own_code_deadline_ms: 0,
             own_code_busy: false,
             own_code_error: None,
             flow: PairFlow::Form,
@@ -166,7 +169,7 @@ impl AddDeviceDialog {
                 && this
                     .own_code
                     .as_ref()
-                    .is_none_or(|code| seconds_until(code.expires_at_unix_ms, now_unix_ms()) == 0)
+                    .is_none_or(|_| seconds_until(this.own_code_deadline_ms, now_unix_ms()) == 0)
             {
                 this.refresh_own_code(cx);
             }
@@ -247,10 +250,9 @@ impl AddDeviceDialog {
     /// 放弃当前发起流程：递增代数让迟到响应失效；核对中的会话立即释放。
     fn abandon_flow(&mut self, cx: &mut Context<Self>) {
         self.generation = self.generation.wrapping_add(1);
-        if let PairFlow::Verify { token, .. } = &self.flow {
+        if let Some(token) = self.flow.session_token().map(str::to_owned) {
             let port = self.host.read(cx).port();
-            cx.background_spawn(abandon_session(port, token.clone()))
-                .detach();
+            cx.background_spawn(abandon_session(port, token)).detach();
         }
         self.flow = PairFlow::Form;
     }
@@ -261,7 +263,7 @@ impl AddDeviceDialog {
         if !std::mem::replace(&mut self.direct_started, false) {
             return;
         }
-        self.own_code = None;
+        let stopped_code = self.own_code.take().map(|code| code.code);
         self.own_code_error = None;
         self.rescanning = false;
         self.selected_address = None;
@@ -270,7 +272,11 @@ impl AddDeviceDialog {
             discovery_params(false),
             cx,
         );
-        let stop = self.link_call(method::AGENT_LINK_STOP_PAIRING, serde_json::json!({}), cx);
+        let stop_params = match stopped_code {
+            Some(code) => serde_json::json!({ "code": code }),
+            None => serde_json::json!({}),
+        };
+        let stop = self.link_call(method::AGENT_LINK_STOP_PAIRING, stop_params, cx);
         cx.background_spawn(async move {
             if let Err(error) = discovery.await {
                 // 发现停止失败也必须继续撤回配对广播。
@@ -341,7 +347,14 @@ impl AddDeviceDialog {
                 // 期间已离开直连页 / 关闭对话框：广播已撤回，结果作废（回到页签后由 ticker 重新申请）。
                 if this.direct_started && !this.closed {
                     match result {
-                        Ok(code) => this.own_code = Some(code),
+                        Ok(code) => {
+                            this.own_code_deadline_ms = local_deadline_ms(
+                                code.ttl_ms,
+                                code.expires_at_unix_ms,
+                                now_unix_ms(),
+                            );
+                            this.own_code = Some(code);
+                        }
                         Err(error) => {
                             this.own_code_error = Some(error_text(
                                 this.host.read(cx).translator().read(cx),
@@ -455,8 +468,12 @@ impl AddDeviceDialog {
         let generation = self.generation;
         let port = self.host.read(cx).port();
         cx.notify();
-        let params =
-            serde_json::to_value(LinkPairBeginParams { address, code }).unwrap_or_default();
+        let params = serde_json::to_value(LinkPairBeginParams {
+            address,
+            code,
+            request_control: false,
+        })
+        .unwrap_or_default();
         let future = self.link_call(method::AGENT_LINK_PAIR_BEGIN, params, cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await.and_then(|value| {
@@ -575,8 +592,8 @@ impl AddDeviceDialog {
     /// 等待对端确认期间取消：回到表单并放弃等待。
     fn cancel_waiting(&mut self, cx: &mut Context<Self>) {
         if matches!(self.flow, PairFlow::Finishing { .. }) {
-            self.generation = self.generation.wrapping_add(1);
-            self.flow = PairFlow::Form;
+            // 通知 agent 中止在途确认，否则对端之后批准仍会悄悄配对成功。
+            self.abandon_flow(cx);
             cx.notify();
         }
     }
@@ -683,11 +700,12 @@ impl AddDeviceDialog {
                 .into_any_element();
         }
         section = section.child(field_hint(t(&translator, "localPairingMyCodeHint"), cx));
+        section = section.child(field_hint(t(&translator, "linkControlPairCodeHint"), cx));
         if let Some(error) = self.own_code_error.clone() {
             section = section.child(field_error(error, cx));
         }
         if let Some(code) = &self.own_code {
-            let remaining = seconds_until(code.expires_at_unix_ms, now_unix_ms());
+            let remaining = seconds_until(self.own_code_deadline_ms, now_unix_ms());
             let status = if remaining == 0 {
                 t(&translator, "localPairingMyCodeExpired")
             } else {
@@ -767,6 +785,19 @@ impl AddDeviceDialog {
             }
         } else if self.own_code_busy {
             section = section.child(field_hint(t(&translator, "localPairingDiscovering"), cx));
+        } else if self.own_code_error.is_some() {
+            // 首次生成失败后 ticker 不再自动重试：提供手动重试入口。
+            section = section.child(
+                h_flex().w_full().justify_start().child(
+                    Button::new("add-device-retry-code")
+                        .outline()
+                        .label(self.t("localPairingMyCodeRefresh", cx))
+                        .control(cx)
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.refresh_own_code(cx);
+                        })),
+                ),
+            );
         }
         section.into_any_element()
     }

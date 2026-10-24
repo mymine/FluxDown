@@ -14,7 +14,9 @@ mod strings;
 mod submission;
 
 pub use components::status_bar::{DownloadWidget, WidgetPlacement};
-pub use components::title_bar::DownloadTitleBar;
+pub use components::title_bar::{
+    DownloadPageWidget, DownloadSearchBox, DownloadTitleBar, DownloadViewMenu,
+};
 pub use controller::{
     DownloadsCommand, DownloadsController, DownloadsPort, DownloadsResult,
     LAST_DOWNLOAD_TARGET_PREF, LAST_SAVE_DIR_PREF, PortFuture, QueueFields,
@@ -22,9 +24,11 @@ pub use controller::{
 };
 pub use model::devices::{DeviceEntry, DeviceKind, DispatchTarget};
 pub use model::progress_window::{
-    COMPLETION_WINDOW_PREF, MAX_TRACKED_WINDOW_TASKS, PROGRESS_WINDOW_PREF, ProgressWindowEffect,
-    ProgressWindowPrefs, ProgressWindowTracker, UserStartIntent,
+    COMPLETION_WINDOW_PREF, MAX_TRACKED_WINDOW_TASKS, MainWindowState, PROGRESS_WINDOW_PREF,
+    ProgressWindowEffect, ProgressWindowPrefs, ProgressWindowTracker, StartOrigin, UserStartIntent,
+    WindowContext,
 };
+pub use model::save_dir_category::NewDownloadCategory;
 pub use model::shutdown::*;
 pub use pages::downloads::*;
 pub use pages::file_conflict::*;

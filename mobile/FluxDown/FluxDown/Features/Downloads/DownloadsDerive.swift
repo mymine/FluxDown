@@ -32,7 +32,7 @@ struct DownloadsDeriver {
         let runtime: TaskRuntime?
         let down: Int64
         let up: Int64
-        let queuePosition: Int
+        let queueOrder: Int64?
         let boosted: Bool
         let awaitingDecision: Bool
         let category: TaskCategory?
@@ -98,20 +98,20 @@ struct DownloadsDeriver {
         let remoteScoped = f.groupId == nil && f.queueId == nil
             ? input.remote.filter { query.isEmpty || Self.matches($0, query: query) }
             : []
-        var folderCounts = Array(repeating: 0, count: StatusFolder.allCases.count)
+        var folderCounts = Array(repeating: 0, count: StatusFolder.visible.count)
         for it in scoped {
-            for (i, folder) in StatusFolder.allCases.enumerated() where folder.accepts(it.task.status) {
+            for (i, folder) in StatusFolder.visible.enumerated() where folder.accepts(it.task) {
                 folderCounts[i] += 1
             }
         }
         for task in remoteScoped {
-            for (i, folder) in StatusFolder.allCases.enumerated() where folder.accepts(task.status) {
+            for (i, folder) in StatusFolder.visible.enumerated() where folder.accepts(task.status) {
                 folderCounts[i] += 1
             }
         }
 
         // 3. 文件夹内 → 分类计数 → 分类 / 仅远程筛选
-        let inFolder = scoped.filter { f.folder.accepts($0.task.status) }
+        let inFolder = scoped.filter { f.folder.accepts($0.task) }
         let remoteInFolder = remoteRows(remoteScoped.filter { f.folder.accepts($0.status) })
         var categoryCounts: [String: Int] = [:]
         for it in inFolder {
@@ -209,7 +209,8 @@ struct DownloadsDeriver {
                 sections: sections,
                 visibleIds: visible,
                 taskTotal: s.tasks.count + input.remote.count,
-                loaded: true
+                loaded: !s.tasksLoading,
+                loadingTotal: s.tasksLoading ? s.taskTotal : 0
             ),
             facets: Facets(
                 folderCounts: folderCounts,
@@ -277,26 +278,26 @@ struct DownloadsDeriver {
         let down = speed?.down ?? 0
         let up = speed?.up ?? 0
         let runtime = s.runtime[task.taskId]
-        let queuePosition = Int(s.queuePositions[task.taskId] ?? 0)
+        let queueOrder = s.queueOrder.order(of: task.taskId)
         let boosted = s.priorityTaskId == task.taskId
         let category = resolveCategory(task.fileName)
         let queue = queuesById[normalizedQueueId(task.queueId)]
 
         if let previous = entries[task.taskId],
            previous.task == task, previous.runtime == runtime, previous.down == down, previous.up == up,
-           previous.queuePosition == queuePosition, previous.boosted == boosted, previous.awaitingDecision == awaitingDecision,
+           previous.queueOrder == queueOrder, previous.boosted == boosted, previous.awaitingDecision == awaitingDecision,
            previous.category == category, previous.queue == queue {
             return previous.item
         }
 
-        let visual = TaskVisual(task, queuePosition: queuePosition)
+        let visual = TaskVisual(task, queued: queueOrder != nil)
         var kind = FileKind.from(fileName: task.fileName)
         if kind == .other, task.protocol == .bt { kind = .torrent }
         let built = TaskItem(
             task: task,
             speedDown: down,
             speedUp: up,
-            queuePosition: queuePosition,
+            queueOrder: queueOrder,
             boosted: boosted,
             awaitingDecision: awaitingDecision,
             category: category,
@@ -312,7 +313,7 @@ struct DownloadsDeriver {
             connectedPeers: runtime?.connectedPeers.map { Int($0) }
         )
         entries[task.taskId] = Entry(
-            task: task, runtime: runtime, down: down, up: up, queuePosition: queuePosition,
+            task: task, runtime: runtime, down: down, up: up, queueOrder: queueOrder,
             boosted: boosted, awaitingDecision: awaitingDecision, category: category, queue: queue, item: built
         )
         return built
@@ -546,7 +547,7 @@ struct DownloadsDeriver {
             visible.append(contentsOf: inflight.compactMap { $0.item?.id })
         }
         if !history.isEmpty {
-            let named: StatusFolder? = (folder == .completed || folder == .failed || folder == .paused) ? folder : nil
+            let named: StatusFolder? = (folder == .completed || folder == .seeding || folder == .failed || folder == .paused) ? folder : nil
             sections.append(DownloadsSection(
                 id: "history", kind: .history, title: .history(named), count: history.count, doneOfTotal: nil,
                 downSpeed: 0, collapsed: false, rows: history
@@ -625,6 +626,7 @@ struct DownloadsDeriver {
         }
     }
 
+    #if FULL_FLAVOR
     /// 无 host 的行是否属于 BT / 磁力（本机看协议，远程看链接形态）。
     private static func isBt(_ row: DownloadsRow) -> Bool {
         switch row {
@@ -632,6 +634,7 @@ struct DownloadsDeriver {
         case let .remote(remote): remote.task.url.hasPrefix("magnet:") || remote.task.url.hasPrefix("torrent-file://")
         }
     }
+    #endif
 
     private func groups(
         for rows: [DownloadsRow],
@@ -708,11 +711,16 @@ struct DownloadsDeriver {
                 out.append(Group(key: "site:\(site)", title: .text(site), rows: bySite[site] ?? []))
             }
             if let hostless = bySite[""] {
+                #if FULL_FLAVOR
                 // 无 host：磁力 / 种子归「BT · 磁力」，其余（eD2K 等）归「—」。
                 let bt = hostless.filter(Self.isBt)
                 let other = hostless.filter { !Self.isBt($0) }
                 if !bt.isEmpty { out.append(Group(key: "site:", title: .key("viewSiteBt"), rows: bt)) }
                 if !other.isEmpty { out.append(Group(key: "site:-", title: .text(Format.dash), rows: other)) }
+                #else
+                // store 不含 P2P：无 host 的行一律归「—」。
+                out.append(Group(key: "site:-", title: .text(Format.dash), rows: hostless))
+                #endif
             }
             return out
         case .group:

@@ -34,6 +34,22 @@ describe('planTaskCommand', () => {
     expect(plan.remote).toEqual([paused])
   })
 
+  test('继续跳过已完成的本地任务，删除仍包含（#935）', () => {
+    const view = (taskId: string, state: string) =>
+      ({ source: 'local', taskId, remoteStatus: null, state }) as unknown as DownloadTaskView
+    const views = [view('done', 'completed'), view('failed', 'failed'), view('paused', 'paused')]
+    expect(planTaskCommand(views, 'resume').localIds).toEqual(['failed', 'paused'])
+    expect(planTaskCommand(views, 'delete').localIds).toEqual(['done', 'failed', 'paused'])
+  })
+
+  test('继续只放行可恢复做种的完成态任务（2..=7 且文件在），做种中 / 无做种 / 文件缺失仍跳过', () => {
+    const view = (taskId: string, seedingStatus: number, fileMissing = false) =>
+      ({ source: 'local', taskId, remoteStatus: null, state: 'completed', seedingStatus, fileMissing }) as unknown as DownloadTaskView
+    const views = [view('none', 0), view('seeding', 1), view('ratio', 2), view('stopped', 4), view('inactive', 7), view('queued', 8), view('missing', 4, true)]
+    expect(planTaskCommand(views, 'resume').localIds).toEqual(['ratio', 'stopped', 'inactive'])
+    expect(planTaskCommand(views, 'pause').localIds).toHaveLength(views.length)
+  })
+
   test('空选择无任何调用', () => {
     const plan = planTaskCommand([], 'delete')
     expect(plan.localIds).toEqual([])

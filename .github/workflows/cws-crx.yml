@@ -1,0 +1,47 @@
+name: Chrome Store CRX
+
+# 商店审核通过后，把 Chrome 网上应用店签名的 CRX 搬到同版本 GitHub Release（+ OSS 镜像），
+# 供无法直接打开商店的用户离线安装：商店签名包的扩展 ID 与商店一致，装好后由 Chrome 照常自动更新。
+# 审核异步完成，release.yml 推 tag 时拿不到新包，所以这里定时轮询。逻辑见 .github/scripts/cws_crx.py。
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cws-crx
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync store-signed CRX
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch and verify store CRX
+        id: crx
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 .github/scripts/cws_crx.py release-assets
+
+      - name: Upload to GitHub Release
+        if: steps.crx.outputs.upload == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release upload "${{ steps.crx.outputs.tag }}" "${{ steps.crx.outputs.file }}"
+
+      - name: Upload to OSS
+        if: steps.crx.outputs.upload == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/oss-upload
+        with:
+          tag: ${{ steps.crx.outputs.tag }}
+          dir: release-assets
+          access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}

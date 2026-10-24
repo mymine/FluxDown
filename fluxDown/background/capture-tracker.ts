@@ -188,7 +188,7 @@ export function installCaptureTracker(): void {
     Promise.resolve(browser.notifications.clear(notificationId)).catch(() => {});
   });
   browser.notifications?.onClicked?.addListener((notificationId) => {
-    // Firefox MV2 不支持 buttons：点击正文打开站点配置。
+    // Firefox 通知不支持 buttons：点击正文打开站点配置。
     if (!import.meta.env.FIREFOX || !notificationId.startsWith(ASK_PREFIX)) return;
     const host = notificationId.slice(ASK_PREFIX.length);
     browser.tabs

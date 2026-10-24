@@ -571,7 +571,7 @@ pub const SHORTCUT_SPECS: &[ShortcutSpec] = &[
         Everywhere,
         "shortcutActionCloseWindow",
         &["super-w"],
-        &[],
+        &["ctrl-w"],
     ),
     app(
         "minimize_window",

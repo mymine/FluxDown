@@ -1,6 +1,7 @@
 import type { JSX } from "preact";
 import { useEffect, useState } from "preact/hooks";
 import { browser } from "wxt/browser";
+import { HostAccessNotice } from "@/ui/components/HostAccessNotice";
 import { Icon, type UiIconName } from "@/ui/components/Icon";
 import { ToastHost } from "@/ui/components/Toast";
 import { useSidePanelOpener } from "@/ui/hooks/useSidePanelOpener";
@@ -14,6 +15,7 @@ import { BackupPanel } from "./panels/BackupPanel";
 import { GeneralPanel } from "./panels/GeneralPanel";
 import { InterceptPanel } from "./panels/InterceptPanel";
 import { RemotePanel } from "./panels/RemotePanel";
+import { PageScriptsPanel } from "./panels/PageScriptsPanel";
 import { RulesPanel } from "./panels/rules/RulesPanel";
 import { ShortcutsPanel } from "./panels/ShortcutsPanel";
 import { SitesPanel } from "./panels/SitesPanel";
@@ -25,6 +27,7 @@ const NAV: Record<PanelId, { icon: UiIconName; label: MessageKey }> = {
   sniff: { icon: "search", label: "options.nav.sniff" },
   sites: { icon: "globe", label: "options.nav.sites" },
   rules: { icon: "link", label: "options.nav.rules" },
+  pageScripts: { icon: "play", label: "options.nav.pageScripts" },
   remote: { icon: "upload", label: "options.nav.remote" },
   shortcuts: { icon: "keyboard", label: "options.nav.shortcuts" },
   backup: { icon: "folder", label: "options.nav.backup" },
@@ -73,6 +76,9 @@ export function App(): JSX.Element {
       break;
     case "rules":
       content = <RulesPanel />;
+      break;
+    case "pageScripts":
+      content = <PageScriptsPanel />;
       break;
     case "remote":
       content = <RemotePanel />;
@@ -124,7 +130,10 @@ export function App(): JSX.Element {
         </div>
       </aside>
 
-      <main class="opt-content">{content}</main>
+      <main class="opt-content">
+        <HostAccessNotice flush />
+        {content}
+      </main>
       <ToastHost />
     </div>
   );

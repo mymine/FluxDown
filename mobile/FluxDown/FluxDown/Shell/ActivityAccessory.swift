@@ -15,8 +15,7 @@ struct ActivityAccessory: View {
         let active = Int(stats.activeTasks)
         let down = Format.speedOrZero(stats.totalDownloadBps)
         let up = Format.speedOrZero(stats.totalUploadBps)
-        let resumable = active == 0 && stats.pendingTasks == 0
-            && state.tasks.contains { $0.status == .paused || $0.status == .failed }
+        let resumable = state.tasks.isAllPaused(active: active, pending: Int(stats.pendingTasks))
         ActivityBarContent(
             downText: active > 0 ? "↓ \(down)" : L("mobileIdleSummary"),
             upText: "↑ \(up)",

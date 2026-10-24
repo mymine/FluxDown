@@ -15,6 +15,8 @@ import com.fluxdown.app.i18n.str
 import com.fluxdown.app.ui.TaskVisualState
 import com.fluxdown.core.format.Format
 import com.fluxdown.core.model.Queue
+import com.fluxdown.core.model.SeedingStatus
+import com.fluxdown.core.model.TaskErrorMessage
 import com.fluxdown.core.model.TaskProtocol
 import com.fluxdown.fluxui.data.MetaTone
 import com.fluxdown.fluxui.data.buildTaskMeta
@@ -31,9 +33,19 @@ internal class RowText(c: Context) {
     val preparing = c.str(R.string.subtitlePreparing)
     val verifying = c.str(R.string.statusVerifying)
     val seeding = c.str(R.string.statusSeeding)
+    val seedingQueued = c.str(R.string.seedingStatusQueued)
     val completed = c.str(R.string.statusCompleted)
     val missing = c.str(R.string.statusFileMissing)
     val failed = c.str(R.string.statusError)
+    private val errorPostOnlyEndpoint = c.str(R.string.taskErrorPostOnlyEndpoint)
+    private val errorPostOnlyResume = c.str(R.string.taskErrorPostOnlyResume)
+
+    /** 引擎稳定错误文案 → 本地化；其余原样。 */
+    fun taskError(raw: String): String = when (TaskErrorMessage.match(raw)) {
+        TaskErrorMessage.PostOnlyEndpoint -> errorPostOnlyEndpoint
+        TaskErrorMessage.PostOnlyResume -> errorPostOnlyResume
+        null -> raw
+    }
 
     private val etaSecondsFmt = c.getString(R.string.etaSeconds)
     private val etaMinutesFmt = c.getString(R.string.etaMinutes)
@@ -119,6 +131,7 @@ private fun firstLine(s: String): String? = s.lineSequence().map { it.trim() }.f
 /**
  * 元信息行（§3.7 taskMeta）：按状态拼接，失败行整行 coralText 且不追加尾部字段。
  * 字段可选项来自视图偏好 [fields]，尾部顺序固定：协议 · 来源 · 队列 · 创建时间。
+ * [queuePosition] = 排队名次（1 起），只对排队行有意义：由渲染方按可见行取，不随任务行模型缓存。
  */
 internal fun buildRowMeta(
     colors: FluxColors,
@@ -126,6 +139,7 @@ internal fun buildRowMeta(
     item: TaskItem,
     fields: Set<CardField>,
     nowSec: Long,
+    queuePosition: Int,
 ): AnnotatedString = colors.buildTaskMeta {
     val task = item.task
     val showSize = CardField.Size in fields
@@ -152,7 +166,7 @@ internal fun buildRowMeta(
             if (showSize && total > 0) part(doneOfTotal)
         }
         TaskVisualState.Queued -> {
-            part(t.queued(item.queuePosition))
+            part(t.queued(queuePosition))
             if (showSize) part(totalSize)
         }
         TaskVisualState.Pending -> {
@@ -161,14 +175,18 @@ internal fun buildRowMeta(
         }
         TaskVisualState.Preparing -> part(t.preparing)
         TaskVisualState.Verifying -> part(t.verifying)
-        TaskVisualState.Failed -> part(firstLine(task.errorMessage) ?: t.failed, MetaTone.Coral)
+        TaskVisualState.Failed -> part(firstLine(t.taskError(task.errorMessage)) ?: t.failed, MetaTone.Coral)
         TaskVisualState.Missing -> {
             part(t.missing, MetaTone.Amber)
             if (showSize) part(totalSize)
         }
         TaskVisualState.Seeding -> {
-            part(t.seeding, MetaTone.Mint)
-            part(upText)
+            if (task.seedingStatus == SeedingStatus.QueuedForSlot) {
+                part(t.seedingQueued, MetaTone.Mint)
+            } else {
+                part(t.seeding, MetaTone.Mint)
+                part(upText)
+            }
             if (showSize) part(totalSize)
         }
         TaskVisualState.Completed -> {

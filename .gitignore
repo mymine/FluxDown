@@ -93,3 +93,6 @@ assets/screenshot/
 
 # Promo video production workspace (local only)
 /promo-video/
+
+# 本地 PoC 实验
+/poc/

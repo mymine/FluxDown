@@ -26,9 +26,13 @@ final class GroupDetailModel {
     private(set) var group: DownloadGroup?
     private(set) var summary = GroupSummary(members: [])
     private(set) var items: [TaskItem] = []
+    /// 排队顺序：可见排队行按稳定键取名次（`QueueOrder.rank`），顺序变化不重建行模型。
+    private(set) var queueOrder = QueueOrder.empty
     private(set) var isReadOnly = true
     /// 首次快照到达前（含尚未绑定）：不能判定「组不存在」。
     private(set) var isLoading = true
+    /// 任务表分页载入中：成员 / 汇总是半份列表，不得显示成「没有成员」。
+    private(set) var tasksLoading = false
 
     @ObservationIgnored private var store: HostStore?
     @ObservationIgnored private var deriver = DownloadsDeriver()
@@ -83,10 +87,12 @@ final class GroupDetailModel {
         )
         let nextItems = result.list.sections.flatMap(\.rows).compactMap(\.item)
         if nextItems != items { items = nextItems }
+        if state.queueOrder != queueOrder { queueOrder = state.queueOrder }
 
         if state.isReadOnly != isReadOnly { isReadOnly = state.isReadOnly }
         let loading = state.connection == .connecting && state.tasks.isEmpty && state.groups.isEmpty
         if loading != isLoading { isLoading = loading }
+        if state.tasksLoading != tasksLoading { tasksLoading = state.tasksLoading }
     }
 }
 
@@ -167,14 +173,22 @@ private struct GroupDetailPage: View {
         let style = RowStyle(density: container.viewPrefs.density, fields: Set(container.viewPrefs.fields))
         List {
             Section {
-                GroupOverviewCard(title: title, summary: summary)
+                GroupOverviewCard(title: title, summary: summary, loading: model.tasksLoading)
                     .listRowInsets(EdgeInsets(top: 18, leading: 18, bottom: 18, trailing: 18))
             }
             Section {
                 infoRows
             }
             Section {
-                if model.items.isEmpty {
+                if model.tasksLoading {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                        Text(L("mobileTasksLoading"))
+                    }
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .accessibilityElement(children: .combine)
+                } else if model.items.isEmpty {
                     Text(L("groupDetailNoMembers"))
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, minHeight: 44)
@@ -188,7 +202,7 @@ private struct GroupDetailPage: View {
                 HStack {
                     Text(L("groupDetailMembersTab"))
                     Spacer(minLength: 0)
-                    Text(model.items.count, format: .number)
+                    if !model.tasksLoading { Text(model.items.count, format: .number) }
                 }
                 .font(.subheadline.weight(.semibold))
                 .monospacedDigit()
@@ -233,10 +247,12 @@ private struct GroupDetailPage: View {
     // MARK: 成员行（与下载列表同款）
 
     private func row(_ item: TaskItem, style: RowStyle) -> some View {
-        DownloadRowView(
+        let queuePosition = item.visual == .queued ? model.queueOrder.rank(of: item.id) : 0
+        return DownloadRowView(
             item: item,
             style: style,
             isLocalHost: container.isLocalHost,
+            queuePosition: queuePosition,
             showsRing: true,
             zoom: nil,
             onOpen: { navigation?.open(.task(item.id)) }
@@ -246,7 +262,9 @@ private struct GroupDetailPage: View {
         .contextMenu {
             TaskMenuItems(task: item.task, boosted: item.boosted)
         } preview: {
-            DownloadRowView(item: item, style: style, isLocalHost: container.isLocalHost, showsRing: false)
+            DownloadRowView(
+                item: item, style: style, isLocalHost: container.isLocalHost, queuePosition: queuePosition, showsRing: false
+            )
                 .padding(.horizontal)
                 .frame(minWidth: 320)
                 .environment(actions)
@@ -325,6 +343,7 @@ private struct GroupDetailPage: View {
 private struct GroupOverviewCard: View {
     let title: String
     let summary: GroupSummary
+    let loading: Bool
 
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.fluxAccent) private var accent
@@ -372,6 +391,7 @@ private struct GroupOverviewCard: View {
     }
 
     private var statusLine: String {
+        guard !loading else { return L("mobileTasksLoading") }
         guard summary.total > 0 else { return L("groupDetailNoMembers") }
         let done = L("groupDoneOfTotal", ["done": summary.completed, "total": summary.total])
         return summary.progress.map { done + " · " + Format.percent($0) } ?? done

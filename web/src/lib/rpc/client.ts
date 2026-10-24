@@ -1,12 +1,18 @@
 // agent `/rpc` WebSocket JSON-RPC 客户端（单例连接）。
 //
-// 流程：WebSocket 子协议鉴权 → system.hello → system.snapshot → 按 service.event 增量应用。
-// - 事件序号断档 / epoch 变化 / 关闭码 4009：重新 snapshot（同一连接内先缓冲后回放）；
+// 流程：WebSocket 子协议鉴权 → system.hello → system.snapshot（头，不含任务表）→ 分页 system.taskPage
+// 载入任务表 / 队列位置表 → 回放载入期间缓冲的帧 → 按 service.event 增量应用。
+// - 载入期间（快照 / 页在途）到达的帧只缓冲不应用；载入完成前不宣布 ready，快照里的 taskTotal /
+//   queueTotal 即「加载态」标志；
+// - 运行中收到 snapshotReplaced 头 / tablesReloading：应用它进入加载态，就地重新载入；
+// - 事件序号断档 / epoch 变化 / 页不一致：重新 snapshot（同一连接内先缓冲后回放）；
+// - 关闭码 4009（订阅者落后）：带抖动的短退避后重连并重新 snapshot；
+// - 事件帧按时间片成批应用（见 `FRAME_BATCH_MS`）；
 // - 关闭原因 `service-quit`：不再重连；
 // - 其他断线：指数退避重连，网络恢复/页面回到前台立即重试；
 // - 升级前失败（浏览器拿不到 HTTP 状态）：探测 `/api/v1/info` 区分密钥无效 / 需初始化 / 网络问题。
 
-import { applyAgentEvent } from './apply'
+import { applyAgentEvents, installQueue, installTasks, serviceEventReloadsTables, tablesLoading } from './apply'
 import { judgeFrame, type EventCursor } from './cursor'
 import { RpcError, TRANSPORT_ERROR_CODE, errorMessage, transportError } from './error'
 import {
@@ -14,11 +20,16 @@ import {
   CLOSE_REASON_SERVICE_QUIT,
   CLOSE_REASON_SERVICE_RESTART,
   EVENT_GAP_CLOSE_CODE,
+  METHOD,
   MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
+  TABLE_SYNC_BACKLOG_LIMIT,
 } from './protocol'
+import { normalizeAgentSnapshot, normalizeFrame, normalizeTablePage } from './normalize'
 import { claimIncompatibleReload, shouldReloadForVersionChange } from './reload'
-import type { AgentEvent, ClientHello, EventFrame, RpcErrorData, ServiceHello, Snapshot } from './protocol'
+import { TableLoad, TableSyncError } from './tableSync'
+import type { LoadedTables } from './tableSync'
+import type { AgentEvent, ClientHello, DaemonSnapshot, EventFrame, RpcErrorData, ServiceHello, Snapshot, TablePageWire } from './protocol'
 import { probeToken } from '../access/setup'
 import { rpcStore, setConnection } from './store'
 
@@ -33,8 +44,14 @@ const BACKOFF_BASE_MS = 500
 const BACKOFF_MAX_MS = 15_000
 /** 同一次连接内连续 resync 的上限，超过则断开重连。 */
 const MAX_RESYNC = 5
-/** 快照期间事件缓冲上限，溢出视为断档。 */
-const MAX_BUFFERED = 20_000
+/** 快照 / 载入期间事件缓冲上限（协议常量）；溢出后快照 / 页到达即重新同步。 */
+const MAX_BUFFERED = TABLE_SYNC_BACKLOG_LIMIT
+/** 事件帧成批应用的时间片：同一时间片内到达的帧一次性应用（大集合整批只复制一次）。 */
+const FRAME_BATCH_MS = 16
+/** 4009（事件落后）后重连退避：起点 / 封顶；`GAP_STREAK_WINDOW_MS` 内再次落后视为连续。 */
+const GAP_BACKOFF_BASE_MS = 250
+const GAP_BACKOFF_MAX_MS = 3_000
+const GAP_STREAK_WINDOW_MS = 30_000
 
 export interface CallOptions {
   /** 请求超时（ms），默认 30s。安装类长任务请调大。 */
@@ -77,6 +94,13 @@ class RpcConnection {
   private cursor: EventCursor | null = null
   private syncing = false
   private buffered: EventFrame[] = []
+  /** 快照在途期间缓冲溢出：溢出的帧已丢，快照到达后必须重新拉取。 */
+  private bufferOverflowed = false
+  /** 已通过游标判定、待成批应用的帧。 */
+  private queued: EventFrame[] = []
+  private batchTimer: ReturnType<typeof setTimeout> | null = null
+  private gapStreak = 0
+  private lastGapAt = 0
   private resyncs = 0
   private retryTimer: ReturnType<typeof setTimeout> | null = null
   private pingTimer: ReturnType<typeof setInterval> | null = null
@@ -236,29 +260,140 @@ class RpcConnection {
     this.scheduleRetry(errorMessage(error))
   }
 
-  /** 拉取快照并回放缓冲事件。 */
+  /**
+   * 拉取快照、分页载入任务表并回放缓冲事件。快照 / 载入在途期间到达的帧只缓冲、不应用（`syncing`）；
+   * 缓冲超过上限时溢出部分已被丢弃，这份快照之后的状态缺口无法补齐：丢掉它重新拉取
+   * （重试次数受 `MAX_RESYNC` 限制）。载入完成前不宣布 `ready`。
+   */
   private async sync(generation: number): Promise<void> {
-    this.syncing = true
-    this.buffered = []
-    this.cursor = null
-    setConnection({ phase: 'syncing' })
-    const snapshot = await this.request<Snapshot>('system.snapshot', undefined, DEFAULT_TIMEOUT_MS, true)
-    if (generation !== this.generation) return
-    if (snapshot.body.role !== 'agent') throw new Error('unexpected snapshot role')
-    const agent = snapshot.body.snapshot
-    this.cursor = { epoch: snapshot.epoch, sequence: snapshot.sequence }
-    rpcStore.update((state) => ({ ...state, snapshot: agent }), true)
+    for (;;) {
+      this.syncing = true
+      this.buffered = []
+      this.bufferOverflowed = false
+      this.discardPending()
+      this.cursor = null
+      rpcStore.update((state) => (state.tableLoad === null ? state : { ...state, tableLoad: null }))
+      setConnection({ phase: 'syncing' })
+      const snapshot = await this.request<Snapshot>('system.snapshot', undefined, DEFAULT_TIMEOUT_MS, true)
+      if (generation !== this.generation) return
+      if (snapshot.body.role !== 'agent') throw new Error('unexpected snapshot role')
+      if (this.bufferOverflowed) {
+        if (this.exhaustedResyncs()) return
+        continue
+      }
+      const agent = normalizeAgentSnapshot(snapshot.body.snapshot)
+      this.cursor = { epoch: snapshot.epoch, sequence: snapshot.sequence }
+      rpcStore.update((state) => ({ ...state, snapshot: agent }), true)
 
-    const backlog = this.buffered
-    this.buffered = []
-    this.syncing = false
-    for (const frame of backlog) {
-      if (!this.handleFrame(frame, generation)) return
+      const outcome = await this.settle(generation)
+      if (outcome === 'stale') return
+      if (outcome === 'resync') {
+        if (this.exhaustedResyncs()) return
+        continue
+      }
+      this.everReady = true
+      this.attempt = 0
+      setConnection({ phase: 'ready', attempt: 0, nextRetryAt: null, lastError: null, restarting: false })
+      this.startPing()
+      return
     }
-    this.everReady = true
-    this.attempt = 0
-    setConnection({ phase: 'ready', attempt: 0, nextRetryAt: null, lastError: null, restarting: false })
-    this.startPing()
+  }
+
+  /** 连续重新同步次数超限则断开重连（返回 true）。 */
+  private exhaustedResyncs(): boolean {
+    this.resyncs += 1
+    if (this.resyncs <= MAX_RESYNC) return false
+    this.ws?.close(4000, 'resync-loop')
+    return true
+  }
+
+  /**
+   * 基准帧（快照或宣告重载的事件）已应用到投影之后的收尾：按投影里的待载入标记分页载入表并装入，
+   * 再以基准序号为游标回放缓冲帧；回放中遇到又一个 `reloadsTables` 帧就应用它并重新载入
+   * （契约 §2）。整个过程 `syncing` 保持为真，帧只缓冲；返回 `done` 时同步退出缓冲态。
+   *
+   * - `done`：投影完整、缓冲已清空；
+   * - `resync`：缓冲溢出 / 页不一致 / 帧断档，调用方应整体重新同步；
+   * - `stale`：连接已被替换或关闭，什么都不要再做。
+   */
+  private async settle(generation: number): Promise<'done' | 'resync' | 'stale'> {
+    for (;;) {
+      const cursor = this.cursor
+      const daemon = rpcStore.peek().snapshot?.daemon
+      if (cursor === null || daemon === undefined) return 'resync'
+      if (tablesLoading(daemon)) {
+        const loaded = await this.loadTables(generation, cursor.epoch, daemon)
+        if (loaded === 'stale' || loaded === 'resync') return loaded
+        this.installTables(loaded)
+      }
+
+      // 回放整个缓冲：逐帧判定游标，应用只做一次批量。
+      const backlog = this.buffered
+      this.buffered = []
+      let reloadAt = -1
+      for (let at = 0; at < backlog.length; at += 1) {
+        const frame = backlog[at] as EventFrame
+        const verdict = judgeFrame(cursor, frame)
+        if (verdict === 'skip') continue
+        if (verdict === 'resync') return 'resync'
+        cursor.sequence = frame.sequence
+        this.queued.push(frame)
+        if (serviceEventReloadsTables(frame.event)) {
+          reloadAt = at
+          break
+        }
+      }
+      if (!this.flushPending()) return 'resync'
+      if (reloadAt >= 0) {
+        // 重载帧已应用（投影回到加载态）；其后的帧留作下一轮的缓冲。
+        this.buffered = backlog.slice(reloadAt + 1)
+        continue
+      }
+      this.syncing = false
+      return 'done'
+    }
+  }
+
+  /** 逐页拉取待载入的表（先任务、后队列位置）；载入期间到达的帧由 `onMessage` 缓冲。 */
+  private async loadTables(
+    generation: number,
+    epoch: string,
+    daemon: DaemonSnapshot,
+  ): Promise<LoadedTables | 'resync' | 'stale'> {
+    const load = TableLoad.forSnapshot(epoch, daemon)
+    if (load === null) return { tasks: null, queue: null }
+    rpcStore.update((state) => ({ ...state, tableLoad: { loadedTasks: 0 } }))
+    for (;;) {
+      const params = load.nextRequest()
+      if (params === null) return load.parts()
+      const wire = await this.request<TablePageWire>(METHOD.SYSTEM_TASK_PAGE, params, DEFAULT_TIMEOUT_MS, false)
+      if (generation !== this.generation) return 'stale'
+      if (this.bufferOverflowed) return 'resync'
+      try {
+        load.accept(normalizeTablePage(wire))
+      } catch (error) {
+        if (error instanceof TableSyncError) {
+          console.warn('table paging failed; resyncing', error.failure)
+          return 'resync'
+        }
+        throw error
+      }
+      rpcStore.update((state) => ({ ...state, tableLoad: { loadedTasks: load.loadedTasks } }))
+    }
+  }
+
+  /**
+   * 把载入的表装入投影并退出加载态。不立即发布：紧随其后回放缓冲帧，订阅者只应看到回放后的完整状态
+   * （初次同步由随后的 `ready`、重载由下一帧的合并发布一并带出）。
+   */
+  private installTables(tables: LoadedTables): void {
+    rpcStore.update((state) => {
+      if (state.snapshot === null) return state
+      let daemon = state.snapshot.daemon
+      if (tables.tasks !== null) daemon = installTasks(daemon, tables.tasks)
+      if (tables.queue !== null) daemon = installQueue(daemon, tables.queue)
+      return { ...state, snapshot: { ...state.snapshot, daemon }, tableLoad: null }
+    })
   }
 
   private onMessage(text: string): void {
@@ -271,26 +406,48 @@ class RpcConnection {
     if (typeof message !== 'object' || message === null) return
     const record = message as Record<string, unknown>
     if ('id' in record && ('result' in record || 'error' in record)) {
+      // 应答之前到达的事件必须先生效：调用方拿到结果后立即读快照，不能比应答旧。
+      this.flushPending()
       this.onResponse(record)
       return
     }
     if (record.method === 'service.event' && typeof record.params === 'object' && record.params !== null) {
-      const frame = record.params as EventFrame
-      if (this.syncing) {
-        if (this.buffered.length >= MAX_BUFFERED) {
+      // 入口归一化：帧里的 `TaskDto` 补齐线上省略的默认值字段，之后 reducer / UI 只见完整任务。
+      // 解不出来的帧不能丢（游标会与投影脱节）：按「应用失败」处理，整体重新同步。
+      let frame: EventFrame
+      try {
+        frame = normalizeFrame(record.params as EventFrame)
+      } catch (error) {
+        console.error('failed to decode service event; resyncing', error)
+        if (this.syncing) {
           this.buffered = []
+          this.bufferOverflowed = true
+        } else {
           void this.resync(this.generation)
+        }
+        return
+      }
+      if (this.syncing) {
+        if (this.bufferOverflowed) return
+        if (this.buffered.length >= MAX_BUFFERED) {
+          // 丢弃缓冲并记下溢出：快照 / 页到达后（`sync` / `loadTables`）据此重新同步。这里不能调用
+          // `resync`——它在同步期间会直接返回，缺口就被静默吞掉了。
+          this.buffered = []
+          this.bufferOverflowed = true
           return
         }
         this.buffered.push(frame)
         return
       }
-      this.handleFrame(frame, this.generation)
+      if (this.admit(frame, this.generation)) this.scheduleFlush()
     }
   }
 
-  /** 处理一个事件帧；返回 false 表示已触发重新同步/断线，调用方应停止回放。 */
-  private handleFrame(frame: EventFrame, generation: number): boolean {
+  /**
+   * 按游标判定一帧并推进游标；接受的帧进入待应用队列（由 `flushPending` 成批应用）。
+   * 返回 false 表示已触发重新同步 / 重新载入，调用方不必再安排应用。
+   */
+  private admit(frame: EventFrame, generation: number): boolean {
     const cursor = this.cursor
     if (!cursor) return false
     const verdict = judgeFrame(cursor, frame)
@@ -300,12 +457,95 @@ class RpcConnection {
       return false
     }
     cursor.sequence = frame.sequence
-    if (frame.event.service === 'agent') {
-      const event: AgentEvent = frame.event.event
-      rpcStore.update((state) => (state.snapshot ? { ...state, snapshot: applyAgentEvent(state.snapshot, event) } : state))
+    this.queued.push(frame)
+    if (serviceEventReloadsTables(frame.event)) {
+      this.beginReload(generation)
+      return false
     }
-    for (const listener of this.listeners) listener(frame)
     return true
+  }
+
+  /**
+   * 运行中收到要求重载表的帧（`snapshotReplaced` 头 / `tablesReloading`）：先把它（及此前已接受的帧）
+   * 应用掉，投影才会进入加载态；之后到达的帧一律缓冲，直到页载完并回放。
+   */
+  private beginReload(generation: number): void {
+    if (!this.flushPending()) return
+    this.syncing = true
+    this.buffered = []
+    this.bufferOverflowed = false
+    void this.reloadTables(generation)
+  }
+
+  private async reloadTables(generation: number): Promise<void> {
+    try {
+      const outcome = await this.settle(generation)
+      if (outcome === 'stale' || outcome === 'done') return
+      this.syncing = false
+      await this.resync(generation)
+    } catch (error) {
+      this.onHandshakeFailure(generation, error)
+    }
+  }
+
+  private scheduleFlush(): void {
+    if (this.batchTimer !== null) return
+    this.batchTimer = setTimeout(() => {
+      this.batchTimer = null
+      this.flushPending()
+    }, FRAME_BATCH_MS)
+  }
+
+  /** 丢弃尚未应用的帧（重新同步 / 断线：快照会整体取代它们）。 */
+  private discardPending(): void {
+    if (this.batchTimer !== null) clearTimeout(this.batchTimer)
+    this.batchTimer = null
+    this.queued = []
+  }
+
+  /**
+   * 把已接受的帧一次性应用到快照并通知监听器。游标在入队时已前移，应用抛异常意味着快照与游标
+   * 脱节，只能重新同步；返回 false 表示已触发重新同步。监听器各自隔离：一个监听器出错不影响
+   * 其他监听器，也不影响快照。
+   */
+  private flushPending(): boolean {
+    if (this.batchTimer !== null) clearTimeout(this.batchTimer)
+    this.batchTimer = null
+    const frames = this.queued
+    if (frames.length === 0) return true
+    this.queued = []
+    const events: AgentEvent[] = []
+    for (const frame of frames) {
+      if (frame.event.service === 'agent') events.push(frame.event.event)
+    }
+    if (events.length > 0) {
+      try {
+        rpcStore.update((state) => (state.snapshot ? { ...state, snapshot: applyAgentEvents(state.snapshot, events) } : state))
+      } catch (error) {
+        console.error('failed to apply service events; resyncing', error)
+        void this.resync(this.generation)
+        return false
+      }
+    }
+    for (const frame of frames) {
+      for (const listener of this.listeners) {
+        try {
+          listener(frame)
+        } catch (error) {
+          console.error('service event listener failed', error)
+        }
+      }
+    }
+    return true
+  }
+
+  /** 4009 后的重连延迟：30s 内连续落后按 250ms 起翻倍到 3s 封顶，再取 50%~100% 抖动。 */
+  private gapRetryDelay(): number {
+    const now = Date.now()
+    this.gapStreak = now - this.lastGapAt < GAP_STREAK_WINDOW_MS ? this.gapStreak + 1 : 0
+    this.lastGapAt = now
+    const ceiling = Math.min(GAP_BACKOFF_MAX_MS, GAP_BACKOFF_BASE_MS * 2 ** this.gapStreak)
+    return Math.round(ceiling * (0.5 + Math.random() * 0.5))
   }
 
   private async resync(generation: number): Promise<void> {
@@ -331,6 +571,7 @@ class RpcConnection {
     this.syncing = false
     this.cursor = null
     this.buffered = []
+    this.discardPending()
     this.rejectAll(transportError('connection closed', 'unavailable'))
     if (!this.wanted) return
 
@@ -345,8 +586,9 @@ class RpcConnection {
       return
     }
     if (event.code === EVENT_GAP_CLOSE_CODE) {
-      // 事件落后：立即重连并重新 snapshot，不计退避。
-      this.open()
+      // 事件落后（4009）：服务端重连后仍要重拉整份快照，立即重连会让落后的订阅者反复重拉；
+      // 带抖动的短退避，连续落后时逐步拉长。
+      this.scheduleRetry(event.reason || 'event-gap', this.gapRetryDelay())
       return
     }
     if (!opened) {
@@ -365,11 +607,11 @@ class RpcConnection {
     setConnection({ phase, nextRetryAt: null, lastError: message, restarting: false })
   }
 
-  private scheduleRetry(reason: string): void {
+  private scheduleRetry(reason: string, delayMs?: number): void {
     this.clearRetry()
     const exponent = Math.min(this.attempt, 10)
     const base = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * 2 ** exponent)
-    const delay = Math.round(base * (0.8 + Math.random() * 0.4))
+    const delay = delayMs ?? Math.round(base * (0.8 + Math.random() * 0.4))
     this.attempt += 1
     setConnection({
       phase: 'reconnecting',
@@ -402,6 +644,7 @@ class RpcConnection {
     this.syncing = false
     this.cursor = null
     this.buffered = []
+    this.discardPending()
     this.rejectAll(transportError('connection closed', 'unavailable'))
   }
 

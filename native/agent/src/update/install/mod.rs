@@ -72,7 +72,7 @@ pub struct InstallTarget {
 
 impl InstallTarget {
     /// Android APK：按设备 ABI 偏好（`Build.SUPPORTED_ABIS` 顺序）取第一个有分包的 ABI，
-    /// 并以 universal 包兜底；安装由宿主语言执行（PackageInstaller），见
+    /// 并以 universal 包兜底；安装由宿主语言交给安装程序执行，见
     /// [`super::UpdateService::delegated`]。
     #[must_use]
     pub fn android(supported_abis: &[String], manual_reason: Option<UpdateManualReason>) -> Self {

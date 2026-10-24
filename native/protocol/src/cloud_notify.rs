@@ -15,12 +15,12 @@ pub struct TaskNoticeDto {
     /// 事件唯一 ID（UUID v4），云端按 `(user, deliveryId)` 幂等去重。
     pub delivery_id: String,
     /// webhook wire 名：`task.created` / `task.started` / `task.completed` /
-    /// `task.failed` / `task.paused` / `queue.drained`。
+    /// `task.failed` / `task.paused` / `queue.started` / `queue.drained`。
     pub event: String,
     pub timestamp_ms: i64,
     pub queue_id: String,
     pub queue_name: String,
-    /// `queue.drained` 为 `None`，其余事件必有。
+    /// `queue.started` / `queue.drained` 为 `None`，其余事件必有。
     #[serde(default)]
     pub task: Option<TaskNoticeTaskDto>,
 }

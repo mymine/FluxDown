@@ -1,9 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 打开已完成文件（ACTION_VIEW）时授予只读 URI：公共下载目录与应用私有目录 -->
+<!-- 打开已完成文件（ACTION_VIEW）/ 通知「打开」「分享」时授予只读 URI：公共存储、应用私有目录与可移动存储卡 -->
 <paths>
     <external-path name="external" path="." />
+    <!-- 可移动 SD 卡 / U 盘挂载在 /storage/<卷ID>/，不属于 external-path（仅覆盖主存储）；
+         root-path 以文件系统根为基准、限定 /storage/，使 /storage/6BF9-89B3/... 也能生成 content URI。
+         provider 非导出、仅按 Intent 对单个 URI 授权，不会因此暴露整盘。 -->
+    <root-path name="storage_volumes" path="storage/" />
     <external-files-path name="external_files" path="." />
     <files-path name="files" path="." />
     <!-- 诊断页导出日志：zip 先写到缓存目录，再经系统分享面板分享 -->
     <cache-path name="log_export" path="log-export/" />
+    <!-- 应用自更新：已校验的 APK 在 noBackupFilesDir/updates/（Rust 更新器目录），以只读 content:// 交给安装程序。
+         FileProvider 没有 no_backup 根；noBackupFilesDir 恒为 filesDir 的同级目录（ContextImpl：dataDir/no_backup），
+         根路径会被规范化为该目录本身。不可信应用不能建硬链接，复制几十 MB 的安装包又是无谓开销，故直接映射。 -->
+    <files-path name="app_update" path="../no_backup/updates/" />
 </paths>

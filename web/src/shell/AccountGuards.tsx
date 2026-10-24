@@ -7,24 +7,25 @@ import type { EventFrame, LinkDeviceInfo, LinkPairingRequestDto } from '../lib/r
 import { accountErrorKey } from '../pages/settings/sections/account/errorText'
 import { sessionRevokedKey } from '../pages/settings/sections/account/sessionNotice'
 import { Button, Dialog, DialogFooter, FieldHint, toast } from '../ui'
+import { localDeadlineMs, secondsUntil } from '../pages/settings/sections/account/pairing'
 
 const NO_REQUESTS: readonly LinkPairingRequestDto[] = []
 const NO_LINKED: readonly LinkDeviceInfo[] = []
 
-function useSecondsLeft(expiresAtUnixMs: number): number {
+function useSecondsLeft(deadlineMs: number): number {
   const [now, setNow] = useState(() => Date.now())
   useEffect(() => {
     setNow(Date.now())
     const id = setInterval(() => setNow(Date.now()), 500)
     return () => clearInterval(id)
-  }, [expiresAtUnixMs])
-  return Math.max(0, Math.ceil((expiresAtUnixMs - now) / 1000))
+  }, [deadlineMs])
+  return secondsUntil(deadlineMs, now)
 }
 
-function RequestDialog({ request, onApproved }: { request: LinkPairingRequestDto; onApproved: (request: LinkPairingRequestDto) => void }) {
+function RequestDialog({ request, deadlineMs, onApproved }: { request: LinkPairingRequestDto; deadlineMs: number; onApproved: (request: LinkPairingRequestDto) => void }) {
   const t = useT()
   const [busy, setBusy] = useState(false)
-  const seconds = useSecondsLeft(request.expiresAtUnixMs)
+  const seconds = useSecondsLeft(deadlineMs)
   const decided = useRef(false)
 
   const decide = useCallback(
@@ -65,12 +66,18 @@ function RequestDialog({ request, onApproved }: { request: LinkPairingRequestDto
             {t('localPairingReject')}
           </Button>
           <Button variant="primary" loading={busy} onClick={() => void decide(true)}>
-            {t('localPairingConfirm')}
+            {request.requestsControl ? t('linkControlApprove') : t('localPairingConfirm')}
           </Button>
         </DialogFooter>
       }
     >
       <div className="flex flex-col gap-3 pb-2">
+        {request.requestsControl ? (
+          <div className="flex flex-col gap-1 rounded-md border border-destructive/40 bg-destructive/10 p-3">
+            <span className="text-sm font-semibold text-destructive">{t('linkControlRequestTag')}</span>
+            <span className="text-xs text-foreground">{t('linkControlRequestWarning')}</span>
+          </div>
+        ) : null}
         <FieldHint>{t('localPairingSasHint')}</FieldHint>
         <div className="flex flex-col items-center gap-1 rounded-md bg-muted py-4">
           <span className="tabular font-mono text-display font-semibold tracking-widest text-foreground">{request.sas}</span>
@@ -94,6 +101,14 @@ function PairingRequestHost() {
   linkedRef.current = linked
   const first = requests[0]
 
+  // 截止时刻 = 本机首次看到该请求的时刻 + ttlMs（免疫主机时钟偏差）；旧主机无 ttlMs 才用绝对时间。
+  const deadlines = useRef(new Map<string, number>())
+  const live = new Set(requests.map((request) => request.sessionId))
+  for (const id of deadlines.current.keys()) if (!live.has(id)) deadlines.current.delete(id)
+  for (const request of requests) {
+    if (!deadlines.current.has(request.sessionId)) deadlines.current.set(request.sessionId, localDeadlineMs(request, Date.now()))
+  }
+
   // 记录批准时该指纹的 pairedAt 基线：已存在（重新配对）时 pairedAt 变化也算成功，仅新出现不够。
   const onApproved = useCallback((request: LinkPairingRequestDto) => {
     const existing = linkedRef.current.find((device) => device.fingerprint === request.peerFingerprint && !device.revoked)
@@ -116,7 +131,7 @@ function PairingRequestHost() {
     }
   }, [linked])
 
-  return first ? <RequestDialog key={first.sessionId} request={first} onApproved={onApproved} /> : null
+  return first ? <RequestDialog key={first.sessionId} request={first} deadlineMs={deadlines.current.get(first.sessionId) ?? first.expiresAtUnixMs} onApproved={onApproved} /> : null
 }
 
 /** agent 推送的会话撤销通知（主动登出 / 删本设备不会发）：按 reason 一次性提示。 */

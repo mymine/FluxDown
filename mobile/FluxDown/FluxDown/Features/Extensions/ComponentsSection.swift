@@ -1,6 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
+#if FULL_FLAVOR
 
 /// S11.6 · 组件（ffmpeg / yt-dlp）：生效状态、系统 PATH、手动路径、托管安装（版本 / 安装 / 更新 / 卸载 / 进度）。
 /// 仅在连接远端 `--server` 主机时由 `ExtensionsPage` 呈现（iOS 本机没有可执行文件）。
@@ -416,3 +417,4 @@ private struct ComponentCardBody: View {
         kind == .ytdlp ? "componentsInstallSectionDescYtdlp" : "componentsInstallSectionDescFfmpeg"
     }
 }
+#endif

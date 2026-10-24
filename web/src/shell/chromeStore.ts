@@ -4,7 +4,7 @@
 
 import { useSyncExternalStore } from 'react'
 import { getChromeCatalog, subscribeChromeCatalog } from './chromeCatalog'
-import { defaultLayout, moveItem, normalizeLayout, serializeLayout } from './chromeLayout'
+import { defaultLayout, moveItem, normalizeLayout, serializeLayout, setHidden } from './chromeLayout'
 import type { ChromeLayout, ChromeZone } from './chromeLayout'
 
 export const CHROME_LAYOUT_KEY = 'fluxdown.chromeLayout'
@@ -60,7 +60,14 @@ export function moveChromeItem(id: string, zone: ChromeZone, target: string | nu
   return result.changed
 }
 
-/** 重置为默认布局（写入完整默认值）。 */
+/** 隐藏 / 显示一个条目并在成功时立即持久化（摆放位置不变；固定 / 未知条目被拒绝）；返回是否发生了变化。 */
+export function setChromeItemHidden(id: string, hidden: boolean): boolean {
+  const result = setHidden(getChromeLayout(), getChromeCatalog(), id, hidden)
+  if (result.changed) persist(result.layout)
+  return result.changed
+}
+
+/** 重置为默认布局（写入完整默认值，同时清除所有隐藏）。 */
 export function resetChromeLayout(): void {
   persist(defaultLayout(getChromeCatalog()))
 }

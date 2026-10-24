@@ -408,6 +408,11 @@ export interface LinkDiscoveryParams {
   enabled: boolean;
 }
 
+/** `agent.link.stopPairing`：带 `code` 时仅当它仍是当前配对码才作废（多客户端互不干扰）。 */
+export interface LinkStopPairingParams {
+  code?: string;
+}
+
 /** 接受 `host`、`host:port`、`http(s)://host[:port][/base]`。 */
 export interface LinkAddressParams {
   address: string;
@@ -416,6 +421,8 @@ export interface LinkAddressParams {
 export interface LinkPairBeginParams {
   address: string;
   code: string;
+  /** 请求「完全控制」对端；对端批准后其会签发设备控制凭据。 */
+  requestControl?: boolean;
 }
 
 export interface LinkPairFinishParams {

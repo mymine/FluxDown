@@ -41,6 +41,7 @@ import com.fluxdown.app.nav.Route
 import com.fluxdown.app.nav.SettingsPage
 import com.fluxdown.app.shell.LocalAppContainer
 import com.fluxdown.app.shell.hostState
+import com.fluxdown.app.ui.launchDocumentPicker
 import com.fluxdown.core.model.HostRef
 import com.fluxdown.core.protocol.HostCapability
 import com.fluxdown.core.protocol.MarketEntry
@@ -143,6 +144,7 @@ private fun ExtensionsContent() {
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) model.installFile(env, uri)
     }
+    val noFilePicker = str(R.string.mobileNoFilePicker)
     val installLabel = when (val phase = model.installPhase) {
         is ExtensionsModel.InstallPhase.Uploading ->
             str(R.string.webPluginUploading, "percent" to Math.round(phase.fraction * 100))
@@ -213,7 +215,7 @@ private fun ExtensionsContent() {
                                     icon = FluxIcons.FileUp,
                                     loading = model.installPhase != null,
                                     enabled = !readOnly && model.installPhase == null,
-                                    onClick = { importer.launch(arrayOf("*/*")) },
+                                    onClick = { launchDocumentPicker(overlays, noFilePicker) { importer.launch(arrayOf("*/*")) } },
                                 )
                             }
                             val phase = model.installPhase

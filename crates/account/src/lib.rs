@@ -30,6 +30,7 @@ use gpui::SharedString;
 pub use assets::{AccountAssets, CLOUD_ICON_PATH, CROWN_ICON_PATH};
 pub use controller::AccountController;
 pub use dialogs::add_device::open as open_add_device;
+pub use dialogs::device::{confirm_unpair_by_fingerprint, open_link_rename_by_fingerprint};
 pub use dialogs::pairing_prompt::open as open_pairing_prompt;
 pub use host::{AccountHost, AccountHostEvent};
 pub use rail::AccountRailButton;

@@ -216,7 +216,8 @@ export interface CompiledRules {
   classify(url: string, mime?: string): ResourceType;
   /** classify 所用规则的可序列化形式（求值顺序），经 PageConfig 下发给页面上下文。 */
   classifyRules(): ClassifyRule[];
-  isIgnored(url: string, pageUrl: string, attachment: boolean): RuleRef | null;
+  /** `mime` 可选：带上响应 MIME 时，按 MIME 排除的噪音规则（如 `/api/v1/…` 下的 PDF）与 classifyResponse 一致。 */
+  isIgnored(url: string, pageUrl: string, attachment: boolean, mime?: string): RuleRef | null;
   /** 替代 normalizeUrlForDedup */
   dedupeKey(url: string, pageUrl: string): string;
   /** 先取 path 扩展名，再依次尝试命中的 filename 规则（取第一个非空结果） */
@@ -881,8 +882,8 @@ export function compileRules(input: CompileInput): CompiledRules {
       return classifyRuleList;
     },
 
-    isIgnored(url, pageUrl, attachment) {
-      const c = makeCtx(url, pageUrl, { attachment });
+    isIgnored(url, pageUrl, attachment, mime) {
+      const c = makeCtx(url, pageUrl, { attachment, mime });
       for (const r of candidates(ignoreIndex, c.ext)) {
         if (r.matches(c)) return r.ref;
       }

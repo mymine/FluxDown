@@ -199,5 +199,7 @@ const autoZhHref = lang === "en" && Astro.props.alternates === undefined ? switc
       baseUrl 是 http://127.0.0.1:5300,直连会让所有请求打到访客本机。
     -->
     <script is:inline defer data-title="FD助手" src={withBase("/api/langbot-widget.js")}></script>
+    <!-- Cloudflare Web Analytics（手动安装，不依赖区域代理的自动注入；区域侧须保持自动注入关闭以免重复计数） -->
+    <script is:inline defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token": "a19315d531084052929d5123a1a64dbe"}'></script>
   </body>
 </html>

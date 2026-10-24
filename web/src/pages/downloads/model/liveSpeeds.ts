@@ -51,16 +51,19 @@ function drop(taskId: string) {
   schedule()
 }
 
+/** 本地做种中（已完成 + 正在做种）：保留上传速率采样。 */
+const isSeedingDto = (task: { status: number; seedingStatus: number }) => task.status === 3 && task.seedingStatus === 1
+
 function onDaemonEvent(event: DaemonEvent) {
   switch (event.type) {
     case 'snapshotReplaced':
       clearAll()
       break
     case 'taskChanged':
-      if (event.data.status !== 1 && event.data.status !== 5) drop(event.data.taskId)
+      if (event.data.status !== 1 && event.data.status !== 5 && !isSeedingDto(event.data)) drop(event.data.taskId)
       break
     case 'tasksChanged':
-      for (const task of event.data) if (task.status !== 1 && task.status !== 5) drop(task.taskId)
+      for (const task of event.data) if (task.status !== 1 && task.status !== 5 && !isSeedingDto(task)) drop(task.taskId)
       break
     case 'taskDeleted':
       drop(event.data.taskId)
@@ -75,7 +78,7 @@ function onDaemonEvent(event: DaemonEvent) {
           drop(message.taskId)
         } else {
           working.download[message.taskId] = message.status === 1 ? message.speed : 0
-          working.upload[message.taskId] = message.status === 1 || message.seedingStatus === 1 ? message.uploadSpeed : 0
+          working.upload[message.taskId] = message.status === 1 || isSeedingDto(message) ? message.uploadSpeed : 0
           schedule()
         }
       } else if (message.type === 'tasksSnapshot') {

@@ -142,6 +142,7 @@ enum class WebhookEvent(val wire: String) {
     Completed("task.completed"),
     Failed("task.failed"),
     Paused("task.paused"),
+    QueueStarted("queue.started"),
     QueueDrained("queue.drained"),
     ;
 

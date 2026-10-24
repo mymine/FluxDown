@@ -29,10 +29,16 @@ public struct HostState: Sendable {
     public var info: HostInfo?
     /// 按创建顺序（快照顺序 + 新增追加）。
     public var tasks: [DownloadTask] = []
+    /// 任务表尚在分页载入：`tasks` 只是占位 / 半份列表，**不是完整列表**。UI 只能显示加载态
+    /// （进度文案可用 ``taskTotal``），任务计数、空态、批量操作范围、「任务已不存在」的删除推断都不得基于 `tasks`。
+    public var tasksLoading = false
+    /// ``tasksLoading`` 期间服务端的任务总数；载入完成后为 0。
+    public var taskTotal: UInt64 = 0
     public var runtime: [String: TaskRuntime] = [:]
     public var speeds: [String: LiveSpeed] = [:]
     public var queues: [TaskQueue] = []
-    public var queuePositions: [String: Int32] = [:]
+    /// 排队顺序（按引擎排序键的名次 = 「排队 #n」）；顺序未变时前后状态共享同一份存储。
+    public var queueOrder = QueueOrder.empty
     public var groups: [DownloadGroup] = []
     public var stats = RuntimeStats()
     public var priorityTaskId: String?
@@ -179,7 +185,7 @@ public final class HostStore {
         switch event {
         case let .taskChanged(task):
             w.upsert(task)
-            if !task.status.isActive { clearActiveRuntime(task.taskId) }
+            settleRuntime(task.taskId, status: task.status)
             return true
         case let .taskDeleted(taskId):
             removeTask(taskId)
@@ -191,8 +197,10 @@ public final class HostStore {
         case let .queuesChanged(queues):
             w.queues = queues
             return true
-        case let .queuePositionsChanged(positions):
-            w.queuePositions = positions
+        case let .queuePositionsChanged(entries):
+            w.queueEntries = entries
+        case let .queueOrderChanged(removed, added):
+            w.queueEntries = QueueOrder.applying(removed: removed, added: added, to: w.queueEntries)
         case let .groupsChanged(groups):
             w.groups = groups
             return true
@@ -252,7 +260,7 @@ public final class HostStore {
         }
         guard let previous = w.tasks[e.taskId] else { return false }
         let status = TaskStatus(wire: e.status)
-        if !status.isActive { clearActiveRuntime(e.taskId) }
+        settleRuntime(e.taskId, status: status)
         var next = previous
         next.status = status
         next.downloadedBytes = e.downloadedBytes
@@ -270,13 +278,23 @@ public final class HostStore {
     }
 
     private func applyRuntime(_ runtime: TaskRuntime) {
-        guard let task = w.tasks[runtime.taskId] else { return }
+        guard let task = w.tasks[runtime.taskId], task.status.retainsRuntime else { return }
         let previous = w.runtime[runtime.taskId]
         if let previous, previous.sampleSequence != 0, runtime.sampleSequence <= previous.sampleSequence { return }
         var next = runtime
         if runtime.segments.isEmpty, let previous { next.segments = previous.segments }
         if !task.status.isActive { next = Self.inactive(next) }
         w.runtime[runtime.taskId] = next
+    }
+
+    /// 任务状态变化后的运行时收尾（对应 Rust `settle_runtime`）：完成即删除条目，其余非活跃状态清零读数。
+    private func settleRuntime(_ id: String, status: TaskStatus) {
+        if !status.retainsRuntime {
+            w.runtime[id] = nil
+            w.speeds[id] = nil
+        } else if !status.isActive {
+            clearActiveRuntime(id)
+        }
     }
 
     private func clearActiveRuntime(_ id: String) {
@@ -327,10 +345,24 @@ private struct Working {
     /// 插入序（快照顺序 + 新增追加）。
     var order: [String] = []
     var tasks: [String: DownloadTask] = [:]
+    var tasksLoading = false
+    var taskTotal: UInt64 = 0
     var runtime: [String: TaskRuntime] = [:]
     var speeds: [String: LiveSpeed] = [:]
     var queues: [TaskQueue] = []
-    var queuePositions: [String: Int32] = [:]
+    /// 顺序变化才重建不可变视图；其余发布复用同一份。
+    var queueEntries: [QueueOrderEntry] = [] {
+        didSet { queueOrderCache = nil }
+    }
+    private var queueOrderCache: QueueOrder?
+    var queueOrder: QueueOrder {
+        mutating get {
+            if let cached = queueOrderCache { return cached }
+            let built = QueueOrder(sorted: queueEntries)
+            queueOrderCache = built
+            return built
+        }
+    }
     var groups: [DownloadGroup] = []
     var stats = RuntimeStats()
     var priorityTaskId: String?
@@ -351,9 +383,11 @@ private struct Working {
     init(snapshot s: HostSnapshot, previous: Working) {
         info = s.info
         for task in s.tasks { upsert(task) }
-        runtime = s.runtime.filter { tasks[$0.key] != nil }
+        tasksLoading = s.tasksLoading
+        taskTotal = s.tasksLoading ? s.taskTotal : 0
+        runtime = s.runtime.filter { tasks[$0.key]?.status.retainsRuntime == true }
         queues = s.queues
-        queuePositions = s.queuePositions
+        queueEntries = s.queueOrder
         groups = s.groups
         stats = s.stats
         priorityTaskId = s.priorityTaskId
@@ -366,7 +400,8 @@ private struct Working {
         categories = s.categories
         sections = s.sections
         history = previous.history
-        taskHistory = previous.taskHistory.filter { tasks[$0.key] != nil }
+        // 载入期间的空任务表不是「任务都被删了」：保留速度曲线，载入完成的快照再按真实任务表裁剪。
+        taskHistory = s.tasksLoading ? previous.taskHistory : previous.taskHistory.filter { tasks[$0.key] != nil }
         if !s.daemonConnected { runtime.removeAll() }
     }
 
@@ -378,15 +413,17 @@ private struct Working {
         if tasks.removeValue(forKey: id) != nil { order.removeAll { $0 == id } }
     }
 
-    func snapshot() -> HostState {
+    mutating func snapshot() -> HostState {
         var state = HostState()
         state.connection = connection
         state.info = info
         state.tasks = order.compactMap { tasks[$0] }
+        state.tasksLoading = tasksLoading
+        state.taskTotal = taskTotal
         state.runtime = runtime
         state.speeds = speeds
         state.queues = queues
-        state.queuePositions = queuePositions
+        state.queueOrder = queueOrder
         state.groups = groups
         state.stats = stats
         state.priorityTaskId = priorityTaskId

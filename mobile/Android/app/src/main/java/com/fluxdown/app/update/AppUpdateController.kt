@@ -1,10 +1,12 @@
 package com.fluxdown.app.update
 
 import android.content.Context
+import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.util.Log
 import com.fluxdown.app.data.DeviceSettings
+import com.fluxdown.app.diag.AppDiagnostics
 import com.fluxdown.bridge.FluxBridge
 import com.fluxdown.core.host.HostException
 import com.fluxdown.core.update.AppUpdateConfig
@@ -31,10 +33,18 @@ import kotlinx.coroutines.withTimeoutOrNull
 data class InstallInterrupt(val packagePath: String, val version: String, val activeDownloads: Int)
 
 /**
+ * 待交给安装程序的请求：只由前台界面（[UpdateEffects]）拉起，避免后台启动 Activity 被系统静默拦截。
+ * 普通类（按引用比较）：同一安装包再次交接也是新的请求。
+ */
+class InstallHandoff internal constructor(val intent: Intent)
+
+/**
  * 应用自更新控制器（进程级，挂在 `AppContainer`，惰性创建）。
  *
- * 状态机在 Rust（[AppUpdatePort]）；这里负责：信号 → [status]、安装请求 → 提交 [ApkInstaller]、前台 / 后台检查与自动下载、
+ * 状态机在 Rust（[AppUpdatePort]）；这里负责：信号 → [status]、安装请求 → 预检后经 [handoff] 交给安装程序、前台 / 后台检查与自动下载、
  * 通知与一次性提示。永不在无用户点击时安装：[install] 只来自 UI 点按，后台路径（[backgroundCheck]）只检查 / 下载 / 通知。
+ * 交接后 Rust 停在 Installing（`pending.json` 保留供下次启动对账）：安装成功时系统替换应用并结束进程；安装程序关闭而进程仍在时
+ * 只置 [installerClosed]，不断言失败（部分安装程序关闭界面后仍在后台安装）。
  * 所有 Rust 调用的 [HostException] 在此捕获并记 warn，不让协程崩溃；失败态由 Rust 状态机经 [status] 呈现。
  */
 class AppUpdateController internal constructor(
@@ -58,10 +68,18 @@ class AppUpdateController internal constructor(
     /** 非空 = 需要用户确认「安装会中断下载」；UI 调 [confirmInterrupt] / [dismissInterrupt]。 */
     val interrupt: StateFlow<InstallInterrupt?> = _interrupt.asStateFlow()
 
-    private val _needsInstallPermission = MutableStateFlow(false)
+    private val _handoff = MutableStateFlow<InstallHandoff?>(null)
 
-    /** true = 安装已就绪但系统尚未授予「安装未知应用」：UI 显示授权引导；授权返回前台自动重试。 */
-    val needsInstallPermission: StateFlow<Boolean> = _needsInstallPermission.asStateFlow()
+    /** 非空 = 等待前台界面拉起安装程序；界面拉起后调 [consumeHandoff]，安装程序界面返回时调 [onInstallerClosed]。 */
+    val handoff: StateFlow<InstallHandoff?> = _handoff.asStateFlow()
+
+    private val _installerClosed = MutableStateFlow(false)
+
+    /**
+     * true = 已交给安装程序、界面已关闭而本进程仍在（取消 / 安装失败 / 安装程序仍在后台安装）：UI 提供
+     * 「安装更新」（[reinstall]）与「换用其他安装程序」。只在 [status] 仍为 Installing 时有意义。
+     */
+    val installerClosed: StateFlow<Boolean> = _installerClosed.asStateFlow()
 
     private val _installedVersion = MutableStateFlow<String?>(null)
 
@@ -72,8 +90,11 @@ class AppUpdateController internal constructor(
     private val opLock = Mutex()
     private var port: AppUpdatePort? = null
 
-    /** 等待授权的安装包路径（仅主线程协程访问）。 */
-    private var awaitingPermissionPath: String? = null
+    /** 已交接的安装包（[reinstall] 复用）。 */
+    private class HandedOff(val packagePath: String, val version: String)
+
+    /** 最近一次交接的安装包（仅主线程协程访问）。 */
+    private var handedOff: HandedOff? = null
 
     /** 当前渠道：用户选择，否则按当前版本取默认（预览构建默认 frontier）。 */
     val channel: String get() = settings.updateChannelChoice ?: UpdatePolicy.defaultChannel(env.currentVersion)
@@ -116,7 +137,7 @@ class AppUpdateController internal constructor(
     fun confirmInterrupt() {
         val request = _interrupt.value ?: return
         _interrupt.value = null
-        scope.launch { commit(request.packagePath) }
+        scope.launch { handOff(request.packagePath, request.version, chooser = false) }
     }
 
     fun dismissInterrupt() {
@@ -125,31 +146,44 @@ class AppUpdateController internal constructor(
         scope.launch { reportFailure(UpdateFailure.ElevationCancelled, "cancelled before install") }
     }
 
-    /** 放弃等待授权的安装（用户不想授权）。 */
-    fun abandonPendingInstall() {
-        if (awaitingPermissionPath == null) return
-        awaitingPermissionPath = null
-        _needsInstallPermission.value = false
-        scope.launch { reportFailure(UpdateFailure.ElevationCancelled, "install permission not granted") }
+    /**
+     * 安装程序关闭后重新交接同一安装包（Rust 仍在 Installing，不重新下载 / 校验）；[chooser] = 弹出系统选择器，
+     * 换用默认以外的安装程序。
+     */
+    fun reinstall(chooser: Boolean) {
+        val pkg = handedOff ?: return
+        if (_status.value.phase != UpdatePhase.Installing) return
+        scope.launch { handOff(pkg.packagePath, pkg.version, chooser) }
     }
 
     fun consumeInstalledNotice() {
         _installedVersion.value = null
     }
 
-    /** [ApkInstaller] 的结果接收者回报：安装失败 / 用户取消。 */
-    suspend fun onInstallFailed(failure: UpdateFailure, detail: String) {
-        awaitingPermissionPath = null
-        _needsInstallPermission.value = false
-        reportFailure(failure, detail)
+    /** 前台界面已拉起 [request]：清空，回到前台 / 配置变更时不再重复拉起。 */
+    fun consumeHandoff(request: InstallHandoff) {
+        if (_handoff.value === request) _handoff.value = null
+    }
+
+    /** 安装程序界面返回而本进程仍在：应用未被替换（取消 / 失败 / 安装程序仍在后台安装），由用户决定重试或换安装程序。 */
+    fun onInstallerClosed() {
+        val pkg = handedOff ?: return
+        if (_status.value.phase != UpdatePhase.Installing) return
+        AppDiagnostics.event("update: installer returned, app not replaced (v${pkg.version})")
+        _installerClosed.value = true
+    }
+
+    /** 没有任何应用能打开 APK（精简系统）：按安装失败回报。 */
+    fun onInstallerUnavailable(detail: String) {
+        AppDiagnostics.event("update: no installer available: $detail")
+        scope.launch { reportFailure(UpdateFailure.Install, "no installer: $detail") }
     }
 
     // ───────────────────────────── 生命周期 / 后台 ─────────────────────────────
 
-    /** 进程回到前台：重试挂起的安装；按节流检查；条件允许自动下载。 */
+    /** 进程回到前台：按节流检查；条件允许自动下载（待交接的安装由 [UpdateEffects] 在界面可见时拉起）。 */
     fun onForeground() {
         launchOp { p ->
-            retryPendingInstall()
             if (UpdatePolicy.shouldCheck(System.currentTimeMillis(), settings.updateLastCheckMs, settings.updateAutoCheck)) {
                 checkNow(p)
             }
@@ -277,34 +311,29 @@ class AppUpdateController internal constructor(
         if (busy > 0) {
             _interrupt.value = InstallInterrupt(path, version, busy)
         } else {
-            commit(path)
+            handOff(path, version, chooser = false)
         }
     }
 
-    private suspend fun commit(path: String) {
-        when (val outcome = installer.install(path)) {
-            InstallOutcome.Submitted -> {
-                awaitingPermissionPath = null
-                _needsInstallPermission.value = false
-            }
-            InstallOutcome.PermissionMissing -> {
-                awaitingPermissionPath = path
-                _needsInstallPermission.value = true
+    private suspend fun handOff(path: String, version: String, chooser: Boolean) {
+        when (val outcome = installer.prepare(path, chooser)) {
+            is InstallOutcome.Ready -> {
+                handedOff = HandedOff(path, version)
+                _installerClosed.value = false
+                AppDiagnostics.event("update: hand off v$version to ${outcome.target}")
+                _handoff.value = InstallHandoff(outcome.intent)
             }
             is InstallOutcome.Rejected -> {
-                awaitingPermissionPath = null
-                _needsInstallPermission.value = false
+                AppDiagnostics.event("update: v$version rejected before install: ${outcome.failure} ${outcome.detail}")
                 reportFailure(outcome.failure, outcome.detail)
             }
         }
     }
 
-    private suspend fun retryPendingInstall() {
-        val path = awaitingPermissionPath ?: return
-        if (installer.canRequestInstalls()) commit(path)
-    }
-
     private suspend fun reportFailure(failure: UpdateFailure, detail: String) {
+        handedOff = null
+        _handoff.value = null
+        _installerClosed.value = false
         val p = port ?: return
         try {
             _status.value = p.reportInstallFailure(failure, detail)

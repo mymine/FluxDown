@@ -26,6 +26,8 @@ use crate::{AccountCommand, t, t_with};
 struct PairingPrompt {
     host: Entity<AccountHost>,
     request: LinkPairingRequestDto,
+    /// 本机截止时刻（收到时刻 + `ttlMs`）；到点自动拒绝。
+    deadline_ms: i64,
     remaining: u64,
     busy: bool,
     /// 已向 agent 提交过决定（含超时自动拒绝），不再重复提交。
@@ -87,7 +89,11 @@ impl PairingPrompt {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let remaining = seconds_until(request.expires_at_unix_ms, now_unix_ms());
+        let deadline_ms = host
+            .read(cx)
+            .pairing_deadline_ms(&request.session_id)
+            .unwrap_or(request.expires_at_unix_ms);
+        let remaining = seconds_until(deadline_ms, now_unix_ms());
         let session_id = request.session_id.clone();
         // 承载窗口被关闭 / 实体被释放而请求仍未处理：清空队列的 active，否则之后所有请求都只会排队；
         // 并把本请求与排队中的请求重新抛给 app，在仍存在（或重新打开）的窗口里再弹。
@@ -113,7 +119,7 @@ impl PairingPrompt {
         })
         .detach();
         spawn_ticker(window, cx, |this: &mut Self, window, cx| {
-            this.remaining = seconds_until(this.request.expires_at_unix_ms, now_unix_ms());
+            this.remaining = seconds_until(this.deadline_ms, now_unix_ms());
             // 到期仍无人处理：自动拒绝（agent 侧也会过期，这里让请求方立刻得到结果）。
             if this.remaining == 0 {
                 this.respond(false, window, cx);
@@ -124,6 +130,7 @@ impl PairingPrompt {
         Self {
             host,
             request,
+            deadline_ms,
             remaining,
             busy: false,
             answered: false,
@@ -240,6 +247,17 @@ impl Render for PairingPrompt {
                     })
                     .child(field_hint(self.t("incomingPairingHint", cx), cx)),
             )
+            .when(self.request.requests_control, |column| {
+                column.child(crate::ui::notice(
+                    crate::ui::NoticeTone::Danger,
+                    SharedString::from(format!(
+                        "{}\n{}",
+                        self.t("linkControlRequestTag", cx),
+                        self.t("linkControlRequestWarning", cx)
+                    )),
+                    cx,
+                ))
+            })
             .child(
                 div()
                     .w_full()
@@ -278,7 +296,11 @@ impl Render for PairingPrompt {
                     .child(
                         Button::new("incoming-pairing-accept")
                             .primary()
-                            .label(self.t("incomingPairingAccept", cx))
+                            .label(if self.request.requests_control {
+                                self.t("linkControlApprove", cx)
+                            } else {
+                                self.t("incomingPairingAccept", cx)
+                            })
                             .control(cx)
                             .busy(self.busy)
                             .disabled(self.busy)

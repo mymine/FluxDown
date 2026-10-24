@@ -231,7 +231,7 @@ Each test calls one function of the rule engine and compares the result with `ex
 | --- | --- | --- |
 | `classifyResponse` | `[{ url, pageUrl, size, attachment, mime?, status?, resourceType?, headers? }]` (`size` and `attachment` are required; `size` `-1` or `0` = unknown; `headers` is an object) | `{ decision: "resource", type, confidence?, rule: { id, version, tier } }`, `{ decision: "ignore", rule }` or `{ decision: "none" }` |
 | `classify` | `[url, mime?]` | A resource type such as `"video"` |
-| `isIgnored` | `[url, pageUrl, attachment]` | The matching rule reference `{ id, version, tier }`, or `null` |
+| `isIgnored` | `[url, pageUrl, attachment, mime?]` (pass `mime` to apply MIME-based `exclude` the same way `classifyResponse` does) | The matching rule reference `{ id, version, tier }`, or `null` |
 | `dedupeKey` | `[url, pageUrl]` | The normalised URL string used to detect duplicates |
 | `fileExtension` | `[url, pageUrl]` | The extension (`"zip"`), or `""` |
 | `trackKind` | `[{ url, pageUrl, filename?, mime? }]` | `"video"`, `"audio"` or `null` |

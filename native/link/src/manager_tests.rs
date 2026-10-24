@@ -264,7 +264,11 @@ async fn serve_one(
             body: body.to_string().into_bytes(),
         }
     } else {
-        post(&request)
+        // 处理器可能故意阻塞（模拟对端用户迟迟不表态）：放到阻塞线程池，免得占住运行时工作线程，
+        // 让同一线程 LIFO 槽里被唤醒的任务（如在途 confirm 的取消分支）无法被窃取执行。
+        tokio::task::spawn_blocking(move || post(&request))
+            .await
+            .unwrap()
     };
     write_reply(&mut socket, reply).await;
 }
@@ -553,6 +557,9 @@ async fn replay_nonce_is_kept_until_the_skewed_timestamp_window_closes() {
     // 而不是只保留到「收到时刻 + 120」。
     let secret = vec![7u8; 32];
     let (mgr, fp) = mgr_with_device(secret.clone()).await;
+    // 本测试关注的是时间窗内的 nonce 保留：把「进程启动时刻」挪到时间窗之前，不触发重启重放防护。
+    mgr.started_at
+        .store(now_unix() - 1_000, std::sync::atomic::Ordering::Relaxed);
     let ts = now_unix() + 100;
     authorize_as(&mgr, &secret, &fp, LINK_TASKS_PATH, ts, "ahead", b"{}")
         .await
@@ -1318,6 +1325,7 @@ fn wire_hello(hello: &HelloRequest) -> WireHello {
         platform: hello.platform.clone(),
         app_version: hello.app_version.clone(),
         initiator_addrs: hello.initiator_addrs.clone(),
+        request_control: hello.request_control,
     }
 }
 
@@ -1429,6 +1437,7 @@ async fn hello_from_other_protocol_version_is_rejected_before_field_decoding() {
         platform: None,
         app_version: None,
         initiator_addrs: vec![],
+        request_control: false,
     };
     assert!(matches!(
         mgr.pair_hello_wire(stale, None),
@@ -1643,4 +1652,388 @@ async fn self_heal_browsing_is_a_no_op_when_mdns_is_disabled() {
     mgr.browse_for(Duration::from_secs(30)).await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(mgr.browser.lock().unwrap().is_none());
+}
+
+// ── 设备控制（requestControl / 凭据）────────────────────────────────────────
+
+/// 经 wire 形态走完一次完整配对（hello → reveal → 批准 → confirm），返回发起方视角的名册记录。
+/// `request_control` 同时核对响应方事件里的 `requests_control`。
+async fn wire_pair(
+    host: &Arc<LinkManager>,
+    events: &mut mpsc::Receiver<LinkEngineEvent>,
+    controller: &LinkIdentity,
+    request_control: bool,
+) -> PeerRecord {
+    let code = host.generate_code();
+    let mut initiator = PairingInitiator::new(controller.clone()).request_control(request_control);
+    let hello = initiator.build_hello(
+        &code,
+        &SelfInfo {
+            name: "phone".into(),
+            platform: Some("android".into()),
+            ..SelfInfo::default()
+        },
+        vec![],
+    );
+    let resp = host.pair_hello_wire(wire_hello(&hello), None).unwrap();
+    let hello_resp = parse_hello_response(&serde_json::json!({
+        "protocolVersion": resp.protocol_version,
+        "sessionId": resp.session_id,
+        "responderEphPub": resp.responder_eph_pub,
+        "responderNonce": resp.responder_nonce,
+        "responderIdPub": resp.responder_id_pub,
+        "name": resp.name,
+        "platform": resp.platform,
+        "appVersion": resp.app_version,
+    }))
+    .unwrap();
+    let reveal = initiator
+        .on_hello_response(&hello_resp, "10.0.0.1:17800", &[])
+        .unwrap();
+    let revealed = host
+        .pair_reveal_wire(WireReveal {
+            session_id: reveal.session_id.clone(),
+            initiator_eph_pub: B64.encode(reveal.initiator_eph_pub),
+            initiator_nonce: B64.encode(reveal.initiator_nonce),
+        })
+        .unwrap();
+    let reveal_resp =
+        parse_reveal_response(&serde_json::json!({ "responderSig": revealed.responder_sig }))
+            .unwrap();
+    initiator.on_reveal_response(&reveal_resp).unwrap();
+
+    let session_id = loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let LinkEngineEvent::IncomingPairing {
+            session_id,
+            requests_control,
+            ..
+        } = event
+        {
+            assert_eq!(requests_control, request_control);
+            break session_id;
+        }
+    };
+    host.approve_incoming(&session_id, true).unwrap();
+    assert!(host.pair_confirm(&session_id, true).await.unwrap().paired());
+    initiator.finalize().unwrap()
+}
+
+#[tokio::test]
+async fn repairing_takes_the_new_control_grant_and_never_inherits_the_old_one() {
+    let (host, mut events) = responder_mgr().await;
+    let controller = LinkIdentity::generate();
+    let fingerprint = controller.fingerprint().to_owned();
+
+    // 第一次：请求并获批控制。
+    let initiator_side = wire_pair(&host, &mut events, &controller, true).await;
+    assert!(initiator_side.controllable && !initiator_side.grants_control);
+    let record = host.get_device(&fingerprint).await.unwrap().unwrap();
+    assert!(record.grants_control && !record.controllable);
+
+    // 同一台设备重新配对且这次没有请求控制：授权随新记录消失。
+    let initiator_side = wire_pair(&host, &mut events, &controller, false).await;
+    assert!(!initiator_side.controllable);
+    let record = host.get_device(&fingerprint).await.unwrap().unwrap();
+    assert!(
+        !record.grants_control,
+        "a plain re-pairing must drop control"
+    );
+
+    // 再请求一次：重新授予。
+    wire_pair(&host, &mut events, &controller, true).await;
+    assert!(
+        host.get_device(&fingerprint)
+            .await
+            .unwrap()
+            .unwrap()
+            .grants_control
+    );
+}
+
+#[tokio::test]
+async fn control_credential_is_issued_only_for_controllable_unrevoked_hosts() {
+    let secret = vec![9u8; 32];
+    let (mgr, fp) = mgr_with_device(secret.clone()).await;
+    // 普通配对（没有 controllable 标志）：不签发；未知设备同样不签发。
+    assert!(matches!(
+        mgr.control_credential(&fp).await,
+        Err(LinkError::NotPaired)
+    ));
+    assert!(matches!(
+        mgr.control_credential(&other_fp()).await,
+        Err(LinkError::NotPaired)
+    ));
+
+    let mut record = paired_record(secret.clone(), vec![]);
+    record.controllable = true;
+    mgr.store.upsert(&record).await.unwrap();
+    let token = mgr.control_credential(&fp).await.unwrap();
+    assert_eq!(
+        token,
+        crate::crypto::control_credential(&secret, mgr.fingerprint(), &fp).unwrap()
+    );
+
+    // 对端解除配对（revoked）后不再签发。
+    record.revoked = true;
+    mgr.store.upsert(&record).await.unwrap();
+    assert!(matches!(
+        mgr.control_credential(&fp).await,
+        Err(LinkError::NotPaired)
+    ));
+}
+
+#[tokio::test]
+async fn control_credential_verification_follows_the_roster() {
+    let secret = vec![9u8; 32];
+    // 这里的 mgr 是被控主机：名册里的 `peer_fp()` 是控制端。
+    let (host, controller_fp) = mgr_with_device(secret.clone()).await;
+    let token =
+        crate::crypto::control_credential(&secret, &controller_fp, host.fingerprint()).unwrap();
+
+    // 记录存在但没有授权控制（普通配对）：拒绝。
+    assert_eq!(host.verify_control_credential(&token).await, None);
+
+    let mut record = paired_record(secret.clone(), vec![]);
+    record.grants_control = true;
+    host.store.upsert(&record).await.unwrap();
+    assert_eq!(
+        host.verify_control_credential(&token).await.as_deref(),
+        Some(controller_fp.as_str())
+    );
+
+    // 伪造：同一指纹但密钥不同 / 为另一台主机签发的凭据 / 指纹不在名册里。
+    let wrong_secret =
+        crate::crypto::control_credential(&[1u8; 32], &controller_fp, host.fingerprint()).unwrap();
+    let other_host =
+        crate::crypto::control_credential(&secret, &controller_fp, &other_fp()).unwrap();
+    let unknown =
+        crate::crypto::control_credential(&secret, &other_fp(), host.fingerprint()).unwrap();
+    for forged in [wrong_secret, other_host, unknown] {
+        assert_eq!(host.verify_control_credential(&forged).await, None);
+    }
+    // 格式错误。
+    let no_mac = format!("fdl1.{controller_fp}.");
+    for malformed in ["", "fdl1", "fdl1.x.y", "Bearer", no_mac.as_str()] {
+        assert_eq!(host.verify_control_credential(malformed).await, None);
+    }
+
+    // 重新配对产生新的 link_secret：旧凭据随之失效。
+    let mut repaired = record.clone();
+    repaired.link_secret = vec![5u8; 32];
+    host.store.upsert(&repaired).await.unwrap();
+    assert_eq!(host.verify_control_credential(&token).await, None);
+
+    // 授权被撤销（grants_control 变化）/ 对端解除配对（revoked）：拒绝。
+    let mut revoked = record.clone();
+    revoked.revoked = true;
+    host.store.upsert(&revoked).await.unwrap();
+    assert_eq!(host.verify_control_credential(&token).await, None);
+    let mut ungranted = record;
+    ungranted.grants_control = false;
+    host.store.upsert(&ungranted).await.unwrap();
+    assert_eq!(host.verify_control_credential(&token).await, None);
+    host.store.remove(&controller_fp).await.unwrap();
+    assert_eq!(host.verify_control_credential(&token).await, None);
+}
+
+#[tokio::test]
+async fn requesting_control_from_a_legacy_peer_fails_before_any_hello_is_sent() {
+    // 旧版对端 `/ping` 没有 `linkControl`：不发 hello（旧版会忽略 requestControl 而静默配成
+    // 普通设备，签名字节也对不上），返回版本不兼容。
+    let legacy = FakePeer::start(
+        peer_fp(),
+        Some(2),
+        Arc::new(|_| status_reply(400, r#"{"success":false,"message":"nope"}"#)),
+    )
+    .await;
+    let (mgr, _rx) = responder_mgr().await;
+    let address = PeerAddress::parse(&legacy.addr.to_string()).unwrap();
+
+    assert!(matches!(
+        mgr.begin_pairing(&address, "123456", true).await,
+        Err(LinkError::UnsupportedVersion)
+    ));
+    assert!(
+        legacy.posts().is_empty(),
+        "no hello may reach the legacy peer"
+    );
+
+    // 不请求控制的配对不做这项预检：hello 照常发出（这里被假对端 400 拒绝）。
+    assert!(mgr.begin_pairing(&address, "123456", false).await.is_err());
+    assert_eq!(legacy.posts().len(), 1);
+    assert_eq!(legacy.posts()[0].path, "/api/v1/link/pair/hello");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declining_while_the_peer_decides_aborts_the_in_flight_confirm() {
+    // 对端用户迟迟不表态：accept=true 的 confirm 在对端那里挂着。
+    let peer = FakePeer::start(
+        peer_fp(),
+        Some(2),
+        Arc::new(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body["confirm"] == true {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            status_reply(200, r#"{"success":true,"paired":false}"#)
+        }),
+    )
+    .await;
+    let (mgr, _rx) = responder_mgr().await;
+    mgr.pending.lock().unwrap().insert(
+        "token".to_owned(),
+        PendingInit {
+            initiator: PairingInitiator::new(LinkIdentity::generate()),
+            session_id: "session-1".to_owned(),
+            peer: PeerAddress::parse(&peer.addr.to_string()).unwrap(),
+            created: std::time::Instant::now(),
+            confirming: false,
+            cancel: Arc::new(tokio::sync::Notify::new()),
+        },
+    );
+
+    let in_flight = {
+        let mgr = mgr.clone();
+        tokio::spawn(async move { mgr.confirm_pairing("token", true).await })
+    };
+    for _ in 0..100 {
+        if !peer.posts().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        peer.posts().len(),
+        1,
+        "the accept=true confirm must be on the wire"
+    );
+    // 重复确认没有意义。
+    assert!(matches!(
+        mgr.confirm_pairing("token", true).await,
+        Err(LinkError::SessionExpired)
+    ));
+
+    // 用户取消：取消调用立即通知对端放弃并返回「未配对」，在途调用马上以会话过期结束。
+    let started = std::time::Instant::now();
+    assert!(mgr.confirm_pairing("token", false).await.unwrap().is_none());
+    let result = tokio::time::timeout(Duration::from_secs(2), in_flight)
+        .await
+        .expect("the in-flight confirm must end promptly")
+        .unwrap();
+    assert!(
+        matches!(result, Err(LinkError::SessionExpired)),
+        "{result:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(mgr.pending.lock().unwrap().is_empty());
+    let confirms: Vec<serde_json::Value> = peer
+        .posts()
+        .iter()
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    assert_eq!(confirms.len(), 2, "abort posts exactly one confirm=false");
+    assert_eq!(confirms[1]["confirm"], false);
+    assert_eq!(confirms[1]["sessionId"], "session-1");
+    // 已结束的待确认项不能再被使用。
+    assert!(matches!(
+        mgr.confirm_pairing("token", false).await,
+        Err(LinkError::SessionExpired)
+    ));
+}
+
+// ── 发现快照：mDNS 实例消失 ──────────────────────────────────────────────────
+
+fn discovered(fingerprint: Option<&str>, kind: DiscoveryKind, port: u16) -> DiscoveredPeer {
+    DiscoveredPeer {
+        fingerprint: fingerprint.map(str::to_owned),
+        name: "peer".into(),
+        platform: None,
+        host: "10.0.0.2".into(),
+        port,
+        app_version: None,
+        kind,
+    }
+}
+
+#[test]
+fn lost_mdns_instances_leave_the_discovery_snapshot() {
+    let alpha = "aa".repeat(32);
+    let beta = "bb".repeat(32);
+    let mut snapshot = vec![
+        discovered(Some(&alpha), DiscoveryKind::Mdns, 1),
+        discovered(Some(&beta), DiscoveryKind::Mdns, 2),
+        // 手动探测加入的设备没有「下线」概念：同指纹也不动。
+        discovered(Some(&alpha), DiscoveryKind::Manual, 3),
+        discovered(None, DiscoveryKind::Mdns, 4),
+    ];
+    // 实例名 = 指纹前 12 位。
+    assert!(remove_lost_instance(&mut snapshot, &alpha[..12]));
+    let ports: Vec<u16> = snapshot.iter().map(|peer| peer.port).collect();
+    assert_eq!(ports, vec![2, 3, 4]);
+    // 再来一次 / 未知实例：没有变化，调用方据此不发事件。
+    assert!(!remove_lost_instance(&mut snapshot, &alpha[..12]));
+    assert!(!remove_lost_instance(&mut snapshot, "ffffffffffff"));
+    assert_eq!(snapshot.len(), 3);
+}
+
+// ── 重启重放防护 ─────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn requests_older_than_the_process_start_are_refused_even_inside_the_skew_window() {
+    let secret = vec![9u8; 32];
+    let (mgr, fp) = mgr_with_device(secret.clone()).await;
+    let started = mgr.started_at.load(std::sync::atomic::Ordering::Relaxed);
+    // 重启之前发出的请求（`ts` 早于启动，但仍在 120s 时间窗内）：拒绝，不管 MAC 对不对。
+    let stale = authorize_as(
+        &mgr,
+        &secret,
+        &fp,
+        LINK_INFO_PATH,
+        started - 1,
+        "n-stale",
+        b"{}",
+    )
+    .await;
+    assert!(matches!(stale, Err(LinkError::ClockSkew)), "{stale:?}");
+    let long_ago = authorize_as(
+        &mgr,
+        &secret,
+        &fp,
+        LINK_INFO_PATH,
+        started - 100,
+        "n-old",
+        b"{}",
+    )
+    .await;
+    assert!(
+        matches!(long_ago, Err(LinkError::ClockSkew)),
+        "{long_ago:?}"
+    );
+    // 启动时刻及之后的请求照常受理。
+    let fresh = authorize_as(
+        &mgr,
+        &secret,
+        &fp,
+        LINK_INFO_PATH,
+        started,
+        "n-fresh",
+        b"{}",
+    )
+    .await;
+    assert!(fresh.is_ok(), "{fresh:?}");
+    let later = authorize_as(
+        &mgr,
+        &secret,
+        &fp,
+        LINK_INFO_PATH,
+        now_unix(),
+        "n-now",
+        b"{}",
+    )
+    .await;
+    assert!(later.is_ok(), "{later:?}");
 }

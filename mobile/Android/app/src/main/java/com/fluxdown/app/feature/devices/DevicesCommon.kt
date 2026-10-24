@@ -4,23 +4,17 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.takeOrElse
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.fluxdown.app.R
 import com.fluxdown.app.i18n.str
-import com.fluxdown.app.nav.LocalNavigator
 import com.fluxdown.core.model.HostRef
 import com.fluxdown.fluxui.icons.FluxIcon
 import com.fluxdown.fluxui.icons.FluxIcons
@@ -91,43 +85,4 @@ fun platformLabel(platform: String?): String? = when (platform?.lowercase()) {
     "ios" -> str(R.string.accountDevicePlatformIos)
     "web" -> str(R.string.accountDevicePlatformWeb)
     else -> platform
-}
-
-/**
- * 坞收缩联动（D1 同款）：列表下滑 > 5dp → 迷你坞；上滑或回到顶部 → 展开；离开页面复位。
- * 只依赖首个可见项的 (index, offset)，不触发重组。
- */
-@Composable
-fun DockMiniEffect(state: LazyListState) {
-    val nav = LocalNavigator.current
-    val thresholdPx = with(LocalDensity.current) { 5.dp.toPx() }
-    LaunchedEffect(state, nav, thresholdPx) {
-        var lastIndex = state.firstVisibleItemIndex
-        var lastOffset = state.firstVisibleItemScrollOffset
-        var acc = 0f
-        snapshotFlow { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }.collect { (index, offset) ->
-            val delta = when {
-                index == lastIndex -> (offset - lastOffset).toFloat()
-                index > lastIndex -> 1_000f
-                else -> -1_000f
-            }
-            lastIndex = index
-            lastOffset = offset
-            if (index == 0 && offset < thresholdPx) {
-                acc = 0f
-                nav.dockMini = false
-            } else {
-                if ((delta > 0f && acc < 0f) || (delta < 0f && acc > 0f)) acc = 0f
-                acc += delta
-                if (acc > thresholdPx) {
-                    nav.dockMini = true
-                    acc = 0f
-                } else if (acc < -thresholdPx) {
-                    nav.dockMini = false
-                    acc = 0f
-                }
-            }
-        }
-    }
-    DisposableEffect(nav) { onDispose { nav.dockMini = false } }
 }

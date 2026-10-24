@@ -354,6 +354,23 @@ impl ExtensionsController {
         self.call(method::DAEMON_PLUGIN_MARKET_LIST, serde_json::json!({}))
     }
 
+    /// 收藏数据：公开计数 + （已登录时）我的收藏。
+    pub fn plugin_favorites(&self) -> PortFuture<serde_json::Value> {
+        self.call(method::AGENT_PLUGIN_FAVORITE_LIST, serde_json::json!({}))
+    }
+
+    /// 收藏 / 取消收藏（幂等）；需要登录。
+    pub fn set_plugin_favorite(
+        &self,
+        plugin_id: String,
+        favorited: bool,
+    ) -> PortFuture<serde_json::Value> {
+        self.call(
+            method::AGENT_PLUGIN_FAVORITE_SET,
+            serde_json::json!({ "pluginId": plugin_id, "favorited": favorited }),
+        )
+    }
+
     /// 站点默认插件列表（按站点升序）。
     pub fn site_defaults(&self) -> PortFuture<serde_json::Value> {
         self.call(method::DAEMON_PLUGIN_SITE_DEFAULTS, serde_json::json!({}))

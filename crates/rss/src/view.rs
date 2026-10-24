@@ -7,7 +7,7 @@ use fluxdown_protocol::{
 };
 use fluxdown_ui_components::{
     CheckState, ControlExt as _, FluxIcon, SidebarPanel, SidebarState, caption_number, check_mark,
-    nav_icon_color, tabular_numbers, toolbar_action_button,
+    nav_icon_color, tabular_numbers, toolbar_action_button, tooltip_view,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -23,7 +23,6 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
-    tooltip::Tooltip,
     v_flex,
 };
 use std::{
@@ -676,9 +675,7 @@ impl RssView {
                             div()
                                 .id(badge_id)
                                 .flex_none()
-                                .tooltip(move |window, cx| {
-                                    Tooltip::new(unread.clone()).build(window, cx)
-                                })
+                                .tooltip(move |window, cx| tooltip_view(unread.clone(), window, cx))
                                 .child(caption_number(count.to_string(), cx)),
                         )
                     }),
@@ -724,7 +721,9 @@ impl RssView {
             cx,
         );
         let can_ignore = item.status == 0;
-        let task_missing = item.status == 1 && self.controller.task_status(&item).is_none();
+        let task_missing = item.status == 1
+            && !self.controller.tasks_loading
+            && self.controller.task_status(&item).is_none();
         let group = SharedString::from(format!("rss-item-{source_id}-{guid}"));
         let status_id = SharedString::from(format!("rss-status-{source_id}-{guid}"));
         let mut meta = Vec::new();
@@ -785,9 +784,7 @@ impl RssView {
                             .text_size(tokens.typography.sm.size)
                             .line_height(tokens.typography.sm.line_height)
                             .text_color(colors.foreground)
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(title.clone()).build(window, cx)
-                            })
+                            .tooltip(move |window, cx| tooltip_view(title.clone(), window, cx))
                             .child(item.title.clone()),
                     )
                     .when(!meta.is_empty(), |column| {
@@ -926,7 +923,7 @@ impl RssView {
         div()
             .id(SharedString::from(format!("{id}-tooltip")))
             .flex_none()
-            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
             .child(
                 toolbar_action_button(
                     id,
@@ -1046,7 +1043,7 @@ fn status_badge(
         .line_height(caption.line_height)
         .font_weight(FontWeight::MEDIUM)
         .text_color(tone.unwrap_or(tokens.colors.muted_foreground))
-        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx))
+        .tooltip(move |window, cx| tooltip_view(full.clone(), window, cx))
         .child(text)
 }
 
@@ -1188,8 +1185,7 @@ impl Render for RssView {
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(colors.foreground)
                                             .tooltip(move |window, cx| {
-                                                Tooltip::new(tooltip_title.clone())
-                                                    .build(window, cx)
+                                                tooltip_view(tooltip_title.clone(), window, cx)
                                             })
                                             .child(title),
                                     )

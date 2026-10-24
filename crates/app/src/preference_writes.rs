@@ -135,6 +135,7 @@ mod tests {
         let mut frame = EventFrame {
             epoch: "e".into(),
             sequence: 1,
+            previous: None,
             event: ServiceEvent::Agent(AgentEvent::PreferencesChanged(AgentPreferencesDto {
                 revision,
                 values,

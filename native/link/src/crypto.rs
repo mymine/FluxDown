@@ -12,6 +12,8 @@
 //!   与请求 nonce（见 [`request_aad`] / [`response_aad`]）：响应无法被旧响应 / 另一方向的
 //!   密文替换，发起方只在响应成功解封后才相信「对端确实是那台已配对设备」。
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
@@ -29,6 +31,11 @@ pub const LINK_AUTH_SKEW_SECS: i64 = 120;
 /// 数据面链路协议版本：`/ping` 的 `linkProtocol`。发起方在下发 / 交换信息 / 解除配对前
 /// 若对端版本低于它，直接 [`crate::LinkError::PeerOutdated`]，不发请求。
 pub const LINK_PROTOCOL_VERSION: u32 = 2;
+
+/// 设备控制配对能力版本：`/ping` 的 `linkControl`。发起方请求「完全控制」时若对端 `/ping` 没有
+/// 达到它，直接放弃（[`crate::LinkError::UnsupportedVersion`]），不发 hello——旧版对端会忽略
+/// 未知的 `requestControl` 字段，签名也对不上。
+pub const LINK_CONTROL_VERSION: u32 = 1;
 
 /// `X-FluxLink-Enc` 请求头 / 响应头的取值：数据面方案 v2。缺失或其它值（含 v1）一律拒绝，
 /// 不留降级回退路径。
@@ -339,6 +346,98 @@ pub fn verify_link_auth_tag(
     ct_eq(expected.as_bytes(), tag_hex.as_bytes())
 }
 
+/// 设备控制凭据（`/rpc` 的 `Authorization: Bearer`）的格式前缀。
+pub const CONTROL_CREDENTIAL_PREFIX: &str = "fdl1";
+
+/// 设备控制凭据 HMAC 的域分隔标签。
+const CONTROL_CREDENTIAL_DOMAIN: &str = "fluxdown-rpc-control-v1";
+
+/// 指纹形态：64 位小写 hex。
+#[must_use]
+pub fn is_fingerprint_shaped(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// 控制凭据的 HMAC：`HMAC-SHA256(link_secret, "fluxdown-rpc-control-v1\n{发起方指纹}\n{响应方指纹}")`。
+fn control_credential_mac(
+    link_secret: &[u8],
+    initiator_fp: &str,
+    responder_fp: &str,
+) -> Option<[u8; 32]> {
+    let mut mac = <SimpleHmac<Sha256> as Mac>::new_from_slice(link_secret).ok()?;
+    mac.update(CONTROL_CREDENTIAL_DOMAIN.as_bytes());
+    mac.update(b"\n");
+    mac.update(initiator_fp.as_bytes());
+    mac.update(b"\n");
+    mac.update(responder_fp.as_bytes());
+    Some(mac.finalize().into_bytes().into())
+}
+
+/// 签发设备控制凭据：`fdl1.<发起方指纹>.<base64url 无 padding(HMAC)>`。
+///
+/// 凭据由发起方（控制端）用与响应方（被控主机）共享的每对设备 `link_secret` 派生，**绑定双方
+/// 指纹**；响应方无需额外存储，按指纹找到名册记录后重算即可校验。链路密钥永不外泄，任何持有
+/// 凭据的人都只能用它连接那一台主机的 `/rpc`。`link_secret` 不可用（空）时返回 `None`。
+#[must_use]
+pub fn control_credential(
+    link_secret: &[u8],
+    initiator_fp: &str,
+    responder_fp: &str,
+) -> Option<String> {
+    if link_secret.is_empty() {
+        return None;
+    }
+    let mac = control_credential_mac(link_secret, initiator_fp, responder_fp)?;
+    Some(format!(
+        "{CONTROL_CREDENTIAL_PREFIX}.{initiator_fp}.{}",
+        URL_SAFE_NO_PAD.encode(mac)
+    ))
+}
+
+/// 解析设备控制凭据，返回其中声明的发起方指纹（形态已校验）与 HMAC 字节。前缀不符、段数不对、
+/// 指纹形态非法或 HMAC 不是 32 字节的 base64url 一律 `None`。**不**校验 HMAC 本身。
+#[must_use]
+pub fn parse_control_credential(token: &str) -> Option<(&str, [u8; 32])> {
+    let mut parts = token.split('.');
+    let prefix = parts.next()?;
+    let fingerprint = parts.next()?;
+    let encoded = parts.next()?;
+    if parts.next().is_some()
+        || prefix != CONTROL_CREDENTIAL_PREFIX
+        || !is_fingerprint_shaped(fingerprint)
+    {
+        return None;
+    }
+    let mac = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+    let mac = <[u8; 32]>::try_from(mac.as_slice()).ok()?;
+    Some((fingerprint, mac))
+}
+
+/// 常量时间校验设备控制凭据：解析出的发起方指纹必须等于 `initiator_fp`，且 HMAC 与用
+/// `link_secret` + 双方指纹重算的一致。`link_secret` 为空一律 `false`。
+#[must_use]
+pub fn verify_control_credential(
+    link_secret: &[u8],
+    initiator_fp: &str,
+    responder_fp: &str,
+    token: &str,
+) -> bool {
+    if link_secret.is_empty() {
+        return false;
+    }
+    let Some((claimed, presented)) = parse_control_credential(token) else {
+        return false;
+    };
+    if claimed != initiator_fp {
+        return false;
+    }
+    control_credential_mac(link_secret, initiator_fp, responder_fp)
+        .is_some_and(|expected| ct_eq(&expected, &presented))
+}
+
 /// 常量时间字节比较（长度不等直接 false）。
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -582,5 +681,100 @@ mod tests {
 
         assert_ne!(aead_key.as_slice(), link_key.as_slice());
         assert_ne!(aead_key.as_slice(), sas.as_bytes());
+    }
+
+    #[test]
+    fn control_credential_round_trips_and_binds_both_fingerprints() {
+        let secret = [7u8; 32];
+        let controller = "a".repeat(64);
+        let host = "b".repeat(64);
+        let token = control_credential(&secret, &controller, &host).unwrap();
+        // fdl1.<发起方指纹>.<base64url 无 padding 的 32 字节 HMAC>
+        assert_eq!(token.len(), 4 + 1 + 64 + 1 + 43);
+        assert!(token.starts_with(&format!("fdl1.{controller}.")));
+        assert!(!token.contains('='));
+        assert!(verify_control_credential(
+            &secret,
+            &controller,
+            &host,
+            &token
+        ));
+        assert_eq!(
+            parse_control_credential(&token).map(|(fingerprint, _)| fingerprint),
+            Some(controller.as_str())
+        );
+
+        // 密钥不同 / 换了一台主机（跨主机重放）/ 角色对调 / 声明的指纹与记录不符。
+        assert!(!verify_control_credential(
+            &[8u8; 32],
+            &controller,
+            &host,
+            &token
+        ));
+        assert!(!verify_control_credential(
+            &secret,
+            &controller,
+            &"c".repeat(64),
+            &token
+        ));
+        assert!(!verify_control_credential(
+            &secret,
+            &host,
+            &controller,
+            &token
+        ));
+        // 篡改 HMAC 的最后一个字符。
+        let mut forged = token.clone();
+        let last = forged.pop().unwrap();
+        forged.push(if last == 'A' { 'B' } else { 'A' });
+        assert!(!verify_control_credential(
+            &secret,
+            &controller,
+            &host,
+            &forged
+        ));
+        // 空密钥既不签发也不通过校验。
+        assert!(control_credential(&[], &controller, &host).is_none());
+        assert!(!verify_control_credential(&[], &controller, &host, &token));
+    }
+
+    #[test]
+    fn malformed_control_credentials_are_rejected() {
+        let secret = [7u8; 32];
+        let controller = "a".repeat(64);
+        let host = "b".repeat(64);
+        let token = control_credential(&secret, &controller, &host).unwrap();
+        let mac = token.rsplit('.').next().unwrap().to_owned();
+        let upper = "A".repeat(64);
+        let bad = [
+            String::new(),
+            "fdl1".to_owned(),
+            "fdl1.".to_owned(),
+            format!("fdl1.{controller}"),
+            format!("fdl1.{controller}."),
+            format!("fdl2.{controller}.{mac}"),
+            format!("FDL1.{controller}.{mac}"),
+            format!("fdl1.short.{mac}"),
+            format!("fdl1.{upper}.{mac}"),
+            format!("fdl1.{controller}.{mac}.extra"),
+            format!("fdl1.{controller}.{mac}="),
+            format!("fdl1.{controller}.!!!!"),
+            // 长度不是 32 字节的 base64url。
+            format!("fdl1.{controller}.{}", &mac[..mac.len() - 4]),
+            format!("fdl1.{controller}.{mac}AAAA"),
+            // Bearer 里常见的其它凭据形态。
+            "agent-token".to_owned(),
+            "flux2026".to_owned(),
+        ];
+        for token in bad {
+            assert!(
+                parse_control_credential(&token).is_none(),
+                "{token:?} must not parse"
+            );
+            assert!(
+                !verify_control_credential(&secret, &controller, &host, &token),
+                "{token:?} must not verify"
+            );
+        }
     }
 }

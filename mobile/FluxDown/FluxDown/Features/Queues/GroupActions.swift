@@ -180,7 +180,15 @@ private struct TaskRowSwipeActions: ViewModifier {
         case .failed:
             Button(L("mobileRetry"), systemImage: FluxSymbol.retry) { actions.resume([item.id]) }
                 .tint(accent.color)
-        case .preparing, .completed, .unknown:
+        case .completed:
+            if item.task.presentsSeeding {
+                Button(L("pause"), systemImage: FluxSymbol.pause) { actions.pause([item.id]) }
+                    .tint(Color.fdStatusWarning)
+            } else if item.task.presentsResumeSeeding {
+                Button(L("resume"), systemImage: FluxSymbol.resume) { actions.resume([item.id]) }
+                    .tint(accent.color)
+            }
+        case .preparing, .unknown:
             EmptyView()
         }
     }

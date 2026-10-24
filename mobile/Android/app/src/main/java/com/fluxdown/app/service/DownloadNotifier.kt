@@ -17,6 +17,7 @@ import com.fluxdown.app.AppContainer
 import com.fluxdown.app.HomeActivity
 import com.fluxdown.app.R
 import com.fluxdown.app.data.DeviceSettings
+import com.fluxdown.app.i18n.localizedTaskError
 import com.fluxdown.app.i18n.str
 import com.fluxdown.app.nav.AppNavigator
 import com.fluxdown.app.nav.AppTab
@@ -215,7 +216,8 @@ object DownloadNotifier {
     private fun process(container: AppContainer, context: Context, tracker: NotificationTracker, state: HostState, hostId: String) {
         val delta = tracker.ingest(
             hostId = hostId,
-            isLive = state.connection == Connection.Live,
+            // 任务表载入中视同未就绪：丢弃基线，等完整表到达再静默播种（否则历史完成项会被当作新事件）。
+            isLive = state.connection == Connection.Live && !state.tasksLoading,
             tasks = state.tasks,
             selections = state.selections,
             now = System.currentTimeMillis() / 1000,
@@ -300,7 +302,7 @@ object DownloadNotifier {
                 builder.build()
             }
             NotificationEvent.Kind.Failed -> {
-                val reason = event.errorMessage.trim()
+                val reason = context.localizedTaskError(event.errorMessage.trim())
                 val body = if (reason.isEmpty()) event.fileName else "${event.fileName}\n$reason"
                 NotificationCompat.Builder(context, CHANNEL_FAILED)
                     .setSmallIcon(R.drawable.ic_stat_download)
@@ -362,7 +364,7 @@ object DownloadNotifier {
 
     /**
      * 完成通知的「打开」「分享」：任务属于本机主机且是普通文件时才提供（目录 / 远端文件无法打开或分享）；
-     * 文件不在 FileProvider 声明的根目录内（如外置存储卡）时同样不提供。
+     * 文件不在 FileProvider 声明的根目录内时同样不提供。
      */
     private fun addFileActions(builder: NotificationCompat.Builder, context: Context, hostId: String, state: HostState, taskId: String, code: Int) {
         if (hostId != HostRef.Local.ID) return

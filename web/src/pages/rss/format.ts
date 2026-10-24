@@ -70,12 +70,16 @@ export function encodeTaskState(status: number, fileMissing: boolean): number {
   return status * 2 + (fileMissing ? 1 : 0)
 }
 
+/** 任务表仍在载入：关联任务是否存在未知（不能判定为「已删除」）。 */
+export const TASK_STATE_UNKNOWN = -1
+
 /** 条目状态徽标文案键（GPUI `status_key`）：已建任务以真实任务状态为准。 */
 export function itemStatusKey(item: RssItemDto, tasks: LinkedTaskStates): string {
   switch (item.status) {
     case RSS_ITEM_STATUS.downloaded: {
       const state = item.taskId === '' ? undefined : tasks[item.taskId]
       if (state === undefined) return 'rssTaskMissing'
+      if (state === TASK_STATE_UNKNOWN) return 'rssTaskCreated'
       const status = Math.floor(state / 2)
       const missing = state % 2 === 1
       switch (status) {

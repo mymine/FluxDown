@@ -2,16 +2,18 @@ import FluxDomain
 import Foundation
 import Security
 
-/// 已保存的远端 `fluxdown-agent --server` 主机（同 Android `HostRepo`）。
+/// 已保存的远端主机（同 Android `HostRepo`）：`fluxdown-agent --server` / 开启局域网访问的桌面 agent。
 ///
-/// 列表（id / 名称 / 地址）存 `UserDefaults`；访问密钥存钥匙串（`kSecClassGenericPassword`，
-/// `AfterFirstUnlockThisDeviceOnly`：不随备份迁移到新设备，换机后需重新输入）。
+/// 列表（id / 名称 / 地址 / 可选 `linkFingerprint`）存 `UserDefaults`；凭据（访问密钥，或局域网配对得到的设备控制凭据）
+/// 存钥匙串（`kSecClassGenericPassword`，`AfterFirstUnlockThisDeviceOnly`：不随备份迁移到新设备，换机后需重新输入 / 重新配对）。
+/// `linkFingerprint` 非空 = 该主机是经局域网配对添加的（凭据是设备控制凭据，指纹是主机的链路身份指纹）；旧数据缺省为 nil。
 @MainActor
 final class HostRepo {
     private struct Saved: Codable {
         var id: String
         var name: String
         var endpoint: String
+        var linkFingerprint: String?
     }
 
     private static let listKey = "hosts.remotes"
@@ -19,15 +21,24 @@ final class HostRepo {
 
     private let defaults: UserDefaults
     private(set) var remotes: [HostRef] = []
+    private var fingerprints: [String: String] = [:]
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        remotes = load().map { .remote(id: $0.id, displayName: $0.name, endpoint: $0.endpoint) }
+        publish(load())
     }
 
     private func load() -> [Saved] {
         guard let data = defaults.data(forKey: Self.listKey) else { return [] }
         return (try? JSONDecoder().decode([Saved].self, from: data)) ?? []
+    }
+
+    private func publish(_ list: [Saved]) {
+        remotes = list.map { .remote(id: $0.id, displayName: $0.name, endpoint: $0.endpoint) }
+        fingerprints = Dictionary(
+            list.compactMap { saved in saved.linkFingerprint.map { (saved.id, $0) } },
+            uniquingKeysWith: { first, _ in first }
+        )
     }
 
     private func store(_ list: [Saved]) throws(HostError) {
@@ -36,16 +47,37 @@ final class HostRepo {
         } catch {
             throw HostError(.internal, message: "encode hosts: \(error)")
         }
-        remotes = list.map { .remote(id: $0.id, displayName: $0.name, endpoint: $0.endpoint) }
+        publish(list)
     }
 
-    func add(name: String, endpoint: String, accessKey: String) throws(HostError) -> HostRef {
+    /// 该主机经局域网配对添加时的主机链路指纹；访问密钥主机 = nil。
+    func linkFingerprint(id: String) -> String? { fingerprints[id] }
+
+    /// 已保存的、对应同一链路指纹的主机（重新配对时更新它而不是新增一台）。
+    func remote(linkFingerprint: String) -> HostRef? {
+        guard let id = fingerprints.first(where: { $0.value == linkFingerprint })?.key else { return nil }
+        return remotes.first { $0.id == id }
+    }
+
+    func add(name: String, endpoint: String, accessKey: String, linkFingerprint: String? = nil) throws(HostError) -> HostRef {
         let id = UUID().uuidString.lowercased()
         try Keychain.set(accessKey, service: Self.service, account: id)
         var list = load()
-        list.append(Saved(id: id, name: name, endpoint: endpoint))
+        list.append(Saved(id: id, name: name, endpoint: endpoint, linkFingerprint: linkFingerprint))
         try store(list)
         return .remote(id: id, displayName: name, endpoint: endpoint)
+    }
+
+    /// 重新配对：同一主机换新凭据与最新地址（名称沿用用户已有的）。
+    func updateCredential(id: String, endpoint: String, accessKey: String) throws(HostError) -> HostRef {
+        var list = load()
+        guard let index = list.firstIndex(where: { $0.id == id }) else {
+            throw HostError(.notFound, message: "host not found")
+        }
+        try Keychain.set(accessKey, service: Self.service, account: id)
+        list[index].endpoint = endpoint
+        try store(list)
+        return .remote(id: id, displayName: list[index].name, endpoint: endpoint)
     }
 
     func remove(id: String) throws(HostError) {

@@ -210,6 +210,15 @@ pub struct QueuePosition {
     pub task_id: String,
     /// 1-based,0 = 不在队列中。
     pub position: i32,
+    /// 引擎排序键：任务在队列期间保持不变，队首出队不改变其余任务的键。
+    pub order: i64,
+}
+
+/// 队列顺序增量里新增 / 更新的一项：任务及其排序键。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueOrderEntry {
+    pub task_id: String,
+    pub order: i64,
 }
 
 /// 单个分段的字节范围与进度。

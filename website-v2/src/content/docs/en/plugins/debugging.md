@@ -135,10 +135,12 @@ The engine reports these with the prefix `manifest 非法: ` (“manifest invali
 | `resolver timeoutMs 不可为 0` | `timeoutMs` is `0` (also checked for `auth` and `subscription`). | Use a positive integer, at most 30000 effective. |
 | `hooks.events 不可为空` | `hooks` without events. | List at least one event. |
 | `未知事件 '…'，合法：[…]` | Not one of `onStart`, `onError`, `onDone`, `onMetaProbed`, `onCancel`. | Fix the name (also applies to `main.events`). |
-| `未知权限 '…'，合法：[…]` | A permission name that does not exist. | Use one of `ffmpeg`, `ytdlp`, `auth`, `tasks`, `browserRules`, `desktop`, `background`, `intercept`. |
+| `未知权限 '…'，合法：[…]` | A permission name that does not exist. | Use one of `ffmpeg`, `ytdlp`, `auth`, `tasks`, `browserRules`, `desktop`, `background`, `intercept`, `pageScripts`. |
 | `声明 auth.entry 时 permissions 必须包含 auth` | `auth` without the `auth` permission. | Add `"auth"` to `permissions`. |
 | `声明 sniffRules 时 permissions 必须包含 browserRules` | Sniff rules without the permission. | Add `"browserRules"`. |
 | `main.background 为 true 时 permissions 必须包含 background` | `main.background` is `true` without the `background` permission. | Add `"background"`. |
+| `声明 pageScripts 时 permissions 必须包含 pageScripts` | `contributes.pageScripts` without the permission. | Add `"pageScripts"` to `permissions`. |
+| `pageScript '<id>' …` (id, title, matches, js errors) | A page script breaks a rule in the [manifest reference](/docs/en/plugins/manifest/#pagescripts). | Fix the named field. |
 | `view '<id>' 有可移植实现，必须声明 main` | A view without `desktop` (or with `portable: true`) needs a `main` script. | Declare `main`. |
 | `声明 commands 时必须声明 main` | Commands need `main`. | Declare `main`. |
 | `view id '…' 非法` / `command id '…' 非法：须匹配 ^[a-z][a-z0-9-]{0,31}$` | Id is not lowercase-letter-first, `a-z0-9-`, at most 32 characters. | Rename. |
@@ -153,6 +155,9 @@ The engine reports these with the prefix `manifest 非法: ` (“manifest invali
 | `读取入口文件 '…' 失败: …` (“failed to read entry file '…'”) | The entry file exists but cannot be read (no permission, the path is a directory, or the file is not valid UTF-8); the text after the colon is the OS error. Same places as above. | Fix the permissions or the file (UTF-8 text), then **Reload**. |
 | `main entry '…' 扩展名须为 .js` | `main` is not a `.js` file. | Rename. |
 | `sniffRules '…' 扩展名须为 .json` / `sniffRules format 须为 fluxdown-sniff-pack` / `sniffRules 至多 500 条规则` / `sniffRules 文件超过 262144 字节` | Bad sniff rule pack. | See the [manifest reference](/docs/en/plugins/manifest/). |
+| `view '<id>' icon 路径 '…' 非法` / `view '<id>' icon '…' 扩展名须为 .svg` | The view `icon` is not a safe package-relative path, or is not a `.svg` file. | Use a relative `.svg` path inside the package. |
+| `view '<id>' icon 超过 16384 字节` / `view '<id>' icon 不是合法 UTF-8` | The icon file is larger than 16 KiB or is not UTF-8 text. | Minify the SVG; save it as UTF-8. |
+| `view '<id>' icon 不是 SVG 文档` | After an optional BOM and whitespace the file does not start with `<svg` or `<?xml`, or contains no `<svg`. | Provide a real SVG file. |
 | `需要 App ≥ X，当前 Y` (“requires app ≥ X, current Y”) | `minAppVersion` is newer than your app. | Update FluxDown or lower `minAppVersion`. |
 | `脚本编译失败: …` (“script compile failed”) | A resolver, hooks, interceptors, auth or subscription script has a syntax error — **or throws at top level**. The check evaluates the script once in a bare context where `flux` and `console` do not exist. | Fix the syntax; move every `flux.*` / `console.*` call into an entry function. For TypeScript projects, run `npm run typecheck` and check that the bundle was rebuilt. |
 | `安装后未能加载插件（校验失败或版本门槛不满足）` (“the plugin could not be loaded after install (validation failed or version gate not met)”) | The checks above failed during install; the previous version, if any, was restored. | Read the earlier lines in the log for the actual reason. |
@@ -193,7 +198,7 @@ All of these appear as `[插件] <identity>: <message>`. Messages from the host 
 | `插件运行时错误: 入口 resolve 未定义` (“entry resolve is not defined”) | The script ran, but did not put a function on `globalThis.resolve` — a missing `defineResolver(...)`, a wrongly named function, or an ES `export` instead of the global. | Define `resolve`. Hooks: the names are `onStart`/`onError`/`onDone`/`onMetaProbed`/`onCancel`; auth: `authenticate`; subscription: `subscribe`. |
 | `脚本编译失败: …` | Syntax error in the script. | Fix it. |
 | `脚本执行超时` (“script execution timed out”) | The call did not finish within the budget (10 s by default, at most 30 s). Counts toward the circuit breaker. | Speed up or lower the number of requests; raise `timeoutMs` up to 30000 if a slow host needs it. |
-| `脚本超出内存上限` (“script exceeded the memory limit”) | More than 64 MB used. Counts toward the breaker. | Do not hold big responses; use `truncated` bodies carefully. |
+| `脚本超出内存上限` (“script exceeded the memory limit”) | More memory used than the budget (64 MB by default). Counts toward the breaker. | Do not hold big responses; use `truncated` bodies carefully. A resolver that really needs more can declare `memoryLimitMb` (up to 512). |
 | `插件运行时过载（并发已满）` (“plugin runtime overloaded”) | Too many resolves at once; waiting for a free slot timed out after 3 s. | Retry the task. |
 | `插件输出非法: resolve 返回值非法: …` (“resolve return value invalid”) | The returned object has wrong field types, e.g. `totalBytes` that is not a number. | Return the shape from the [API reference](/docs/en/plugins/api-reference/). |
 | `插件输出非法: url scheme 不允许: …`, `url 超过 8KB`, `file_name 非法: …`, `variants 过多: N > 50`, `manifest 与 url/variants/audioUrl 互斥` | The result violates a rule: unsupported URL scheme, over-long URL, an unsafe file name, too many variants, or `manifest` combined with `url`. | Fix the returned fields. |
@@ -223,6 +228,8 @@ Also see the [resolver walkthrough](/docs/en/plugins/your-first-plugin/#5-test-a
 | `blocked: non-routable redirect target` | The server redirected to such an address. |
 | `fetch 失败: …` (“fetch failed”) + detail | Connection error, TLS error, timeout (10 s per request), or a DNS name that resolves only to non-public addresses. |
 | `插件未声明 auth 权限，不能使用认证凭据` (“the plugin does not declare the auth permission”) | You passed `authRef` without the `auth` permission. |
+
+**Exception: developer-mode plugins.** A plugin loaded via Settings → Extensions → Plugins → "Install from directory (developer mode)" is not restricted to public addresses: its `flux.fetch` can reach `localhost` or LAN services directly (bypassing the global proxy), so you can develop against a local server. Normally installed plugins are unchanged. The alternatives below apply to non-developer-mode installs.
 
 How to **test against your own server** when developing: you cannot point `flux.fetch` at `localhost` or your LAN. Options: expose a staging endpoint on a public host (HTTPS, any port), use a public mock service, or put your test logic behind a setting that returns canned data instead of fetching. For URL-rewriting resolvers you do not need a server at all — the resolver can return a fixed `url` (see the `.invalid` host trick in [TypeScript project](/docs/en/plugins/typescript-project/#4-add-a-resolver)). The response body is text only (`truncated: true` beyond 8 MB).
 

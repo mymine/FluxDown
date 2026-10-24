@@ -1,14 +1,14 @@
 use std::{collections::HashSet, rc::Rc};
 
-use fluxdown_ui_components::{FluxIcon, SidebarState, sidebar_toggle_button};
+use fluxdown_ui_components::{SidebarState, sidebar_toggle_button};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     AnyElement, AnyView, AnyWindowHandle, App, Context, Entity, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement, Pixels, Render, SharedString, Styled,
-    Window, div, img, px,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
+    Styled, Window, div, img, px,
 };
-use gpui_component::{Icon, TitleBar, h_flex, v_flex};
+use gpui_component::{Icon, TitleBar, h_flex, menu::AppMenuBar, v_flex};
 use serde_json::Value;
 
 use crate::assets::APP_LOGO_PATH;
@@ -101,8 +101,8 @@ impl ShellRoute {
         }
     }
 
-    /// 创建插件视图路由（`id` 须以 `plugin:` 开头），标签为原文，图标固定为 Sparkles。
-    pub fn plugin(id: RouteId, label: SharedString, view: AnyView) -> Self {
+    /// 创建插件视图路由（`id` 须以 `plugin:` 开头），标签为原文，图标由 app 按插件声明给出。
+    pub fn plugin(id: RouteId, label: SharedString, icon: Icon, view: AnyView) -> Self {
         let button_id = SharedString::from(format!("activity-{}", id.as_str()));
         let tooltip_id = SharedString::from(format!("activity-{}-tooltip", id.as_str()));
         Self {
@@ -110,7 +110,7 @@ impl ShellRoute {
             button_id,
             tooltip_id,
             label: ShellLabel::Text(label),
-            icon: Icon::new(FluxIcon::Sparkles),
+            icon,
             view,
             title_bar: None,
             sidebar: None,
@@ -387,6 +387,8 @@ pub struct ShellView {
     window: Option<AnyWindowHandle>,
     /// 宿主最近一次下发（或本窗口写回）的布局偏好；动态路由变化时据此重新归一化。
     pub(crate) stored_layout: Option<Value>,
+    /// Windows / Linux 标题栏内的应用菜单；`None` = 不显示（宿主按偏好注入，macOS 恒为 `None`）。
+    menu_bar: Option<Entity<AppMenuBar>>,
 }
 
 impl ShellView {
@@ -422,6 +424,7 @@ impl ShellView {
             traffic_light_y: crate::initial_traffic_light_y(),
             window: None,
             stored_layout: None,
+            menu_bar: None,
         }
     }
 
@@ -535,6 +538,16 @@ impl ShellView {
         cx.notify();
     }
 
+    /// 设置标题栏应用菜单栏（宿主偏好回流入口）；`None` 隐藏。
+    pub fn set_menu_bar(&mut self, menu_bar: Option<Entity<AppMenuBar>>, cx: &mut Context<Self>) {
+        if self.menu_bar.as_ref().map(Entity::entity_id) == menu_bar.as_ref().map(Entity::entity_id)
+        {
+            return;
+        }
+        self.menu_bar = menu_bar;
+        cx.notify();
+    }
+
     /// 统一顶栏：macOS 交通灯 / Windows·Linux logo + 应用菜单，其后是顶栏左区、当前活跃路由的
     /// 插槽与顶栏右区；Windows·Linux 的窗口按钮由 `TitleBar` 自带。
     fn render_title_bar(
@@ -546,13 +559,21 @@ impl ShellView {
         let spacing = theme.tokens().spacing;
         let extended = theme.extended().colors;
         let is_macos = cfg!(target_os = "macos");
-        // macOS 交通灯占据左侧，不渲染 logo。
+        // macOS 交通灯占据左侧，不渲染 logo；应用菜单走原生菜单栏。
         let leading = (!is_macos).then(|| {
             h_flex()
                 .h_full()
                 .flex_none()
                 .items_center()
+                .gap(spacing.sm)
                 .child(img(APP_LOGO_PATH).size(px(16.)))
+                .children(self.menu_bar.clone().map(|menu_bar| {
+                    h_flex()
+                        .h_full()
+                        .items_center()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(menu_bar)
+                }))
         });
         let slot = self.active_title_bar();
         let title_leading = self.render_title_zone(ChromeZone::TitleLeading, window, cx);
@@ -687,6 +708,7 @@ impl Render for ShellView {
 mod tests {
     use std::{cell::Cell, rc::Rc, sync::Arc};
 
+    use fluxdown_ui_components::FluxIcon;
     use fluxdown_ui_i18n::I18nCatalog;
     use gpui::{AppContext as _, Empty, TestApp};
     use serde_json::json;
@@ -708,7 +730,12 @@ mod tests {
     }
 
     fn route(cx: &mut App, id: &'static str) -> ShellRoute {
-        ShellRoute::plugin(RouteId::new(id), SharedString::new_static(id), view(cx))
+        ShellRoute::plugin(
+            RouteId::new(id),
+            SharedString::new_static(id),
+            Icon::new(FluxIcon::Sparkles),
+            view(cx),
+        )
     }
 
     fn route_ids(shell: &ShellView) -> Vec<String> {

@@ -1,15 +1,16 @@
 // Web 外壳条目目录：id / 默认区域 / 可放置的区域族。
 // 默认区域复现改造前的布局（顺序即目录顺序）；文本类条目（速度 / 剩余空间）放不进 48px 活动栏。
 // id 与 GPUI 共用（GPUI 另有 `shutdown`，Web 没有）。
+// `fixed` 条目（下载 / 设置）可移动但不能隐藏，保证主入口始终可达；插件条目可隐藏。
 
 import type { ChromeItemSpec } from './chromeLayout'
 
 export const CHROME_CATALOG: readonly ChromeItemSpec[] = [
-  { id: 'downloads', defaultZone: 'railTop', families: ['rail', 'title', 'status'] },
+  { id: 'downloads', defaultZone: 'railTop', families: ['rail', 'title', 'status'], fixed: true },
   { id: 'rss', defaultZone: 'railTop', families: ['rail', 'title', 'status'] },
   { id: 'webhooks', defaultZone: 'railTop', families: ['rail', 'title', 'status'] },
   { id: 'account', defaultZone: 'railBottom', families: ['rail', 'title'] },
-  { id: 'settings', defaultZone: 'railBottom', families: ['rail', 'title', 'status'] },
+  { id: 'settings', defaultZone: 'railBottom', families: ['rail', 'title', 'status'], fixed: true },
   { id: 'downloadSpeed', defaultZone: 'statusLeading', families: ['title', 'status'] },
   { id: 'uploadSpeed', defaultZone: 'statusLeading', families: ['title', 'status'] },
   { id: 'pauseAll', defaultZone: 'statusLeading', families: ['rail', 'title', 'status'] },

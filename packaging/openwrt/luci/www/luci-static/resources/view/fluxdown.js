@@ -13,6 +13,8 @@
  *
  * 汉化：手打 ipk 没有 po2lmo 工具链，视图内置 zh 词典；
  * 若将来接入标准 .lmo，_() 命中翻译时优先使用。
+ * 界面语言取 <html lang>（主题按 dispatcher.lang 输出，如 zh_Hans / zh-cn）；
+ * L.env 不含语言字段，不能用来判定。
  */
 
 var DESC = 'Blazing fast multi-protocol download manager (HTTP/FTP/BitTorrent/HLS). ' +
@@ -52,11 +54,13 @@ ZH[DESC] = '极速多协议下载管理器（HTTP/FTP/BitTorrent/HLS）。服务
 ZH[TOKEN_HELP] = '留空则在首次访问 Web 界面时设置。填写后，每次启动都以此为准并覆盖已保存的密钥。' +
 	'需为 8–128 位可见 ASCII 字符，且同时包含字母和数字。';
 
+var IS_ZH = /^zh/i.test(document.documentElement.getAttribute('lang') || '');
+
 function T(s) {
 	var t = _(s);
 	if (t !== s)
 		return t;
-	return /^zh/i.test((L.env && L.env.lang) || '') ? (ZH[s] || s) : s;
+	return IS_ZH ? (ZH[s] || s) : s;
 }
 
 var callServiceList = rpc.declare({

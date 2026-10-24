@@ -1,0 +1,24 @@
+# lint-changed.py 专用 clippy 配置（经 CLIPPY_CONF_DIR 指向本目录）。
+# 注意：CLIPPY_CONF_DIR 下的 clippy.toml 会整体替代根 clippy.toml，
+# 因此「根 clippy.toml 的全部键」必须原样保留在下面第一段；
+# lint-changed.py 启动时会校验根配置的每一行都出现在本文件中，不一致则退出 2。
+
+# ---- 与根 clippy.toml 保持同步 ----
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# ---- 本脚本追加 ----
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+
+disallowed-methods = [
+    { path = "str::split_at", reason = "非字符边界会 panic；改用 str::split_at_checked" },
+    { path = "str::split_at_mut", reason = "非字符边界会 panic；改用 str::split_at_mut_checked" },
+    { path = "std::string::String::remove", reason = "非字符边界或越界会 panic；先 is_char_boundary 与长度校验" },
+    { path = "std::string::String::truncate", reason = "非字符边界会 panic；先 is_char_boundary 校验，或用 floor_char_boundary 思路自行回退" },
+    { path = "std::string::String::split_off", reason = "非字符边界会 panic；先 is_char_boundary 校验，或用 s.get(a..) 取子串" },
+    { path = "std::string::String::insert_str", reason = "非字符边界会 panic；先 is_char_boundary 校验" },
+    { path = "std::string::String::insert", reason = "非字符边界会 panic；先 is_char_boundary 校验" },
+    { path = "std::string::String::drain", reason = "非字符边界会 panic；先 is_char_boundary 校验，或用 s.get(a..b) 取子串" },
+    { path = "std::string::String::replace_range", reason = "非字符边界会 panic；先 is_char_boundary 校验" },
+]

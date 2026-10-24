@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# 提交前格式检查：只查暂存区里的 .rs 内容（不是工作区文件），与 CI 的 `cargo fmt --check` 同一套规则
+# （stable rustfmt、workspace edition 2024，无 rustfmt.toml）。合并提交同样经过本 hook。
+# 启用：git config core.hooksPath .githooks
+set -euo pipefail
+
+if ! command -v rustfmt >/dev/null 2>&1; then
+  echo "pre-commit: 未找到 rustfmt（rustup component add rustfmt）" >&2
+  exit 1
+fi
+
+bad=()
+# 注意：rustfmt 从 stdin 读入时 --check 发现差异仍返回 0，只能以是否输出 diff 判定。
+while IFS= read -r -d '' file; do
+  if ! out=$(git show ":$file" | rustfmt --edition 2024 --check 2>&1) || [ -n "$out" ]; then
+    bad+=("$file")
+  fi
+done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.rs')
+
+if [ ${#bad[@]} -gt 0 ]; then
+  echo "pre-commit: 以下暂存的 Rust 文件未格式化：" >&2
+  printf '  %s\n' "${bad[@]}" >&2
+  echo "运行 cargo fmt（或 rustfmt --edition 2024 <文件>）后重新 git add 再提交。" >&2
+  exit 1
+fi

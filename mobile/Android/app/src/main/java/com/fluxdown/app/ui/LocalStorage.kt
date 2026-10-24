@@ -19,6 +19,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import com.fluxdown.app.R
 import com.fluxdown.app.i18n.str
+import com.fluxdown.fluxui.overlay.FluxOverlayState
 import com.fluxdown.fluxui.overlay.FluxToastKind
 import com.fluxdown.fluxui.overlay.LocalFluxOverlays
 import java.io.File
@@ -102,7 +103,11 @@ internal fun rememberStorageAccessRequest(onResult: (Boolean) -> Unit): () -> Un
     }
     return {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            permission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            try {
+                permission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            } catch (_: ActivityNotFoundException) {
+                overlays.toast(noSettingsApp, FluxToastKind.Error)
+            }
         } else {
             try {
                 allFiles.launch(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, "package:${context.packageName}".toUri()))
@@ -141,4 +146,16 @@ fun friendlyLocalPath(context: Context, path: String): String {
     val roots = context.getExternalFilesDirs(null).filterNotNull().map { appLabel to it.path } +
         layout.volumes.map { it.label to it.path }
     return friendlyPath(path, roots)
+}
+
+/**
+ * 启动系统文件选择器（`ACTION_OPEN_DOCUMENT`）。部分精简 ROM 去掉了 DocumentsUI，没有任何 Activity 能处理该意图，
+ * `launch` 会抛 [ActivityNotFoundException]：这里接住并提示，而不是让应用崩溃。
+ */
+internal inline fun launchDocumentPicker(overlays: FluxOverlayState, noPickerText: String, launch: () -> Unit) {
+    try {
+        launch()
+    } catch (_: ActivityNotFoundException) {
+        overlays.toast(noPickerText, FluxToastKind.Error)
+    }
 }

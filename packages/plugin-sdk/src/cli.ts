@@ -9,7 +9,6 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
-  statSync,
   watch,
   writeFileSync,
 } from "node:fs";
@@ -18,16 +17,12 @@ import { fileURLToPath } from "node:url";
 import {
   isSafeRelativePath,
   packageFilesOf,
-  riskOf,
-  networkHostsOf,
-  validateManifest,
-  validateSniffPack,
+  reviewOf,
+  validatePackage,
 } from "./manifest";
 
 const SDK_NAME = "fluxdown-plugin-sdk";
 const CONFIG_FILE = "fluxdown-plugin.config.json";
-const MAX_ENTRIES = 200;
-const MAX_TOTAL_BYTES = 50 * 1024 * 1024;
 
 /** Modules the desktop (GPUI Shell) runtime provides; they stay as bare imports. */
 const DESKTOP_EXTERNALS = [
@@ -234,29 +229,16 @@ function validateDist(root: string): string[] {
   const manifestPath = join(dist, "manifest.json");
   if (!existsSync(manifestPath)) return ["dist/manifest.json missing"];
   const manifest = readJson(manifestPath);
-  const files = listFiles(dist);
-  const errors: string[] = [];
-  const result = validateManifest(manifest, new Set(files), { strict: true });
-  errors.push(...result.errors);
-  if (files.length > MAX_ENTRIES) errors.push(`package has ${files.length} files; the limit is ${MAX_ENTRIES}`);
-  const total = files.reduce((sum, f) => sum + statSync(join(dist, f)).size, 0);
-  if (total > MAX_TOTAL_BYTES) errors.push(`package is ${total} bytes; the limit is ${MAX_TOTAL_BYTES}`);
-  if (isRecord(manifest) && isRecord(manifest.contributes)) {
-    const rules = manifest.contributes.sniffRules;
-    if (typeof rules === "string" && files.includes(rules)) {
-      errors.push(...validateSniffPack(readFileSync(join(dist, rules))).errors);
-    }
-  }
-  return errors;
+  const files = new Map(listFiles(dist).map((file) => [file, new Uint8Array(readFileSync(join(dist, file)))]));
+  return validatePackage(manifest, files).errors;
 }
 
 function validate(root: string): void {
   const errors = validateDist(root);
   if (errors.length) throw new CliError(`validation failed:\n${errors.map((e) => `  - ${e}`).join("\n")}`);
-  const manifest = readJson(join(root, "dist", "manifest.json")) as Parameters<typeof riskOf>[0] &
-    Parameters<typeof networkHostsOf>[0];
-  const hosts = networkHostsOf(manifest);
-  console.log(`valid (risk: ${riskOf(manifest)}${hosts.length ? `, network hosts: ${hosts.join(", ")}` : ""})`);
+  const review = reviewOf(readJson(join(root, "dist", "manifest.json")) as Record<string, unknown>);
+  const hosts = review.networkHosts;
+  console.log(`valid (risk: ${review.risk}${hosts.length ? `, network hosts: ${hosts.join(", ")}` : ""})`);
 }
 
 // ---------------------------------------------------------------------------

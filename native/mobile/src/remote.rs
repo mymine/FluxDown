@@ -141,9 +141,15 @@ impl RemoteConnector {
         request
             .headers_mut()
             .insert(AUTHORIZATION, self.authorization.clone());
+        // 快照与整表替换只带头、任务表分页拉取（单页 < 16 MiB）；仍沿用协议统一的入站上限，
+        // 帧与消息上限一同放宽，避免大页被默认 16 MiB 限制截断。
+        let limit = Some(fluxdown_protocol::MAX_INBOUND_RPC_MESSAGE_BYTES);
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_frame_size(limit)
+            .max_message_size(limit);
         let (socket, _response) = connect_async_tls_with_config(
             request,
-            None,
+            Some(config),
             true,
             Some(Connector::Rustls(self.tls.clone())),
         )
@@ -497,6 +503,28 @@ mod tests {
     fn bare_host_defaults_to_plain_ws_and_ipv6_is_preserved() {
         assert_eq!(norm("192.168.1.5:8080"), "ws://192.168.1.5:8080/rpc");
         assert_eq!(norm("http://[::1]:8080"), "ws://[::1]:8080/rpc");
+    }
+
+    #[test]
+    fn lan_pairing_address_shapes_map_to_the_rpc_endpoint() {
+        // 局域网配对得到的主机地址（发现的 `host:port`、手输、配对码里的 `http(s)://host:port`、
+        // 反代子路径）直接作为远端主机端点：设备控制凭据走同一条 `/rpc` 升级。
+        assert_eq!(norm("192.168.1.20:17800"), "ws://192.168.1.20:17800/rpc");
+        assert_eq!(
+            norm("http://192.168.1.20:17800"),
+            "ws://192.168.1.20:17800/rpc"
+        );
+        assert_eq!(norm("http://nas.local:17800/"), "ws://nas.local:17800/rpc");
+        assert_eq!(
+            norm("https://nas.example.com/fluxdown"),
+            "wss://nas.example.com/fluxdown/rpc"
+        );
+        assert_eq!(
+            norm("https://nas.example.com:8443/fluxdown/"),
+            "wss://nas.example.com:8443/fluxdown/rpc"
+        );
+        assert_eq!(norm("[fd00::5]:17800"), "ws://[fd00::5]:17800/rpc");
+        assert_eq!(norm("http://[fd00::5]:17800"), "ws://[fd00::5]:17800/rpc");
     }
 
     #[test]

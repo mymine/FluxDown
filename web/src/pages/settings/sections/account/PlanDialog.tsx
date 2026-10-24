@@ -78,7 +78,7 @@ function Banner({ tone, children }: { tone: 'danger' | 'info'; children: string 
 function PlanCard({ plan, state, credit, selected, onSelect, ordinal }: { plan: CloudPlan; state: PlanCardState; credit: number; selected: boolean; onSelect: () => void; ordinal: number | null }) {
   const t = useT()
   const color = planColor(plan)
-  const price = priceDisplay(plan, credit)
+  const price = priceDisplay(plan, state, credit)
   const progress = campaignProgress(plan)
   const endDate = localDate(plan.campaign?.endAt)
   const available = state === 'available'

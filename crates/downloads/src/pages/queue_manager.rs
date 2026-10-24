@@ -9,7 +9,7 @@ use fluxdown_protocol::{
 use fluxdown_ui_components::{
     ControlExt as _, FluxIcon, check_row, field_error, field_hint, form as form_layout, form_field,
     form_row, input_with_action, option_group, option_row, sidebar_navigation_button,
-    toolbar_action_button,
+    toolbar_action_button, tooltip_view,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -27,7 +27,6 @@ use gpui_component::{
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
     switch::Switch,
-    tooltip::Tooltip,
     v_flex,
 };
 
@@ -644,7 +643,7 @@ impl QueueManagerView {
                             .id("queue-manager-new-tooltip")
                             .flex_none()
                             .tooltip(move |window, cx| {
-                                Tooltip::new(tooltip_label.clone()).build(window, cx)
+                                tooltip_view(tooltip_label.clone(), window, cx)
                             })
                             .child(
                                 toolbar_action_button(

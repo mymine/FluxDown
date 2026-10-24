@@ -91,6 +91,22 @@ The extension's toolbar icon shows a numeric badge with the resource count for t
 
 Many of the resources you'll sniff — streaming manifests especially — don't arrive as one finished file. DASH streams (`.mpd`) routinely split audio and video into separate tracks, so downloading one produces two files (for example `video.mp4` and `video.audio.m4a`) unless FluxDown can merge them. That merge is done with **FFmpeg** (a fast stream copy, no re-encoding), which isn't bundled with the app — it's an optional component you install on demand from **Settings → Extensions → Components** inside the desktop app. With it installed, DASH audio/video tracks are merged into a single playable file automatically; without it, the tracks are kept separate for you to merge yourself. Installing FFmpeg also unlocks plugins that declare the `ffmpeg` capability (see the [plugin API reference](/docs/en/plugins/api-reference/)), and installs `ffprobe` alongside it. HLS (`.m3u8`) downloads don't need FFmpeg — FluxDown reassembles and remuxes those to MP4 on its own.
 
+## Plugin page scripts
+
+Some FluxDown plugins ship **page scripts**: small scripts the extension runs on the websites the plugin lists, for example to add a download button to a page. They are off until you turn them on, and the extension only ever runs scripts of plugins you have installed in the FluxDown desktop app and approved there.
+
+To turn them on:
+
+1. In the FluxDown desktop app (Settings → Extensions → Plugins), install the plugin and approve it. A plugin with page scripts has **Full trust** risk, and its approval dialog lists each script and the sites it runs on.
+2. Open the extension's options page, go to **Page scripts** in the sidebar and click **Enable** for the plugin you want. The first time you do this for a plugin, the extension explains that its scripts can read and change those pages and your logged-in sessions there, lists the sites they run on and asks you to confirm (**I understand the risks, enable**); after that, plugin updates update the scripts without asking again. Use **Disable and remove** to remove them, and **View source** to inspect a script at any time.
+3. Allow the browser permission when prompted, and make sure the browser's user-scripts switch is on:
+   - **Chrome / Edge (Chromium)**: open `chrome://extensions`, open FluxDown's **Details** and turn on **Allow User Scripts** (Chrome 138 and later; on older versions turn on **Developer mode** instead).
+   - **Firefox**: accept the optional **user scripts** permission request. It can be granted or removed under `about:addons` → FluxDown → **Permissions**.
+
+After that the extension keeps scripts up to date with the desktop app on its own: a plugin update, a new script or a changed site list applies automatically, and you are not asked again for that plugin. The extension does not store a copy of the script code; it always takes it from the desktop app, and scripts that are already registered keep running if the app is closed.
+
+To remove them: turn the plugin's scripts off in the options page, or disable or uninstall the plugin in the desktop app — its scripts are unregistered from the browser at the next sync. Revoking the user-scripts permission (Firefox) or turning **Allow User Scripts** off (Chrome) stops every plugin script at once and leaves the rest of the extension working.
+
 ## Track today's stats
 
 The popup's **Today's Stats** section shows two running counters for the current day: **Intercepted** (downloads successfully handed off to FluxDown) and **Failed** (hand-offs that didn't go through, typically because the desktop app was unreachable at the time). Both reset automatically at the start of a new day, or immediately if you click **Reset Stats** in the popup's footer.

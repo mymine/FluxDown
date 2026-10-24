@@ -678,3 +678,39 @@ body {
 .opt-links a:hover {
   text-decoration: underline;
 }
+
+/* ===== 页面脚本面板 ===== */
+.opt-ps-warn {
+  margin: 0 0 10px;
+  padding-left: 18px;
+  color: var(--fd-text);
+}
+
+.opt-ps-matches-title {
+  margin-bottom: 4px;
+  color: var(--fd-text-secondary);
+  font-size: 12px;
+}
+
+.opt-ps-matches {
+  margin: 0;
+  padding: 8px 10px 8px 26px;
+  max-height: 160px;
+  overflow: auto;
+  border: 1px solid var(--fd-border);
+  border-radius: var(--fd-radius-sm);
+  background: var(--fd-surface);
+}
+
+.opt-ps-source {
+  max-height: 50vh;
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  overflow: auto;
+  border: 1px solid var(--fd-border);
+  border-radius: var(--fd-radius-sm);
+  background: var(--fd-surface);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  white-space: pre;
+}

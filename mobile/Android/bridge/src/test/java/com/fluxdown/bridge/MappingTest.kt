@@ -11,6 +11,7 @@ import com.fluxdown.core.host.ImportRetry
 import com.fluxdown.core.host.ImportRules
 import com.fluxdown.core.host.ImportUpdate
 import com.fluxdown.core.model.FileExistsAction
+import com.fluxdown.core.model.QueueOrderEntry
 import com.fluxdown.core.model.PluginCandidate
 import com.fluxdown.core.model.SeedingStatus
 import com.fluxdown.core.model.SelectionKind
@@ -88,6 +89,18 @@ class MappingTest {
     fun progressEventIsPassedThroughUnchanged() {
         val event = HostEventDto.TaskProgress("t", 4, 1, 2, 3, 4, "f", "deleted", 5, 0).toCore()
         assertEquals(HostEvent.TaskProgress("t", 4, 1, 2, 3, 4, "f", "deleted", 5, 0), event)
+    }
+
+    @Test
+    fun queueOrderEventsKeepKeysAndRemovals() {
+        assertEquals(
+            HostEvent.QueuePositionsChanged(listOf(QueueOrderEntry("a", 10), QueueOrderEntry("b", 20))),
+            HostEventDto.QueuePositionsChanged(listOf(QueueOrderDto("a", 10), QueueOrderDto("b", 20))).toCore(),
+        )
+        assertEquals(
+            HostEvent.QueueOrderChanged(listOf("a"), listOf(QueueOrderEntry("c", 30))),
+            HostEventDto.QueueOrderChanged(listOf("a"), listOf(QueueOrderDto("c", 30))).toCore(),
+        )
     }
 
     @Test
@@ -210,9 +223,11 @@ class MappingTest {
 
     @Test
     fun importBatchMapsCommonAndItemsToTheWire() {
-        val common = CreateTaskRequest(url = "", saveDir = "/d", segments = 4, queueId = "q", startPaused = true, headers = mapOf("X" to "1"))
+        val common = CreateTaskRequest(url = "", saveDir = "/d", segments = 4, queueId = "q", startPaused = true, headers = mapOf("X" to "1"), offeredSaveDir = "/o", unattended = true)
         val dto = ImportBatch(common, listOf(ImportItem("https://a/1", "one.bin", "sha256=ab"), ImportItem("https://a/2"))).toDto()
         assertEquals("/d", dto.common.saveDir)
+        assertEquals("/o", dto.common.offeredSaveDir)
+        assertTrue(dto.common.unattended)
         assertEquals(4, dto.common.segments)
         assertEquals("q", dto.common.queueId)
         assertTrue(dto.common.startPaused)
@@ -271,6 +286,40 @@ class MappingTest {
         // 按序号还原为条目（保留文件名 / 校验值）；越界序号被忽略而不是崩溃
         assertEquals(listOf(items[1], items[2]), summary.unfinished)
     }
+
+    @Test
+    fun loadingSnapshotKeepsTheLoadingFlagAndTotalInsteadOfLookingEmpty() {
+        val loading = snapshot(tasksLoading = true, taskTotal = 230_000u, tasks = emptyList()).toCore()
+        assertTrue(loading.tasksLoading)
+        assertEquals(230_000L, loading.taskTotal)
+        assertTrue(loading.tasks.isEmpty())
+
+        val done = snapshot(tasksLoading = false, taskTotal = 1u, tasks = listOf(task(status = 1, seeding = 0))).toCore()
+        assertEquals(false, done.tasksLoading)
+        assertEquals(listOf("t1"), done.tasks.map { it.taskId })
+    }
+
+    private fun snapshot(tasksLoading: Boolean, taskTotal: ULong, tasks: List<TaskDto>) = HostSnapshotDto(
+        info = HostInfoDto("fluxdown-agent", "1.0.0", 17u, emptyList()),
+        daemonConnected = true,
+        tasksLoading = tasksLoading,
+        taskTotal = taskTotal,
+        tasks = tasks,
+        runtime = emptyList(),
+        queues = emptyList(),
+        queueOrder = emptyList(),
+        groups = emptyList(),
+        stats = RuntimeStatsDto(0u, 0u, 0, 0, null, "", 0u),
+        priorityTaskId = null,
+        pendingSelections = emptyList(),
+        config = emptyMap(),
+        configRevision = 1u,
+        rssSources = emptyList(),
+        cloudDevices = emptyList(),
+        linkDevices = emptyList(),
+        categories = emptyList(),
+        sections = emptyMap(),
+    )
 
     private fun task(status: Int, seeding: Int) = TaskDto(
         taskId = "t1", url = "https://example.com/a.bin", originUrl = "", fileName = "a.bin", saveDir = "/data",

@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -27,10 +27,11 @@ use tokio::sync::mpsc;
 
 use super::address::PeerAddress;
 use super::crypto::{
-    LINK_AUTH_SKEW_SECS, LINK_ENC_V2, LINK_PROTOCOL_VERSION, LinkExchange, derive_link_aead_key,
-    link_auth_tag, open_link_body, request_aad, response_aad, seal_link_body, verify_link_auth_tag,
+    LINK_AUTH_SKEW_SECS, LINK_CONTROL_VERSION, LINK_ENC_V2, LINK_PROTOCOL_VERSION, LinkExchange,
+    derive_link_aead_key, is_fingerprint_shaped, link_auth_tag, open_link_body, request_aad,
+    response_aad, seal_link_body, verify_link_auth_tag,
 };
-use super::discovery::{self, MdnsAdvertiser, MdnsBrowser};
+use super::discovery::{self, BrowseEvent, MdnsAdvertiser, MdnsBrowser};
 use super::error::{LinkError, LinkResult};
 use super::identity::LinkIdentity;
 use super::pairing::{
@@ -44,7 +45,8 @@ use super::text::{
 };
 use super::transport::{PeerConn, TransportStack};
 use super::types::{
-    DiscoveredPeer, MAX_DIRECT_CANDIDATES, PeerCandidate, PeerInfo, PeerRecord, TransportKind,
+    DiscoveredPeer, DiscoveryKind, MAX_DIRECT_CANDIDATES, PeerCandidate, PeerInfo, PeerRecord,
+    TransportKind,
 };
 use super::wire::{self, classify_failure, read_json_object, send_failure};
 
@@ -70,6 +72,9 @@ const HEADER_ENC: &str = "X-FluxLink-Enc";
 pub enum LinkEngineEvent {
     /// mDNS/手动发现到一台设备。
     Discovered(DiscoveredPeer),
+    /// 一个 mDNS 服务实例消失（对端下线 / 记录过期），发现快照里对应条目已移除：宿主应重新发布
+    /// 发现快照。
+    DiscoveredLost,
     /// 一台设备完成配对并入册（含 link_secret，宿主转 UI 前须剥除敏感字段）。
     Paired(PeerRecord),
     /// 一台设备被解除配对（fingerprint）。
@@ -84,6 +89,8 @@ pub enum LinkEngineEvent {
         peer_platform: Option<String>,
         /// 发起方 Ed25519 身份指纹（设备 ID）。
         peer_fingerprint: String,
+        /// 发起方请求「完全控制」本机：批准即授权它经 `/rpc` 操作本机。
+        requests_control: bool,
     },
     /// 子系统错误（供 UI 提示）。
     Error(String),
@@ -150,6 +157,21 @@ fn upsert_discovered(snapshot: &mut Vec<DiscoveredPeer>, peer: DiscoveredPeer) {
     }
 }
 
+/// 从发现快照里移除一个已消失的 mDNS 服务实例（实例名 = 设备指纹前 12 位，见
+/// [`discovery::BrowseEvent::Lost`]）；返回是否有条目被移除。只动 mDNS 来源的条目——手动探测加入的
+/// 设备没有「下线」概念。
+fn remove_lost_instance(snapshot: &mut Vec<DiscoveredPeer>, instance: &str) -> bool {
+    let before = snapshot.len();
+    snapshot.retain(|peer| {
+        !(matches!(peer.kind, DiscoveryKind::Mdns)
+            && peer
+                .fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint.starts_with(instance)))
+    });
+    snapshot.len() != before
+}
+
 /// 发起方待确认会话（[`PendingInit`]）存活上限。**必须**与响应方
 /// `pairing.rs` 的 `SESSION_TTL`（180s）保持一致——双端各自独立维护一套
 /// 过期判定，[`LinkManager::begin_pairing`] 的剪枝与
@@ -173,6 +195,10 @@ struct PendingInit {
     session_id: String,
     peer: PeerAddress,
     created: std::time::Instant,
+    /// 一次 `accept=true` 的 confirm 正在等对端用户表态（最长约 70s）。
+    confirming: bool,
+    /// 通知在途的 confirm 中止（用户在「等待对方确认」时取消 / 关闭面板）。
+    cancel: Arc<tokio::sync::Notify>,
 }
 
 /// [`LinkManager`] 的宿主相关选项。
@@ -235,13 +261,16 @@ pub struct LinkManager {
     /// `max(请求 ts, 当前时间) + LINK_AUTH_SKEW_SECS`：发送方时钟超前时，同一份请求在整个
     /// 「ts ± 容忍窗」内都能通过时间窗，nonce 必须保留到窗口真正关闭为止。
     ///
-    /// **纯内存态，无持久化**：进程重启即清空全部历史。残余风险——若攻击者
-    /// 截获过一份合法的 `(ts, nonce, tag)`，理论上可在响应方重启后、原始
-    /// `ts` 仍落在 `LINK_AUTH_SKEW_SECS`（120s）容忍窗口内时重放一次。攻击
-    /// 窗口极窄（需精确命中「重启后 120s 内」这个时机，且重启本身不频繁），
-    /// 判定为可接受风险：加持久化的工程成本（落盘 + 跨重启一致性）远大于
-    /// 收窄这个窗口带来的收益。这是权衡后的结论，不是遗漏。
+    /// **纯内存态，无持久化**：进程重启即清空全部历史。为堵住「截获合法 `(ts, nonce, tag)` 后在
+    /// 响应方重启后、原始 `ts` 仍在 `LINK_AUTH_SKEW_SECS` 窗口内重放一次」，[`Self::authorize`]
+    /// 拒绝时间戳**早于本进程启动时刻**（[`Self::started_at`]）的请求：重启之前发出的请求其 `ts`
+    /// 必然早于重启，重放不了。
     seen_nonces: Mutex<HashMap<String, i64>>,
+    /// 本进程（本 `LinkManager`）的启动时刻（Unix 秒）。取舍：发送方时钟比本机慢 `δ` 秒时，
+    /// 它在本机启动后的头 `δ`（≤ `LINK_AUTH_SKEW_SECS`）秒内发来的合法请求 `ts` 也会早于启动时刻，
+    /// 被当作时钟偏差拒绝；对端的周期性信息交换 / 重试在之后自然恢复，换来的是重启重放窗口
+    /// 彻底关闭。
+    started_at: AtomicI64,
     /// 发现快照（发起方侧）：浏览转发任务里按 [`upsert_discovered`]
     /// 去重更新；`start_discovery` 调用时清空；`probe` 的结果不入此快照。
     /// `Arc` 包裹以便转发任务（`tokio::spawn` 的 `'static` 闭包）持有写句柄。
@@ -322,6 +351,7 @@ impl LinkManager {
             ui_discovery: Arc::new(AtomicBool::new(false)),
             pending: Mutex::new(HashMap::new()),
             seen_nonces: Mutex::new(HashMap::new()),
+            started_at: AtomicI64::new(now_unix()),
             discovered: Arc::new(Mutex::new(Vec::new())),
             hinted: Arc::new(Mutex::new(HashMap::new())),
             probed: Mutex::new(HashMap::new()),
@@ -507,6 +537,7 @@ impl LinkManager {
             platform: w.platform,
             app_version: w.app_version,
             initiator_addrs: w.initiator_addrs,
+            request_control: w.request_control,
         };
         let resp = self.responder.handle_hello(&req, source)?;
         Ok(WireHelloResponse {
@@ -537,6 +568,7 @@ impl LinkManager {
             accepted.peer_name,
             accepted.peer_platform,
             &accepted.peer_id_pub,
+            accepted.request_control,
         );
         Ok(WireRevealResponse {
             responder_sig: B64.encode(accepted.response.responder_sig),
@@ -595,6 +627,7 @@ impl LinkManager {
         peer_name: String,
         peer_platform: Option<String>,
         peer_id_pub: &[u8; 32],
+        requests_control: bool,
     ) {
         let tx = self.events.clone();
         let event = LinkEngineEvent::IncomingPairing {
@@ -603,6 +636,7 @@ impl LinkManager {
             peer_name,
             peer_platform,
             peer_fingerprint: super::crypto::fingerprint(peer_id_pub),
+            requests_control,
         };
         tokio::spawn(async move {
             if tx.send(event).await.is_err() {
@@ -710,6 +744,10 @@ impl LinkManager {
         if let Ok(mut snapshot) = self.discovered.lock() {
             snapshot.clear();
         }
+        // `FLUXDOWN_MDNS=off`：界面发起的浏览同样不起（手动地址配对照常可用）。
+        if !self.advertise {
+            return Ok(());
+        }
         self.ui_discovery.store(true, Ordering::Relaxed);
         self.ensure_browser()
     }
@@ -720,7 +758,7 @@ impl LinkManager {
         if guard.is_some() {
             return Ok(());
         }
-        let (tx, mut rx) = mpsc::channel::<DiscoveredPeer>(64);
+        let (tx, mut rx) = mpsc::channel::<BrowseEvent>(64);
         let out = self.events.clone();
         let hinted = Arc::clone(&self.hinted);
         let self_fp = self.identity.fingerprint().to_string();
@@ -728,7 +766,19 @@ impl LinkManager {
         let ui_discovery = Arc::clone(&self.ui_discovery);
         let store = self.store.clone();
         tokio::spawn(async move {
-            while let Some(peer) = rx.recv().await {
+            while let Some(event) = rx.recv().await {
+                let peer = match event {
+                    BrowseEvent::Found(peer) => peer,
+                    BrowseEvent::Lost { instance } => {
+                        let removed = discovered.lock().is_ok_and(|mut snapshot| {
+                            remove_lost_instance(&mut snapshot, &instance)
+                        });
+                        if removed && out.send(LinkEngineEvent::DiscoveredLost).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 // 过滤掉本机自身的广播。
                 if peer.fingerprint.as_deref() == Some(self_fp.as_str()) {
                     continue;
@@ -868,6 +918,11 @@ impl LinkManager {
     /// （揭示临时公钥），返回 `(token, sas, 对端名)`。UI 展示 SAS 供用户与对端核对，
     /// 随后调 [`confirm_pairing`]。
     ///
+    /// `request_control`：同时请求「完全控制」对端（受 hello 签名保护）。对端用户批准后本机
+    /// 记录标记 `controllable`，可用 [`Self::control_credential`] 取得其 `/rpc` 的设备控制凭据。
+    /// 先读对端 `/ping`：没有 `linkControl >= 1`（旧版对端不认识该标志）→
+    /// [`LinkError::UnsupportedVersion`]，不发 hello。
+    ///
     /// 发起方已知该地址上设备的发现指纹（mDNS 快照或最近一次手动探测）时，对端出示的
     /// 身份必须与之一致，否则 [`LinkError::IdentityMismatch`]——此时还没有揭示临时
     /// 公钥。对端配对协议版本不符（含旧版对端）→ [`LinkError::UnsupportedVersion`]。
@@ -879,12 +934,19 @@ impl LinkManager {
         &self,
         address: &PeerAddress,
         code: &str,
+        request_control: bool,
     ) -> LinkResult<BeginPairingResult> {
-        let mut initiator = PairingInitiator::new(self.identity.clone());
+        if request_control
+            && discovery::probe_link_control(&self.client, address).await? < LINK_CONTROL_VERSION
+        {
+            return Err(LinkError::UnsupportedVersion);
+        }
+        let mut initiator =
+            PairingInitiator::new(self.identity.clone()).request_control(request_control);
         let addrs = self.self_addrs_towards(address).await;
         let hello = initiator.build_hello(code, &self.responder.self_info(), addrs);
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "protocolVersion": hello.protocol_version,
             "code": hello.code,
             "initiatorIdPub": B64.encode(hello.initiator_id_pub),
@@ -895,6 +957,9 @@ impl LinkManager {
             "appVersion": hello.app_version.clone().unwrap_or_default(),
             "initiatorAddrs": hello.initiator_addrs,
         });
+        if hello.request_control {
+            body["requestControl"] = serde_json::Value::Bool(true);
+        }
         let json = self
             .post_pairing_step(address, "/api/v1/link/pair/hello", &body)
             .await
@@ -941,6 +1006,8 @@ impl LinkManager {
                     session_id: hello_resp.session_id.clone(),
                     peer: address.clone(),
                     created: std::time::Instant::now(),
+                    confirming: false,
+                    cancel: Arc::new(tokio::sync::Notify::new()),
                 },
             );
         }
@@ -1015,47 +1082,77 @@ impl LinkManager {
     }
 
     /// SAS 核对后确认/拒绝配对。`accept=true` 且对端确认成功 → 落库 + 广播 Paired。
+    ///
+    /// 待确认条目保留到 confirm 结束。`accept=true` 的调用在等对端用户表态（最长约 70s）期间，同一
+    /// token 上的 `accept=false` 就是**中止**：立即通知对端放弃（对端弹窗随之关闭），在途调用以
+    /// [`LinkError::SessionExpired`] 尽快返回，取消调用本身返回 `Ok(None)`。
     pub async fn confirm_pairing(
         &self,
         token: &str,
         accept: bool,
     ) -> LinkResult<Option<PeerRecord>> {
-        let pending = {
+        let (session_id, peer, cancel) = {
             let mut guard = self.pending.lock().map_err(|_| LinkError::Unavailable)?;
-            guard.remove(token)
+            let Some(entry) = guard.get_mut(token) else {
+                return Err(LinkError::SessionExpired);
+            };
+            // 本地也校验过期：双端各自维护一套过期逻辑，未来任一端常量独立调整就会行为不一致。
+            // 本机用户迟迟不核验 SAS 时在这里直接短路，不必再发起一次注定失败、还要等待
+            // 下方最多 70s 超时的网络往返。
+            if entry.created.elapsed() > PENDING_INIT_TTL {
+                guard.remove(token);
+                return Err(LinkError::SessionExpired);
+            }
+            let info = (
+                entry.session_id.clone(),
+                entry.peer.clone(),
+                entry.cancel.clone(),
+            );
+            if accept {
+                if entry.confirming {
+                    // 同一待确认项上已有在途确认：重复确认没有意义。
+                    return Err(LinkError::SessionExpired);
+                }
+                entry.confirming = true;
+            } else if entry.confirming {
+                // 中止在途确认：条目由它自己在返回前移除。
+                entry.cancel.notify_one();
+            } else {
+                guard.remove(token);
+            }
+            info
         };
-        let Some(pending) = pending else {
-            return Err(LinkError::SessionExpired);
-        };
-        // 本地也校验过期：双端各自维护一套过期逻辑，未来任一端常量独立调整就会行为不一致。
-        // 本机用户迟迟不核验 SAS 时在这里直接短路，不必再发起一次注定失败、还要等待
-        // 下方最多 70s 超时的网络往返。
-        if pending.created.elapsed() > PENDING_INIT_TTL {
-            return Err(LinkError::SessionExpired);
-        }
-        let body = serde_json::json!({ "sessionId": pending.session_id, "confirm": accept });
-        let resp = self
+        let body = serde_json::json!({ "sessionId": session_id, "confirm": accept });
+        let request = self
             .client
-            .post(pending.peer.url("/api/v1/link/pair/confirm"))
+            .post(peer.url("/api/v1/link/pair/confirm"))
             .json(&body)
             // 对端响应方要等本机用户在 confirm 阶段核验 SAS 并点击批准/拒绝
             // （PairingResponder::handle_confirm 等待用户决策，上限 60s），因此这里的超时
             // 必须盖过那 60s 决策窗口再留出网络往返余量，否则发起方会在对端用户点确认前就
             // 先行超时掉线。
-            .timeout(Duration::from_secs(70))
-            .send()
-            .await
-            .map_err(|e| send_failure(&e))?;
-        if !resp.status().is_success() {
-            return Err(classify_failure(resp).await);
-        }
+            .timeout(Duration::from_secs(70));
         if !accept {
+            confirm_response(request).await?;
             return Ok(None);
         }
-        let json = read_json_object(resp).await?;
+        let outcome = tokio::select! {
+            outcome = confirm_response(request) => outcome,
+            () = cancel.notified() => Err(LinkError::SessionExpired),
+        };
+        // 无论结局如何，这个待确认项到此为止。
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| LinkError::Unavailable)?
+            .remove(token);
+        let json = outcome?;
+        let Some(pending) = pending else {
+            return Err(LinkError::SessionExpired);
+        };
         // 对端 confirm 响应体 `{"success":true,"paired":<bool>,"reason":<"rejected"|
         // "timeout"|null>}`。对端用户拒绝与核验超时都是**协议正常终局**，对端以 2xx +
-        // `paired=false` 返回（而非 4xx），否则这里的非 2xx 分支会把它们一律压成
+        // `paired=false` 返回（而非 4xx），否则非 2xx 分支会把它们一律压成
         // SessionExpired，用户看到的是「会话过期」而不是「对方拒绝了配对」。
         let paired = json
             .get("paired")
@@ -1525,6 +1622,10 @@ impl LinkManager {
         if (now as i128 - ts as i128).abs() > LINK_AUTH_SKEW_SECS as i128 {
             return Err(LinkError::ClockSkew);
         }
+        // 重启重放防护：早于本进程启动时刻的请求一律拒绝（取舍见 `started_at`）。
+        if ts < self.started_at.load(Ordering::Relaxed) {
+            return Err(LinkError::ClockSkew);
+        }
         let record = self
             .store
             .get(device_fp)
@@ -1572,6 +1673,49 @@ impl LinkManager {
             nonce: nonce.to_string(),
             aead_key,
         })
+    }
+
+    // ── 设备控制凭据（`/rpc`）──────────────────────────────────────────────
+
+    /// 为「本机可控制」的已配对主机签发 `/rpc` 设备控制凭据（发起方 / 控制端侧）。仅当名册记录
+    /// `controllable && !revoked` 时成功，否则 [`LinkError::NotPaired`]。凭据绑定双方指纹，由
+    /// 配对时派生的 `link_secret` 做 HMAC，见 [`super::crypto::control_credential`]。
+    pub async fn control_credential(&self, fingerprint: &str) -> LinkResult<String> {
+        let record = self
+            .store
+            .get(fingerprint)
+            .await?
+            .filter(|record| record.controllable && !record.revoked)
+            .ok_or(LinkError::NotPaired)?;
+        super::crypto::control_credential(
+            &record.link_secret,
+            self.identity.fingerprint(),
+            &record.fingerprint,
+        )
+        .ok_or(LinkError::NotPaired)
+    }
+
+    /// 校验对端出示的 `/rpc` 设备控制凭据（响应方 / 被控主机侧）：解析 → 按凭据里的指纹找名册
+    /// 记录 → 要求 `grants_control && !revoked` → 重算 HMAC 常量时间比较。通过返回该设备指纹。
+    /// 任何失败（含名册读取失败）一律 `None`：宁可拒绝也不放行。
+    pub async fn verify_control_credential(&self, token: &str) -> Option<String> {
+        let (fingerprint, _) = super::crypto::parse_control_credential(token)?;
+        let record = match self.store.get(fingerprint).await {
+            Ok(record) => record?,
+            Err(error) => {
+                tracing::warn!(error = %error, "could not read the link roster to verify a control credential");
+                return None;
+            }
+        };
+        (record.grants_control
+            && !record.revoked
+            && super::crypto::verify_control_credential(
+                &record.link_secret,
+                &record.fingerprint,
+                self.identity.fingerprint(),
+                token,
+            ))
+        .then_some(record.fingerprint)
     }
 
     /// 剪枝全部「只靠恰好又发生一次同类调用才顺带清理」的过期状态：
@@ -1654,14 +1798,6 @@ impl LinkRequest {
         };
         seal_link_body(&self.aead_key, &response_aad(&exchange), plaintext)
     }
-}
-
-/// 指纹形态：64 位小写 hex。
-fn is_fingerprint_shaped(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// nonce 形态：`[A-Za-z0-9_-]{1,64}`。
@@ -1757,6 +1893,7 @@ pub struct WireHello {
     pub platform: Option<String>,
     pub app_version: Option<String>,
     pub initiator_addrs: Vec<String>,
+    pub request_control: bool,
 }
 
 /// 出站 `hello` 回复的 wire 形式（base64 字符串字段）。
@@ -1786,6 +1923,14 @@ pub struct WireRevealResponse {
     pub responder_sig: String,
 }
 
+/// 发出 confirm 请求并读回成功响应的 JSON 对象；非 2xx 按 [`crate::wire`] 的规则分类。
+async fn confirm_response(request: reqwest::RequestBuilder) -> LinkResult<serde_json::Value> {
+    let resp = request.send().await.map_err(|e| send_failure(&e))?;
+    if !resp.status().is_success() {
+        return Err(classify_failure(resp).await);
+    }
+    read_json_object(resp).await
+}
 fn decode_b64_array<const N: usize>(s: &str) -> LinkResult<[u8; N]> {
     let bytes = B64
         .decode(s)

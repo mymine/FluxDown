@@ -96,6 +96,7 @@ Returned from `prepare`, and accepted as the `request` field of a [resolver](/do
 | `originHeaders` | `[{origin, headers}]` — extra headers applied only to requests whose site (`scheme://host[:port]`) equals `origin`, e.g. for segment hosts. At most 32 rules; merged per origin. |
 | `segments` | `0..=512`; **overrides the user's thread count for this run** (0 = automatic). |
 | `maxConnections` | `1..=512`; a hard cap that always applies. |
+| `maxRangeBytes` | HTTP tasks only; integer in bytes, `>= 65536` (64 KiB). Caps the `Range` span of **every** data request of the task, for direct links that reject large ranges (for example a cloud-drive CDN that answers 403 above ~5 MiB per request — set it at or below the limit, such as `4 * 1024 * 1024`). Segment workers request their share in windows of at most this size and reuse the connection; single-stream and fallback downloads send only bounded `Range` requests of at most this size (never a plain GET or an open-ended `bytes=N-`); with `ephemeral`, the first connection carries a `Range` too. It needs a known size (`totalBytes`, or the probe) and a server that honours `Range` — otherwise it cannot be applied. The metadata probe (`HEAD`, `Range: bytes=0-0`) is unaffected. Rejected for FTP / HLS / DASH tasks. |
 | `ephemeral` | HTTP tasks only. Same meaning as in a resolver result: skip the metadata probe for this run, so a one-time credential is not spent on it. |
 | `totalBytes` / `rangeSupported` | HTTP only, and only together with `ephemeral: true`. `totalBytes` (> 0) is the size used instead of probing; `rangeSupported` says whether the server is known to accept ranges (default `false` on a first run). |
 | `fileName` | No path separators, `..` or control characters. **Only honoured on the first run**, before the download starts; later runs ignore it and note that. |
@@ -124,7 +125,7 @@ Limits:
 - Refreshing stops after **5 consecutive refreshes that never produced a successful response** (credentials that never work). A credential that succeeded at least once before being rejected counts as normally used, which resets the counter — so one-token-per-request schemes can refresh as often as needed.
 - Concurrent rejections are **single-flighted**: one plugin call serves them all; a request already sent with an outdated identity is simply resent with the current one. If the plugin changes nothing, that identity generation is marked rejected and is not asked again.
 - Refreshed credentials are **not persisted**; the next run starts from `prepare` again.
-- Non-HTTP tasks cannot refresh `url` (other credential fields work). `refresh` cannot change `method`, `body`, `segments`, `maxConnections`, `fileName` or `ephemeral`.
+- Non-HTTP tasks cannot refresh `url` (other credential fields work). `refresh` cannot change `method`, `body`, `segments`, `maxConnections`, `maxRangeBytes`, `fileName` or `ephemeral`.
 - `failed` retries have their own allowance of 5 and are **not** affected by the auto-retry switch.
 - Once the User-Agent / Referer is pinned, probe adaptation no longer resends an identical request.
 

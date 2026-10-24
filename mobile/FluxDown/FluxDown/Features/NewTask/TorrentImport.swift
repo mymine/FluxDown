@@ -3,7 +3,7 @@ import FluxUI
 import Foundation
 import UniformTypeIdentifiers
 
-#if FULL_P2P
+#if FULL_FLAVOR
 /// N3 · `.torrent` 导入（`02-downloads.md` §13）。
 ///
 /// 每个文件：security-scoped 读取（主线程外，上限 `maxBytes + 1`）→ 粗校验 → `daemon.task.create{request.torrentB64}`。

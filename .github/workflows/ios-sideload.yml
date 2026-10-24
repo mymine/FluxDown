@@ -1,7 +1,7 @@
 # 原生 iOS App（mobile/FluxDown）侧载版：full flavor（本机引擎含 BitTorrent / eD2K）**未签名** IPA，
 # 供 AltStore / SideStore / Sideloadly 等用户自签安装。商店构建（store flavor）见 ios-testflight.yml，两者互相独立。
 # 流程与本机一致，全部在 mobile/FluxDown/scripts/sideload.sh：
-#   build-core.sh --release --flavor full → xcodebuild archive（CODE_SIGNING_ALLOWED=NO、FLUX_FLAVOR_CONDITIONS=FULL_P2P）
+#   build-core.sh --release --flavor full → xcodebuild archive（CODE_SIGNING_ALLOWED=NO、FLUX_FLAVOR_CONDITIONS=FULL_FLAVOR）
 #   → 打包 Payload/FluxDown.app 为 .ipa。不需要任何签名密钥。
 # 触发：
 #   - 推送 v* tag：版本号取 tag（vX.Y.Z-rc.N → X.Y.Z）；IPA 作为 artifact，并挂到同名 GitHub Release
@@ -76,10 +76,29 @@ jobs:
             echo "release_tag=$RELEASE_TAG"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Select newest Xcode
+      - name: Select newest non-beta Xcode
+        # 与 ios-testflight.yml 同名步骤逐字一致（判定规则见那里的注释）：侧载包与商店包用同一工具链。
         run: |
-          XCODE=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
-          sudo xcode-select -s "$XCODE/Contents/Developer"
+          candidates=""
+          for app in /Applications/Xcode*.app; do
+            real="$(cd "$app" && pwd -P)"
+            plist="$real/Contents/version.plist"
+            [ -f "$plist" ] || continue
+            version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
+            build="$(/usr/libexec/PlistBuddy -c 'Print :ProductBuildVersion' "$plist")"
+            if [[ "$build" =~ ^[0-9]+[A-Z]5[0-9]{3}[a-z]$ ]] || [[ "$(basename "$real" | tr '[:upper:]' '[:lower:]')" == *beta* ]]; then
+              echo "skip beta: $real ($version $build)"
+              continue
+            fi
+            candidates+="$version $build $real"$'\n'
+          done
+          best="$(printf '%s' "$candidates" | sort -u -V | tail -n 1)"
+          if [ -z "$best" ]; then
+            echo "::error::镜像上没有非 beta 的 Xcode（App Store Connect 拒收 beta 构建）"
+            exit 1
+          fi
+          echo "selected: $best"
+          sudo xcode-select -s "${best#* * }/Contents/Developer"
           xcodebuild -version
 
       - name: Setup Rust toolchain

@@ -48,14 +48,6 @@ export function matchesAssetSize(response: Response, expected: number): boolean 
     length !== null && /^\d+$/.test(length) && Number(length) === expected;
 }
 
-export function mayProbeOss(
-  source: DownloadSource,
-  configured: boolean,
-  stale: boolean,
-): boolean {
-  return source !== "github" && configured && !stale;
-}
-
 export class DownloadLookupError extends Error {
   constructor(message: string, readonly transient: boolean) {
     super(message);
@@ -68,7 +60,7 @@ export function transientGitHubStatus(status: number, headers: Headers): boolean
       headers.has("retry-after")));
 }
 
-export function downloadRedirect(location: string, source: "github" | "oss" | "cdn" | "cn-cdn", stale = false): Response {
+export function downloadRedirect(location: string, source: "github" | "cdn", stale = false): Response {
   return new Response(null, {
     status: 302,
     headers: {

@@ -9,13 +9,12 @@ import { useT } from '../../../i18n'
 import { cn } from '../../../lib/cn'
 import { Checkbox, ContextMenuArea, Icon, Tooltip } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
-import { downloadViewsFiles, isDownloadable, pauseViews, resumeViews } from '../model/actions'
+import { downloadViewsFiles, isDownloadable, openGroupFolder, pauseViews, resumeViews } from '../model/actions'
 import { remoteCan } from '../model/batchPlan'
 import { notePointerActivity } from '../model/rowOrder'
-import { formatBytes, formatDateTime, MAX_ETA_SECS, PROTOCOL_LABEL, sourceSite } from '../model/task'
+import { canResumeSeeding, formatBytes, formatDateTime, isSeeding, MAX_ETA_SECS, PROTOCOL_LABEL, sourceSite } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
 import {
-  columnShown,
   COLUMN_LABEL_KEY,
   COLUMN_SORT_KEY,
   FILE_NAME_MAX_WIDTH,
@@ -26,56 +25,42 @@ import {
   resolveColumns,
   toColumnPrefs,
 } from '../model/viewPrefs'
-import type { ColumnKind, ResolvedColumn, ViewDensity } from '../model/viewPrefs'
+import type { ColumnKind, ViewDensity } from '../model/viewPrefs'
 import { useDownloads } from '../state'
-import type { VisibleRow } from '../state'
 import { useConflictTaskIds } from '../dialogs/fileConflict'
 import { FileCell, KindGlyph, ProgressCell, StatusCell } from './cells'
-import { formatEta } from './text'
+import { formatEta, seedingUploadLabel } from './text'
 import type { Translate } from './text'
 import { usePluginTaskCommands } from '../../plugins/usePluginContributions'
 import { buildGroupMenu, buildTaskMenu } from './menus'
 import { SelectionHeaderBar } from '../selection'
 import { TaskEmpty } from './TaskEmpty'
-
-/** 固定左侧选择列宽（含左侧留白）。 */
-const SELECTION_COLUMN_WIDTH = 36
-const TRAILING_GUTTER = 8
-const HEADER_HEIGHT = 28
-const CELL_PADDING_X = 8
-const PROGRESS_LABEL_WIDTH = 32
-const PROGRESS_GAP = 8
-/** 分组头槽位：28 高内容 + 上方 8px 留白。 */
-const GROUP_SLOT_HEIGHT = HEADER_HEIGHT + 8
-
-interface LayoutColumn extends ResolvedColumn {
-  /** 文件名列吸收剩余宽度（未固定）。 */
-  fluid: boolean
-}
-
-function cellStyle(column: LayoutColumn) {
-  return column.fluid
-    ? { flex: '1 1 0%', minWidth: MIN_WIDTH.file_name }
-    : { flex: '0 0 auto', width: column.width }
-}
-
-function Meta({ children, numeric, tertiary }: { children: string; numeric: boolean; tertiary?: boolean }) {
-  return (
-    <div
-      className={cn(
-        'min-w-0 truncate text-xs',
-        numeric && 'tabular text-right',
-        tertiary ? 'text-text-tertiary' : 'text-muted-foreground',
-      )}
-    >
-      {children}
-    </div>
-  )
-}
+import { TaskLoading } from './TaskLoading'
+import { useRowAccessors } from './rowLayout'
+import type { BucketRow, GroupFolderRow, MemberRow } from '../model/groupRows'
+import type { TaskRow as EngineTaskRow } from '../model/rowEngine'
+import { DirRowView, GroupRowView } from './GroupRows'
+import {
+  BUCKET_SLOT_HEIGHT,
+  CELL_PADDING_X,
+  cellStyle,
+  DIR_INDENT_SLOT,
+  DIR_RAIL_OFFSET,
+  HEADER_HEIGHT,
+  PROGRESS_GAP,
+  PROGRESS_LABEL_WIDTH,
+  rowHeightClass,
+  selectionColumnWidth,
+  TRAILING_GUTTER,
+} from './rowMetrics'
+import type { LayoutColumn } from './rowMetrics'
+import { Meta, RowActionsBar } from './rowParts'
 
 interface RowProps {
   t: Translate
   view: DownloadTaskView
+  /** 树缩进级数：组内成员行 1（组根）/ 2（目录下），顶层任务 0。 */
+  depth: number
   columns: readonly LayoutColumn[]
   density: ViewDensity
   conflict: boolean
@@ -110,7 +95,15 @@ function renderCell(props: RowProps, column: LayoutColumn) {
       )
     case 'status':
       return <StatusCell t={t} view={view} density={density} />
-    case 'speed':
+    case 'speed': {
+      const upload = seedingUploadLabel(view)
+      if (upload !== null) {
+        return (
+          <Meta numeric success>
+            {upload}
+          </Meta>
+        )
+      }
       return downloading && view.speed !== null && view.speed > 0 ? (
         <Meta numeric>{`${formatBytes(view.speed)}/s`}</Meta>
       ) : (
@@ -118,6 +111,7 @@ function renderCell(props: RowProps, column: LayoutColumn) {
           —
         </Meta>
       )
+    }
     case 'eta':
       return downloading && view.etaSeconds !== null && view.etaSeconds <= MAX_ETA_SECS ? (
         <Meta numeric>{formatEta(t, view.etaSeconds)}</Meta>
@@ -158,6 +152,11 @@ function RowActions({ view, labels, selected }: { view: DownloadTaskView; labels
       if (remoteCan(view, 'resume')) buttons.push({ key: 'retry', label: labels.resume, icon: RotateCw, run: () => void resumeViews([view]) })
       break
     case 'completed':
+      if (isSeeding(view)) {
+        buttons.push({ key: 'pause', label: labels.pause, icon: Pause, run: () => void pauseViews([view]) })
+      } else if (canResumeSeeding(view)) {
+        buttons.push({ key: 'resume', label: labels.resume, icon: Play, run: () => void resumeViews([view]) })
+      }
       if (isDownloadable(view)) {
         buttons.push({ key: 'download', label: labels.download, icon: Download, run: () => downloadViewsFiles([view]) })
       }
@@ -165,12 +164,7 @@ function RowActions({ view, labels, selected }: { view: DownloadTaskView; labels
   }
   if (buttons.length === 0) return null
   return (
-    <div
-      className={cn(
-        'absolute inset-y-0 right-1 rounded-r-[var(--fx-components-task-row-radius)] hidden items-center gap-0.5 pl-1 pr-1 group-hover/row:flex',
-        selected ? 'bg-nav-selected' : 'bg-row-hover',
-      )}
-    >
+    <RowActionsBar selected={selected}>
       {buttons.map((button) => (
         <Tooltip key={button.key} content={button.label}>
           <button
@@ -187,12 +181,12 @@ function RowActions({ view, labels, selected }: { view: DownloadTaskView; labels
           </button>
         </Tooltip>
       ))}
-    </div>
+    </RowActionsBar>
   )
 }
 
 const TaskRow = memo(function TaskRow(props: RowProps) {
-  const { view, columns, selected, anySelected, onClick, onDoubleClick, onToggle, getMenu, onContext, density } = props
+  const { view, columns, selected, anySelected, onClick, onDoubleClick, onToggle, getMenu, onContext, density, depth } = props
   const twoLine = density !== 'compact'
   return (
     <ContextMenuArea entries={() => getMenu(view)} title={view.name}>
@@ -204,13 +198,14 @@ const TaskRow = memo(function TaskRow(props: RowProps) {
         onContextMenu={() => onContext(view)}
         className={cn(
           'group/row relative flex cursor-default select-none items-center',
-          density === 'relaxed' ? 'h-task-row-relaxed' : twoLine ? 'h-task-row' : 'h-task-row-compact',
+          rowHeightClass(density),
         )}
       >
         <div className={cn('pointer-events-none absolute inset-y-0 left-1 right-1 rounded-[var(--fx-components-task-row-radius)]', selected ? 'bg-accent' : 'group-hover/row:bg-row-hover')} />
-        <div className="relative flex shrink-0 items-center justify-center self-stretch" style={{ width: SELECTION_COLUMN_WIDTH }}>
+        <div className="relative flex shrink-0 items-center justify-center self-stretch" style={{ width: selectionColumnWidth(density) }}>
+          {depth > 0 ? <span aria-hidden className="pointer-events-none absolute inset-y-0 left-1/2 w-px bg-hairline" /> : null}
           {anySelected ? (
-            <div className="flex p-1" onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}>
+            <div className="relative flex p-1" onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}>
               <Checkbox checked={selected} onCheckedChange={() => onToggle(view)} aria-label={view.name} />
             </div>
           ) : (
@@ -226,25 +221,43 @@ const TaskRow = memo(function TaskRow(props: RowProps) {
                 }}
                 onDoubleClick={(event) => event.stopPropagation()}
               >
-                <span className="flex group-hover/sel:hidden">
-                  <KindGlyph view={view} tile={density === 'relaxed'} />
+                <span className="relative flex group-hover/sel:hidden">
+                  {depth > 0 ? null : <KindGlyph view={view} tile={density === 'relaxed'} />}
                 </span>
-                <span aria-hidden className="hidden p-1 group-hover/sel:flex">
+                <span aria-hidden className="relative hidden p-1 group-hover/sel:flex">
                   <Checkbox checked={false} className="pointer-events-none" />
                 </span>
               </div>
             </Tooltip>
           )}
         </div>
-        {columns.map((column) => (
-          <div
-            key={column.kind}
-            className={cn('relative min-w-0 shrink-0', twoLine ? 'py-1' : '')}
-            style={{ ...cellStyle(column), paddingInline: CELL_PADDING_X }}
-          >
-            {renderCell(props, column)}
-          </div>
-        ))}
+        {columns.map((column) => {
+          const member = depth > 0 && column.kind === 'file_name'
+          return (
+            <div
+              key={column.kind}
+              className={cn('relative min-w-0 shrink-0', member ? 'flex items-center self-stretch' : twoLine ? 'py-1' : '')}
+              style={{ ...cellStyle(column), paddingInline: CELL_PADDING_X }}
+            >
+              {member ? (
+                <>
+                  {depth === 2 ? (
+                    // 目录之下：缩进槽 = 展开箭头槽 + 目录图标 + 间距，槽内细竖线对准上方目录行文件夹图标的中线。
+                    <span aria-hidden className="relative shrink-0 self-stretch" style={{ width: DIR_INDENT_SLOT }}>
+                      <span className="absolute inset-y-0 w-px bg-hairline" style={{ left: DIR_RAIL_OFFSET }} />
+                    </span>
+                  ) : null}
+                  <span className="mr-2 flex shrink-0 items-center">
+                    <KindGlyph view={view} tile={density === 'relaxed'} />
+                  </span>
+                  <div className="min-w-0 flex-1">{renderCell(props, column)}</div>
+                </>
+              ) : (
+                renderCell(props, column)
+              )}
+            </div>
+          )
+        })}
         <div style={{ width: TRAILING_GUTTER }} className="shrink-0" />
         <RowActions view={view} labels={props.rowActionLabels} selected={selected} />
       </div>
@@ -252,40 +265,16 @@ const TaskRow = memo(function TaskRow(props: RowProps) {
   )
 })
 
-function GroupHeaderRow({
-  row,
-  progress,
-  onToggle,
-  entries,
-  title,
-}: {
-  row: Extract<VisibleRow, { type: 'group' }>
-  progress: string | null
-  onToggle: () => void
-  entries: readonly MenuEntry[]
-  title: string
-}) {
-  const header = (
-    <div
-      role="row"
-      onClick={onToggle}
-      className="flex h-full cursor-pointer select-none items-end"
-      style={{ paddingLeft: 8 }}
-    >
+/** 分组方式的桶标题行（纯分组方式标题：名称 + 桶内任务数）。 */
+function BucketHeaderRow({ row, onToggle }: { row: BucketRow; onToggle: () => void }) {
+  return (
+    <div role="row" onClick={onToggle} className="flex h-full cursor-pointer select-none items-end" style={{ paddingLeft: 8 }}>
       <div className="flex items-center gap-1 text-xs" style={{ height: HEADER_HEIGHT }}>
         <Icon icon={row.collapsed ? ChevronRight : ChevronDown} size="sm" className="text-text-tertiary" />
         <span className="min-w-0 truncate font-medium text-foreground">{row.label}</span>
         <span className="tabular shrink-0 text-text-tertiary">{row.count}</span>
-        {progress ? <span className="tabular shrink-0 text-text-tertiary">{progress}</span> : null}
       </div>
     </div>
-  )
-  return entries.length > 0 ? (
-    <ContextMenuArea entries={entries} title={title} className="h-full">
-      {header}
-    </ContextMenuArea>
-  ) : (
-    header
   )
 }
 
@@ -293,7 +282,7 @@ export function TaskTable() {
   const t = useT()
   const ctx = useDownloads()
   const conflictTaskIds = useConflictTaskIds()
-  const { rows, prefs, selected, visibleKeys, views, groupSummaries } = ctx
+  const { rows, prefs, selected, visibleCount, visibleSelected } = ctx
   const scrollRef = useRef<HTMLDivElement>(null)
   // 拖拽调宽中的临时宽度（松手后写回偏好）。
   const [resizing, setResizing] = useState<{ kind: ColumnKind; width: number } | null>(null)
@@ -301,7 +290,7 @@ export function TaskTable() {
 
   const resolved = useMemo(() => resolveColumns(prefs.columns), [prefs.columns])
   const columns = useMemo<LayoutColumn[]>(() => {
-    const shown = resolved.filter((column) => columnShown(column.kind, column.visible, prefs.density))
+    const shown = resolved.filter((column) => column.visible)
     return shown.map((column) => {
       let width = column.width
       let fluid = false
@@ -318,27 +307,40 @@ export function TaskTable() {
       }
       return { ...column, width, fluid }
     })
-  }, [resolved, prefs.file_name_width, prefs.density, resizing])
+  }, [resolved, prefs.file_name_width, resizing])
   const totalMinWidth = useMemo(
     () =>
-      SELECTION_COLUMN_WIDTH +
+      selectionColumnWidth(prefs.density) +
       TRAILING_GUTTER +
       columns.reduce((sum, column) => sum + (column.fluid ? MIN_WIDTH.file_name : column.width), 0),
-    [columns],
+    [columns, prefs.density],
   )
 
   const rowActionLabels = useMemo(
     () => ({ pause: t('pause'), resume: t('resume'), download: t('webDownloadFile'), select: t('selectTaskTooltip') }),
     [t],
   )
+  const groupLabels = useMemo(
+    () => ({
+      pauseAll: t('groupPauseAll'),
+      resumeAll: t('groupResumeAll'),
+      openFolder: t('groupOpenFolder'),
+      detail: t('detail'),
+      select: t('selectTaskTooltip'),
+    }),
+    [t],
+  )
 
+  // 行数据随进度帧每帧换新，键序列与密度不变时回调保持引用稳定，虚拟化器不重算全部行位置。
+  const taskRowHeight = prefs.density === 'relaxed' ? 64 : prefs.density === 'comfortable' ? 44 : 30
+  const { getItemKey, estimateSize } = useRowAccessors(rows, BUCKET_SLOT_HEIGHT, taskRowHeight)
   const virtualizer = useVirtualizer({
     count: rows.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: (index) => (rows[index]?.type === 'group' ? GROUP_SLOT_HEIGHT : prefs.density === 'relaxed' ? 66 : prefs.density === 'comfortable' ? 44 : 30),
+    estimateSize,
     overscan: 10,
     scrollMargin: HEADER_HEIGHT,
-    getItemKey: (index) => rows[index]?.key ?? index,
+    getItemKey,
   })
 
   // 密度切换会改变所有任务行高，清掉屏外行的旧测量，避免滚动时保留旧间距。
@@ -376,9 +378,21 @@ export function TaskTable() {
       pluginCommands: pluginCommandsRef.current,
     })
   }, [])
+  const onGroupClick = useCallback((event: MouseEvent, row: GroupFolderRow) => {
+    ctxRef.current.clickGroup(row, { shift: event.shiftKey, secondary: event.ctrlKey || event.metaKey })
+  }, [])
+  // 组菜单在打开时才构建；可用项按全组成员（`groupTotals`）判定。
+  const getGroupMenu = useCallback((row: GroupFolderRow) => {
+    const current = ctxRef.current
+    return buildGroupMenu(tRef.current, row.group, row.name, current.groupTotals(row.groupId)?.counts, current.allViews)
+  }, [])
+  const onOpenGroupFolder = useCallback((row: GroupFolderRow) => {
+    void openGroupFolder(ctxRef.current.allViews(), row.groupId, row.group.saveDir)
+  }, [])
 
-  const allChecked = visibleKeys.length > 0 && visibleKeys.every((key) => selected.has(key))
-  const someChecked = !allChecked && visibleKeys.some((key) => selected.has(key))
+  const anySelected = selected.size > 0
+  const allChecked = anySelected && visibleCount > 0 && visibleSelected === visibleCount
+  const someChecked = anySelected && !allChecked && visibleSelected > 0
 
   const toggleSort = (kind: ColumnKind) => {
     const key = COLUMN_SORT_KEY[kind]
@@ -427,7 +441,31 @@ export function TaskTable() {
     })
   }
 
+  if (ctx.tasksLoading) return <TaskLoading />
   if (rows.length === 0) return <TaskEmpty />
+
+  const renderTaskRow = (row: EngineTaskRow | MemberRow) => {
+    const view = row.type === 'member' ? row.row.view : row.view
+    return (
+      <TaskRow
+        t={t}
+        view={view}
+        depth={row.type === 'member' ? row.depth : 0}
+        columns={columns}
+        density={prefs.density}
+        conflict={view.source === 'local' && conflictTaskIds.has(view.taskId)}
+        selected={selected.has(row.key)}
+        anySelected={ctx.multiSelect}
+        queueName={ctx.queueName}
+        onClick={onClick}
+        onDoubleClick={onDoubleClick}
+        onToggle={onToggle}
+        getMenu={getMenu}
+        onContext={onContext}
+        rowActionLabels={rowActionLabels}
+      />
+    )
+  }
 
   return (
     <div
@@ -446,14 +484,14 @@ export function TaskTable() {
         >
           <div
             className="group/all flex shrink-0 items-center justify-center"
-            style={{ width: SELECTION_COLUMN_WIDTH }}
+            style={{ width: selectionColumnWidth(prefs.density) }}
           >
             {/* 非多选模式（普通单击选中）表头全选框按未选处理；表头选择条只在显式多选模式出现，单项操作走右键菜单。 */}
             <div className={cn(ctx.multiSelect ? 'flex' : 'invisible group-hover/all:visible')}>
               <Checkbox
                 checked={!ctx.multiSelect ? false : allChecked ? true : someChecked ? 'indeterminate' : false}
                 onCheckedChange={() => (ctx.multiSelect && allChecked ? ctx.clearSelection() : ctx.selectAll())}
-                aria-label={t('selectedCount', { n: visibleKeys.length })}
+                aria-label={t('selectedCount', { n: visibleCount })}
               />
             </div>
           </div>
@@ -520,38 +558,35 @@ export function TaskTable() {
                 className="absolute left-0 top-0 w-full"
                 style={{
                   transform: `translateY(${item.start - HEADER_HEIGHT}px)`,
-                  height: row.type === 'group' ? GROUP_SLOT_HEIGHT : undefined,
+                  height: row.type === 'bucket' ? BUCKET_SLOT_HEIGHT : undefined,
                 }}
               >
-                {row.type === 'group' ? (
-                  <GroupHeaderRow
-                    row={row}
-                    progress={groupProgress(row.key, views)}
-                    onToggle={() => ctx.toggleGroupCollapsed(row.key)}
-                    entries={
-                      row.key.startsWith('group:')
-                        ? buildGroupMenu(t, row.key.slice(6), groupSummaries.find((group) => group.id === row.key.slice(6)), views)
-                        : []
-                    }
-                    title={row.label}
-                  />
-                ) : (
-                  <TaskRow
+                {row.type === 'bucket' ? (
+                  <BucketHeaderRow row={row} onToggle={() => ctx.toggleBucketCollapsed(row.key)} />
+                ) : row.type === 'group' ? (
+                  <GroupRowView
                     t={t}
-                    view={row.view}
+                    row={row}
                     columns={columns}
                     density={prefs.density}
-                    conflict={row.view.source === 'local' && conflictTaskIds.has(row.view.taskId)}
-                    selected={selected.has(row.key)}
-                    anySelected={ctx.multiSelect}
+                    selected={selected}
+                    multiSelect={ctx.multiSelect}
+                    detailOpen={ctx.detailOpen}
+                    totals={ctx.groupTotals(row.groupId)}
                     queueName={ctx.queueName}
-                    onClick={onClick}
-                    onDoubleClick={onDoubleClick}
-                    onToggle={onToggle}
-                    getMenu={getMenu}
-                    onContext={onContext}
-                    rowActionLabels={rowActionLabels}
+                    labels={groupLabels}
+                    onClick={onGroupClick}
+                    onToggleSelected={ctx.toggleGroupSelected}
+                    onToggleExpanded={ctx.toggleGroupExpanded}
+                    getMenu={getGroupMenu}
+                    onContext={ctx.contextSelectGroup}
+                    onDetail={ctx.showGroupDetail}
+                    onOpenFolder={onOpenGroupFolder}
                   />
+                ) : row.type === 'dir' ? (
+                  <DirRowView t={t} row={row} columns={columns} density={prefs.density} onToggle={ctx.toggleDirCollapsed} />
+                ) : (
+                  renderTaskRow(row)
                 )}
               </div>
             )
@@ -560,18 +595,4 @@ export function TaskTable() {
       </div>
     </div>
   )
-}
-
-/** 任务组头的 `完成/总数`。 */
-function groupProgress(groupKey: string, views: readonly DownloadTaskView[]): string | null {
-  if (!groupKey.startsWith('group:') || groupKey === 'group:') return null
-  const groupId = groupKey.slice(6)
-  let completed = 0
-  let total = 0
-  for (const view of views) {
-    if (view.source !== 'local' || view.groupId !== groupId) continue
-    total += 1
-    if (view.state === 'completed') completed += 1
-  }
-  return `${completed}/${total}`
 }

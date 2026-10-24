@@ -123,8 +123,10 @@ internal fun DownloadRow(
     val compact = style.density == Density.Compact
     val latest by rememberUpdatedState(item)
 
-    val meta = remember(item, style.fields, colors, text) {
-        buildRowMeta(colors, text, item, style.fields, System.currentTimeMillis() / 1000)
+    // 排队名次在组合里按稳定键二分取（只读 queueOrder 的可见排队行随顺序变化重组）；非排队行不读它。
+    val queuePosition = if (item.visual == TaskVisualState.Queued) view.queueOrder.rank(id) else 0
+    val meta = remember(item, style.fields, colors, text, queuePosition) {
+        buildRowMeta(colors, text, item, style.fields, System.currentTimeMillis() / 1000, queuePosition)
     }
 
     val selecting = nav.selecting

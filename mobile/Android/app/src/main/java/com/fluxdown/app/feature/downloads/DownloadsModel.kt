@@ -8,17 +8,25 @@ import com.fluxdown.core.model.Task
 import com.fluxdown.core.model.TaskStatus
 import com.fluxdown.core.protocol.RemoteTaskDto
 import com.fluxdown.core.protocol.RemoteTaskStatus
+import com.fluxdown.core.store.TaskTable
 import com.fluxdown.fluxui.data.FlowSegmentUi
 import com.fluxdown.fluxui.data.FlowStripState
 
 /** 状态文件夹（ScopeTabs / Rail）；顺序即显示顺序。 */
 enum class StatusFolder {
-    All, Active, Completed, Failed, Paused;
+    All, Active, Completed, Seeding, Failed, Paused;
+
+    /** 本地任务归属：做种中 = 已完成且正在 / 排队做种（仍同时属于已完成，同 qBittorrent）。 */
+    fun accepts(task: Task): Boolean = when (this) {
+        Seeding -> task.isSeeding
+        else -> accepts(task.status)
+    }
 
     fun accepts(status: TaskStatus): Boolean = when (this) {
         All -> true
         Active -> status == TaskStatus.Pending || status == TaskStatus.Downloading || status == TaskStatus.Preparing
         Completed -> status == TaskStatus.Completed
+        Seeding -> false
         Failed -> status == TaskStatus.Failed
         Paused -> status == TaskStatus.Paused
     }
@@ -32,6 +40,7 @@ enum class StatusFolder {
         Active -> status == RemoteTaskStatus.Pending || status == RemoteTaskStatus.Accepted ||
             status == RemoteTaskStatus.Downloading || status is RemoteTaskStatus.Unknown
         Completed -> status == RemoteTaskStatus.Completed
+        Seeding -> false
         Failed -> status == RemoteTaskStatus.Failed || status == RemoteTaskStatus.Canceled
         Paused -> status == RemoteTaskStatus.Paused
     }
@@ -85,7 +94,8 @@ data class TaskItem(
     val task: Task,
     val speedDown: Long,
     val speedUp: Long,
-    val queuePosition: Int,
+    /** 引擎排序键（任务在队列期间不变）；null = 不在排队。名次不进模型：渲染可见行时按 `QueueOrder` 取。 */
+    val queueOrder: Long?,
     val boosted: Boolean,
     override val category: Category?,
     val queue: Queue?,
@@ -255,13 +265,17 @@ data class RemoteRowEntry(
     override val contentType: Int get() = ContentType.RowRemote
 }
 
-/** 派生出的列表：条目 + 可见任务 id（全选范围）+ 总任务数（区分「无任务」与「筛选后为空」）。 */
+/**
+ * 派生出的列表：条目 + 可见任务 id（全选范围）+ 总任务数（区分「无任务」与「筛选后为空」）。
+ * [loading] 非空 = 主机的任务表正在分页载入：[entries] 为空不代表“没有任务”，页面只能显示加载态。
+ */
 @Immutable
 data class DownloadsList(
     val entries: List<ListEntry>,
     val visibleIds: List<String>,
     val taskTotal: Int,
     val loaded: Boolean,
+    val loading: TaskTable.Loading? = null,
 ) {
     companion object {
         val Initial = DownloadsList(emptyList(), emptyList(), 0, loaded = false)

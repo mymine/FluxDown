@@ -1,12 +1,13 @@
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, Ref, RefCell},
+    cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     time::{Duration, Instant},
 };
 
 use fluxdown_protocol::{RemoteCommandAction, RemoteCommandParams, RemoteTaskStatus};
-use fluxdown_ui_components::{CheckState, FluxIcon, check_mark, tabular_numbers};
+use fluxdown_ui_components::{CheckState, FluxIcon, check_mark, tabular_numbers, tooltip_view};
 use fluxdown_ui_icon_pack::FileKind;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -22,7 +23,6 @@ use gpui_component::{
     scroll::Scrollbar,
     spinner::Spinner,
     table::{Column, DataTable, TableDelegate, TableState},
-    tooltip::Tooltip,
     v_flex,
 };
 
@@ -35,11 +35,12 @@ use crate::{
     controller::DownloadsCommand,
     deletion::{MIN_BATCH_DELETE, split_local_deletes},
     model::{
-        CategoryIndex, DownloadFilter, DownloadTaskView, RowId, RowKey, SidebarSelection,
-        TaskProtocol, TaskSource, TaskState, TaskStore,
+        CategoryIndex, DownloadFilter, DownloadTaskView, RowChange, RowId, RowKey,
+        SidebarSelection, TaskProtocol, TaskSource, TaskState, TaskStore,
         counts::SidebarCounts,
         dispatch::DispatchSummary,
         format_bytes,
+        group_tree::GroupMeta,
         row_order::{InteractionHold, RowOrder},
         view_prefs::{
             DateBucket, SortDir, ViewDensity, ViewGroupBy, ViewPrefs, ViewSortKey, state_group_key,
@@ -49,9 +50,14 @@ use crate::{
     strings::{DownloadStrings, error_text},
 };
 
-/// 固定左侧选择列宽（含表格左侧留白）：平时显示文件类型图标，行悬停 / 已选中 /
-/// 存在任意选中时换成复选框。
-pub(crate) const SELECTION_COLUMN_WIDTH: f32 = 36.;
+#[path = "task_table_groups.rs"]
+mod groups;
+use groups::GroupRow;
+
+/// 固定左侧选择列的最小宽（含表格左侧留白）：平时显示文件类型图标，行悬停 / 已选中 /
+/// 存在任意选中时换成复选框。实际宽度随密度下的图标尺寸放宽，见
+/// [`DownloadTableDelegate::selection_column_width`]。
+const MIN_SELECTION_COLUMN_WIDTH: f32 = 36.;
 /// 表头拖拽调宽的上限（下限按列取 [`DownloadColumnKind::min_width`]）。
 const MAX_COLUMN_WIDTH: f32 = 480.;
 /// 文件名列拖宽上限（长文件名需要比其他列更宽的空间）。
@@ -83,6 +89,23 @@ const FILE_ICON_COMFORTABLE_SCALE: f32 = 1.5;
 const FILE_ICON_RELAXED_SCALE: f32 = 2.;
 /// 选中底色左右内缩（inset 样式）。
 const SELECTED_INSET_X: f32 = 4.;
+/// 选择列图标与选中底色左右边缘之间的最小留白：图标（含满画布的图标包字形）不贴边、不越出圆角底色。
+const FILE_ICON_GAP_X: f32 = 4.;
+
+/// 各密度下选择列文件图标边长（`lg` = 主题 `icon.lg`）。
+fn file_icon_size_for(density: ViewDensity, lg: f32) -> f32 {
+    match density {
+        ViewDensity::Relaxed => lg * FILE_ICON_RELAXED_SCALE,
+        ViewDensity::Comfortable => lg * FILE_ICON_COMFORTABLE_SCALE,
+        ViewDensity::Compact => lg,
+    }
+}
+
+/// 选择列宽：图标居中后两侧仍留出 选中内缩 + 留白，且不小于 [`MIN_SELECTION_COLUMN_WIDTH`]。
+fn selection_column_width_for(density: ViewDensity, lg: f32) -> f32 {
+    let icon = file_icon_size_for(density, lg);
+    (icon + 2. * (SELECTED_INSET_X + FILE_ICON_GAP_X)).max(MIN_SELECTION_COLUMN_WIDTH)
+}
 /// 任务行 group 名：选择列复选框与行操作按钮随行悬停显隐。
 const ROW_GROUP: &str = "download-task-row";
 /// 表头全选格 group 名：悬停该格时显示全选框。
@@ -148,21 +171,6 @@ impl DownloadColumnKind {
             self,
             Self::FileName | Self::Size | Self::Progress | Self::Status | Self::Created
         )
-    }
-
-    /// 宽松密度把大小 / 进度 / 速度 / 剩余时间并入文件名主列（Web `RELAXED_MERGED_COLUMNS` 镜像）。
-    fn merged_in_relaxed(self) -> bool {
-        matches!(self, Self::Size | Self::Progress | Self::Speed | Self::Eta)
-    }
-
-    /// 列在当前密度下是否实际渲染：宽松密度主列恒显示、被并入的列不单独显示；
-    /// 列偏好（`visible`）本身不改，切回其他密度原样恢复。
-    fn shown(self, visible: bool, density: ViewDensity) -> bool {
-        match density {
-            ViewDensity::Relaxed if self == Self::FileName => true,
-            ViewDensity::Relaxed => visible && !self.merged_in_relaxed(),
-            ViewDensity::Comfortable | ViewDensity::Compact => visible,
-        }
     }
 
     /// 文件名列的值只在容器宽度未知时使用；已知后由 [`DownloadTableDelegate`]
@@ -296,10 +304,25 @@ impl Render for DraggedColumnMenuItem {
     }
 }
 
-/// 表格可见行：任务行或分组头。
+/// 表格可见行：任务行、任务组文件夹行（及其展开的成员行 / 目录行）或分组方式的分桶头。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum VisibleRow {
     Task(RowId),
+    /// 任务组文件夹行（`DownloadTableDelegate::group_rows` 下标）。
+    Group(usize),
+    /// 展开的组内成员；`depth` 1 = 组根目录，2 = 位于某个目录行之下。
+    Member {
+        id: RowId,
+        depth: u8,
+    },
+    /// 展开的组内目录分段行（`group` 为所属组行下标）。
+    GroupDir {
+        group: usize,
+        path: String,
+        count: usize,
+        size_bytes: u64,
+        collapsed: bool,
+    },
     GroupHeader {
         key: String,
         label: SharedString,
@@ -315,11 +338,49 @@ struct GroupBucket {
     order: i64,
 }
 
-/// 上次计算的侧栏计数及其有效期键（存储 generation + 分类索引身份）。
-struct CountsCache {
-    generation: u64,
-    categories: Rc<CategoryIndex>,
-    counts: Rc<SidebarCounts>,
+/// 自上次重算以来，影响可见行的变化范围。
+enum ViewChange {
+    /// 没有影响排序 / 筛选 / 分组的变化：可见行与选中集都无需重算。
+    Unchanged,
+    /// 只有这些本地行变了（下标为当前布局）、没有行被移除；排序已增量并入。选中集只需复核它们。
+    Rows(Vec<usize>),
+    /// 视图参数变了 / 有行被移除 / 整表重排：筛选结果与选中集都要整体复核。
+    Everything,
+}
+
+fn row_at<'a>(
+    local: &'a [DownloadTaskView],
+    remote: &'a [DownloadTaskView],
+    id: RowId,
+) -> Option<&'a DownloadTaskView> {
+    match id {
+        RowId::Local(ix) => local.get(ix),
+        RowId::Remote(ix) => remote.get(ix),
+    }
+}
+
+/// 行的稳定平局序：本地行在前、各自按下标。
+fn row_slot(id: RowId) -> (bool, usize) {
+    match id {
+        RowId::Local(ix) => (false, ix),
+        RowId::Remote(ix) => (true, ix),
+    }
+}
+
+/// 排序比较（全序：比较器以任务 key 收尾，key 相同时按行下标定序，与稳定排序结果一致）。
+fn compare_rows(
+    prefs: &ViewPrefs,
+    local: &[DownloadTaskView],
+    remote: &[DownloadTaskView],
+    left: RowId,
+    right: RowId,
+) -> Ordering {
+    match (row_at(local, remote, left), row_at(local, remote, right)) {
+        (Some(left_row), Some(right_row)) => prefs
+            .compare(left_row, right_row)
+            .then_with(|| row_slot(left).cmp(&row_slot(right))),
+        _ => row_slot(left).cmp(&row_slot(right)),
+    }
 }
 
 /// 按 key 分桶：桶顺序为 key 首次出现的顺序，桶元数据取首个成员的；用 key → 下标的
@@ -380,6 +441,10 @@ pub(crate) struct TaskMenuFacts {
     pub(crate) is_plugin_retry_error: bool,
     /// 已完成但产物已不在下载目录（文件跟踪扫描结果）。
     pub(crate) file_missing: bool,
+    /// 本地做种中（已完成且 seeding_status 1 / 8）：可暂停（停止做种）。
+    pub(crate) is_seeding: bool,
+    /// 已完成且做种已停止 / 达标（seeding_status 2..=7）、产物仍在：可继续（恢复做种）。
+    pub(crate) can_resume_seeding: bool,
 }
 
 /// 引擎/daemon 插件系统失败任务的错误消息前缀。
@@ -440,6 +505,8 @@ pub(crate) fn task_menu_facts_for(store: &TaskStore, key: &RowKey) -> Option<Tas
         is_plugin_retry_error: row.state == TaskState::Failed
             && row.error_message.starts_with(PLUGIN_ERROR_PREFIX),
         file_missing: row.is_file_missing(),
+        is_seeding: row.is_seeding(),
+        can_resume_seeding: row.can_resume_seeding(),
     })
 }
 
@@ -479,19 +546,25 @@ pub(crate) enum MenuEntry {
 ///
 /// 多选时每一项都要求对**全部**选中任务成立（交集语义），resume/pause 例外
 /// ——只要选中集合中**存在**一个可恢复/可暂停的任务就显示（与工具栏按钮行为
-/// 一致：工具栏无条件对每个选中项下发命令，无效状态的任务被服务端忽略）。
+/// 一致：命令按 `task_command` 逐项生成，不适用状态的任务（如已完成任务的「继续」）被跳过）。
 pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> {
     if selection.is_empty() {
         return Vec::new();
     }
     let mut items = Vec::new();
     if selection.iter().any(|task| {
-        task.controllable && !matches!(task.state, TaskState::Completed | TaskState::Downloading)
+        task.controllable
+            && (task.can_resume_seeding
+                || !matches!(task.state, TaskState::Completed | TaskState::Downloading))
     }) {
         items.push(MenuEntry::Resume);
     }
+    // 失败的本机任务也可暂停：撤销已排程的自动重试，任务落为已暂停（#947）。
     if selection.iter().any(|task| {
-        task.controllable && matches!(task.state, TaskState::Downloading | TaskState::Pending)
+        task.controllable
+            && (task.is_seeding
+                || matches!(task.state, TaskState::Downloading | TaskState::Pending)
+                || (task.is_local && task.state == TaskState::Failed))
     }) {
         items.push(MenuEntry::Pause);
     }
@@ -500,7 +573,9 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
             items.push(MenuEntry::IgnorePluginRetry);
         }
         if only.is_local {
-            items.push(if only.boosted {
+            // 已完成 / 失败的任务不会处于 Boost；残留标记也只显示「优先下载」，点击给出提示。
+            let ended = matches!(only.state, TaskState::Completed | TaskState::Failed);
+            items.push(if only.boosted && !ended {
                 MenuEntry::CancelBoost
             } else {
                 MenuEntry::Boost
@@ -596,49 +671,58 @@ fn separator_index(items: &[MenuEntry]) -> usize {
         .unwrap_or(items.len())
 }
 
+/// 分组头菜单项的外观：普通图标项，或破坏性项（图标与文字取主题 `destructive` 色）。
+fn group_menu_base(label: SharedString, icon: FluxIcon, tint: Option<Hsla>) -> PopupMenuItem {
+    match tint {
+        Some(color) => {
+            PopupMenuItem::element(move |_, _| div().text_color(color).child(label.clone()))
+                .icon(Icon::from(icon).text_color(color))
+        }
+        None => PopupMenuItem::new(label).icon(icon),
+    }
+}
+
 /// 构造一个分组头右键菜单项：点击时把 `group_id` 回调进 [`DownloadView`] 的方法
-/// （无需 `Window`，用于批量命令类操作）。
+/// （无需 `Window`，用于批量命令类操作）。`tint` 为 `Some` 时按破坏性项着色。
 fn group_menu_item(
     label: SharedString,
     icon: FluxIcon,
+    tint: Option<Hsla>,
     host: &WeakEntity<DownloadView>,
     group_id: &str,
     action: fn(&mut DownloadView, String, &mut Context<DownloadView>),
 ) -> PopupMenuItem {
     let host = host.clone();
     let group_id = group_id.to_owned();
-    PopupMenuItem::new(label)
-        .icon(icon)
-        .on_click(move |_, _, cx| {
-            let group_id = group_id.clone();
+    group_menu_base(label, icon, tint).on_click(move |_, _, cx| {
+        let group_id = group_id.clone();
 
-            let Ok(()) = host.update(cx, |view, cx| action(view, group_id, cx)) else {
-                // 视图已释放，结束这次回调而不再更新状态。
-                return;
-            };
-        })
+        let Ok(()) = host.update(cx, |view, cx| action(view, group_id, cx)) else {
+            // 视图已释放，结束这次回调而不再更新状态。
+            return;
+        };
+    })
 }
 
 /// 同 [`group_menu_item`]，但回调需要 `Window`（打开确认对话框 / 独立窗口）。
 fn group_menu_item_windowed(
     label: SharedString,
     icon: FluxIcon,
+    tint: Option<Hsla>,
     host: &WeakEntity<DownloadView>,
     group_id: &str,
     action: fn(&mut DownloadView, String, &mut Window, &mut Context<DownloadView>),
 ) -> PopupMenuItem {
     let host = host.clone();
     let group_id = group_id.to_owned();
-    PopupMenuItem::new(label)
-        .icon(icon)
-        .on_click(move |_, window, cx| {
-            let group_id = group_id.clone();
+    group_menu_base(label, icon, tint).on_click(move |_, window, cx| {
+        let group_id = group_id.clone();
 
-            let Ok(()) = host.update(cx, |view, cx| action(view, group_id, window, cx)) else {
-                // 视图已释放，结束这次回调而不再更新状态。
-                return;
-            };
-        })
+        let Ok(()) = host.update(cx, |view, cx| action(view, group_id, window, cx)) else {
+            // 视图已释放，结束这次回调而不再更新状态。
+            return;
+        };
+    })
 }
 
 pub(crate) struct DownloadTableDelegate {
@@ -646,27 +730,34 @@ pub(crate) struct DownloadTableDelegate {
     pub(crate) columns: Vec<DownloadColumn>,
     store: Rc<TaskStore>,
     categories: Rc<CategoryIndex>,
-    /// 侧栏计数缓存（侧栏渲染经不可变引用读取，故内部可变）。
-    counts: RefCell<Option<CountsCache>>,
     visible: Vec<VisibleRow>,
     seen_generation: u64,
     /// 上次重算时存储的结构计数；未变说明只有行内容变化，可沿用上次的行顺序。
     seen_structure: u64,
-    /// 全量排序所得的分组前顺序，不是 RowOrder 保持期内显示的顺序。
+    /// 全部行（本地 + 远程）按 `sorted_for` 排好的顺序，筛选 / 搜索之前，不是 RowOrder 保持期内
+    /// 显示的顺序。排序键没变时随存储变更日志增量维护，不随事件整表重排。
     sorted_rows: Vec<RowId>,
-    seen_sort_values: u64,
-    seen_view_fields: u64,
+    sorted_for: Option<(ViewSortKey, SortDir)>,
+    /// `sorted_rows` 已追平到的存储变更日志位置，及当时的本地行数（重放日志需要变更前的布局）。
+    sorted_log_pos: u64,
+    sorted_local_len: usize,
     sorted_group_date: Option<chrono::NaiveDate>,
     #[cfg(test)]
     force_full_sort: bool,
     #[cfg(test)]
     full_sort_count: usize,
+    /// 整表重排（而非增量重放）的次数。
+    #[cfg(test)]
+    sort_all_count: usize,
     view_dirty: bool,
     /// 行顺序稳定器：指针活动期间 / 动态排序键限频内推迟内容变化引起的重排。
     row_order: RowOrder,
     /// 被推迟的重排的补偿定时器（到期后强制按最新排序重排）。
     reorder_timer: Option<Task<()>>,
     selected_tasks: HashSet<RowKey>,
+    /// 正在构建的任务 / 组行：`render_tr` 记下，同一行随后的 `render_last_empty_col` 取走并
+    /// 在右侧留白上挂行悬停操作（留白始终贴可视区右缘，横向滚动时按钮不随末列移出视口）。
+    trailing_actions: Option<groups::Entity>,
     selection_anchor: Option<RowKey>,
     /// 显式多选模式：仅 Cmd/Ctrl+点击或全选进入，普通单击 / 清空选择退出；
     /// 行首复选框只在该模式且有选中项时显示（与 Web `multiSelect` 对齐）。
@@ -678,8 +769,16 @@ pub(crate) struct DownloadTableDelegate {
     prefs: ViewPrefs,
     /// queue_id → 名称（列 / 分组标签）。
     queue_names: Vec<(String, String)>,
-    /// group_id → 名称。
-    group_names: HashMap<String, String>,
+    /// group_id → 组元信息；为空时不折叠任务组（如组详情窗口的成员表）。
+    groups: HashMap<String, GroupMeta>,
+    /// 本次可见行里的任务组文件夹行（`VisibleRow::Group` 的下标对象）。
+    group_rows: Vec<GroupRow>,
+    /// 运行期展开的任务组（默认折叠，不持久化）。
+    expanded_groups: HashSet<String>,
+    /// 运行期折叠的组内目录：group_id → 相对目录集合（默认展开）。
+    collapsed_dirs: HashMap<String, HashSet<String>>,
+    /// 经组行单击选中的组：选区恰为该组成员时停靠面板显示组概览。
+    focused_group: Option<String>,
     /// 远程任务目标设备显示名：设备 id / 指纹 → 已消歧的名称。
     device_names: HashMap<String, String>,
     /// 表格容器宽（`render_download_table` 在 prepaint 测得、帧外写入）；0 = 尚未测得。
@@ -689,6 +788,9 @@ pub(crate) struct DownloadTableDelegate {
     /// 最近一次交给表格的文字缩放（界面缩放 × 字号缩放，`column()` 写入）：
     /// 列的最小宽 / 默认宽按它放大，与当前主题不同即需 refresh 重建列。
     text_scale: Cell<f32>,
+    /// 最近一次交给表格的主题 `icon.lg`（`column()` 写入）：选择列宽按它与密度推算，
+    /// 与当前主题不同即需 refresh 重建列。
+    icon_base: Cell<f32>,
     /// 列配置（宽度 / 可见性 / 顺序 / 排序指示）需要重建表头 `col_groups`。
     /// 纯行数据变化不置位：`TableState::refresh` 会用代理宽度覆盖表格内部
     /// 实时宽度，进度节拍若每次都刷新会把用户正在拖拽的列宽弹回去。
@@ -713,22 +815,25 @@ impl DownloadTableDelegate {
                 .collect(),
             store,
             categories: Rc::new(CategoryIndex::default()),
-            counts: RefCell::new(None),
             visible: Vec::new(),
             seen_generation: u64::MAX,
             seen_structure: u64::MAX,
             sorted_rows: Vec::new(),
-            seen_sort_values: u64::MAX,
-            seen_view_fields: u64::MAX,
+            sorted_for: None,
+            sorted_log_pos: u64::MAX,
+            sorted_local_len: 0,
             sorted_group_date: None,
             #[cfg(test)]
             force_full_sort: false,
             #[cfg(test)]
             full_sort_count: 0,
+            #[cfg(test)]
+            sort_all_count: 0,
             view_dirty: true,
             row_order: RowOrder::default(),
             reorder_timer: None,
             selected_tasks: HashSet::new(),
+            trailing_actions: None,
             selection_anchor: None,
             multi_select: false,
             pending_delete: HashSet::new(),
@@ -736,11 +841,16 @@ impl DownloadTableDelegate {
             query: String::new(),
             prefs: ViewPrefs::default(),
             queue_names: Vec::new(),
-            group_names: HashMap::new(),
+            groups: HashMap::new(),
+            group_rows: Vec::new(),
+            expanded_groups: HashSet::new(),
+            collapsed_dirs: HashMap::new(),
+            focused_group: None,
             device_names: HashMap::new(),
             viewport_width: 0.,
             applied_file_width: Cell::new(0.),
             text_scale: Cell::new(1.),
+            icon_base: Cell::new(16.),
             columns_dirty: false,
             host: None,
             plugin_commands: Vec::new(),
@@ -783,9 +893,11 @@ impl DownloadTableDelegate {
         }
     }
 
-    pub(crate) fn set_group_names(&mut self, groups: HashMap<String, String>) {
-        if self.group_names != groups {
-            self.group_names = groups;
+    pub(crate) fn set_groups(&mut self, groups: HashMap<String, GroupMeta>) {
+        if self.groups != groups {
+            self.expanded_groups.retain(|id| groups.contains_key(id));
+            self.collapsed_dirs.retain(|id, _| groups.contains_key(id));
+            self.groups = groups;
             self.view_dirty = true;
         }
     }
@@ -850,11 +962,7 @@ impl DownloadTableDelegate {
         let text_scale = self.text_scale.get();
         let mut file_name_width = None;
         let mut changed = false;
-        let density = self.prefs.density;
-        let shown = self
-            .columns
-            .iter_mut()
-            .filter(|column| column.kind.shown(column.visible, density));
+        let shown = self.columns.iter_mut().filter(|column| column.visible);
         for (column, width) in shown.zip(widths.iter().skip(1)) {
             let width = f32::from(*width);
             if column.kind == DownloadColumnKind::FileName {
@@ -906,27 +1014,35 @@ impl DownloadTableDelegate {
         let others: f32 = self
             .columns
             .iter()
-            .filter(|column| {
-                column.kind != DownloadColumnKind::FileName
-                    && column.kind.shown(column.visible, self.prefs.density)
-            })
+            .filter(|column| column.kind != DownloadColumnKind::FileName && column.visible)
             .map(|column| column.kind.display_width(column.width, text_scale))
             .sum();
-        let reserved =
-            SELECTION_COLUMN_WIDTH + others + TABLE_TRAILING_GUTTER + f32::from(Scrollbar::width());
+        let reserved = self.selection_column_width()
+            + others
+            + TABLE_TRAILING_GUTTER
+            + f32::from(Scrollbar::width());
         (viewport - reserved).max(min_width)
     }
 
     fn file_name_visible(&self) -> bool {
-        self.columns.iter().any(|column| {
-            column.kind == DownloadColumnKind::FileName
-                && column.kind.shown(column.visible, self.prefs.density)
-        })
+        self.columns
+            .iter()
+            .any(|column| column.kind == DownloadColumnKind::FileName && column.visible)
     }
 
     /// 文字缩放（主题的界面缩放 × 字号缩放）与上次交给表格的列不一致，需重建列。
     fn text_scale_stale(&self, text_scale: f32) -> bool {
         (self.text_scale.get() - text_scale).abs() > f32::EPSILON
+    }
+
+    /// 主题 `icon.lg` 与上次交给表格的列不一致（选择列宽随之变化），需重建列。
+    fn icon_base_stale(&self, lg: f32) -> bool {
+        (self.icon_base.get() - lg).abs() > f32::EPSILON
+    }
+
+    /// 当前密度下的选择列宽（px）；选择条等覆盖层据此对齐选择列右缘。
+    pub(crate) fn selection_column_width(&self) -> f32 {
+        selection_column_width_for(self.prefs.density, self.icon_base.get())
     }
 
     /// prepaint 判定：容器宽变化，或文件名列宽与期望不符（例如刚同步了其他列宽）。
@@ -1024,28 +1140,272 @@ impl DownloadTableDelegate {
             return false;
         }
         let structure = self.store.structure_generation();
-        let content_only = !self.view_dirty && structure == self.seen_structure;
+        let dirty = self.view_dirty;
+        let content_only = !dirty && structure == self.seen_structure;
         self.seen_generation = generation;
         self.seen_structure = structure;
         self.view_dirty = false;
+        let store = Rc::clone(&self.store);
+        #[cfg(test)]
+        let force_full = self.force_full_sort;
+        #[cfg(not(test))]
+        let force_full = false;
+        let change = self.sync_sorted(&store, dirty, force_full);
+        let group_date =
+            (self.prefs.group_by == ViewGroupBy::Date).then(|| chrono::Local::now().date_naive());
+        let reuse = content_only
+            && !force_full
+            && matches!(change, ViewChange::Unchanged)
+            && group_date == self.sorted_group_date;
+        self.sorted_group_date = group_date;
+        #[cfg(test)]
+        {
+            if !reuse {
+                self.full_sort_count += 1;
+            }
+        }
+        if reuse && !self.row_order.is_stale() {
+            // 没有任何变化影响排序 / 筛选 / 分组（进度、速度等纯内容更新）：可见行与选中集都不变，
+            // 只需维持保持期时钟，不再逐帧遍历全部可见行；组行的聚合值随成员内容刷新。
+            self.row_order
+                .settle_unchanged(self.prefs.sort_key.is_live(), now);
+            self.refresh_group_rows();
+            return true;
+        }
         self.visible = self.compute_visible(content_only, now);
-        // 选中集只保留当前筛选 + 搜索下仍在视图内的任务（已删除、被侧栏切换 / 搜索 /
-        // 状态变化筛掉的一律移出），选择条计数与快捷键批量动作都只作用于看得见的任务。
-        // 折叠分组内的任务仍属于当前视图，不因折叠而取消选中。
-        let mut selected = std::mem::take(&mut self.selected_tasks);
-        selected.retain(|key| {
-            !self.is_pending_delete(key)
-                && self
+        self.revalidate_selection(&change);
+        true
+    }
+
+    /// 选中集只保留当前筛选 + 搜索下仍在视图内的任务（已删除、被侧栏切换 / 搜索 /
+    /// 状态变化筛掉的一律移出），选择条计数与快捷键批量动作都只作用于看得见的任务。
+    /// 折叠分组内的任务仍属于当前视图，不因折叠而取消选中。只有部分行变了时只复核这些行。
+    fn revalidate_selection(&mut self, change: &ViewChange) {
+        let still_visible = |this: &Self, key: &RowKey| {
+            !this.is_pending_delete(key)
+                && this
                     .store
                     .get(key)
-                    .is_some_and(|task| self.matches_filter(&task) && self.matches_query(&task))
-        });
-        self.selected_tasks = selected;
+                    .is_some_and(|task| this.matches_filter(&task) && this.matches_query(&task))
+        };
+        match change {
+            ViewChange::Unchanged => {}
+            ViewChange::Rows(rows) => {
+                if !self.selected_tasks.is_empty() {
+                    let store = Rc::clone(&self.store);
+                    let local = store.local();
+                    for row in rows.iter().filter_map(|&ix| local.get(ix)) {
+                        if self.selected_tasks.contains(&row.key) && !still_visible(self, &row.key)
+                        {
+                            self.selected_tasks.remove(&row.key);
+                        }
+                    }
+                }
+            }
+            ViewChange::Everything => {
+                let mut selected = std::mem::take(&mut self.selected_tasks);
+                selected.retain(|key| still_visible(self, key));
+                self.selected_tasks = selected;
+            }
+        }
         self.selection_anchor = self
             .selection_anchor
             .take()
             .filter(|key| self.selected_tasks.contains(key));
-        true
+    }
+
+    /// 把 `sorted_rows` 追平到存储当前状态：排序键没变且存储变更日志仍连续时只重放日志
+    /// （变更行各做一次二分定位，加一趟线性搬移）；否则整表重排。
+    fn sync_sorted(&mut self, store: &TaskStore, dirty: bool, force_full: bool) -> ViewChange {
+        let local = store.local();
+        let remote = store.remote();
+        let end = store.change_log_end();
+        let sort = (self.prefs.sort_key, self.prefs.sort_dir);
+        let replayed = if force_full || self.sorted_for != Some(sort) {
+            None
+        } else {
+            store
+                .changes_since(self.sorted_log_pos)
+                .and_then(|entries| self.replay_changes(&entries, &local, &remote))
+        };
+        let change = replayed.unwrap_or_else(|| {
+            self.sort_all(&local, &remote);
+            ViewChange::Everything
+        });
+        self.sorted_for = Some(sort);
+        self.sorted_log_pos = end;
+        self.sorted_local_len = local.len();
+        if dirty {
+            ViewChange::Everything
+        } else {
+            change
+        }
+    }
+
+    fn sort_all(&mut self, local: &[DownloadTaskView], remote: &[DownloadTaskView]) {
+        #[cfg(test)]
+        {
+            self.sort_all_count += 1;
+        }
+        self.sorted_rows.clear();
+        self.sorted_rows.extend(
+            (0..local.len())
+                .map(RowId::Local)
+                .chain((0..remote.len()).map(RowId::Remote)),
+        );
+        let prefs = &self.prefs;
+        self.sorted_rows
+            .sort_unstable_by(|&left, &right| compare_rows(prefs, local, remote, left, right));
+    }
+
+    /// 把存储变更日志重放到 `sorted_rows`；结果与整表重排相同。日志与布局对不上时返回
+    /// `None`，由调用方整表重排。
+    fn replay_changes(
+        &mut self,
+        entries: &[RowChange],
+        local: &[DownloadTaskView],
+        remote: &[DownloadTaskView],
+    ) -> Option<ViewChange> {
+        /// 重放里新追加、尚未进入 `sorted_rows` 的行。
+        const FRESH: usize = usize::MAX;
+        const KEEP: u8 = 0;
+        const DROP: u8 = 1;
+        const RENAME: u8 = 2;
+        let old_len = self.sorted_local_len;
+        let sort_bit = self.prefs.sort_key.change_bit();
+        // 当前下标处的行在上次排序时的下标（`FRESH` = 其后新追加）；没记录的下标沿用原位。
+        let mut origin: HashMap<usize, usize> = HashMap::new();
+        let origin_of = |origin: &HashMap<usize, usize>, ix: usize| {
+            origin
+                .get(&ix)
+                .copied()
+                .unwrap_or(if ix < old_len { ix } else { FRESH })
+        };
+        let mut dropped = Vec::new();
+        let mut resort = Vec::new();
+        let mut touched = Vec::new();
+        let (mut changed, mut removed) = (false, false);
+        for &entry in entries {
+            match entry {
+                RowChange::Updated { ix, view, sort } => {
+                    let moves = sort & sort_bit != 0;
+                    if !view && !moves {
+                        continue;
+                    }
+                    changed = true;
+                    touched.push(ix);
+                    if moves {
+                        let was = origin_of(&origin, ix);
+                        if was != FRESH {
+                            resort.push(was);
+                        }
+                    }
+                }
+                RowChange::Appended(ix) => {
+                    changed = true;
+                    origin.insert(ix, FRESH);
+                    touched.push(ix);
+                }
+                RowChange::Removed { ix, last } => {
+                    changed = true;
+                    removed = true;
+                    let gone = origin_of(&origin, ix);
+                    if gone != FRESH {
+                        dropped.push(gone);
+                    }
+                    if ix == last {
+                        origin.remove(&ix);
+                    } else {
+                        let moved = origin_of(&origin, last);
+                        origin.insert(ix, moved);
+                        origin.remove(&last);
+                    }
+                }
+            }
+        }
+        if !changed {
+            return Some(ViewChange::Unchanged);
+        }
+        let mut flags = vec![KEEP; old_len];
+        let mut renames: HashMap<usize, usize> = HashMap::new();
+        let mut fresh: Vec<RowId> = Vec::new();
+        for (&now_at, &was) in &origin {
+            if was == FRESH {
+                fresh.push(RowId::Local(now_at));
+            } else if was != now_at {
+                renames.insert(was, now_at);
+                if let Some(flag) = flags.get_mut(was) {
+                    *flag = RENAME;
+                }
+            }
+        }
+        for &was in &dropped {
+            if let Some(flag) = flags.get_mut(was) {
+                *flag = DROP;
+            }
+        }
+        // 排序值变了的行：从旧位置摘下，按新值（及搬迁后的新下标）重新插入。
+        for &was in &resort {
+            if let Some(flag) = flags.get_mut(was)
+                && *flag != DROP
+            {
+                *flag = DROP;
+                fresh.push(RowId::Local(renames.get(&was).copied().unwrap_or(was)));
+            }
+        }
+        if flags.iter().any(|flag| *flag != KEEP) {
+            self.sorted_rows.retain_mut(|id| {
+                let RowId::Local(ix) = id else {
+                    return true;
+                };
+                match flags.get(*ix).copied() {
+                    Some(DROP) => false,
+                    Some(RENAME) => {
+                        if let Some(&moved_to) = renames.get(&*ix) {
+                            *ix = moved_to;
+                        }
+                        true
+                    }
+                    _ => true,
+                }
+            });
+        }
+        if !fresh.is_empty() {
+            self.merge_fresh(fresh, local, remote);
+        }
+        if self.sorted_rows.len() != local.len() + remote.len() {
+            return None;
+        }
+        Some(if removed {
+            ViewChange::Everything
+        } else {
+            ViewChange::Rows(touched)
+        })
+    }
+
+    /// 把一批行按排序并入已排好的 `sorted_rows`：先把它们排好，再每行二分定位、整段搬移。
+    fn merge_fresh(
+        &mut self,
+        mut fresh: Vec<RowId>,
+        local: &[DownloadTaskView],
+        remote: &[DownloadTaskView],
+    ) {
+        let prefs = &self.prefs;
+        fresh.sort_unstable_by(|&left, &right| compare_rows(prefs, local, remote, left, right));
+        let base = std::mem::take(&mut self.sorted_rows);
+        let mut merged = Vec::with_capacity(base.len() + fresh.len());
+        let mut start = 0;
+        for id in fresh {
+            let at = start
+                + base[start..].partition_point(|&probe| {
+                    compare_rows(prefs, local, remote, probe, id) == Ordering::Less
+                });
+            merged.extend_from_slice(&base[start..at]);
+            merged.push(id);
+            start = at;
+        }
+        merged.extend_from_slice(&base[start..]);
+        self.sorted_rows = merged;
     }
 
     /// 本地日期跨过零点：按日期分组时「今天 / 昨天」等分桶随之改变，强制重算可见行。
@@ -1072,6 +1432,7 @@ impl DownloadTableDelegate {
         self.reorder_timer.is_none() && self.reorder_deadline().is_some()
     }
 
+    /// 搜索命中：任务名 / 链接 / 站点，或任务所在任务组的显示名（命中组名时整组可见）。
     fn matches_query(&self, task: &DownloadTaskView) -> bool {
         if self.query.is_empty() {
             return true;
@@ -1079,6 +1440,7 @@ impl DownloadTableDelegate {
         task.name_fold.contains(&self.query)
             || task.url_fold.contains(&self.query)
             || task.site_fold.contains(&self.query)
+            || self.group_name_matches(task)
     }
 
     fn matches_filter(&self, task: &DownloadTaskView) -> bool {
@@ -1092,71 +1454,62 @@ impl DownloadTableDelegate {
         }
     }
 
+    /// 按当前排序顺序（`sorted_rows`）取出通过筛选 / 搜索的行；`pick` 决定随行带出什么（分组需要
+    /// 行本身，不分组只需要下标）。
+    fn filtered_rows<'a, T: Copy>(
+        &self,
+        local: &'a [DownloadTaskView],
+        remote: &'a [DownloadTaskView],
+        pick: impl Fn(&'a DownloadTaskView) -> T,
+    ) -> Vec<(RowId, T)> {
+        self.sorted_rows
+            .iter()
+            .filter_map(|&id| row_at(local, remote, id).map(|task| (id, task)))
+            .filter(|(_, task)| self.matches_filter(task) && self.matches_query(task))
+            .map(|(id, task)| (id, pick(task)))
+            .collect()
+    }
+
     fn compute_visible(&mut self, content_only: bool, now: Instant) -> Vec<VisibleRow> {
         let store = Rc::clone(&self.store);
         let local = store.local();
         let remote = store.remote();
-        let sort_values = store.sort_generation(self.prefs.sort_key);
-        let view_fields = store.view_fields_generation();
-        let group_date =
-            (self.prefs.group_by == ViewGroupBy::Date).then(|| chrono::Local::now().date_naive());
-        let reuse_sorted = content_only
-            && sort_values == self.seen_sort_values
-            && view_fields == self.seen_view_fields
-            && group_date == self.sorted_group_date;
-        #[cfg(test)]
-        let reuse_sorted = reuse_sorted && !self.force_full_sort;
-        let mut rows: Vec<(RowId, &DownloadTaskView)> = if reuse_sorted {
-            self.sorted_rows
-                .iter()
-                .filter_map(|&id| {
-                    let task = match id {
-                        RowId::Local(ix) => local.get(ix),
-                        RowId::Remote(ix) => remote.get(ix),
-                    };
-                    task.map(|task| (id, task))
-                })
-                .collect()
-        } else {
-            local
-                .iter()
-                .enumerate()
-                .map(|(ix, task)| (RowId::Local(ix), task))
-                .chain(
-                    remote
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, task)| (RowId::Remote(ix), task)),
-                )
-                .filter(|(_, task)| self.matches_filter(task) && self.matches_query(task))
-                .collect()
-        };
-        if !reuse_sorted {
-            rows.sort_by(|(_, left), (_, right)| self.prefs.compare(left, right));
-            self.sorted_rows.clear();
-            self.sorted_rows.extend(rows.iter().map(|(id, _)| *id));
-            self.seen_sort_values = sort_values;
-            self.seen_view_fields = view_fields;
-            self.sorted_group_date = group_date;
-            #[cfg(test)]
-            {
-                self.full_sort_count += 1;
-            }
-        }
+        // 沿用上次可见行的缓冲，大表重算不再为它重新分配。
+        let mut visible = std::mem::take(&mut self.visible);
+        visible.clear();
         // 即使排序输入不变，也照常应用保持期：过期顺序和动态键的重排时钟必须一致。
         let live_key = self.prefs.sort_key.is_live();
-        let rows = self.row_order.apply(rows, content_only, live_key, now);
 
-        if self.prefs.group_by == ViewGroupBy::None {
-            return rows
-                .into_iter()
-                .map(|(id, _)| VisibleRow::Task(id))
-                .collect();
+        if self.prefs.group_by == ViewGroupBy::None && self.groups.is_empty() {
+            self.group_rows.clear();
+            // 「全部」且无搜索：每行都通过，不必逐行读取行内容（大表里是随机内存访问）。
+            let rows = if self.query.is_empty()
+                && self.filter == TableFilter::Download(DownloadFilter::ALL)
+            {
+                self.sorted_rows.iter().map(|&id| (id, ())).collect()
+            } else {
+                self.filtered_rows(&local, &remote, |_| ())
+            };
+            let rows = self.row_order.apply(rows, content_only, live_key, now);
+            visible.extend(rows.into_iter().map(|(id, ())| VisibleRow::Task(id)));
+            return visible;
         }
 
+        let rows = self.filtered_rows(&local, &remote, |task| task);
+        let rows = self.row_order.apply(rows, content_only, live_key, now);
+        // 任务组折叠成文件夹行，与其余任务一起按当前排序成为顶层实体。
+        let entities = self.fold_groups(rows);
+        if self.prefs.group_by == ViewGroupBy::None {
+            for entity in entities {
+                self.push_entity(&mut visible, entity);
+            }
+            return visible;
+        }
         let mut buckets = group_by_key(
-            rows.into_iter()
-                .map(|(id, task)| (self.group_bucket(task), id)),
+            entities.into_iter().filter_map(|entity| {
+                self.entity_bucket(entity, &local, &remote)
+                    .map(|bucket| (bucket, entity))
+            }),
             |bucket: &GroupBucket| bucket.key.as_str(),
         );
         buckets.sort_by(|(left, _), (right, _)| {
@@ -1164,17 +1517,22 @@ impl DownloadTableDelegate {
                 .cmp(&right.order)
                 .then_with(|| left.label.cmp(&right.label))
         });
-        let mut visible = Vec::new();
-        for (bucket, ids) in buckets {
+        for (bucket, entities) in buckets {
             let collapsed = self.prefs.is_group_collapsed(&bucket.key);
             visible.push(VisibleRow::GroupHeader {
                 key: bucket.key,
                 label: bucket.label,
-                count: ids.len(),
+                // 分桶计数按任务：组行计入其在本视图内的成员数。
+                count: entities
+                    .iter()
+                    .map(|entity| self.entity_task_count(*entity))
+                    .sum(),
                 collapsed,
             });
             if !collapsed {
-                visible.extend(ids.into_iter().map(VisibleRow::Task));
+                for entity in entities {
+                    self.push_entity(&mut visible, entity);
+                }
             }
         }
         visible
@@ -1201,24 +1559,7 @@ impl DownloadTableDelegate {
                     order: bucket as i64,
                 }
             }
-            ViewGroupBy::Type => {
-                let id = self.categories.category_of(task);
-                let (label, order) = self
-                    .categories
-                    .rules()
-                    .iter()
-                    .enumerate()
-                    .find(|(_, rule)| rule.dto.id == id)
-                    .map_or_else(
-                        || (strings.category_other.clone(), i64::MAX),
-                        |(ix, rule)| (strings.category_label(&rule.dto), ix as i64),
-                    );
-                GroupBucket {
-                    key: format!("type:{id}"),
-                    label,
-                    order,
-                }
-            }
+            ViewGroupBy::Type => self.type_bucket(self.categories.category_of(task)),
             ViewGroupBy::Queue => {
                 if task.source == TaskSource::Remote {
                     return GroupBucket {
@@ -1255,32 +1596,45 @@ impl DownloadTableDelegate {
                     order: 0,
                 }
             }
-            ViewGroupBy::Group => {
-                if task.group_id.is_empty() {
-                    return GroupBucket {
-                        key: "group:".to_owned(),
-                        label: strings.ungrouped.clone(),
-                        order: i64::MAX,
-                    };
-                }
-                let label = self
-                    .group_names
-                    .get(&task.group_id)
-                    .cloned()
-                    .unwrap_or_else(|| task.group_id.clone());
-                GroupBucket {
-                    key: format!("group:{}", task.group_id),
-                    label: SharedString::from(label),
-                    order: 0,
-                }
-            }
         }
     }
 
+    /// 按分类分桶：分类规则顺序即桶顺序，未知分类归「其他」排最后。
+    fn type_bucket(&self, id: &str) -> GroupBucket {
+        let (label, order) = self
+            .categories
+            .rules()
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| rule.dto.id == id)
+            .map_or_else(
+                || (self.strings.category_other.clone(), i64::MAX),
+                |(ix, rule)| (self.strings.category_label(&rule.dto), ix as i64),
+            );
+        GroupBucket {
+            key: format!("type:{id}"),
+            label,
+            order,
+        }
+    }
+
+    /// 「可见任务序列」（全选 / Shift 范围 / 表头三态）：顶层任务按行序；组行位置展开为该组
+    /// 在本视图内的全部成员（目录树顺序，不论展开 / 目录折叠），展开出的成员行不再重复计入。
     fn visible_task_ids(&self) -> impl Iterator<Item = RowId> + '_ {
-        self.visible.iter().filter_map(|row| match row {
-            VisibleRow::Task(id) => Some(*id),
-            VisibleRow::GroupHeader { .. } => None,
+        self.visible.iter().flat_map(move |row| {
+            let (single, members): (Option<RowId>, &[RowId]) = match row {
+                VisibleRow::Task(id) => (Some(*id), &[]),
+                VisibleRow::Group(group) => (
+                    None,
+                    self.group_rows
+                        .get(*group)
+                        .map_or(&[][..], |group| group.members.as_slice()),
+                ),
+                VisibleRow::Member { .. }
+                | VisibleRow::GroupDir { .. }
+                | VisibleRow::GroupHeader { .. } => (None, &[]),
+            };
+            single.into_iter().chain(members.iter().copied())
         })
     }
 
@@ -1290,31 +1644,38 @@ impl DownloadTableDelegate {
             .collect()
     }
 
-    /// 侧栏计数：按存储 generation 与分类索引缓存，一次扫描得出全部桶。
-    fn sidebar_counts(&self) -> Rc<SidebarCounts> {
-        let generation = self.store.generation();
-        let mut cache = self.counts.borrow_mut();
-        if let Some(cached) = cache.as_ref()
-            && cached.generation == generation
-            && Rc::ptr_eq(&cached.categories, &self.categories)
-        {
-            return Rc::clone(&cached.counts);
+    /// 可见任务行里（选中数, 总数）；不分配。
+    fn visible_selection_counts(&self) -> (usize, usize) {
+        let mut selected = 0;
+        let mut total = 0;
+        for id in self.visible_task_ids() {
+            if let Some(row) = self.store.row(id) {
+                total += 1;
+                selected += usize::from(self.selected_tasks.contains(&row.key));
+            }
         }
-        let local = self.store.local();
-        let remote = self.store.remote();
-        let counts = Rc::new(SidebarCounts::compute(
-            local.iter().chain(remote.iter()),
-            &self.categories,
-        ));
-        *cache = Some(CountsCache {
-            generation,
-            categories: Rc::clone(&self.categories),
-            counts: Rc::clone(&counts),
-        });
-        counts
+        (selected, total)
+    }
+
+    /// 侧栏计数：存储按当前分类索引增量维护（行增删 / 状态变化只调整对应桶），换分类索引或
+    /// 整表替换后才整表重算一次；进度等不影响计数的更新不触及它。
+    fn sidebar_counts(&self) -> Ref<'_, SidebarCounts> {
+        self.store.sidebar_counts(&self.categories)
     }
 
     pub(crate) fn count_matching(&self, filter: &DownloadFilter) -> usize {
+        // 任务表载入期间行集合是占位：「全部」显示服务端报告的总数，其余筛选不给出计数。
+        if let Some(total) = self
+            .store
+            .loading()
+            .filter(|_| self.store.local().is_empty())
+        {
+            return if *filter == DownloadFilter::ALL {
+                total
+            } else {
+                0
+            };
+        }
         self.sidebar_counts().filter(filter)
     }
 
@@ -1328,10 +1689,7 @@ impl DownloadTableDelegate {
     }
 
     fn shown_columns_count(&self) -> usize {
-        self.columns
-            .iter()
-            .filter(|column| column.kind.shown(column.visible, self.prefs.density))
-            .count()
+        self.columns.iter().filter(|column| column.visible).count()
     }
 
     fn shown_column(&self, col_ix: usize) -> Option<&DownloadColumn> {
@@ -1340,7 +1698,7 @@ impl DownloadTableDelegate {
         }
         self.columns
             .iter()
-            .filter(|column| column.kind.shown(column.visible, self.prefs.density))
+            .filter(|column| column.visible)
             .nth(col_ix - 1)
     }
 
@@ -1352,12 +1710,7 @@ impl DownloadTableDelegate {
             .columns
             .iter()
             .enumerate()
-            .filter_map(|(ix, column)| {
-                column
-                    .kind
-                    .shown(column.visible, self.prefs.density)
-                    .then_some(ix)
-            })
+            .filter_map(|(ix, column)| column.visible.then_some(ix))
             .collect();
         let Some(&from_position) = positions.get(from_ix - 1) else {
             return;
@@ -1407,6 +1760,10 @@ impl DownloadTableDelegate {
     }
 
     pub(crate) fn select_all_tasks(&mut self) {
+        // 任务表载入期间「全部」不是完整范围：不做全选。
+        if self.store.loading().is_some() {
+            return;
+        }
         let keys: Vec<RowKey> = self
             .visible_task_keys()
             .into_iter()
@@ -1416,12 +1773,14 @@ impl DownloadTableDelegate {
         self.selected_tasks.extend(keys);
         self.selection_anchor = None;
         self.multi_select = true;
+        self.focused_group = None;
     }
 
     pub(crate) fn clear_selection(&mut self) {
         self.selected_tasks.clear();
         self.selection_anchor = None;
         self.multi_select = false;
+        self.focused_group = None;
     }
 
     /// 是否处于显式多选模式（且仍有选中项）：控制行首复选框、表头全选框与表头选择条。
@@ -1447,6 +1806,7 @@ impl DownloadTableDelegate {
             self.selected_tasks.insert(key.clone());
         }
         self.multi_select = true;
+        self.focused_group = None;
         self.selection_anchor = Some(key);
     }
 
@@ -1455,6 +1815,7 @@ impl DownloadTableDelegate {
         if self.is_pending_delete(&key) {
             return;
         }
+        self.focused_group = None;
         if modifiers.shift
             && let Some(anchor) = self.selection_anchor.clone()
         {
@@ -1494,8 +1855,12 @@ impl DownloadTableDelegate {
 
     pub(crate) fn row_key_at(&self, row_ix: usize) -> Option<RowKey> {
         match self.visible.get(row_ix)? {
-            VisibleRow::Task(id) => self.store.row(*id).map(|row| row.key.clone()),
-            VisibleRow::GroupHeader { .. } => None,
+            VisibleRow::Task(id) | VisibleRow::Member { id, .. } => {
+                self.store.row(*id).map(|row| row.key.clone())
+            }
+            VisibleRow::Group(_) | VisibleRow::GroupDir { .. } | VisibleRow::GroupHeader { .. } => {
+                None
+            }
         }
     }
 
@@ -1503,7 +1868,7 @@ impl DownloadTableDelegate {
     pub(crate) fn group_key_at(&self, row_ix: usize) -> Option<&str> {
         match self.visible.get(row_ix)? {
             VisibleRow::GroupHeader { key, .. } => Some(key),
-            VisibleRow::Task(_) => None,
+            _ => None,
         }
     }
 
@@ -1585,6 +1950,10 @@ impl DownloadTableDelegate {
                 TaskState::Paused | TaskState::Failed => summary.any_resumable = true,
                 TaskState::Completed => {}
             }
+            // 失败的本机任务可暂停（撤销等待中的自动重试，#947）。
+            summary.any_active |=
+                row.is_seeding() || (key.is_local() && row.state == TaskState::Failed);
+            summary.any_resumable |= row.can_resume_seeding();
         }
         summary.all_openable = summary.any && !any_unopenable;
         summary
@@ -1649,10 +2018,6 @@ impl DownloadTableDelegate {
         if task.state != TaskState::Downloading {
             return self.strings.task_state_label(task);
         }
-        // 宽松密度的速度 / 剩余时间已在主列元信息行，状态列只给状态名。
-        if self.prefs.density == ViewDensity::Relaxed {
-            return self.strings.status_downloading.clone();
-        }
         let speed = task
             .speed_bytes_per_second
             .filter(|speed| *speed > 0)
@@ -1681,31 +2046,24 @@ impl DownloadTableDelegate {
                 })
             }
             TaskState::Paused => Some(bytes_progress(task)),
-            TaskState::Failed => task
-                .error_message
+            TaskState::Failed => self
+                .strings
+                .task_error_text(&task.error_message)
                 .lines()
                 .next()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
                 .map(str::to_owned),
-            TaskState::Pending => self.strings.queued_label(task),
+            TaskState::Pending => self.strings.queued_label(task, &self.store),
             TaskState::Completed => None,
         }
     }
 
-    /// 宽松密度状态列第二行：只给主列没有的信息（并发连接 / 排队位置 / 失败原因）。
-    fn relaxed_status_detail(&self, task: &DownloadTaskView) -> Option<String> {
-        match task.state {
-            TaskState::Downloading => self.transfer_detail(task),
-            TaskState::Failed | TaskState::Pending => self.status_detail(task),
-            TaskState::Paused | TaskState::Completed => None,
-        }
-    }
-
-    /// 宽松密度主列元信息行：未完成为「已下 / 总量 · 百分比 [· 速度 · 剩余]」，完成为
-    /// 「大小 · 类别」，末尾接来源域名；未知字段直接省略（Web `relaxedMeta` 镜像）。
+    /// 宽松密度主列副标题（旧 Flutter 默认布局）：未完成为「已下 / 总量 [· 速度]」，完成为
+    /// 「大小 · 类别」，末尾接来源域名；进度 / 剩余时间在独立列，未知字段省略（Web
+    /// `relaxedMeta` 镜像）。
     fn relaxed_meta(&self, task: &DownloadTaskView) -> String {
-        let mut parts: Vec<String> = Vec::with_capacity(6);
+        let mut parts: Vec<String> = Vec::with_capacity(4);
         if task.state == TaskState::Completed {
             if task.size_bytes > 0 {
                 parts.push(task.size.clone());
@@ -1713,14 +2071,10 @@ impl DownloadTableDelegate {
             parts.push(self.kind_label(task.kind).to_string());
         } else {
             parts.push(bytes_progress(task));
-            parts.push(percent_label(task.progress).to_string());
-            if task.state == TaskState::Downloading {
-                if let Some(speed) = task.speed_bytes_per_second.filter(|speed| *speed > 0) {
-                    parts.push(format!("{}/s", format_bytes(speed)));
-                }
-                if let Some(seconds) = task.eta_seconds.filter(|seconds| *seconds <= MAX_ETA_SECS) {
-                    parts.push(self.strings.format_eta(seconds).to_string());
-                }
+            if task.state == TaskState::Downloading
+                && let Some(speed) = task.speed_bytes_per_second.filter(|speed| *speed > 0)
+            {
+                parts.push(format!("{}/s", format_bytes(speed)));
             }
         }
         let site = task.source_site();
@@ -1749,14 +2103,23 @@ impl DownloadTableDelegate {
         }
     }
 
+    /// 选择列图标边长：双行 / 三行密度给文件图标更大的尺寸（与文字块等高感），紧凑单行与
+    /// 文字同高。选择列宽随之放宽（[`Self::selection_column_width`]），图标不越出选中底色。
+    fn file_icon_size(&self, cx: &App) -> Pixels {
+        let lg = f32::from(active_theme(cx).extended().icon.lg);
+        px(file_icon_size_for(self.prefs.density, lg))
+    }
+
     /// 固定左列：平时显示系统文件图标（取不到时回退为按类型的图标，元数据加载中为
     /// Spinner）。只有悬停该格本身（而非整行）时图标换成复选框，点击即以该行进入多选；
     /// 横扫列表不会让每行图标闪烁。多选模式下复选框常显。
-    /// 隐藏（`invisible`）的元素不绘制、不注册鼠标监听，不会拦截行点击。
+    /// 隐藏（`invisible`）的元素不绘制、不注册鼠标监听，不会拦截行点击。组内成员
+    /// （`in_group`）的图标在文件名列，这一格平时只画树轨。
     fn render_selection_cell(
         &self,
         row_ix: usize,
         task: &DownloadTaskView,
+        in_group: bool,
         window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> AnyElement {
@@ -1769,6 +2132,9 @@ impl DownloadTableDelegate {
         let checkbox_pinned = self.in_multi_select();
         let checked = checkbox_pinned && selected;
         let glyph = (!checkbox_pinned).then(|| {
+            if in_group {
+                return groups::tree_rail(cx).into_any_element();
+            }
             if task.metadata_pending {
                 return Spinner::new()
                     .with_size(icon_sizes.md)
@@ -1776,13 +2142,7 @@ impl DownloadTableDelegate {
                     .color(muted)
                     .into_any_element();
             }
-            // 双行 / 三行密度给文件图标更大的尺寸（与文字块等高感），紧凑单行与文字同高。
-            let size = match self.prefs.density {
-                ViewDensity::Relaxed => icon_sizes.lg * FILE_ICON_RELAXED_SCALE,
-                ViewDensity::Comfortable => icon_sizes.lg * FILE_ICON_COMFORTABLE_SCALE,
-                ViewDensity::Compact => icon_sizes.lg,
-            };
-            task_file_icon(task, size, window, cx)
+            task_file_icon(task, self.file_icon_size(cx), window, cx)
         });
         let check = check_mark(
             if checked {
@@ -1806,7 +2166,7 @@ impl DownloadTableDelegate {
                 .size_full()
                 .relative()
                 .cursor_pointer()
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
                 .when_some(glyph, |this, glyph| {
                     this.child(
                         h_flex()
@@ -1853,10 +2213,9 @@ impl DownloadTableDelegate {
             .into_any_element()
     }
 
+    /// 文件名列：名称 + 双行密度的副标题（宽松密度用 [`Self::relaxed_meta`]，其余为
+    /// 「类别 · 站点」）。
     fn render_file_cell(&self, task: &DownloadTaskView, cx: &App) -> AnyElement {
-        if self.prefs.density == ViewDensity::Relaxed {
-            return self.render_relaxed_file_cell(task, cx);
-        }
         let theme = active_theme(cx);
         let tokens = theme.tokens();
         let (name, name_color) = if task.metadata_pending {
@@ -1876,6 +2235,9 @@ impl DownloadTableDelegate {
             )
         };
         let meta = (self.prefs.density.two_line() && !task.metadata_pending).then(|| {
+            if self.prefs.density == ViewDensity::Relaxed {
+                return SharedString::from(self.relaxed_meta(task));
+            }
             let category = self.kind_label(task.kind);
             let site = task.source_site();
             if site.is_empty() {
@@ -1905,74 +2267,9 @@ impl DownloadTableDelegate {
                         .truncate()
                         .text_size(tokens.typography.xs.size)
                         .line_height(tokens.typography.xs.line_height)
-                        .text_color(theme.extended().colors.text_tertiary)
-                        .child(meta),
-                )
-            })
-            .into_any_element()
-    }
-
-    /// 宽松密度主列：文件名（中粗）/ 通栏分段进度条（完成态省略）/ 元信息三行。
-    /// 大小、进度、速度、剩余时间列在此密度下并入本列（见 [`DownloadColumnKind::shown`]）。
-    fn render_relaxed_file_cell(&self, task: &DownloadTaskView, cx: &App) -> AnyElement {
-        let theme = active_theme(cx);
-        let tokens = theme.tokens();
-        let (name, name_color) = if task.metadata_pending {
-            (
-                self.strings.metadata_loading.clone(),
-                tokens.colors.muted_foreground,
-            )
-        } else if task.is_file_missing() {
-            (
-                SharedString::from(task.name.clone()),
-                tokens.colors.muted_foreground,
-            )
-        } else {
-            (
-                SharedString::from(task.name.clone()),
-                tokens.colors.foreground,
-            )
-        };
-        let show_bar = task.state != TaskState::Completed && !task.metadata_pending;
-        let bar_width = (self.applied_file_width.get() - 2. * CELL_PADDING_X).max(0.);
-        v_flex()
-            .size_full()
-            .min_w_0()
-            .justify_center()
-            .gap(tokens.spacing.xs)
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(tokens.typography.sm.size)
-                    .line_height(tokens.typography.sm.line_height)
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(name_color)
-                    .child(name),
-            )
-            .when(show_bar, |this| {
-                this.child(
-                    crate::components::segment_progress::render_segment_progress(
-                        task.runtime.as_deref(),
-                        task.progress,
-                        bar_width,
-                        theme.components().progress_height,
-                        theme.components().progress_radius,
-                        progress_bar_color(task.state, cx),
-                        progress_track_color(cx),
-                    ),
-                )
-            })
-            .when(!task.metadata_pending, |this| {
-                this.child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(tokens.typography.xs.size)
-                        .line_height(tokens.typography.xs.line_height)
                         .font_features(tabular_numbers())
                         .text_color(theme.extended().colors.text_tertiary)
-                        .child(self.relaxed_meta(task)),
+                        .child(meta),
                 )
             })
             .into_any_element()
@@ -1983,25 +2280,18 @@ impl DownloadTableDelegate {
     fn render_status_cell(&self, task: &DownloadTaskView, cx: &App) -> AnyElement {
         let theme = active_theme(cx);
         let typography = &theme.tokens().typography;
-        let relaxed = self.prefs.density == ViewDensity::Relaxed;
         let two_line = self.prefs.density.two_line();
-        let detail = if relaxed {
-            self.relaxed_status_detail(task)
-        } else {
-            self.status_detail(task)
-        };
+        let detail = self.status_detail(task);
         let tooltip = if task.state == TaskState::Failed && !task.error_message.trim().is_empty() {
-            Some(SharedString::from(task.error_message.clone()))
+            Some(SharedString::from(
+                self.strings.task_error_text(&task.error_message).to_owned(),
+            ))
         } else if two_line {
             None
         } else {
             detail.clone().map(SharedString::from)
         };
-        let label_style = if relaxed {
-            &typography.sm
-        } else {
-            &typography.xs
-        };
+        let label_style = &typography.xs;
         v_flex()
             .id(SharedString::from(format!(
                 "download-status-{}",
@@ -2010,14 +2300,12 @@ impl DownloadTableDelegate {
             .size_full()
             .min_w_0()
             .justify_center()
-            .when(relaxed, |this| this.gap(theme.tokens().spacing.xs))
             .font_features(tabular_numbers())
             .child(if task.conflict_pending {
                 h_flex()
                     .min_w_0()
                     .child(conflict_badge(
                         task.key.task_id(),
-                        relaxed,
                         &self.strings,
                         self.host.as_ref(),
                         cx,
@@ -2047,7 +2335,7 @@ impl DownloadTableDelegate {
             .when_some(
                 tooltip.filter(|_| !task.conflict_pending),
                 |this, tooltip| {
-                    this.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    this.tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
                 },
             )
             .into_any_element()
@@ -2105,7 +2393,81 @@ impl DownloadTableDelegate {
             .into_any_element()
     }
 
-    /// 行悬停操作（最后一个可见列右端浮层）：暂停 / 继续 / 重试 / 打开 + 在文件夹中
+    /// 任务（或组行代理视图）在某一列的单元格。
+    fn task_cell(&self, kind: DownloadColumnKind, task: &DownloadTaskView, cx: &App) -> AnyElement {
+        let theme = active_theme(cx);
+        let muted = theme.tokens().colors.muted_foreground;
+        let tertiary = theme.extended().colors.text_tertiary;
+        let downloading = task.state == TaskState::Downloading;
+        match kind {
+            DownloadColumnKind::FileName => self.render_file_cell(task, cx),
+            DownloadColumnKind::Progress => self.render_progress_cell(task, cx),
+            DownloadColumnKind::Size if task.size_bytes > 0 => {
+                meta_cell(task.size.clone(), muted, true, cx)
+            }
+            DownloadColumnKind::Status => self.render_status_cell(task, cx),
+            DownloadColumnKind::Speed => match task
+                .speed_bytes_per_second
+                .filter(|speed| downloading && *speed > 0)
+            {
+                Some(speed) => meta_cell(format!("{}/s", format_bytes(speed)), muted, true, cx),
+                None => match seeding_upload_speed(task) {
+                    Some(speed) => meta_cell(
+                        format!("↑ {}/s", format_bytes(speed)),
+                        theme.extended().colors.success,
+                        true,
+                        cx,
+                    ),
+                    None => meta_cell("—", tertiary, true, cx),
+                },
+            },
+            DownloadColumnKind::Eta => match task
+                .eta_seconds
+                .filter(|seconds| downloading && *seconds <= MAX_ETA_SECS)
+            {
+                Some(seconds) => meta_cell(self.strings.format_eta(seconds), muted, true, cx),
+                None => meta_cell("—", tertiary, true, cx),
+            },
+            DownloadColumnKind::Size => meta_cell("—", tertiary, true, cx),
+            DownloadColumnKind::Created if task.created_at_secs > 0 => meta_cell(
+                DownloadStrings::format_datetime(task.created_at_secs),
+                muted,
+                true,
+                cx,
+            ),
+            DownloadColumnKind::Created => meta_cell("—", tertiary, true, cx),
+            DownloadColumnKind::Protocol => meta_cell(task.protocol.label(), muted, false, cx),
+            DownloadColumnKind::Source => {
+                meta_cell(task.source_site().to_owned(), muted, false, cx)
+            }
+            DownloadColumnKind::Queue => {
+                // 远程任务没有本机队列：这一列显示它所在的目标设备。
+                let name = if task.source == TaskSource::Remote {
+                    self.device_names
+                        .get(&task.to_device)
+                        .cloned()
+                        .unwrap_or_else(|| task.to_device.clone())
+                } else {
+                    self.queue_label(&task.queue_id).to_string()
+                };
+                meta_cell(name, muted, false, cx)
+            }
+        }
+    }
+
+    /// 本机队列显示名；未知队列显示 id。
+    fn queue_label(&self, queue_id: &str) -> SharedString {
+        self.queue_names
+            .iter()
+            .find(|(id, _)| id == queue_id)
+            .map_or_else(
+                || SharedString::from(queue_id.to_owned()),
+                |(id, name)| self.strings.queue_name(id, name),
+            )
+    }
+
+    /// 行悬停操作（挂在右侧留白列上，贴表格可视区右缘，横向滚动时不移出视口）：
+    /// 暂停 / 继续 / 重试 / 打开 + 在文件夹中
     /// 显示；停靠详情面板未打开时再加「详情」（面板打开后单击行即切换详情，按钮多余），
     /// 舒适与紧凑密度一致。底色与行悬停一致（选中时叠加选中色），除「详情」外点击不
     /// 改变选中。
@@ -2116,7 +2478,7 @@ impl DownloadTableDelegate {
         let host = self.host.as_ref()?;
         let is_local = task.key.is_local();
         let with_detail = !self.prefs.detail_open;
-        let mut actions = row_actions(task.state, is_local, task.file_missing, with_detail)
+        let mut actions = row_actions(task, is_local, with_detail)
             .filter(|action| {
                 is_local
                     || action
@@ -2151,7 +2513,7 @@ impl DownloadTableDelegate {
                 .cursor_pointer()
                 .text_color(muted)
                 .hover(move |style| style.bg(pressed).text_color(foreground))
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
@@ -2181,8 +2543,9 @@ impl DownloadTableDelegate {
             h_flex()
                 .absolute()
                 .top_0()
-                .right_0()
                 .bottom_0()
+                // 父节点是右侧留白列：浮层右缘对齐其左缘，即单元格可视区右缘。
+                .right(px(TABLE_TRAILING_GUTTER))
                 .gap(tokens.spacing.xxs)
                 .pl(tokens.spacing.xs)
                 .bg(extended.colors.row_hover)
@@ -2207,23 +2570,6 @@ impl DownloadTableDelegate {
         collapsed: bool,
         cx: &mut Context<TableState<Self>>,
     ) -> AnyElement {
-        let group_progress =
-            key.strip_prefix("group:")
-                .filter(|id| !id.is_empty())
-                .map(|group_id| {
-                    self.store
-                        .local()
-                        .iter()
-                        .filter(|task| task.group_id == group_id)
-                        .fold((0usize, 0usize), |(completed, total), task| {
-                            let completed = if task.state == TaskState::Completed {
-                                completed + 1
-                            } else {
-                                completed
-                            };
-                            (completed, total + 1)
-                        })
-                });
         let key = key.to_owned();
         let on_click = cx.listener(move |table, _: &ClickEvent, _, cx| {
             let delegate = table.delegate_mut();
@@ -2284,16 +2630,7 @@ impl DownloadTableDelegate {
                             .font_features(tabular_numbers())
                             .text_color(tertiary)
                             .child(count.to_string()),
-                    )
-                    .when_some(group_progress, |this, (completed, total)| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .font_features(tabular_numbers())
-                                .text_color(tertiary)
-                                .child(format!("{completed}/{total}")),
-                        )
-                    }),
+                    ),
             )
             .into_any_element()
     }
@@ -2534,38 +2871,42 @@ impl DownloadTableDelegate {
         menu
     }
 
-    /// 分组头行右键菜单（P1.8）；`group_id` 为空（未分组桶）不显示菜单。
-    fn group_context_menu(&self, group_id: &str, menu: PopupMenu) -> PopupMenu {
-        if group_id.is_empty() {
-            return menu;
-        }
+    /// 任务组文件夹行右键菜单：可用性按全组成员判定（命令作用于整个组，不受当前筛选影响）。
+    fn group_context_menu(&self, group_id: &str, menu: PopupMenu, destructive: Hsla) -> PopupMenu {
         let Some(host) = self.host.as_ref() else {
             return menu;
         };
-        let has_failed_member = self
-            .store
-            .local()
-            .iter()
-            .any(|task| task.group_id == group_id && task.state == TaskState::Failed);
-
-        let mut menu = menu.item(group_menu_item(
-            self.strings.group_pause_all.clone(),
-            FluxIcon::Pause,
-            host,
-            group_id,
-            DownloadView::group_pause_all,
-        ));
-        menu = menu.item(group_menu_item(
-            self.strings.group_resume_all.clone(),
-            FluxIcon::Play,
-            host,
-            group_id,
-            DownloadView::group_resume_all,
-        ));
-        if has_failed_member {
+        let counts = self.whole_group_counts(group_id);
+        let has_source = self
+            .groups
+            .get(group_id)
+            .is_some_and(|group| !group.source_url.is_empty());
+        let mut menu = menu;
+        if counts.any_active() {
+            menu = menu.item(group_menu_item(
+                self.strings.group_pause_all.clone(),
+                FluxIcon::Pause,
+                None,
+                host,
+                group_id,
+                DownloadView::group_pause_all,
+            ));
+        }
+        if counts.any_resumable() {
+            menu = menu.item(group_menu_item(
+                self.strings.group_resume_all.clone(),
+                FluxIcon::Play,
+                None,
+                host,
+                group_id,
+                DownloadView::group_resume_all,
+            ));
+        }
+        if counts.failed > 0 {
             menu = menu.item(group_menu_item(
                 self.strings.group_retry_failed.clone(),
                 FluxIcon::RotateCw,
+                None,
                 host,
                 group_id,
                 DownloadView::group_retry_failed,
@@ -2574,21 +2915,26 @@ impl DownloadTableDelegate {
         menu = menu.item(group_menu_item(
             self.strings.group_open_folder.clone(),
             FluxIcon::FolderOpen,
+            None,
             host,
             group_id,
             DownloadView::group_open_folder,
         ));
-        menu = menu.item(group_menu_item_windowed(
-            self.strings.group_copy_source_link.clone(),
-            FluxIcon::Copy,
-            host,
-            group_id,
-            DownloadView::group_copy_source_link,
-        ));
+        if has_source {
+            menu = menu.item(group_menu_item_windowed(
+                self.strings.group_copy_source_link.clone(),
+                FluxIcon::Copy,
+                None,
+                host,
+                group_id,
+                DownloadView::group_copy_source_link,
+            ));
+        }
         menu = menu.separator();
         menu = menu.item(group_menu_item(
             self.strings.group_delete.clone(),
             FluxIcon::Trash2,
+            Some(destructive),
             host,
             group_id,
             DownloadView::group_delete,
@@ -2596,6 +2942,7 @@ impl DownloadTableDelegate {
         menu = menu.item(group_menu_item_windowed(
             self.strings.group_delete_with_files.clone(),
             FluxIcon::Trash2,
+            Some(destructive),
             host,
             group_id,
             DownloadView::confirm_group_delete_with_files,
@@ -2603,6 +2950,7 @@ impl DownloadTableDelegate {
         menu.item(group_menu_item_windowed(
             self.strings.open_group_in_window.clone(),
             FluxIcon::AppWindow,
+            None,
             host,
             group_id,
             DownloadView::open_group_in_window,
@@ -2619,7 +2967,8 @@ impl TableDelegate for DownloadTableDelegate {
         self.visible.len()
     }
 
-    /// 空态：图标 + 标题 + 引导。
+    /// 空态：图标 + 标题 + 引导；任务表分页载入期间改为加载态（行集合只是占位，
+    /// 不能说「暂无下载任务」）。
     fn render_empty(
         &mut self,
         _window: &mut Window,
@@ -2627,6 +2976,16 @@ impl TableDelegate for DownloadTableDelegate {
     ) -> impl IntoElement {
         let theme = active_theme(cx);
         let tokens = theme.tokens();
+        let (title, subtitle) = match self.store.loading() {
+            Some(total) => (
+                self.strings.tasks_loading_title.clone(),
+                self.strings.format_tasks_loading_subtitle(total),
+            ),
+            None => (
+                self.strings.empty_title.clone(),
+                self.strings.empty_subtitle.clone(),
+            ),
+        };
         v_flex()
             .size_full()
             .items_center()
@@ -2643,14 +3002,14 @@ impl TableDelegate for DownloadTableDelegate {
                     .line_height(tokens.typography.sm.line_height)
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(tokens.colors.foreground)
-                    .child(self.strings.empty_title.clone()),
+                    .child(title),
             )
             .child(
                 div()
                     .text_size(tokens.typography.xs.size)
                     .line_height(tokens.typography.xs.line_height)
                     .text_color(tokens.colors.muted_foreground)
-                    .child(self.strings.empty_subtitle.clone()),
+                    .child(subtitle),
             )
     }
 
@@ -2662,10 +3021,13 @@ impl TableDelegate for DownloadTableDelegate {
         if col_ix == 0 {
             // 不设 `fixed_left`：gpui-component 会给固定列画一条 `border` 色竖线，
             // 而文件名列已吸收剩余宽度，常规列集不会出现横向滚动。
+            self.icon_base
+                .set(f32::from(active_theme(cx).extended().icon.lg));
+            let width = px(self.selection_column_width());
             return Column::new("selection", "")
-                .width(px(SELECTION_COLUMN_WIDTH))
-                .min_width(px(SELECTION_COLUMN_WIDTH))
-                .max_width(px(SELECTION_COLUMN_WIDTH))
+                .width(width)
+                .min_width(width)
+                .max_width(width)
                 .resizable(false)
                 .movable(false)
                 .selectable(false)
@@ -2700,17 +3062,15 @@ impl TableDelegate for DownloadTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         if col_ix == 0 {
-            let keys = self.visible_task_keys();
-            let selected_count = keys
-                .iter()
-                .filter(|key| self.selected_tasks.contains(*key))
-                .count();
             // 非多选模式（如普通单击选中一行）表头全选框按未选处理，不随单选点亮。
-            let state = match selected_count {
-                _ if !self.in_multi_select() => CheckState::Unchecked,
-                0 => CheckState::Unchecked,
-                n if n == keys.len() => CheckState::Checked,
-                _ => CheckState::Indeterminate,
+            let state = if self.in_multi_select() {
+                match self.visible_selection_counts() {
+                    (0, _) => CheckState::Unchecked,
+                    (selected, total) if selected == total => CheckState::Checked,
+                    _ => CheckState::Indeterminate,
+                }
+            } else {
+                CheckState::Unchecked
             };
             let hover_border = active_theme(cx).tokens().colors.foreground.opacity(0.7);
             // 全选框平时隐藏，悬停表头该格或已有选中时出现，避免表头常驻一个空框。
@@ -2843,10 +3203,20 @@ impl TableDelegate for DownloadTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
+        self.trailing_actions = None;
         let theme = active_theme(cx);
         let row_height = self.prefs.density.row_height(theme.density());
-        let Some(VisibleRow::Task(id)) = self.visible.get(row_ix).cloned() else {
-            return div().id(("download-group-row", row_ix)).h(row_height);
+        let id = match self.visible.get(row_ix) {
+            Some(VisibleRow::Task(id) | VisibleRow::Member { id, .. }) => *id,
+            Some(VisibleRow::Group(group)) => {
+                let group = *group;
+                self.trailing_actions = Some(groups::Entity::Group(group));
+                return self.render_group_tr(row_ix, group, cx);
+            }
+            Some(VisibleRow::GroupDir { .. }) => return self.render_group_dir_tr(row_ix, cx),
+            Some(VisibleRow::GroupHeader { .. }) | None => {
+                return div().id(("download-group-row", row_ix)).h(row_height);
+            }
         };
         let Some((key, drag_visual)) = self.store.row(id).map(|row| {
             let drag_visual = row.has_local_file().then(|| {
@@ -2894,6 +3264,7 @@ impl TableDelegate for DownloadTableDelegate {
                 };
             }
         });
+        self.trailing_actions = Some(groups::Entity::Task(id));
 
         div()
             .id(("download-task-row", row_ix))
@@ -2940,8 +3311,16 @@ impl TableDelegate for DownloadTableDelegate {
         window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let id = match self.visible.get(row_ix) {
-            Some(VisibleRow::Task(id)) => *id,
+        let (id, depth) = match self.visible.get(row_ix) {
+            Some(VisibleRow::Task(id)) => (*id, 0),
+            Some(VisibleRow::Member { id, depth }) => (*id, *depth),
+            Some(VisibleRow::Group(group)) => {
+                let group = *group;
+                return self.render_group_td(row_ix, col_ix, group, cx);
+            }
+            Some(VisibleRow::GroupDir { .. }) => {
+                return self.render_group_dir_td(row_ix, col_ix, cx);
+            }
             Some(VisibleRow::GroupHeader {
                 key,
                 label,
@@ -2963,91 +3342,58 @@ impl TableDelegate for DownloadTableDelegate {
         let task: &DownloadTaskView = &task;
 
         if col_ix == 0 {
-            return self.render_selection_cell(row_ix, task, window, cx);
+            return self.render_selection_cell(row_ix, task, depth > 0, window, cx);
         }
 
         let Some(kind) = self.shown_column(col_ix).map(|column| column.kind) else {
             return div().into_any_element();
         };
-        let theme = active_theme(cx);
-        let muted = theme.tokens().colors.muted_foreground;
-        let tertiary = theme.extended().colors.text_tertiary;
-        let downloading = task.state == TaskState::Downloading;
-        let cell = match kind {
-            DownloadColumnKind::FileName => self.render_file_cell(task, cx),
-            DownloadColumnKind::Progress => self.render_progress_cell(task, cx),
-            DownloadColumnKind::Size if task.size_bytes > 0 => {
-                meta_cell(task.size.clone(), muted, true, cx)
-            }
-            DownloadColumnKind::Status => self.render_status_cell(task, cx),
-            DownloadColumnKind::Speed => match task
-                .speed_bytes_per_second
-                .filter(|speed| downloading && *speed > 0)
-            {
-                Some(speed) => meta_cell(format!("{}/s", format_bytes(speed)), muted, true, cx),
-                None => meta_cell("—", tertiary, true, cx),
-            },
-            DownloadColumnKind::Eta => match task
-                .eta_seconds
-                .filter(|seconds| downloading && *seconds <= MAX_ETA_SECS)
-            {
-                Some(seconds) => meta_cell(self.strings.format_eta(seconds), muted, true, cx),
-                None => meta_cell("—", tertiary, true, cx),
-            },
-            DownloadColumnKind::Size => meta_cell("—", tertiary, true, cx),
-            DownloadColumnKind::Created if task.created_at_secs > 0 => meta_cell(
-                DownloadStrings::format_datetime(task.created_at_secs),
-                muted,
-                true,
-                cx,
-            ),
-            DownloadColumnKind::Created => meta_cell("—", tertiary, true, cx),
-            DownloadColumnKind::Protocol => meta_cell(task.protocol.label(), muted, false, cx),
-            DownloadColumnKind::Source => {
-                meta_cell(task.source_site().to_owned(), muted, false, cx)
-            }
-            DownloadColumnKind::Queue => {
-                // 远程任务没有本机队列：这一列显示它所在的目标设备。
-                let name = if task.source == TaskSource::Remote {
-                    self.device_names
-                        .get(&task.to_device)
-                        .cloned()
-                        .unwrap_or_else(|| task.to_device.clone())
-                } else {
-                    self.queue_names
-                        .iter()
-                        .find(|(id, _)| *id == task.queue_id)
-                        .map_or_else(
-                            || task.queue_id.clone(),
-                            |(id, name)| self.strings.queue_name(id, name).to_string(),
-                        )
-                };
-                meta_cell(name, muted, false, cx)
-            }
-        };
-        if col_ix == self.shown_columns_count()
-            && let Some(actions) = self.render_row_actions(task, cx)
-        {
-            return div()
+        if kind == DownloadColumnKind::FileName && depth > 0 {
+            // 组内成员：文件图标从选择列挪进文件名列（落在组行展开箭头的位置），整行比
+            // 组行右移一级；目录之下的成员再缩进一级。
+            let icon = task_file_icon(task, self.file_icon_size(cx), window, cx);
+            h_flex()
                 .size_full()
-                .relative()
-                .child(cell)
-                .child(actions)
-                .into_any_element();
+                .min_w_0()
+                .gap(active_theme(cx).tokens().spacing.sm)
+                .when(depth > 1, |this| this.child(self.dir_member_indent(cx)))
+                .child(icon)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.render_file_cell(task, cx)),
+                )
+                .into_any_element()
+        } else {
+            self.task_cell(kind, task, cx)
         }
-        cell
     }
 
-    /// 右侧留白与选择列内含的左侧留白对称。
+    /// 右侧留白与选择列内含的左侧留白对称；任务 / 组行在此挂行悬停操作（见
+    /// `render_row_actions` / `render_group_actions`）。
     fn render_last_empty_col(
         &mut self,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
+        let actions = match self.trailing_actions.take() {
+            Some(groups::Entity::Task(id)) => self
+                .store
+                .row(id)
+                .and_then(|task| self.render_row_actions(&task, cx)),
+            Some(groups::Entity::Group(ix)) => self
+                .group_rows
+                .get(ix)
+                .and_then(|group| self.render_group_actions(ix, group, cx)),
+            None => None,
+        };
         h_flex()
             .w(px(TABLE_TRAILING_GUTTER))
             .h_full()
             .flex_shrink_0()
+            .children(actions)
     }
 
     fn move_column(
@@ -3075,16 +3421,28 @@ impl TableDelegate for DownloadTableDelegate {
             Some(handle) => menu.action_context(handle),
             None => menu,
         };
-        match self.visible.get(row_ix).cloned() {
-            Some(VisibleRow::GroupHeader { key, .. }) => self.group_context_menu(&key, menu),
-            Some(VisibleRow::Task(_)) => {
+        match self.visible.get(row_ix) {
+            Some(VisibleRow::Group(group)) => {
+                let Some(group_id) = self.group_rows.get(*group).map(|group| group.id.clone())
+                else {
+                    return menu;
+                };
+                self.select_group_for_context_menu(&group_id);
+                cx.notify();
+                self.group_context_menu(
+                    &group_id,
+                    menu,
+                    active_theme(cx).tokens().colors.destructive,
+                )
+            }
+            Some(VisibleRow::Task(_) | VisibleRow::Member { .. }) => {
                 if let Some(key) = self.row_key_at(row_ix) {
                     self.select_task_for_context_menu(key);
                     cx.notify();
                 }
                 self.task_context_menu(menu, active_theme(cx).tokens().colors.destructive)
             }
-            None => menu,
+            Some(VisibleRow::GroupDir { .. } | VisibleRow::GroupHeader { .. }) | None => menu,
         }
     }
 }
@@ -3105,7 +3463,8 @@ pub(crate) enum ToolbarCommand {
 /// - `any_local`：含本地任务（在文件夹中显示；远程任务没有本机文件）。
 /// - `all_openable`：全部为本地已完成且文件仍在下载目录的任务（打开文件；未完成的产物
 ///   尚不存在，被删除 / 移走的已找不到）。
-/// - `any_active`：含下载中 / 排队（暂停）；`any_resumable`：含暂停 / 失败（继续）。
+/// - `any_active`：含下载中 / 排队 / 做种中（暂停）；`any_resumable`：含暂停 / 失败 /
+///   可恢复做种（继续）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SelectionSummary {
     pub(crate) count: usize,
@@ -3163,30 +3522,40 @@ impl RowAction {
 }
 
 /// 行悬停操作集合：下载中 / 排队 → 暂停；暂停 → 继续；失败 → 重试；完成 → 打开
-/// 文件（仅本地，且文件仍在下载目录）；本地任务再加「在文件夹中显示」，`with_detail`
+/// 文件（仅本地，且文件仍在下载目录）；做种中的完成任务先给「暂停」、做种已停止 / 达标的
+/// 先给「继续」；本地任务再加「在文件夹中显示」，`with_detail`
 /// 时最后加「详情」（远程任务没有本机详情）。远程任务只给可用操作：已结束的远程任务
 /// （失败 / 取消 / 完成）不能「继续」——云端只接受暂停中任务的继续。
 pub(crate) fn row_actions(
-    state: TaskState,
+    task: &DownloadTaskView,
     is_local: bool,
-    file_missing: bool,
     with_detail: bool,
 ) -> impl Iterator<Item = RowAction> {
-    let primary = match state {
+    let primary = match task.state {
         TaskState::Downloading | TaskState::Pending => Some(RowAction::Pause),
         TaskState::Paused => Some(RowAction::Resume),
         TaskState::Failed => is_local.then_some(RowAction::Retry),
-        TaskState::Completed => (is_local && !file_missing).then_some(RowAction::Open),
+        TaskState::Completed => (is_local && !task.file_missing).then_some(RowAction::Open),
     };
-    primary
+    let seeding = if task.is_seeding() {
+        Some(RowAction::Pause)
+    } else if task.can_resume_seeding() {
+        Some(RowAction::Resume)
+    } else {
+        None
+    };
+    seeding
         .into_iter()
+        .chain(primary)
         .chain(is_local.then_some(RowAction::Reveal))
         .chain((is_local && with_detail).then_some(RowAction::Detail))
 }
 
 /// 单任务命令：本地任务走 daemon；远程任务只有暂停 / 继续 / 删除经 `agent.remote.command`
 /// 转发，且仅限云端状态允许该动作的任务（状态未知的任务不控制）。打开 / 显示没有本机
-/// 文件、全局命令不属于单任务，返回 `None`。
+/// 文件、全局命令不属于单任务，返回 `None`。已完成的本地任务只在做种语义下响应：做种中可
+/// 「暂停」（停止做种）、做种已停止 / 达标且产物仍在可「继续」（恢复做种）；其余已完成任务不发
+/// 「继续」：引擎对完成态的 resume 会从头重新下载（#935），批量选择里混入的已完成任务必须跳过。
 fn task_command(row: &DownloadTaskView, action: ToolbarCommand) -> Option<DownloadsCommand> {
     let task_id = row.key.task_id().to_owned();
     if !row.key.is_local() {
@@ -3209,7 +3578,15 @@ fn task_command(row: &DownloadTaskView, action: ToolbarCommand) -> Option<Downlo
             }));
     }
     Some(match action {
+        ToolbarCommand::Resume
+            if row.state == TaskState::Completed && !row.can_resume_seeding() =>
+        {
+            return None;
+        }
         ToolbarCommand::Resume => DownloadsCommand::Resume { task_id },
+        ToolbarCommand::Pause if row.state == TaskState::Completed && !row.is_seeding() => {
+            return None;
+        }
         ToolbarCommand::Pause => DownloadsCommand::Pause { task_id },
         ToolbarCommand::Delete => DownloadsCommand::Delete {
             task_id,
@@ -3252,13 +3629,30 @@ pub(crate) fn status_color(state: TaskState, cx: &App) -> Hsla {
     }
 }
 
-/// 行级状态色：已完成但文件已不在下载目录时取 `warning`，其余同 [`status_color`]。
+/// 行级状态色：做种中 / 排队做种取 `success`（绿），已完成但文件已不在下载目录时取
+/// `warning`，其余同 [`status_color`]。
 pub(crate) fn task_status_color(task: &DownloadTaskView, cx: &App) -> Hsla {
     if task.is_file_missing() {
         active_theme(cx).extended().colors.warning
+    } else if is_seeding_row(task) {
+        active_theme(cx).extended().colors.success
     } else {
         status_color(task.state, cx)
     }
+}
+
+/// 本地已完成且正在（或排队）做种：`seeding_status` 1 = 做种中，8 = 排队做种。
+fn is_seeding_row(task: &DownloadTaskView) -> bool {
+    task.source == TaskSource::Local
+        && task.state == TaskState::Completed
+        && matches!(task.seeding_status, 1 | 8)
+}
+
+/// 做种中（`seeding_status == 1`）且有上传速度时的实时上传速率（字节/秒）。
+fn seeding_upload_speed(task: &DownloadTaskView) -> Option<u64> {
+    (is_seeding_row(task) && task.seeding_status == 1)
+        .then_some(task.upload_speed_bytes_per_second)
+        .filter(|speed| *speed > 0)
 }
 
 /// 已下 / 总量；总量未知时只给已下。
@@ -3334,16 +3728,18 @@ pub(crate) fn render_download_table(
         .on_prepaint(move |bounds, window, cx| {
             let width = f32::from(bounds.size.width);
             let text_scale = f32::from(active_theme(cx).text_extent(1.));
+            let icon_base = f32::from(active_theme(cx).extended().icon.lg);
             let delegate = observed.read(cx).delegate();
             let sync_width = delegate.viewport_needs_sync(width);
-            let rescale = delegate.text_scale_stale(text_scale);
+            let rescale =
+                delegate.text_scale_stale(text_scale) || delegate.icon_base_stale(icon_base);
             let arm_timer = delegate.needs_reorder_timer();
             if !sync_width && !rescale && !arm_timer {
                 return;
             }
             window.defer(cx, move |_, cx| {
                 observed.update(cx, |table, cx| {
-                    // 界面缩放 / 字号变化后列的最小宽、默认宽随之变化，重建列。
+                    // 界面缩放 / 字号 / 图标尺寸变化后列的最小宽、默认宽、选择列宽随之变化，重建列。
                     let resized = sync_width && table.delegate_mut().set_viewport_width(width);
                     if resized || rescale {
                         table.refresh(cx);
@@ -3699,13 +4095,14 @@ mod tests {
 
     use super::{
         DownloadColumnKind, DownloadTableDelegate, DownloadsCommand, RowAction, SelectionSummary,
-        TableFilter, ToolbarCommand, VisibleRow, group_by_key, percent_label, row_actions,
-        task_command,
+        TableFilter, ToolbarCommand, VisibleRow, group_by_key, is_seeding_row, percent_label,
+        row_actions, seeding_upload_speed, task_command,
     };
     use crate::{
         model::{
             CategoryIndex, DownloadFilter, DownloadStatusFilter, DownloadTaskView, RowKey,
             TaskSource, TaskState, TaskStore,
+            group_tree::GroupMeta,
             view_prefs::{SortDir, ViewGroupBy, ViewPrefs, ViewSortKey},
         },
         strings::DownloadStrings,
@@ -3802,6 +4199,33 @@ mod tests {
         assert!(!delegate.in_multi_select());
         delegate.enter_multi_select();
         assert!(delegate.in_multi_select());
+        Ok(())
+    }
+
+    /// 任务表分页载入期间：侧栏「全部」给出服务端总数、其余不给计数，全选不作用于占位表。
+    #[test]
+    fn loading_state_reports_the_server_total_and_blocks_select_all() -> Result<(), I18nError> {
+        let mut delegate = delegate(&[])?;
+        assert_eq!(delegate.count_matching(&DownloadFilter::ALL), 0);
+        delegate.store.set_loading(Some(230_000));
+        assert_eq!(delegate.count_matching(&DownloadFilter::ALL), 230_000);
+        assert_eq!(
+            delegate.count_matching(&DownloadFilter::status(DownloadStatusFilter::Completed)),
+            0
+        );
+        delegate.select_all_tasks();
+        assert!(delegate.selected_tasks.is_empty());
+        assert!(!delegate.in_multi_select());
+
+        // 队列位置表单独重载时任务行仍在：计数照常，但全选同样被挡住。
+        let mut delegate = delegate_with_missing(&[2, 2], &[])?;
+        delegate.store.set_loading(Some(2));
+        assert_eq!(delegate.count_matching(&DownloadFilter::ALL), 2);
+        delegate.select_all_tasks();
+        assert!(delegate.selected_tasks.is_empty());
+        delegate.store.set_loading(None);
+        delegate.select_all_tasks();
+        assert_eq!(delegate.selected_tasks.len(), 2);
         Ok(())
     }
 
@@ -4066,6 +4490,119 @@ mod tests {
         Ok(())
     }
 
+    /// t0 完成 / t1 下载中 / t2 暂停（子目录 extras）同属组 `g`，t3 排队且不在组里。
+    fn grouped_delegate() -> Result<DownloadTableDelegate, I18nError> {
+        let mut delegate = delegate(&[3, 1, 2, 0])?;
+        for (ix, dir) in [(0, "/tmp/Pack"), (1, "/tmp/Pack"), (2, "/tmp/Pack/extras")] {
+            let mut row = delegate.store.local()[ix].clone();
+            row.group_id = "g".into();
+            row.save_dir = dir.into();
+            delegate.store.set_local(ix, row);
+        }
+        delegate.set_groups(std::collections::HashMap::from([(
+            "g".to_owned(),
+            GroupMeta {
+                name: "Pack".into(),
+                name_fold: "pack".into(),
+                save_dir: "/tmp/Pack".into(),
+                source_url: String::new(),
+                created_at_secs: 99,
+            },
+        )]));
+        delegate.refresh_view();
+        Ok(delegate)
+    }
+
+    fn local(id: &str) -> RowKey {
+        RowKey::Local(id.into())
+    }
+
+    #[test]
+    fn group_folds_into_one_collapsed_row_and_expands_by_directory() -> Result<(), I18nError> {
+        let mut delegate = grouped_delegate()?;
+        // 智能排序：组聚合为下载中，排在排队的 t3 之前；默认折叠。
+        assert!(matches!(
+            delegate.visible.as_slice(),
+            [VisibleRow::Group(0), VisibleRow::Task(_)]
+        ));
+        let counts = delegate.group_rows[0].aggregate.counts;
+        assert_eq!(
+            (counts.total, counts.done, counts.downloading, counts.paused),
+            (3, 1, 1, 1)
+        );
+
+        delegate.toggle_group_expanded("g");
+        delegate.refresh_view();
+        let keys: Vec<Option<RowKey>> = (0..delegate.visible.len())
+            .map(|ix| delegate.row_key_at(ix))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                None,
+                Some(local("t0")),
+                Some(local("t1")),
+                None,
+                Some(local("t2")),
+                Some(local("t3"))
+            ]
+        );
+        assert!(matches!(
+            &delegate.visible[3],
+            VisibleRow::GroupDir { path, count: 1, collapsed: false, .. } if path == "extras"
+        ));
+        assert!(matches!(
+            delegate.visible[4],
+            VisibleRow::Member { depth: 2, .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn group_click_selects_members_and_select_all_covers_collapsed_groups() -> Result<(), I18nError>
+    {
+        let mut delegate = grouped_delegate()?;
+        delegate.select_group("g", Modifiers::default());
+        assert_eq!(
+            delegate.selected_tasks,
+            HashSet::from([local("t0"), local("t1"), local("t2")])
+        );
+        assert_eq!(delegate.focused_group(), Some("g"));
+        // 选区不再恰好是该组时，停靠面板不再显示组概览。
+        delegate.select_task(local("t3"), Modifiers::default());
+        assert_eq!(delegate.focused_group(), None);
+
+        // 折叠的组也在「全选」范围内。
+        delegate.select_all_tasks();
+        assert_eq!(delegate.selection_summary().count, 4);
+
+        // Cmd/Ctrl 单击整组移出 / 并入选区。
+        delegate.select_group("g", Modifiers::secondary_key());
+        assert_eq!(delegate.selected_tasks, HashSet::from([local("t3")]));
+        Ok(())
+    }
+
+    #[test]
+    fn group_row_aggregates_only_members_in_view() -> Result<(), I18nError> {
+        let mut delegate = grouped_delegate()?;
+        delegate.set_filter(TableFilter::Download(DownloadFilter::status(
+            DownloadStatusFilter::Completed,
+        )));
+        delegate.refresh_view();
+        let group = &delegate.group_rows[0];
+        assert_eq!(group.members.len(), 1);
+        assert_eq!(group.aggregate.state(), TaskState::Completed);
+
+        // 搜索命中组名：全部成员可见，组强制展开。
+        delegate.set_filter(TableFilter::Download(DownloadFilter::ALL));
+        delegate.set_query("PACK");
+        delegate.refresh_view();
+        assert_eq!(delegate.group_rows[0].members.len(), 3);
+        assert!(delegate.group_rows[0].expanded);
+        assert_eq!(delegate.visible.len(), 5);
+        Ok(())
+    }
+
     #[test]
     fn shift_range_selection_skips_group_headers() -> Result<(), I18nError> {
         let mut delegate = delegate(&[1, 3, 1, 3])?;
@@ -4095,36 +4632,6 @@ mod tests {
             .iter()
             .find(|column| column.kind == kind)
             .map(|column| column.width)
-    }
-
-    #[test]
-    fn relaxed_density_folds_metric_columns_into_file_name() -> Result<(), I18nError> {
-        let mut delegate = delegate(&[1])?;
-        assert!(delegate.set_column_visible(DownloadColumnKind::Speed, true));
-        assert!(delegate.set_column_visible(DownloadColumnKind::FileName, false));
-        let shown = |delegate: &DownloadTableDelegate| -> Vec<DownloadColumnKind> {
-            (1..=delegate.shown_columns_count())
-                .filter_map(|ix| delegate.shown_column(ix).map(|column| column.kind))
-                .collect()
-        };
-        let comfortable = shown(&delegate);
-        assert!(comfortable.contains(&DownloadColumnKind::Speed));
-        assert!(!comfortable.contains(&DownloadColumnKind::FileName));
-
-        // 宽松：主列恒显示，大小 / 进度 / 速度 / 剩余时间不单独成列，其余列照偏好。
-        delegate.prefs_mut().density = crate::model::view_prefs::ViewDensity::Relaxed;
-        assert_eq!(
-            shown(&delegate),
-            vec![
-                DownloadColumnKind::FileName,
-                DownloadColumnKind::Status,
-                DownloadColumnKind::Created
-            ]
-        );
-        // 列偏好不变：切回舒适密度原样恢复。
-        delegate.prefs_mut().density = crate::model::view_prefs::ViewDensity::Comfortable;
-        assert_eq!(shown(&delegate), comfortable);
-        Ok(())
     }
 
     #[test]
@@ -4253,7 +4760,6 @@ mod tests {
             ViewGroupBy::Type,
             ViewGroupBy::Queue,
             ViewGroupBy::Site,
-            ViewGroupBy::Group,
         ];
         for sort_key in sort_keys {
             for sort_dir in [SortDir::Asc, SortDir::Desc] {
@@ -4270,6 +4776,19 @@ mod tests {
                     ));
                     fast.set_categories(Rc::clone(&categories));
                     full.set_categories(categories);
+                    // `group0` 是已知任务组（折叠成文件夹行），`group1` 是孤儿 id（按普通任务显示）。
+                    let groups = std::collections::HashMap::from([(
+                        "group0".to_owned(),
+                        GroupMeta {
+                            name: "Pack".into(),
+                            name_fold: "pack".into(),
+                            save_dir: "/tmp".into(),
+                            source_url: "https://site0.test/pack".into(),
+                            created_at_secs: 97,
+                        },
+                    )]);
+                    fast.set_groups(groups.clone());
+                    full.set_groups(groups);
                     let prefs = ViewPrefs {
                         sort_key,
                         sort_dir,
@@ -4321,7 +4840,7 @@ mod tests {
                             4 => {
                                 row.boosted = !row.boosted;
                                 row.preparing = !row.preparing;
-                                row.queue_position = (random % 5) as u32;
+                                row.queue_key = Some((random % 5) as i64).filter(|key| *key > 0);
                                 fast.store.set_local(ix, row);
                             }
                             5 => {
@@ -4348,10 +4867,16 @@ mod tests {
                             9 => {
                                 if let Some(key) = fast.visible.iter().find_map(|row| match row {
                                     VisibleRow::GroupHeader { key, .. } => Some(key.clone()),
-                                    VisibleRow::Task(_) => None,
+                                    _ => None,
                                 }) {
                                     fast.toggle_group_collapsed(&key);
                                     full.toggle_group_collapsed(&key);
+                                }
+                                if let Some(id) =
+                                    fast.group_rows.first().map(|group| group.id.clone())
+                                {
+                                    fast.toggle_group_expanded(&id);
+                                    full.toggle_group_expanded(&id);
                                 }
                             }
                             10 => {
@@ -4408,6 +4933,118 @@ mod tests {
                     assert!(fast.full_sort_count < full.full_sort_count);
                 }
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn incremental_sorted_order_matches_full_sort_under_batched_row_churn() -> Result<(), I18nError>
+    {
+        for (sort_key, sort_dir) in [
+            (ViewSortKey::Smart, SortDir::Desc),
+            (ViewSortKey::Created, SortDir::Asc),
+            (ViewSortKey::Name, SortDir::Asc),
+            (ViewSortKey::Size, SortDir::Desc),
+            (ViewSortKey::Status, SortDir::Asc),
+        ] {
+            let statuses: Vec<i32> = (0..90).map(|ix| ix % 6).collect();
+            let (mut fast, mut full) = paired_delegates(&statuses)?;
+            let prefs = ViewPrefs {
+                sort_key,
+                sort_dir,
+                ..ViewPrefs::default()
+            };
+            fast.set_prefs(prefs.clone());
+            full.set_prefs(prefs);
+            let start = Instant::now();
+            refresh_pair(&mut fast, &mut full, start);
+            let template = fast.store.local()[0].clone();
+            let mut random = 0x2545_f491_4f6c_dd1d_u64;
+            let mut serial = 0_u64;
+            for step in 1..=300_u64 {
+                // 一帧内先发生 1-4 个变更，再刷新：重放要处理交错的更新 / 追加 / swap_remove。
+                for _ in 0..=(random % 4) {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    let count = fast.store.local().len();
+                    let ix = (random >> 32) as usize % count.max(1);
+                    match random % 7 {
+                        0 | 1 if count > 0 => {
+                            let mut row = fast.store.local()[ix].clone();
+                            row.state = match (random >> 8) % 5 {
+                                0 => TaskState::Downloading,
+                                1 => TaskState::Pending,
+                                2 => TaskState::Paused,
+                                3 => TaskState::Completed,
+                                _ => TaskState::Failed,
+                            };
+                            row.boosted = (random >> 12).is_multiple_of(4);
+                            fast.store.set_local(ix, row);
+                        }
+                        2 if count > 0 => {
+                            let mut row = fast.store.local()[ix].clone();
+                            row.created_at_secs += (random >> 9) as i64 % 40 - 20;
+                            row.size_bytes = (random >> 20) % 50;
+                            fast.store.set_local(ix, row);
+                        }
+                        3 if count > 0 => {
+                            let mut row = fast.store.local()[ix].clone();
+                            row.name = format!("episode{}.zip", (random >> 10) % 30);
+                            row.name_fold = row.name.to_lowercase();
+                            fast.store.set_local(ix, row);
+                        }
+                        4 => {
+                            for _ in 0..=(random >> 40) % 3 {
+                                serial += 1;
+                                let mut added = template.clone();
+                                added.key = RowKey::Local(format!("added{serial}"));
+                                added.created_at_secs = (serial as i64 * 7) % 120;
+                                added.state = if serial.is_multiple_of(2) {
+                                    TaskState::Pending
+                                } else {
+                                    TaskState::Downloading
+                                };
+                                fast.store.append_local(added);
+                            }
+                            fast.store.commit_appends();
+                        }
+                        5 if count > 8 => {
+                            for _ in 0..=(random >> 40) % 3 {
+                                let count = fast.store.local().len();
+                                if count > 8 {
+                                    let ix = (random >> (8 + serial % 20)) as usize % count;
+                                    serial += 1;
+                                    fast.store.swap_remove_local_quiet(ix);
+                                }
+                            }
+                            fast.store.commit_removals();
+                        }
+                        _ if count > 0 => {
+                            let key = Some((random >> 16) as i64 % 6).filter(|key| *key > 0);
+                            fast.store.set_queue_key(ix, key);
+                        }
+                        _ => {}
+                    }
+                }
+                if step % 37 == 0 {
+                    let query = if fast.query.is_empty() { "episode" } else { "" };
+                    fast.set_query(query);
+                    full.set_query(query);
+                }
+                let now = start + Duration::from_millis(step * 53);
+                refresh_pair(&mut fast, &mut full, now);
+                assert_eq!(
+                    fast.sorted_rows, full.sorted_rows,
+                    "{sort_key:?} step {step}"
+                );
+            }
+            assert!(
+                fast.sort_all_count * 4 < full.sort_all_count,
+                "{sort_key:?}: {} whole-table sorts vs {}",
+                fast.sort_all_count,
+                full.sort_all_count
+            );
         }
         Ok(())
     }
@@ -4576,14 +5213,14 @@ mod tests {
         refresh_pair(&mut fast, &mut full, now);
         let sorts = fast.full_sort_count;
         let mut active = fast.store.local()[0].clone();
-        active.queue_position = 9;
+        active.queue_key = Some(9);
         active.preparing = true;
         fast.store.set_local(0, active);
         refresh_pair(&mut fast, &mut full, now + Duration::from_millis(10));
         assert_eq!(fast.full_sort_count, sorts);
 
         let mut queued = fast.store.local()[1].clone();
-        queued.queue_position = 1;
+        queued.queue_key = Some(1);
         fast.store.set_local(1, queued);
         refresh_pair(&mut fast, &mut full, now + Duration::from_millis(20));
         assert_eq!(fast.full_sort_count, sorts + 1);
@@ -4593,7 +5230,7 @@ mod tests {
         refresh_pair(&mut fast, &mut full, now + Duration::from_millis(30));
         assert_eq!(fast.full_sort_count, sorts + 2);
         let mut preparing = fast.store.local()[1].clone();
-        preparing.queue_position = 3;
+        preparing.queue_key = Some(3);
         fast.store.set_local(1, preparing);
         refresh_pair(&mut fast, &mut full, now + Duration::from_millis(40));
         assert_eq!(fast.full_sort_count, sorts + 2);
@@ -4693,9 +5330,57 @@ mod tests {
         Ok(())
     }
 
+    fn local_view(status: i32, seeding_status: i32, file_missing: bool) -> DownloadTaskView {
+        let task = serde_json::from_value::<fluxdown_protocol::TaskDto>(serde_json::json!({
+            "taskId": "t1",
+            "url": "magnet:?xt=urn:btih:abc",
+            "fileName": "f.bin",
+            "saveDir": "/tmp",
+            "status": status,
+            "downloadedBytes": 1,
+            "totalBytes": 1,
+            "errorMessage": "",
+            "createdAt": "100",
+            "proxyUrl": "",
+            "queueId": "main",
+            "checksum": ""
+        }))
+        .expect("task");
+        let mut view = DownloadTaskView::local(&task, None, false);
+        view.seeding_status = seeding_status;
+        view.file_missing = file_missing;
+        view
+    }
+
+    #[test]
+    fn only_active_seeding_rows_show_upload_speed() {
+        let with_upload = |status, seeding| {
+            let mut view = local_view(status, seeding, false);
+            view.upload_speed_bytes_per_second = 2048;
+            view
+        };
+        assert_eq!(seeding_upload_speed(&with_upload(3, 1)), Some(2048));
+        // 排队做种 / 已停止 / 下载中都不显示做种上传速度。
+        assert_eq!(seeding_upload_speed(&with_upload(3, 8)), None);
+        assert_eq!(seeding_upload_speed(&with_upload(3, 2)), None);
+        assert_eq!(seeding_upload_speed(&with_upload(1, 1)), None);
+        assert_eq!(seeding_upload_speed(&local_view(3, 1, false)), None);
+        assert!(is_seeding_row(&local_view(3, 8, false)));
+        assert!(!is_seeding_row(&local_view(3, 0, false)));
+    }
+
     #[test]
     fn row_actions_offer_only_available_operations() {
-        let actions = |state, local| row_actions(state, local, false, false).collect::<Vec<_>>();
+        let actions = |state, local| {
+            let status = match state {
+                TaskState::Downloading => 1,
+                TaskState::Paused => 2,
+                TaskState::Completed => 3,
+                TaskState::Failed => 4,
+                TaskState::Pending => 0,
+            };
+            row_actions(&local_view(status, 0, false), local, false).collect::<Vec<_>>()
+        };
         assert_eq!(
             actions(TaskState::Downloading, true),
             [RowAction::Pause, RowAction::Reveal]
@@ -4714,18 +5399,52 @@ mod tests {
         assert!(actions(TaskState::Failed, false).is_empty());
         // 文件已被删除 / 移走的已完成任务：不给「打开」，仍可「在文件夹中显示」。
         assert_eq!(
-            row_actions(TaskState::Completed, true, true, false).collect::<Vec<_>>(),
+            row_actions(&local_view(3, 0, true), true, false).collect::<Vec<_>>(),
             [RowAction::Reveal]
         );
         // 「详情」排在最后，只给本地任务（远程任务没有本机详情）。
         assert_eq!(
-            row_actions(TaskState::Paused, true, false, true).collect::<Vec<_>>(),
+            row_actions(&local_view(2, 0, false), true, true).collect::<Vec<_>>(),
             [RowAction::Resume, RowAction::Reveal, RowAction::Detail]
         );
         assert_eq!(
-            row_actions(TaskState::Paused, false, false, true).collect::<Vec<_>>(),
+            row_actions(&local_view(2, 0, false), false, true).collect::<Vec<_>>(),
             [RowAction::Resume]
         );
+    }
+
+    /// 做种语义：做种中（1 / 8）给「暂停」、达标 / 停止（2..=7）且文件在给「继续」，
+    /// 并分别映射为 pause / resume 命令；seeding_status 0 的已完成任务仍不可继续（#935）。
+    #[test]
+    fn seeding_rows_get_pause_and_stopped_seeds_get_resume() {
+        for seeding in [1, 8] {
+            let view = local_view(3, seeding, false);
+            assert_eq!(
+                row_actions(&view, true, false).collect::<Vec<_>>(),
+                [RowAction::Pause, RowAction::Open, RowAction::Reveal]
+            );
+            assert!(matches!(
+                task_command(&view, ToolbarCommand::Pause),
+                Some(DownloadsCommand::Pause { task_id }) if task_id == "t1"
+            ));
+            assert!(task_command(&view, ToolbarCommand::Resume).is_none());
+        }
+        for seeding in 2..=7 {
+            let view = local_view(3, seeding, false);
+            assert_eq!(
+                row_actions(&view, true, false).collect::<Vec<_>>(),
+                [RowAction::Resume, RowAction::Open, RowAction::Reveal]
+            );
+            assert!(matches!(
+                task_command(&view, ToolbarCommand::Resume),
+                Some(DownloadsCommand::Resume { task_id }) if task_id == "t1"
+            ));
+            assert!(task_command(&view, ToolbarCommand::Pause).is_none());
+        }
+        // 文件丢失的停止做种任务不可继续。
+        let missing = local_view(3, 4, true);
+        assert!(task_command(&missing, ToolbarCommand::Resume).is_none());
+        assert!(!row_actions(&missing, true, false).any(|action| action == RowAction::Resume));
     }
 
     #[test]
@@ -4758,6 +5477,46 @@ mod tests {
         ));
     }
 
+    /// #935：批量「继续」不得把已完成的本地任务交给 daemon（引擎对完成态的 resume 会从头重下）；
+    /// 暂停 / 失败的本地任务照常继续，已完成任务的删除 / 打开不受影响。
+    #[test]
+    fn local_resume_skips_completed_tasks() {
+        let row = |status: i32| {
+            let task = serde_json::from_value::<fluxdown_protocol::TaskDto>(serde_json::json!({
+                "taskId": "t1",
+                "url": "https://example.com/file",
+                "fileName": "f.bin",
+                "saveDir": "/tmp",
+                "status": status,
+                "downloadedBytes": 1,
+                "totalBytes": 1,
+                "errorMessage": "",
+                "createdAt": "100",
+                "proxyUrl": "",
+                "queueId": "main",
+                "checksum": ""
+            }))
+            .expect("task");
+            DownloadTaskView::local(&task, None, false)
+        };
+        assert!(task_command(&row(3), ToolbarCommand::Resume).is_none());
+        assert!(task_command(&row(3), ToolbarCommand::Pause).is_none());
+        for status in [2, 4] {
+            assert!(matches!(
+                task_command(&row(status), ToolbarCommand::Resume),
+                Some(DownloadsCommand::Resume { task_id }) if task_id == "t1"
+            ));
+        }
+        assert!(matches!(
+            task_command(&row(3), ToolbarCommand::Delete),
+            Some(DownloadsCommand::Delete { .. })
+        ));
+        assert!(matches!(
+            task_command(&row(3), ToolbarCommand::Open),
+            Some(DownloadsCommand::OpenTask { .. })
+        ));
+    }
+
     #[test]
     fn percent_label_floors_and_marks_sub_percent_progress() {
         assert_eq!(percent_label(0.).as_ref(), "0%");
@@ -4787,12 +5546,45 @@ mod context_menu_tests {
             url_replaceable: true,
             is_plugin_retry_error: false,
             file_missing: false,
+            is_seeding: false,
+            can_resume_seeding: false,
         }
     }
 
     #[test]
     fn empty_selection_has_no_menu_items() {
         assert!(context_menu_items(&[]).is_empty());
+    }
+
+    #[test]
+    fn seeding_rows_offer_pause_and_stopped_seeds_offer_resume() {
+        let mut seeding = task(true, TaskState::Completed);
+        seeding.is_seeding = true;
+        let items = context_menu_items(&[seeding]);
+        assert!(items.contains(&MenuEntry::Pause));
+        assert!(!items.contains(&MenuEntry::Resume));
+
+        let mut stopped = task(true, TaskState::Completed);
+        stopped.can_resume_seeding = true;
+        let items = context_menu_items(&[stopped]);
+        assert!(items.contains(&MenuEntry::Resume));
+        assert!(!items.contains(&MenuEntry::Pause));
+
+        // 普通已完成任务（含 seeding_status 0、文件丢失）两者都不给。
+        let items = context_menu_items(&[task(true, TaskState::Completed)]);
+        assert!(!items.contains(&MenuEntry::Pause));
+        assert!(!items.contains(&MenuEntry::Resume));
+    }
+
+    #[test]
+    fn failed_local_task_offers_both_resume_and_pause() {
+        // #947：失败任务可能正等待自动重试，暂停用于撤销重试。
+        let items = context_menu_items(&[task(true, TaskState::Failed)]);
+        assert!(items.contains(&MenuEntry::Resume));
+        assert!(items.contains(&MenuEntry::Pause));
+        // 远程任务没有对应的云端暂停命令。
+        let items = context_menu_items(&[task(false, TaskState::Failed)]);
+        assert!(!items.contains(&MenuEntry::Pause));
     }
 
     #[test]
@@ -4863,14 +5655,6 @@ mod context_menu_tests {
     }
 
     #[test]
-    fn multi_select_paused_and_failed_shows_resume_but_not_pause() {
-        let selection = [task(true, TaskState::Paused), task(true, TaskState::Failed)];
-        let items = context_menu_items(&selection);
-        assert!(items.contains(&MenuEntry::Resume));
-        assert!(!items.contains(&MenuEntry::Pause));
-    }
-
-    #[test]
     fn ignore_plugin_retry_only_for_single_failed_plugin_task() {
         let mut plugin_failure = task(true, TaskState::Failed);
         plugin_failure.is_plugin_retry_error = true;
@@ -4896,6 +5680,15 @@ mod context_menu_tests {
 
         let not_boosted = task(true, TaskState::Downloading);
         assert!(context_menu_items(&[not_boosted]).contains(&MenuEntry::Boost));
+
+        // 已结束任务上的残留标记不提供「取消优先」，只给会提示的「优先下载」。
+        for state in [TaskState::Completed, TaskState::Failed] {
+            let mut stale = task(true, state);
+            stale.boosted = true;
+            let items = context_menu_items(&[stale]);
+            assert!(items.contains(&MenuEntry::Boost));
+            assert!(!items.contains(&MenuEntry::CancelBoost));
+        }
     }
 
     #[test]
@@ -5015,6 +5808,7 @@ mod context_menu_tests {
             context_menu_items(&[task(true, TaskState::Failed)]),
             vec![
                 MenuEntry::Resume,
+                MenuEntry::Pause,
                 MenuEntry::Boost,
                 MenuEntry::OpenFolder,
                 MenuEntry::Rename,

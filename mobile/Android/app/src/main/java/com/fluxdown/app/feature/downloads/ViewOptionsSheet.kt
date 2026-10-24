@@ -299,6 +299,7 @@ private fun rememberClearFinished(onDismiss: () -> Unit): () -> Unit {
     val title = stringResource(R.string.mobileClearFinishedTitle)
     val cancel = stringResource(R.string.cancel)
     val disconnected = stringResource(R.string.localServiceDisconnected)
+    val loadingText = stringResource(R.string.mobileTasksLoading)
     val messageFmt = stringResource(R.string.mobileClearFinishedMessage)
     val actionFmt = stringResource(R.string.mobileClearFinishedAction)
     val toastFmt = stringResource(R.string.mobileToastClearedFinished)
@@ -311,6 +312,8 @@ private fun rememberClearFinished(onDismiss: () -> Unit): () -> Unit {
                 haptics.reject()
                 overlays.toast(disconnected, FluxToastKind.Error, FluxIcons.WifiOff)
             }
+            // 任务表还在载入：ids 为空不代表“没有已完成任务”。
+            state.tasksLoading -> overlays.toast(loadingText, FluxToastKind.Info)
             ids.isEmpty() -> overlays.toast(none, FluxToastKind.Info)
             else -> overlays.showDialog(
                 FluxDialogSpec(

@@ -135,10 +135,8 @@ impl DaemonService {
     /// 从线性化投影读取任务，用于二进制文件端点。
     #[must_use]
     pub fn task(&self, task_id: &str) -> Option<fluxdown_protocol::TaskDto> {
-        self.daemon_snapshot()
-            .tasks
-            .into_iter()
-            .find(|task| task.task_id == task_id)
+        self.events
+            .inspect(|snapshot| snapshot.task(task_id).cloned())
     }
 
     /// 分发 hello 后的连接级 RPC 调用。
@@ -172,15 +170,27 @@ impl DaemonService {
     ) -> Result<Value, RpcErrorObject> {
         match method_name {
             method::SYSTEM_PING => Ok(json!({ "ok": true })),
-            method::SYSTEM_SNAPSHOT => to_value(self.events.snapshot()),
-            method::DAEMON_TASK_LIST => to_value(self.daemon_snapshot().tasks),
+            // 线上快照只带头；任务表与队列位置表经 `system.taskPage` 分页（见协议 `table_sync`）。
+            method::SYSTEM_SNAPSHOT => to_value(self.events.wire_snapshot()),
+            method::SYSTEM_TASK_PAGE => {
+                let params = parse_params::<fluxdown_protocol::TablePageParams>(params)?;
+                let page = self.events.task_page(&params).map_err(|_| {
+                    invalid_argument("cursor", "cursor is not valid for this section")
+                })?;
+                to_value(page)
+            }
+            method::DAEMON_TASK_LIST => {
+                let params = parse_optional_params::<fluxdown_protocol::TaskListParams>(params)?;
+                to_value(
+                    self.events
+                        .inspect(|snapshot| list_tasks(snapshot, &params))?,
+                )
+            }
             method::DAEMON_TASK_GET => {
                 let params = parse_params::<IdParams>(params)?;
                 let task = self
-                    .daemon_snapshot()
-                    .tasks
-                    .into_iter()
-                    .find(|task| task.task_id == params.id)
+                    .events
+                    .inspect(|snapshot| snapshot.task(&params.id).cloned())
                     .ok_or_else(not_found)?;
                 to_value(task)
             }
@@ -330,7 +340,9 @@ impl DaemonService {
                 })
                 .await
             }
-            method::DAEMON_QUEUE_LIST => to_value(self.daemon_snapshot().queues),
+            method::DAEMON_QUEUE_LIST => {
+                to_value(self.events.inspect(|snapshot| snapshot.queues.clone()))
+            }
             method::DAEMON_QUEUE_CREATE => {
                 let request = parse_params::<CreateQueueRequest>(params)?;
                 self.execute_unit(ActorOperation::CreateQueue {
@@ -396,7 +408,9 @@ impl DaemonService {
                 self.execute_unit(ActorOperation::Boost { task_id: params.id })
                     .await
             }
-            method::DAEMON_GROUP_LIST => to_value(self.daemon_snapshot().groups),
+            method::DAEMON_GROUP_LIST => {
+                to_value(self.events.inspect(|snapshot| snapshot.groups.clone()))
+            }
             method::DAEMON_GROUP_RESOLVE_PREVIEW => {
                 let request = parse_params::<fluxdown_protocol::ResolvePreviewRequest>(params)?;
                 #[cfg(feature = "plugins")]
@@ -466,7 +480,9 @@ impl DaemonService {
                 })
                 .await
             }
-            method::DAEMON_CONFIG_GET => to_value(self.daemon_snapshot().config),
+            method::DAEMON_CONFIG_GET => {
+                to_value(self.events.inspect(|snapshot| snapshot.config.clone()))
+            }
             method::DAEMON_CONFIG_PATCH => {
                 let patch = parse_params::<DaemonConfigPatch>(params)?;
                 let values = crate::config::validate_config_patch(&patch.values)
@@ -771,6 +787,56 @@ impl DaemonService {
                 })
             }
             #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_PAGE_SCRIPTS => {
+                let manager = self.plugin_manager()?;
+                let plugins = manager.list().await;
+                let result = fluxdown_engine::plugin::page_scripts::query(&plugins, &self.db)
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
+                to_value(fluxdown_protocol::PluginPageScriptsDto {
+                    sequence: result.sequence,
+                    epoch: result.epoch,
+                    scripts: result
+                        .scripts
+                        .into_iter()
+                        .map(|s| fluxdown_protocol::PluginPageScriptDto {
+                            identity: s.identity,
+                            plugin_name: s.plugin_name,
+                            plugin_version: s.plugin_version,
+                            id: s.id,
+                            title: s.title,
+                            matches: s.matches,
+                            exclude_matches: s.exclude_matches,
+                            run_at: s.run_at,
+                            world: s.world,
+                            all_frames: s.all_frames,
+                            sha256: s.sha256,
+                            bytes: s.bytes,
+                        })
+                        .collect(),
+                })
+            }
+            #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_PAGE_SCRIPT_SOURCE => {
+                let params =
+                    parse_params::<fluxdown_protocol::PluginPageScriptSourceParams>(params)?;
+                let manager = self.plugin_manager()?;
+                let plugins = manager.list().await;
+                let source = fluxdown_engine::plugin::page_scripts::source(
+                    &plugins,
+                    &params.identity,
+                    &params.id,
+                )
+                .await
+                .map_err(|error| invalid_argument("id", &error.to_string()))?;
+                to_value(fluxdown_protocol::PluginPageScriptSourceDto {
+                    identity: params.identity,
+                    id: params.id,
+                    sha256: source.sha256,
+                    code: source.code,
+                })
+            }
+            #[cfg(feature = "plugins")]
             method::DAEMON_PLUGIN_AUTH => {
                 let request = parse_params::<fluxdown_protocol::PluginAuthRequest>(params)?;
                 let result = self
@@ -1063,7 +1129,8 @@ impl DaemonService {
             | method::DAEMON_PLUGIN_VIEW_SNAPSHOT
             | method::DAEMON_PLUGIN_VIEW_KEEPALIVE
             | method::DAEMON_PLUGIN_COMMAND
-            | method::DAEMON_PLUGIN_INVOKE => self.plugin_host_call(method_name, params).await,
+            | method::DAEMON_PLUGIN_INVOKE
+            | method::DAEMON_PLUGIN_PAGE_INVOKE => self.plugin_host_call(method_name, params).await,
             #[cfg(not(feature = "plugins"))]
             method::DAEMON_PLUGIN_VIEW_OPEN
             | method::DAEMON_PLUGIN_VIEW_EVENT
@@ -1071,12 +1138,15 @@ impl DaemonService {
             | method::DAEMON_PLUGIN_VIEW_SNAPSHOT
             | method::DAEMON_PLUGIN_VIEW_KEEPALIVE
             | method::DAEMON_PLUGIN_COMMAND
-            | method::DAEMON_PLUGIN_INVOKE => {
+            | method::DAEMON_PLUGIN_INVOKE
+            | method::DAEMON_PLUGIN_PAGE_INVOKE => {
                 Err(unsupported_error("daemon was built without plugin support"))
             }
             #[cfg(not(feature = "plugins"))]
             method::DAEMON_PLUGIN_LIST
             | method::DAEMON_PLUGIN_SNIFF_RULES
+            | method::DAEMON_PLUGIN_PAGE_SCRIPTS
+            | method::DAEMON_PLUGIN_PAGE_SCRIPT_SOURCE
             | method::DAEMON_PLUGIN_SET_ENABLED
             | method::DAEMON_PLUGIN_UPDATE_SETTINGS
             | method::DAEMON_PLUGIN_INSTALL
@@ -1246,15 +1316,24 @@ impl DaemonService {
                 }
             }
             method::DAEMON_DIAGNOSTICS_DESCRIBE => {
-                let snapshot = self.daemon_snapshot();
+                let (tasks, queues, groups, config_revision, components) =
+                    self.events.inspect(|snapshot| {
+                        (
+                            snapshot.tasks.len(),
+                            snapshot.queues.len(),
+                            snapshot.groups.len(),
+                            snapshot.config.revision,
+                            snapshot.components.clone(),
+                        )
+                    });
                 Ok(json!({
                     "service": self.hello,
-                    "tasks": snapshot.tasks.len(),
-                    "queues": snapshot.queues.len(),
-                    "groups": snapshot.groups.len(),
-                    "configRevision": snapshot.config.revision,
+                    "tasks": tasks,
+                    "queues": queues,
+                    "groups": groups,
+                    "configRevision": config_revision,
                     "logDir": fluxdown_engine::logger::log_dir().display().to_string(),
-                    "components": snapshot.components,
+                    "components": components,
                 }))
             }
             method::DAEMON_DIAGNOSTICS_PROBE => {
@@ -1404,6 +1483,7 @@ impl DaemonService {
                 hint_file_size: params.hint_file_size.filter(|size| *size > 0).unwrap_or(0),
                 name_hint: params.name_hint.unwrap_or_default(),
                 unattended: params.unattended,
+                category_route: params.category_route,
             })
             .await;
         match result {
@@ -1434,6 +1514,7 @@ impl DaemonService {
             batch_id,
             common,
             items,
+            category_route,
         } = params;
         match self
             .actor
@@ -1441,6 +1522,7 @@ impl DaemonService {
                 batch_id,
                 common: Box::new(common),
                 items,
+                category_route,
             })
             .await
         {
@@ -1510,21 +1592,15 @@ impl DaemonService {
         self.execute_unit(operation).await
     }
 
-    fn daemon_snapshot(&self) -> fluxdown_protocol::DaemonSnapshot {
-        match self.events.snapshot().body {
-            SnapshotBody::Daemon(snapshot) => *snapshot,
-            SnapshotBody::Agent(_) => unreachable!("daemon event hub returned agent snapshot"),
-        }
-    }
-
     /// Doctor 动态探测：daemon 自己的目录在前、调用方追加的目录在后，按路径去重后并发真实写入；
     /// 同时运行已解析到路径的外部组件。
     async fn doctor_probe(
         &self,
         params: fluxdown_protocol::DiagnosticsProbeParams,
     ) -> fluxdown_protocol::DiagnosticsProbeResult {
-        let mut targets =
-            crate::doctor_probe::daemon_targets(&self.daemon_snapshot(), &self.data_dir);
+        let mut targets = self
+            .events
+            .inspect(|snapshot| crate::doctor_probe::daemon_targets(snapshot, &self.data_dir));
         targets.extend(params.extra_dirs);
         let components = crate::doctor_probe::component_paths(&self.db, &self.data_dir).await;
         let (storage, components) = tokio::join!(
@@ -1560,13 +1636,15 @@ impl DaemonService {
 
     fn group_spec(&self, request: CreateGroupRequest) -> CreateGroupSpec {
         let base_save_dir = if request.save_dir.trim().is_empty() {
-            self.daemon_snapshot()
-                .config
-                .values
-                .get("default_save_dir")
-                .filter(|value| !value.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(fluxdown_engine::user_dirs::download_dir_or_cwd)
+            self.events.inspect(|snapshot| {
+                snapshot
+                    .config
+                    .values
+                    .get("default_save_dir")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned()
+                    .unwrap_or_else(fluxdown_engine::user_dirs::download_dir_or_cwd)
+            })
         } else {
             request.save_dir
         };
@@ -1844,34 +1922,32 @@ fn component_name(component: fluxdown_protocol::ComponentKind) -> &'static str {
 
 impl DaemonService {
     async fn runtime_stats(&self) -> fluxdown_protocol::DaemonRuntimeStatsDto {
-        let snapshot = self.daemon_snapshot();
-        let save_dir = snapshot
-            .config
-            .values
-            .get("default_save_dir")
-            .cloned()
-            .filter(|path| !path.trim().is_empty())
-            .unwrap_or_else(fluxdown_engine::user_dirs::download_dir_or_cwd);
+        let (save_dir, active_tasks, pending_tasks, stats) = self.events.inspect(|snapshot| {
+            let save_dir = snapshot
+                .config
+                .values
+                .get("default_save_dir")
+                .cloned()
+                .filter(|path| !path.trim().is_empty())
+                .unwrap_or_else(fluxdown_engine::user_dirs::download_dir_or_cwd);
+            let active = snapshot
+                .tasks
+                .iter()
+                .filter(|task| matches!(task.status, 1 | 5))
+                .count();
+            let pending = snapshot
+                .tasks
+                .iter()
+                .filter(|task| task.status == 0)
+                .count();
+            (save_dir, active, pending, snapshot.runtime_stats.clone())
+        });
         fluxdown_protocol::DaemonRuntimeStatsDto {
-            active_tasks: u32::try_from(
-                snapshot
-                    .tasks
-                    .iter()
-                    .filter(|task| matches!(task.status, 1 | 5))
-                    .count(),
-            )
-            .unwrap_or(u32::MAX),
-            pending_tasks: u32::try_from(
-                snapshot
-                    .tasks
-                    .iter()
-                    .filter(|task| task.status == 0)
-                    .count(),
-            )
-            .unwrap_or(u32::MAX),
-            total_download_bps: snapshot.runtime_stats.total_download_bps,
-            retry_pending_tasks: snapshot.runtime_stats.retry_pending_tasks,
-            total_upload_bps: snapshot.runtime_stats.total_upload_bps,
+            active_tasks: u32::try_from(active_tasks).unwrap_or(u32::MAX),
+            pending_tasks: u32::try_from(pending_tasks).unwrap_or(u32::MAX),
+            total_download_bps: stats.total_download_bps,
+            retry_pending_tasks: stats.retry_pending_tasks,
+            total_upload_bps: stats.total_upload_bps,
             disk_free_bytes: fluxdown_engine::disk_space::available_space_checked(
                 std::path::PathBuf::from(&save_dir),
             )
@@ -1884,16 +1960,20 @@ impl DaemonService {
         &self,
         requested_path: String,
     ) -> Result<fluxdown_protocol::FsListResponse, RpcErrorObject> {
-        let snapshot = self.daemon_snapshot();
         let base = if requested_path.trim().is_empty() {
-            let configured = snapshot
-                .config
-                .values
-                .get("default_save_dir")
-                .cloned()
-                .unwrap_or_default();
+            let (configured, fallback) = self.events.inspect(|snapshot| {
+                (
+                    snapshot
+                        .config
+                        .values
+                        .get("default_save_dir")
+                        .cloned()
+                        .unwrap_or_default(),
+                    snapshot.runtime_stats.save_dir.clone(),
+                )
+            });
             if configured.trim().is_empty() {
-                snapshot.runtime_stats.save_dir
+                fallback
             } else {
                 configured
             }
@@ -2137,6 +2217,32 @@ fn parse_optional_params<T: DeserializeOwned + Default>(
     )
 }
 
+/// `daemon.task.list`：无分页参数时取全部（超过单页上限即拒绝，避免一次返回整张大表）；
+/// 带 `limit` / `cursor` 时按 `taskId` 升序分页。
+fn list_tasks(
+    snapshot: &fluxdown_protocol::DaemonSnapshot,
+    params: &fluxdown_protocol::TaskListParams,
+) -> Result<Vec<fluxdown_protocol::TaskDto>, RpcErrorObject> {
+    let max = fluxdown_protocol::TASK_PAGE_MAX_LIMIT;
+    if params.cursor.is_none() && params.limit.is_none() {
+        if snapshot.tasks.len() > max {
+            return Err(invalid_argument(
+                "limit",
+                &format!(
+                    "{} tasks exceed the {max}-task list cap; page with {{cursor, limit}}",
+                    snapshot.tasks.len()
+                ),
+            ));
+        }
+        return Ok(snapshot.tasks.clone());
+    }
+    let limit = params
+        .limit
+        .map_or(max, |limit| usize::try_from(limit).unwrap_or(max))
+        .clamp(1, max);
+    Ok(snapshot.task_page(params.cursor.as_deref(), limit).0)
+}
+
 fn to_value(value: impl serde::Serialize) -> Result<Value, RpcErrorObject> {
     serde_json::to_value(value).map_err(|error| internal_error(error.to_string()))
 }
@@ -2234,6 +2340,13 @@ fn actor_error(error: ActorCallError) -> RpcErrorObject {
             message,
             RpcErrorData::new(ApplicationErrorCode::Conflict, false),
         ),
+        ActorCallError::Operation(ActorError::TaskStateConflict(message)) => {
+            RpcErrorObject::application(
+                message,
+                RpcErrorData::new(ApplicationErrorCode::Conflict, false)
+                    .with_reason(fluxdown_protocol::ErrorReason::TaskStateConflict),
+            )
+        }
     }
 }
 

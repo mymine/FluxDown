@@ -3,7 +3,7 @@ title: 插件 SDK 与 CLI
 description: fluxdown-plugin-sdk 参考——create/build/validate/pack/dev 命令行、项目配置、运行时辅助函数、JSX 运行时、随包类型与 manifest 校验器 API。
 section: plugins
 order: 13
-sourceHash: "5e78e51cdd26"
+sourceHash: "e7118aef9c60"
 ---
 
 `fluxdown-plugin-sdk` 是用 TypeScript 编写 FluxDown 插件的工具链：带类型的 `flux.*`、用于[可移植视图](/docs/zh/plugins/views/)的 JSX 运行时、与引擎和插件索引同一套的 manifest 校验器，以及负责打包、校验、封装 `.fxplug` 的 CLI。
@@ -253,9 +253,9 @@ networkHostsOf(manifest);  // 所有视图的 desktop.networkHosts 的去重并�
 |---|---|
 | `validateManifest(manifest, files, options?)` | `manifest: unknown`，`files?: Set<string>`（包内相对路径，用 `/`；省略时跳过文件存在性检查），`options.strict?: boolean`（strict 模式需要 `files`；缺省时只返回一条要求提供 `files` 的错误，不会抛异常）。返回 `{ ok: boolean; errors: string[] }`，包含发现的**全部**错误。信息为中文，与引擎一致。 |
 | `validateSniffPack(content)` | `content: string \| Uint8Array`；返回 `{ ok, errors }`。 |
-| `riskOf(manifest)` | `permissions` 含 `desktop` 时为 `"full"`；含 `ffmpeg`、`ytdlp`、`auth`、`tasks`、`browserRules`、`background` 中任意一个时为 `"elevated"`；否则为 `"standard"`。 |
+| `riskOf(manifest)` | `permissions` 含 `desktop` 或 `pageScripts` 时为 `"full"`；含 `ffmpeg`、`ytdlp`、`auth`、`tasks`、`browserRules`、`background` 中任意一个时为 `"elevated"`；否则为 `"standard"`。 |
 | `networkHostsOf(manifest)` | `contributes.views[].desktop.networkHosts` 的去重并集，已排序。 |
-| `packageFilesOf(manifest)` | 安装时必须存在的文件：`main.entry`、每个 `desktop.entry`、`sniffRules`。 |
+| `packageFilesOf(manifest)` | 安装时必须存在的文件：`main.entry`、每个 `desktop.entry`、`sniffRules`、每个 `pageScripts[].js` 文件。 |
 | `isSafeRelativePath`、`isValidIdentity`、`isValidNetworkHost` | 校验器内部使用的判定函数。 |
 | `VALID_PERMISSIONS`、`VALID_EVENTS`、`VIEW_LOCATIONS` | 封闭的取值列表。 |
 | `WINDOW_SIZE_MIN`/`MAX`（240 / 4096）、`NETWORK_HOSTS_MAX`（64）、`VIEWS_MAX`（16）、`COMMANDS_MAX`（32）、`TITLE_MAX_CHARS`（40）、`SNIFF_PACK_MAX_BYTES`（256 KiB）、`SNIFF_PACK_MAX_RULES`（500）、`SNIFF_PACK_FORMAT` | 校验所用的上限常量。 |

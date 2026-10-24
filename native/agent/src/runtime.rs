@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use fluxdown_protocol::local_service::AgentStartupFailureKind;
 use fluxdown_protocol::{AgentSnapshot, ServiceEvent};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::api_host::AgentApiHost;
@@ -17,6 +18,7 @@ use crate::lifecycle::Lifecycle;
 use crate::power::PowerService;
 use crate::server_mode::{ServerHandle, ServerHandleParts, ServerRuntime, TokenSeed};
 use crate::shell::{ShellHost, ShellServices, ShellState};
+use crate::startup_failure::{StartupError, StartupReport};
 use crate::state::{AgentState, StateError, StateStore};
 use crate::supervisor::DaemonSupervisor;
 
@@ -78,10 +80,39 @@ pub async fn run(cancel: CancellationToken, host: ShellHost) -> AgentResult {
 }
 
 /// [`run`] 的完整形态：`server` 为 `Some` 时按 `--server` 契约装配（见 [`crate::server_mode`]）。
+///
+/// 桌面模式下，UI Gateway 开始服务之前的失败会写入启动失败记录（见 [`StartupReport`]），供
+/// 拉起本进程的桌面界面展示具体原因。
 pub(crate) async fn run_with(
     cancel: CancellationToken,
     host: ShellHost,
     server: Option<ServerRuntime>,
+) -> AgentResult {
+    let report = match server {
+        Some(_) => None,
+        None => match resolve_agent_data_dir() {
+            Ok(agent_data_dir) => Some(StartupReport::new(&endpoint_dir(
+                bearer_override().as_deref(),
+                &agent_data_dir,
+            ))),
+            Err(error) => {
+                tracing::warn!(error = %error, "agent data directory is unresolvable; startup failures cannot be reported to the desktop");
+                None
+            }
+        },
+    };
+    let result = run_agent(cancel, host, server, report.as_ref()).await;
+    if let Some(report) = &report {
+        report.finish(&result).await;
+    }
+    result
+}
+
+async fn run_agent(
+    cancel: CancellationToken,
+    host: ShellHost,
+    server: Option<ServerRuntime>,
+    report: Option<&StartupReport>,
 ) -> AgentResult {
     let server_config = server.as_ref().map(|server| &server.config);
     let paths = AgentPaths::resolve()?;
@@ -94,10 +125,15 @@ pub(crate) async fn run_with(
             );
             return Ok(());
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(StartupError::new(AgentStartupFailureKind::DataDir, error).into()),
     };
-    let mut state = store.load().await?;
-    initialize_device_identity(&mut state, &store, server_config, &paths.daemon_data_dir).await?;
+    let mut state = store
+        .load()
+        .await
+        .map_err(|error| StartupError::new(AgentStartupFailureKind::DataDir, error))?;
+    initialize_device_identity(&mut state, &store, server_config, &paths.daemon_data_dir)
+        .await
+        .map_err(|error| StartupError::new(AgentStartupFailureKind::DataDir, error))?;
 
     // 先绑定 UI Gateway：实际端口进入状态与快照，后续 Doctor/兼容 API 都据此探测。
     // server 模式只由 `FLUXDOWN_BIND` 决定（允许非回环，不看 `lan_enabled`）。
@@ -105,7 +141,9 @@ pub(crate) async fn run_with(
         match std::env::var("FLUXDOWN_AGENT_BIND") {
             Ok(value) => Some(value),
             Err(std::env::VarError::NotPresent) => None,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(StartupError::new(AgentStartupFailureKind::GatewayBind, error).into());
+            }
         }
     } else {
         None
@@ -122,22 +160,29 @@ pub(crate) async fn run_with(
     // `FLUXDOWN_BIND` 决定、通常在容器 / 反代后面）。与持久化的 `lan_enabled`（下次启动才
     // 生效）区分开，界面据此决定是否展示配对码或提示「重启后生效」。
     state.gateway.lan_active = server_config.is_some() || !bound.ip().is_loopback();
-    let bearer_override = std::env::var_os("FLUXDOWN_AGENT_TOKEN_FILE").map(PathBuf::from);
-    let bearer = load_or_create_bearer(store.data_dir(), bearer_override.as_deref()).await?;
-    let endpoint_dir = server.is_none().then(|| match bearer_override.as_deref() {
-        Some(path) => path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."))
-            .to_path_buf(),
-        None => store.data_dir().to_path_buf(),
-    });
+    let bearer_override = bearer_override();
+    let bearer = load_or_create_bearer(store.data_dir(), bearer_override.as_deref())
+        .await
+        .map_err(|error| StartupError::new(AgentStartupFailureKind::DataDir, error))?;
+    let endpoint_dir = server
+        .is_none()
+        .then(|| endpoint_dir(bearer_override.as_deref(), store.data_dir()));
     if let Some(directory) = &endpoint_dir {
-        store.save_gateway_endpoint(directory, bound).await?;
+        store
+            .save_gateway_endpoint(directory, bound)
+            .await
+            .map_err(|error| StartupError::new(AgentStartupFailureKind::DataDir, error))?;
     }
     tracing::info!(address = %bound, "fluxdown-agent gateway listening");
 
-    let daemon_address = daemon_socket_address(&paths.daemon_rpc_url)?;
+    // daemon：显式 `FLUXDOWN_DAEMON_URL` 时只连该地址并让 daemon 严格绑定它；否则 daemon 用
+    // 默认端口、不可用时回退系统分配端口，并在 `daemon.token` 同目录发布端点，客户端每次连接
+    // 前重读。token 由 daemon 首次启动时生成，客户端拿到之前不连接，Gateway 不必等它即可服务。
+    let explicit_daemon_bind = paths
+        .daemon_rpc_url
+        .as_deref()
+        .map(daemon_socket_address)
+        .transpose()?;
     // 演示模式：把生效的演示 URL 交给 daemon（内置演示 URL 依赖本进程实际监听端口）。
     let daemon_env = server_config
         .and_then(|config| config.effective_demo_url(bound))
@@ -146,12 +191,15 @@ pub(crate) async fn run_with(
     let daemon_stderr_log =
         crate::log_export::agent_log_dir(&paths.agent_data_dir).join("fluxdownd.stderr.log");
     let supervisor = Arc::new(
-        DaemonSupervisor::new(daemon_address)
+        DaemonSupervisor::new(explicit_daemon_bind)
             .with_extra_env(daemon_env)
             .with_stderr_log(daemon_stderr_log.clone()),
     );
-    let daemon_bearer = load_daemon_bearer(&paths, &supervisor, &cancel).await?;
-    let daemon_config = DaemonClientConfig::new(paths.daemon_rpc_url.clone(), daemon_bearer);
+    let daemon_config = DaemonClientConfig::discovered(
+        paths.daemon_rpc_url.clone(),
+        paths.daemon_token_file.clone(),
+        &paths.daemon_data_dir,
+    );
     let (daemon, daemon_events) =
         DaemonClient::start(daemon_config.clone(), supervisor.clone(), cancel.clone())?;
     let daemon = Arc::new(daemon);
@@ -202,13 +250,22 @@ pub(crate) async fn run_with(
     let power = Arc::new(PowerService::new(events.clone()));
     let power_task = tokio::spawn(power.clone().run(cancel.clone()));
     let (notice_tx, notice_rx) = crate::cloud_notify::notice_channel();
-    let event_task =
-        spawn_daemon_projection(daemon_events, events.clone(), notice_tx, cancel.clone());
+    // 提示音只在桌面宿主播放：headless server 没有「本机用户」，不发声。
+    let (sound_tx, sound_task) =
+        crate::sound::start(events.clone(), cancel.clone(), server.is_none());
+    let event_task = spawn_daemon_projection(
+        daemon_events,
+        events.clone(),
+        notice_tx,
+        sound_tx,
+        cancel.clone(),
+    );
     let notifier = Arc::new(crate::notification::Notifier::new(
         paths.agent_data_dir.clone(),
     ));
     let effects_task = tokio::spawn(
         crate::background_effects::BackgroundEffects::new(events.clone(), notifier.clone())
+            .with_completion_sound(server.is_none())
             .run(cancel.clone()),
     );
 
@@ -446,6 +503,7 @@ pub(crate) async fn run_with(
                 webroot: config.webroot.clone(),
                 demo: config.effective_demo_url(bound).is_some(),
                 allow_local_platform: config.allow_local_platform,
+                link: Some(link.clone()),
             })?))
         }
         None => None,
@@ -458,6 +516,10 @@ pub(crate) async fn run_with(
         link.clone(),
         server_config.and_then(|config| config.language.clone()),
     ));
+    // 启动环节到此全部完成：之后的失败属于运行期，删除上一次的启动失败记录。
+    if let Some(report) = report {
+        report.mark_serving().await;
+    }
     // NMH 只服务浏览器扩展：其端点故障只记日志，不拖垮 agent；正常退出也不是故障。
     let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = crate::gateway::serve(
         listener,
@@ -502,6 +564,7 @@ pub(crate) async fn run_with(
         ("device link", link_task),
         ("device metadata", device_meta_task),
         ("background effects", effects_task),
+        ("sound", sound_task),
         ("analytics", analytics_task),
         ("power", power_task),
         ("shell", shell_task),
@@ -560,8 +623,9 @@ struct ServerBootstrap {
     ready: tokio::sync::watch::Sender<bool>,
 }
 
-/// Gateway 已先行服务；这里等 daemon 首次就绪并完成一次性 legacy 迁移。失败即取消 agent，
-/// 语义与原先「就绪前阻塞启动」一致。迁移可能改写兼容 API 开关与令牌，完成后同步到运行期。
+/// Gateway 已先行服务；这里等 daemon 首次就绪并完成一次性 legacy 迁移。迁移途中 daemon 断开
+/// （崩溃、被重启、正在完全退出）是可重试的：迁移幂等，等 daemon 重连后重做；其它失败即取消
+/// agent，语义与原先「就绪前阻塞启动」一致。迁移可能改写兼容 API 开关与令牌，完成后同步到运行期。
 async fn await_daemon_ready(readiness: DaemonReadiness) -> AgentResult {
     let DaemonReadiness {
         daemon,
@@ -578,15 +642,27 @@ async fn await_daemon_ready(readiness: DaemonReadiness) -> AgentResult {
         // 慢盘 / NAS 冷启动可能远超 30s：daemon 客户端自己持续重连，这里持续等待并周期性
         // 报告状态；只有 agent 退出（信号 / daemon 致命错误 → cancel）才结束等待。
         let started = std::time::Instant::now();
-        while let Err(error) = daemon.wait_ready(DAEMON_READY_POLL).await {
-            tracing::warn!(
-                error = ?error,
-                waited_secs = started.elapsed().as_secs(),
-                "fluxdownd is not ready yet; still waiting"
-            );
-        }
         let fresh = state.lock().await.gateway_migration_revision.is_none();
-        crate::link::migrate_legacy_state(&daemon, &state, &store, &events).await?;
+        loop {
+            while let Err(error) = daemon.wait_ready(DAEMON_READY_POLL).await {
+                tracing::warn!(
+                    error = ?error,
+                    waited_secs = started.elapsed().as_secs(),
+                    "fluxdownd is not ready yet; still waiting"
+                );
+            }
+            match crate::link::migrate_legacy_state(&daemon, &state, &store, &events).await {
+                Ok(()) => break,
+                Err(crate::link::LinkMigrationError::Daemon(error)) if error.retryable => {
+                    tracing::warn!(
+                        code = ?error.code,
+                        "fluxdownd became unavailable during the legacy migration; retrying once it reconnects"
+                    );
+                    tokio::time::sleep(MIGRATION_RETRY_DELAY).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         // 迁移可能写入 daemon 时代的身份与名册：互联必须在它之后才加载 / 生成身份。
         // 失败只影响局域网互联（`agent.link.*` 报 Unavailable），不拖垮下载与云功能。
         if let Err(error) = link.start().await {
@@ -644,6 +720,7 @@ pub(crate) fn spawn_daemon_projection(
     mut daemon_events: tokio::sync::mpsc::Receiver<DaemonClientEvent>,
     events: AgentEventHub,
     notices: crate::cloud_notify::NoticeSender,
+    sounds: Option<crate::sound::SoundSender>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -662,7 +739,7 @@ pub(crate) fn spawn_daemon_projection(
                         }
                         DaemonClientEvent::Event(frame) => {
                             if let ServiceEvent::Daemon(event) = frame.event {
-                                crate::cloud_notify::route_daemon_event(&events, &notices, event);
+                                crate::cloud_notify::route_daemon_event(&events, &notices, sounds.as_ref(), event);
                             }
                         }
                         DaemonClientEvent::Stale => {
@@ -688,6 +765,8 @@ pub(crate) fn spawn_daemon_projection(
 
 /// 每轮等待 daemon 就绪的时长；超时只记录状态并继续等待。
 const DAEMON_READY_POLL: Duration = Duration::from_secs(30);
+/// legacy 迁移因 daemon 断开而失败后，重新等待就绪前的间隔（避免 daemon 仍回可重试错误时空转）。
+const MIGRATION_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// FluxCloud 服务地址：运行期环境变量 > 构建期注入 > 本地默认。空串（CI 未配置 secret 时传入）视为未设置。
 pub(crate) fn fluxcloud_base_url(runtime: Option<String>, build_time: Option<&str>) -> String {
@@ -862,58 +941,6 @@ pub(crate) async fn finalize_device_identity(
     Ok(())
 }
 
-async fn load_daemon_bearer(
-    paths: &AgentPaths,
-    supervisor: &DaemonSupervisor,
-    cancel: &CancellationToken,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let token = match tokio::fs::read_to_string(&paths.daemon_token_file).await {
-        Ok(token) => token,
-        // 冷启动时 daemon 尚未生成令牌，只有缺失允许进入启动 / 等待路径。
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
-    };
-    if !token.trim().is_empty() {
-        return Ok(token.trim().to_owned());
-    }
-    let address = daemon_socket_address(&paths.daemon_rpc_url)?;
-    match TcpStream::connect(address).await {
-        Ok(_) => {
-            return Err("daemon is listening but its bearer token file is unavailable".into());
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
-            supervisor.ensure_running().await?;
-        }
-        Err(error) => return Err(error.into()),
-    }
-    // daemon 在迁移 / 慢盘冷启动后才写 token：与 await_daemon_ready 一致持续等待，直到取消。
-    const TICKS_PER_CHECK: u32 = 300;
-    let mut remaining = TICKS_PER_CHECK;
-    loop {
-        let token = match tokio::fs::read_to_string(&paths.daemon_token_file).await {
-            Ok(token) => token,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.into()),
-        };
-        if !token.trim().is_empty() {
-            return Ok(token.trim().to_owned());
-        }
-        tokio::select! {
-            () = cancel.cancelled() => {
-                return Err("cancelled while waiting for the daemon token file".into());
-            }
-            () = tokio::time::sleep(Duration::from_millis(100)) => {}
-        }
-        remaining -= 1;
-        if remaining == 0 {
-            remaining = TICKS_PER_CHECK;
-            tracing::warn!("still waiting for the daemon token file");
-            // 子进程若已崩溃则重新拉起；仍存活的代际上是空操作。
-            supervisor.ensure_running().await?;
-        }
-    }
-}
-
 fn compatibility_api_config(state: &AgentState) -> fluxdown_api::server::ApiServerConfig {
     let config = HashMap::from([
         ("local_server_enabled".to_owned(), "true".to_owned()),
@@ -954,27 +981,76 @@ fn compatibility_api_config(state: &AgentState) -> fluxdown_api::server::ApiServ
 }
 
 /// 发布实际绑定端口；固定 server / env 地址禁止运行期端口修改。
+///
+/// 桌面默认配置（非 server、无 `FLUXDOWN_AGENT_BIND`）下，已保存端口被占用或落在系统保留区间
+/// （Windows Hyper-V / WSL / Docker 的动态排除端口，绑定返回 WSAEACCES）时回退到系统分配的
+/// 端口：实际端口写回状态并经 `gateway-endpoint.json` 发布，桌面据此连接，兼容 API 与油猴脚本
+/// 使用设置页显示的生效端口。显式地址严格失败，错误带上地址。
 async fn bind_gateway_listener(
     state: &mut AgentState,
     store: &StateStore,
     server_bind: Option<std::net::SocketAddr>,
     override_bind: Option<&str>,
-) -> Result<TcpListener, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<TcpListener, StartupError> {
     let address = match server_bind {
         Some(bind) => bind,
-        None => gateway_bind_address(&state.gateway, override_bind)?,
+        None => gateway_bind_address(&state.gateway, override_bind)
+            .map_err(|error| StartupError::new(AgentStartupFailureKind::GatewayBind, error))?,
     };
-    let listener = TcpListener::bind(address).await?;
+    let editable = server_bind.is_none() && override_bind.is_none();
+    let listener = bind_with_fallback(address, editable)
+        .await
+        .map_err(|error| StartupError::new(AgentStartupFailureKind::GatewayBind, error))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| StartupError::new(AgentStartupFailureKind::GatewayBind, error))?
+        .port();
     let previous = state.gateway.clone();
-    state.gateway.port = listener.local_addr()?.port();
-    state.gateway.port_editable = server_bind.is_none() && override_bind.is_none();
+    state.gateway.port = port;
+    state.gateway.port_editable = editable;
     if state.gateway != previous
         && let Err(error) = store.save(state).await
     {
         state.gateway = previous;
-        return Err(error.into());
+        return Err(StartupError::new(AgentStartupFailureKind::DataDir, error));
     }
     Ok(listener)
+}
+
+/// 绑定 `address`；`fallback` 时地址被占用或被系统保留，改绑同一接口上系统分配的端口。
+async fn bind_with_fallback(
+    address: std::net::SocketAddr,
+    fallback: bool,
+) -> std::io::Result<TcpListener> {
+    let error = match TcpListener::bind(address).await {
+        Ok(listener) => return Ok(listener),
+        Err(error) => error,
+    };
+    let unavailable = matches!(
+        error.kind(),
+        std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+    );
+    if !(fallback && unavailable) {
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("could not bind the UI gateway on {address}: {error}"),
+        ));
+    }
+    tracing::warn!(
+        %address,
+        error = %error,
+        "UI gateway port is in use or reserved by the system; falling back to an OS-assigned port"
+    );
+    TcpListener::bind(std::net::SocketAddr::new(address.ip(), 0))
+        .await
+        .map_err(|fallback_error| {
+            std::io::Error::new(
+                fallback_error.kind(),
+                format!(
+                    "could not bind the UI gateway on {address} ({error}) nor on an OS-assigned port: {fallback_error}"
+                ),
+            )
+        })
 }
 
 /// UI Gateway 监听地址：`FLUXDOWN_AGENT_BIND` 覆盖时必须是回环；否则按持久化的
@@ -1011,7 +1087,8 @@ struct AgentPaths {
     /// daemon 的 engine 数据目录（`daemon.lock` 进程租约所在）。
     daemon_data_dir: PathBuf,
     daemon_token_file: PathBuf,
-    daemon_rpc_url: String,
+    /// 显式 `FLUXDOWN_DAEMON_URL`；未设置时按 daemon 发布的端点发现。
+    daemon_rpc_url: Option<String>,
 }
 
 impl AgentPaths {
@@ -1026,13 +1103,31 @@ impl AgentPaths {
             .map(PathBuf::from)
             .unwrap_or_else(|| daemon_data_dir.join("daemon.token"));
         let daemon_rpc_url = std::env::var("FLUXDOWN_DAEMON_URL")
-            .unwrap_or_else(|_| "ws://127.0.0.1:17801/rpc".to_owned());
+            .ok()
+            .filter(|url| !url.trim().is_empty());
         Ok(Self {
             agent_data_dir,
             daemon_data_dir,
             daemon_token_file,
             daemon_rpc_url,
         })
+    }
+}
+
+/// `FLUXDOWN_AGENT_TOKEN_FILE`：agent bearer 文件的显式位置。
+fn bearer_override() -> Option<PathBuf> {
+    std::env::var_os("FLUXDOWN_AGENT_TOKEN_FILE").map(PathBuf::from)
+}
+
+/// 桌面端点（`gateway-endpoint.json`）与启动失败记录所在目录：bearer 同目录。
+fn endpoint_dir(bearer_override: Option<&Path>, agent_data_dir: &Path) -> PathBuf {
+    match bearer_override {
+        Some(path) => path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf(),
+        None => agent_data_dir.to_path_buf(),
     }
 }
 
@@ -1240,34 +1335,78 @@ mod tests {
         }
     }
 
+    /// 桌面默认配置下保存的端口被占用（或被系统保留）：回退到系统分配的端口，实际端口写回状态，
+    /// 仍可在设置中修改。
     #[tokio::test]
-    async fn failed_gateway_bind_preserves_the_active_port() {
-        let dir = gateway_test_dir("failed_port_bind");
+    async fn occupied_saved_port_falls_back_to_an_os_assigned_port() {
+        let dir = gateway_test_dir("fallback_port_bind");
         let store = crate::state::StateStore::open(dir.clone())
             .await
             .expect("open store");
         let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("reserve conflicting port");
+        let occupied_port = occupied.local_addr().expect("occupied address").port();
         let mut state = AgentState::default();
-        state.gateway.port = occupied.local_addr().expect("occupied address").port();
+        state.gateway.port = occupied_port;
         store.save(&state).await.expect("save active port");
-        let before = state.gateway.clone();
-        assert!(
-            bind_gateway_listener(&mut state, &store, None, None)
-                .await
-                .is_err()
-        );
-        assert_eq!(state.gateway, before);
+        let listener = bind_gateway_listener(&mut state, &store, None, None)
+            .await
+            .expect("fallback bind");
+        let bound = listener.local_addr().expect("fallback address");
+        assert!(bound.ip().is_loopback());
+        assert_ne!(bound.port(), occupied_port);
+        assert_eq!(state.gateway.port, bound.port());
+        assert!(state.gateway.port_editable);
         assert_eq!(
-            store.load().await.expect("reload failed bind").gateway,
-            before
+            store.load().await.expect("reload fallback bind").gateway,
+            state.gateway
         );
+        drop(listener);
         drop(occupied);
         drop(store);
         if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
-            tracing::warn!(path = %dir.display(), error = %error, "remove failed bind test directory");
+            tracing::warn!(path = %dir.display(), error = %error, "remove fallback bind test directory");
         }
+    }
+
+    /// 显式地址（server 模式 `FLUXDOWN_BIND`、`FLUXDOWN_AGENT_BIND`）被占用时严格失败：错误带上
+    /// 地址，已生效端口不变。
+    #[tokio::test]
+    async fn explicit_bindings_fail_strictly_and_preserve_the_active_port() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve conflicting port");
+        let address = occupied.local_addr().expect("occupied address");
+        let text = address.to_string();
+        for server_mode in [false, true] {
+            let dir = gateway_test_dir("strict_port_bind");
+            let store = crate::state::StateStore::open(dir.clone())
+                .await
+                .expect("open store");
+            let mut state = AgentState::default();
+            state.gateway.port = 17_800;
+            store.save(&state).await.expect("save active port");
+            let before = state.gateway.clone();
+            let server_bind = server_mode.then_some(address);
+            let override_bind = (!server_mode).then_some(text.as_str());
+            let Err(error) =
+                bind_gateway_listener(&mut state, &store, server_bind, override_bind).await
+            else {
+                panic!("an occupied explicit address must not fall back");
+            };
+            assert!(error.to_string().contains(&text), "{error}");
+            assert_eq!(state.gateway, before);
+            assert_eq!(
+                store.load().await.expect("reload failed bind").gateway,
+                before
+            );
+            drop(store);
+            if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+                tracing::warn!(path = %dir.display(), error = %error, "remove strict bind test directory");
+            }
+        }
+        drop(occupied);
     }
 
     #[tokio::test]

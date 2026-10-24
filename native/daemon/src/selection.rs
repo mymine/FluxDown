@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use fluxdown_protocol::{
     DaemonEvent, EventFrame, FileExistsAction, SelectionKind, SelectionOutcome,
-    SelectionRequestDto, SelectionResolutionDto, ServiceEvent, SnapshotBody, TaskDto, WsServerMsg,
+    SelectionRequestDto, SelectionResolutionDto, ServiceEvent, TaskDto, WsServerMsg,
 };
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -253,6 +253,33 @@ impl DaemonSelection {
         });
     }
 
+    /// 同 [`Self::cancel_for_tasks`]，任务状态取自 hub 当前投影：只查待处理选择所属的那几个
+    /// 任务，不克隆任务表（整表事件在广播里已不带任务）。
+    fn cancel_for_projection(&self) {
+        let pending: Vec<String> = {
+            let state = lock_or_recover(&self.state);
+            state
+                .pending
+                .values()
+                .map(|pending| pending.task_id.clone())
+                .collect()
+        };
+        if pending.is_empty() {
+            return;
+        }
+        let statuses: HashMap<String, i32> = self.events.inspect(|snapshot| {
+            pending
+                .iter()
+                .filter_map(|id| snapshot.task(id).map(|task| (id.clone(), task.status)))
+                .collect()
+        });
+        self.cancel_matching(|task_id| {
+            statuses
+                .get(task_id)
+                .is_none_or(|status| *status == TASK_STATUS_PAUSED)
+        });
+    }
+
     fn cancel_matching(&self, mut matches: impl FnMut(&str) -> bool) -> usize {
         let cancelled = {
             let mut state = lock_or_recover(&self.state);
@@ -326,7 +353,11 @@ impl DaemonSelection {
             DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks }) => {
                 self.cancel_for_tasks(tasks);
             }
-            DaemonEvent::SnapshotReplaced(snapshot) => self.cancel_for_tasks(&snapshot.tasks),
+            // 广播里的整表替换只带头 / 重载宣告，任务表不在帧内：按 hub 当前投影复核。
+            DaemonEvent::SnapshotReplaced(_)
+            | DaemonEvent::TablesReloading { tasks: Some(_), .. } => {
+                self.cancel_for_projection();
+            }
             _ => {}
         }
     }
@@ -343,9 +374,7 @@ impl DaemonSelection {
                     frame = receiver.recv() => match frame {
                         Ok(frame) => selection.observe_frame(&frame),
                         Err(broadcast::error::RecvError::Lagged(_)) => {
-                            if let SnapshotBody::Daemon(body) = selection.events.snapshot().body {
-                                selection.cancel_for_tasks(&body.tasks);
-                            }
+                            selection.cancel_for_projection();
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
                     },
@@ -882,6 +911,7 @@ mod tests {
         let frame = |event| EventFrame {
             epoch: "e".to_owned(),
             sequence: 1,
+            previous: None,
             event: ServiceEvent::Daemon(event),
         };
         let progress = |task_id: &str, status: i32, error_message: &str| {
@@ -942,6 +972,7 @@ mod tests {
         manager.observe_frame(&EventFrame {
             epoch: "e".to_owned(),
             sequence: 1,
+            previous: None,
             event: ServiceEvent::Daemon(fluxdown_protocol::DaemonEvent::Engine(
                 WsServerMsg::TasksSnapshot { tasks: Vec::new() },
             )),

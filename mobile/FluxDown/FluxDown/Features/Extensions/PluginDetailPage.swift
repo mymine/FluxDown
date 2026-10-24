@@ -1,6 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
+#if FULL_FLAVOR
 
 /// S11.3 · 插件详情（已安装）：manifest 信息 + 操作区（启用 / 设置 / 登录 / 更新 / 重载 / 卸载）。
 struct PluginDetailPage: View {
@@ -229,3 +230,4 @@ struct PluginLoadErrorSheet: View {
         .presentationDetents([.medium, .large])
     }
 }
+#endif

@@ -884,26 +884,25 @@ async fn verify_ftp_rest_honoured(
 pub async fn run_ftp_download(params: DownloadParams) {
     let task_id_log = params.task_id.clone();
     let result = match run_ftp_download_inner(&params).await {
-        Ok(total) => match crate::downloader::finalize_with_interceptors(
-            &params,
-            crate::intercept::ProtocolKind::Ftp,
-        )
-        .await
-        {
-            Ok(replaced) => {
-                let (total, renamed) = match replaced {
-                    Some((name, size)) => (size, Some(name)),
-                    None => (total, None),
-                };
-                params
-                    .db
-                    .update_task_status(&params.task_id, 3, "")
-                    .await
-                    .map(|()| (total, renamed))
-                    .map_err(DownloadError::Db)
+        Ok(total) => {
+            match crate::downloader::finalize_output(&params, crate::intercept::ProtocolKind::Ftp)
+                .await
+            {
+                Ok(replaced) => {
+                    let (total, renamed) = match replaced {
+                        Some((name, size)) => (size, Some(name)),
+                        None => (total, None),
+                    };
+                    params
+                        .db
+                        .update_task_status(&params.task_id, 3, "")
+                        .await
+                        .map(|()| (total, renamed))
+                        .map_err(DownloadError::Db)
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
-        },
+        }
         Err(error) => Err(error),
     };
 

@@ -41,6 +41,8 @@ internal object AccountText {
         "accountErrorNetwork" to R.string.accountErrorNetwork,
         "errReasonPairingCodeInvalid" to R.string.errReasonPairingCodeInvalid,
         "errReasonPairingSessionExpired" to R.string.errReasonPairingSessionExpired,
+        "errReasonPairingTimeout" to R.string.errReasonPairingTimeout,
+        "errReasonPeerClockSkew" to R.string.errReasonPeerClockSkew,
         "errReasonPairingPeerUnreachable" to R.string.errReasonPairingPeerUnreachable,
         "errReasonPairingNotFluxDown" to R.string.errReasonPairingNotFluxDown,
         "errReasonPairingThrottled" to R.string.errReasonPairingThrottled,

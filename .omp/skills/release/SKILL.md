@@ -68,24 +68,31 @@ git log stable --not main --oneline    # 须为空
 command -v git-cliff >/dev/null && git cliff --latest --strip header | head -40
 ```
 
-版本"可用"的硬条件：格式合法 · tag 不重复 · 高于同渠道最新 · 停在正确分支且工作树干净 · 稳定版 `stable --not main` 为空。构建绿由调用者在发布前自行保证。
+版本"可用"的硬条件：格式合法 · tag 不重复 · 高于同渠道最新 · 停在正确分支且工作树干净 · 稳定版 `stable --not main` 为空 · **目标提交 CI 全绿**（tag 推送的 `changes` 会再卡一次：CI 红即在建草稿前失败，仍在跑则等待）。
 预览版额外确认：后缀是 `-rc.N` 且 N 递增（预览用户按 SemVer 收 `rc.1 < rc.2 < … < 转正 X.Y.Z`）。
 
 ## 4. 发布（不可逆，仅用户明确要求时）
 
+**只构建一次**：稳定版先在目标提交上跑全量 CI + 演练（演练就是正式构建：签名、公证、Docker digest 全做，只是不发布），两者都绿再推 tag；tag 推送复用演练产物（`changes` 自动查找同提交同 tag 的演练），推 tag 后约 5–10 分钟完成上传 / 镜像打 tag / 转正。没有演练时 tag 推送照常全量构建（预览版可直接推 tag）。
+
 ```bash
-# ⚠️ 推送后立即触发全平台构建与 GitHub Release，无法撤回。
-# 先切到正确分支：稳定版 stable，预览版 main（CI 守卫会拒绝打错分支的 tag）。
-git checkout stable      # 预览版改为: git checkout main
+# 1) 全量 CI + 演练（无副作用；演练里偶发失败在其运行页 Re-run 即可）
+git checkout stable      # 预览版改为 main（CI 守卫会拒绝打错分支的 tag）
+gh workflow run ci.yml --ref stable
+gh workflow run release.yml --ref stable -f rehearsal=true -f tag="$V" -f component=changed
+gh run list --workflow ci.yml --branch stable --limit 1; gh run list --workflow release.yml --limit 1
+# 等两者都 success（演练 run-name「Release 演练 $V（不发布）」，其 head SHA 必须 = 将要打 tag 的提交）
+# 2) ⚠️ 推送后立即发布，无法撤回。omp 的 .omp/hooks/pre/guard.ts 会对 v* tag 推送弹确认（无 UI 会话直接拦截）。
 git tag -a "$V" -m "$V"
 git push origin "$V"
-# 观察流水线
 gh run watch
 ```
 
+演练与 tag 之间 stable 又前进了 → tag 提交与演练提交不同，无法复用，须重跑演练（或接受全量构建）。
+
 ## 4b. 组件打包失败 → 补发（不重跑其余组件）
 
-某组件失败时其余组件照常发布，`publish-release` 以失败结束并在 job summary 列出缺失组件与补发命令。
+某组件失败时其余组件照常上传，但 **release 保持草稿**（不触发 `published` webhook / Telegram 公告，官网与客户端仍提供上一版本）；`publish-release` 以失败结束并在 job summary 列出缺失组件与补发命令。tag 与历次补发的应发布组件累计记在说明头部 `<!-- fluxdown:release:begin … expected=… docker=… -->`，全部有完成哨兵（含 Server Docker）后由补齐的那次运行转正。
 
 ```bash
 # 偶发失败（源码无需改动）：在该运行页点 “Re-run failed jobs”，或

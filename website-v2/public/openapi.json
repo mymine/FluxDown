@@ -3811,6 +3811,10 @@
             ],
             "description": "对端已登录云账号时经已认证链路自报的云设备 id。客户端仅当本机云设备名册里存在同 id\n设备时把两者合并为同一台设备展示；直连设备本身永不注册到云端、不占云端设备名额。"
           },
+          "controllable": {
+            "type": "boolean",
+            "description": "本机可经 `/rpc` 控制该设备（本机以 `requestControl` 向它发起并完成了配对）。"
+          },
           "customName": {
             "type": [
               "string",
@@ -3827,6 +3831,10 @@
           },
           "fingerprint": {
             "type": "string"
+          },
+          "grantsControl": {
+            "type": "boolean",
+            "description": "该设备被本机授权可经 `/rpc` 完全控制本机（本机用户批准了其 `requestControl` 配对）。"
           },
           "lastSeenAt": {
             "type": "integer",
@@ -4158,6 +4166,10 @@
             "format": "int32",
             "description": "发起方的配对协议版本。旧版发起方没有这个字段（按 0 处理），与响应方版本不一致\n一律以版本不兼容拒绝。",
             "minimum": 0
+          },
+          "requestControl": {
+            "type": "boolean",
+            "description": "发起方请求「完全控制」本机（`/rpc`）。受签名保护（`true` 时进入 hello 签名字节与转录）；\n`false` 时省略，与旧版 hello 逐字节兼容。"
           }
         }
       },
@@ -4459,6 +4471,13 @@
               "$ref": "#/components/schemas/PluginCommandDeclDto"
             }
           },
+          "pageScripts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PluginPageScriptDeclDto"
+            },
+            "description": "浏览器页面脚本声明（供授权 / 详情界面展示将在哪些网站运行脚本）。"
+          },
           "sniffRules": {
             "type": "boolean",
             "description": "是否贡献浏览器扩展嗅探规则。"
@@ -4587,6 +4606,12 @@
             ],
             "description": "插件包在 daemon 主机上的绝对目录（仅已加载插件有值）；本机桌面端据此读取 `desktop.entry`。"
           },
+          "packageRevision": {
+            "type": "integer",
+            "format": "int64",
+            "description": "插件包修订号：包代码被替换（安装 / 升级 / dev 安装 / dev 重载）后变化，只做相等比较；\n桌面端据此重新挂载桌面脚本视图。旧 daemon 不下发时为 0。",
+            "minimum": 0
+          },
           "permissions": {
             "type": "array",
             "items": {
@@ -4633,6 +4658,34 @@
           }
         }
       },
+      "PluginPageScriptDeclDto": {
+        "type": "object",
+        "description": "页面脚本贡献声明（镜像 manifest `contributes.pageScripts[]` 的展示字段）。",
+        "required": [
+          "id",
+          "title",
+          "matches",
+          "world"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "matches": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "title": {
+            "type": "string"
+          },
+          "world": {
+            "type": "string",
+            "description": "`isolated` / `main`。"
+          }
+        }
+      },
       "PluginViewDeclDto": {
         "type": "object",
         "description": "视图贡献声明。",
@@ -4652,6 +4705,13 @@
                 "description": "桌面增强实现（仅 GPUI 桌面端经 gpui-shell 运行，daemon 不执行）。"
               }
             ]
+          },
+          "iconSvg": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "视图图标 SVG 文本（manifest `icon` 指向的包内文件，加载期读入并校验）；客户端\n只把它当单色蒙版按主题着色渲染。未声明时为 `None`，客户端用默认图标。"
           },
           "id": {
             "type": "string"
@@ -5401,11 +5461,7 @@
           "status",
           "downloadedBytes",
           "totalBytes",
-          "errorMessage",
-          "createdAt",
-          "proxyUrl",
-          "queueId",
-          "checksum"
+          "createdAt"
         ],
         "properties": {
           "autoRoute": {

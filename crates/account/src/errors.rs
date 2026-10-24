@@ -97,6 +97,8 @@ pub(crate) fn reason_key(reason: ErrorReason, context: ErrorContext) -> Option<&
         }
         ErrorReason::PairingCodeInvalid => "errReasonPairingCodeInvalid",
         ErrorReason::PairingSessionExpired => "errReasonPairingSessionExpired",
+        ErrorReason::PairingTimeout => "errReasonPairingTimeout",
+        ErrorReason::PeerClockSkew => "errReasonPeerClockSkew",
         ErrorReason::PairingPeerUnreachable => "errReasonPairingPeerUnreachable",
         ErrorReason::PairingNotFluxDown => "errReasonPairingNotFluxDown",
         ErrorReason::PairingThrottled => "errReasonPairingThrottled",
@@ -143,6 +145,7 @@ pub(crate) fn reason_key(reason: ErrorReason, context: ErrorContext) -> Option<&
         | ErrorReason::NotifyChannelLimit
         | ErrorReason::NotifyDisabled
         | ErrorReason::NotifyTargetInvalid
+        | ErrorReason::SoundUnplayable
         | ErrorReason::Unknown => return None,
     })
 }
@@ -177,11 +180,13 @@ fn code_key(error: &RpcErrorData, context: ErrorContext) -> &'static str {
                 return "cloudSyncErrorNetwork";
             }
         }
-        ErrorContext::Pairing => match error.code {
-            Code::InvalidArgument => return "localPairingAddressInvalid",
-            _ if network => return "errReasonPairingPeerUnreachable",
-            _ => {}
-        },
+        ErrorContext::Pairing => {
+            // 不带 reason 的 Unavailable 是本机服务 / 远端主机断开：落到通用的「服务已断开」，
+            // 真正的对端不可达由 `PairingPeerUnreachable` reason 表达。
+            if error.code == Code::InvalidArgument {
+                return "localPairingAddressInvalid";
+            }
+        }
         ErrorContext::General => {}
     }
     generic_key(error.code)
@@ -357,6 +362,22 @@ mod tests {
     }
 
     #[test]
+    fn reasonless_unavailable_in_pairing_is_a_local_disconnect_not_peer_unreachable() {
+        // 不带 reason 的 Unavailable 是本机服务 / 远端主机断开，不能说成「无法连接对端地址」。
+        let offline = RpcErrorData::new(ApplicationErrorCode::Unavailable, true);
+        assert_eq!(
+            error_key(&offline, ErrorContext::Pairing),
+            "localServiceDisconnected"
+        );
+        let unreachable = RpcErrorData::new(ApplicationErrorCode::Unavailable, true)
+            .with_reason(ErrorReason::PairingPeerUnreachable);
+        assert_eq!(
+            error_key(&unreachable, ErrorContext::Pairing),
+            "errReasonPairingPeerUnreachable"
+        );
+    }
+
+    #[test]
     fn revoked_reasons_pick_distinct_prompts_with_expiry_as_fallback() {
         assert_eq!(
             session_revoked_key(ErrorReason::DeviceUntrusted),
@@ -403,6 +424,8 @@ mod tests {
             ErrorReason::CloudUnreachable,
             ErrorReason::PairingCodeInvalid,
             ErrorReason::PairingSessionExpired,
+            ErrorReason::PairingTimeout,
+            ErrorReason::PeerClockSkew,
             ErrorReason::PairingPeerUnreachable,
             ErrorReason::PairingNotFluxDown,
             ErrorReason::PairingThrottled,

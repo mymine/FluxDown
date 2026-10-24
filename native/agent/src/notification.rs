@@ -90,7 +90,7 @@ impl Notifier {
 
     /// 阻塞发送测试或信息通知；成功表示系统接收请求，不保证横幅可见。
     pub fn try_show(&self, title: &str, body: &str) -> Result<(), String> {
-        self.send(title, body, None)
+        self.send(title, body, None, false)
     }
 
     pub(crate) fn show_completion(
@@ -100,13 +100,14 @@ impl Notifier {
         path: Option<PathBuf>,
         open_file_label: String,
         open_folder_label: String,
+        silent: bool,
     ) {
         let actions = path.map(|path| CompletionActions {
             path,
             open_file_label,
             open_folder_label,
         });
-        if let Err(error) = self.send(title, body, actions.as_ref()) {
+        if let Err(error) = self.send(title, body, actions.as_ref(), silent) {
             tracing::warn!(%error, "could not show completion notification");
         }
     }
@@ -117,6 +118,8 @@ impl Notifier {
         title: &str,
         body: &str,
         actions: Option<&CompletionActions>,
+        // 通知中心的 content 默认不带声音：macOS 天然静音，无需额外处理。
+        _silent: bool,
     ) -> Result<(), String> {
         macos::show(title, body, actions)
     }
@@ -127,10 +130,11 @@ impl Notifier {
         title: &str,
         body: &str,
         actions: Option<&CompletionActions>,
+        silent: bool,
     ) -> Result<(), String> {
         let prepared = self.prepared.get_or_init(|| prepare(&self.data_dir));
         prepared.identity.as_ref().map_err(Clone::clone)?;
-        windows::show(&self.data_dir, title, body, actions)
+        windows::show(&self.data_dir, title, body, actions, silent)
     }
 
     #[cfg(target_os = "linux")]
@@ -139,10 +143,14 @@ impl Notifier {
         title: &str,
         body: &str,
         _actions: Option<&CompletionActions>,
+        silent: bool,
     ) -> Result<(), String> {
         let prepared = self.prepared.get_or_init(|| prepare(&self.data_dir));
         let mut notification = notify_rust::Notification::new();
         notification.appname(APP_NAME).summary(title).body(body);
+        if silent {
+            notification.hint(notify_rust::Hint::SuppressSound(true));
+        }
         apply_platform_identity(&mut notification, prepared);
         notification
             .show()
@@ -158,6 +166,7 @@ impl Notifier {
         _title: &str,
         _body: &str,
         _actions: Option<&CompletionActions>,
+        _silent: bool,
     ) -> Result<(), String> {
         Err("system notifications are managed by the host application on this platform".to_owned())
     }

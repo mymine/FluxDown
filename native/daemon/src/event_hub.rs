@@ -74,7 +74,8 @@ impl DaemonEventHub {
         (receiver, snapshot)
     }
 
-    /// 原子读取当前快照与游标。
+    /// 原子读取当前**完整**快照与游标（含任务表，O(任务数) 克隆）。只给进程内使用与测试；
+    /// 线上一律走 [`Self::wire_snapshot`]。
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         let state = lock_or_recover(&self.state);
@@ -83,6 +84,38 @@ impl DaemonEventHub {
             sequence: state.sequence,
             body: SnapshotBody::Daemon(Box::new(state.snapshot.clone())),
         }
+    }
+
+    /// `system.snapshot` 的线上快照：只带头（任务表与队列位置表换成 `taskTotal` /
+    /// `queueTotal`），不克隆任务表。表经 [`Self::task_page`] 分页取。
+    #[must_use]
+    pub fn wire_snapshot(&self) -> Snapshot {
+        let state = lock_or_recover(&self.state);
+        Snapshot {
+            epoch: state.epoch.clone(),
+            sequence: state.sequence,
+            body: SnapshotBody::Daemon(Box::new(state.snapshot.paged_header())),
+        }
+    }
+
+    /// `system.taskPage`：在同一临界区内读出事件位置与一页行。
+    ///
+    /// # Errors
+    ///
+    /// 游标无法解析。
+    pub fn task_page(
+        &self,
+        params: &fluxdown_protocol::TablePageParams,
+    ) -> Result<fluxdown_protocol::TablePage, fluxdown_protocol::InvalidPageCursor> {
+        let state = lock_or_recover(&self.state);
+        fluxdown_protocol::TablePage::build(&state.snapshot, &state.epoch, state.sequence, params)
+    }
+
+    /// 在临界区内只读访问当前投影，只提取调用方需要的字段（不克隆整份快照）。
+    /// 闭包内不得再调用本 hub（非重入锁），也不得 `await`。
+    pub fn inspect<R>(&self, read: impl FnOnce(&DaemonSnapshot) -> R) -> R {
+        let state = lock_or_recover(&self.state);
+        read(&state.snapshot)
     }
 
     /// 先更新物化投影，再递增 sequence 并广播对应帧。
@@ -163,7 +196,10 @@ impl DaemonEventHub {
         let frame = EventFrame {
             epoch: state.epoch.clone(),
             sequence: state.sequence,
-            event: ServiceEvent::Daemon(event),
+            previous: None,
+            // 投影已用完整事件更新；广播 / 线上形态里整表事件换成头或重载宣告，任何一帧
+            // 都不随任务数增长（订阅者经 `system.taskPage` 分页取表）。
+            event: ServiceEvent::Daemon(event.into_wire()),
         };
         // 与序号递增处于同一临界区，接收者不会收到乱序帧。
         // 无订阅者是正常空闲状态，不克隆帧或逐条记录进度日志。
@@ -799,6 +835,13 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
                     .map(fluxdown_engine_protocol::queue_position_to_dto)
                     .collect(),
             },
+            EngineEvent::QueueOrderChanged { removed, added } => WsServerMsg::QueueOrderChanged {
+                removed,
+                added: added
+                    .into_iter()
+                    .map(fluxdown_engine_protocol::queue_order_entry_to_dto)
+                    .collect(),
+            },
             EngineEvent::QueuesChanged(queues) => WsServerMsg::QueuesChanged {
                 queues: queues
                     .into_iter()
@@ -1016,6 +1059,76 @@ mod tests {
     };
 
     use super::{DaemonEngineEventSink, DaemonEventHub};
+
+    /// 引擎的队列顺序增量经 hub 以 `QueueOrderChanged` 发出，并由共享 reducer 更新快照里的
+    /// `queue_positions`（名次 = 按 `order` 升序的下标 + 1）。
+    #[test]
+    fn queue_order_increments_reach_subscribers_and_update_the_snapshot() {
+        use fluxdown_engine::model::{QueueOrderEntry, QueuePosition};
+
+        let hub = DaemonEventHub::new(DaemonSnapshot::default(), 8);
+        let (mut subscriber, _) = hub.subscribe_and_snapshot();
+        let sink = DaemonEngineEventSink(hub.clone());
+        let positions = |hub: &DaemonEventHub| {
+            let SnapshotBody::Daemon(snapshot) = hub.snapshot().body else {
+                panic!("daemon snapshot expected");
+            };
+            snapshot
+                .queue_positions
+                .iter()
+                .map(|entry| (entry.task_id.clone(), entry.position, entry.order))
+                .collect::<Vec<_>>()
+        };
+
+        sink.emit(EngineEvent::QueuePositionsChanged(
+            ["a", "b", "c"]
+                .iter()
+                .zip([10_i64, 20, 30])
+                .zip(1..)
+                .map(|((id, order), position)| QueuePosition {
+                    task_id: (*id).to_owned(),
+                    position,
+                    order,
+                })
+                .collect(),
+        ));
+        subscriber.try_recv().expect("full table frame");
+        assert_eq!(
+            positions(&hub),
+            [
+                ("a".into(), 1, 10),
+                ("b".into(), 2, 20),
+                ("c".into(), 3, 30)
+            ]
+        );
+
+        // 队首出队 + 在两者之间插入新任务：其余任务的键不变，名次随之前移 / 后移。
+        sink.emit(EngineEvent::QueueOrderChanged {
+            removed: vec!["a".to_owned()],
+            added: vec![QueueOrderEntry {
+                task_id: "d".to_owned(),
+                order: 25,
+            }],
+        });
+        let frame = subscriber.try_recv().expect("incremental frame");
+        let ServiceEvent::Daemon(DaemonEvent::Engine(WsServerMsg::QueueOrderChanged {
+            removed,
+            added,
+        })) = frame.event
+        else {
+            panic!("queue order increments must reach subscribers as queueOrderChanged");
+        };
+        assert_eq!(removed, ["a"]);
+        assert_eq!((added[0].task_id.as_str(), added[0].order), ("d", 25));
+        assert_eq!(
+            positions(&hub),
+            [
+                ("b".into(), 1, 20),
+                ("d".into(), 2, 25),
+                ("c".into(), 3, 30)
+            ]
+        );
+    }
 
     #[test]
     fn queue_engine_changes_reach_subscribers_as_queue_domain_events() {
@@ -1393,6 +1506,85 @@ mod tests {
         .expect("traffic task fixture")
     }
 
+    /// 整表替换在广播里只带头 / 重载宣告（一帧不随任务数增长），投影与分页仍是完整的；
+    /// 行数不超过内联上限的整表事件保持内联。
+    #[test]
+    fn oversized_table_events_broadcast_headers_but_keep_the_full_projection() {
+        use fluxdown_protocol::{
+            TABLE_INLINE_LIMIT, TablePageParams, TableSection, TaskDto as Dto,
+        };
+        let hub = DaemonEventHub::new(DaemonSnapshot::default(), 16);
+        let mut subscriber = hub.subscribe();
+        let total = TABLE_INLINE_LIMIT + 7;
+        let tasks: Vec<Dto> = (0..total)
+            .map(|index| traffic_task(&format!("t{index:05}"), 2, 0, 0))
+            .collect();
+        hub.publish(DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks }));
+        let frame = subscriber.try_recv().expect("table frame");
+        let ServiceEvent::Daemon(DaemonEvent::TablesReloading { tasks, queue }) = frame.event
+        else {
+            panic!("an oversized TasksSnapshot must broadcast a reload notice");
+        };
+        assert_eq!((tasks, queue), (Some(total as u64), None));
+
+        let SnapshotBody::Daemon(full) = hub.snapshot().body else {
+            panic!("daemon snapshot");
+        };
+        assert_eq!(full.tasks.len(), total, "the projection keeps every task");
+        let SnapshotBody::Daemon(header) = hub.wire_snapshot().body else {
+            panic!("daemon snapshot");
+        };
+        assert!(header.tasks.is_empty());
+        assert_eq!(header.task_total, Some(total as u64));
+
+        let mut seen = 0;
+        let mut cursor = None;
+        loop {
+            let page = hub
+                .task_page(&TablePageParams {
+                    section: TableSection::Tasks,
+                    cursor: cursor.take(),
+                    limit: Some(1_000),
+                })
+                .expect("page");
+            assert!(page.tasks.len() <= 1_000);
+            seen += page.tasks.len();
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen, total);
+
+        // 小表仍内联，客户端不必进入加载态。
+        hub.publish(DaemonEvent::Engine(WsServerMsg::TasksSnapshot {
+            tasks: vec![traffic_task("only", 2, 0, 0)],
+        }));
+        assert!(matches!(
+            subscriber.try_recv().expect("small table frame").event,
+            ServiceEvent::Daemon(DaemonEvent::Engine(WsServerMsg::TasksSnapshot { .. }))
+        ));
+    }
+
+    /// 替换事件广播里不带任务表，投影本身被完整替换。
+    #[test]
+    fn replaced_snapshots_broadcast_as_headers() {
+        let hub = DaemonEventHub::new(DaemonSnapshot::default(), 16);
+        let mut subscriber = hub.subscribe();
+        hub.replace_snapshot(DaemonSnapshot {
+            tasks: vec![traffic_task("a", 2, 0, 0), traffic_task("b", 2, 0, 0)],
+            ..DaemonSnapshot::default()
+        });
+        let ServiceEvent::Daemon(DaemonEvent::SnapshotReplaced(header)) =
+            subscriber.try_recv().expect("replacement frame").event
+        else {
+            panic!("replacement frame");
+        };
+        assert!(header.tasks.is_empty());
+        assert_eq!(header.task_total, Some(2));
+        assert_eq!(hub.inspect(|snapshot| snapshot.tasks.len()), 2);
+    }
+
     fn traffic_progress(id: &str, status: i32, downloaded: i64, uploaded: i64) -> DaemonEvent {
         DaemonEvent::Engine(WsServerMsg::TaskProgress {
             task_id: id.into(),
@@ -1410,6 +1602,30 @@ mod tests {
             seeding_message: String::new(),
             seeding_time_secs: 0,
         })
+    }
+
+    /// 做种上传帧按引擎采样节奏到达时，总上传速率必须读作真实速率（#939：
+    /// 5 秒一帧时状态栏在约 5 倍真实速率与 0 之间跳动，看似突破上传限速）。
+    #[test]
+    fn seeding_frames_at_engine_sample_cadence_read_as_real_upload_rate() {
+        const MIB: i64 = 1024 * 1024;
+        let cadence = fluxdown_engine::bt_seeding::SEEDING_UPLOAD_SAMPLE_INTERVAL;
+        let cadence_ticks = u64::try_from(cadence.as_millis() / 100).unwrap_or(u64::MAX);
+        assert!(cadence_ticks >= 1);
+        let start = std::time::Instant::now();
+        let mut accounting =
+            super::RuntimeAccounting::new(&[traffic_task("seed", 3, 10 * MIB, 0)], start);
+        // 1 MiB/s 的稳定做种上传（会话级限速下的真实流量）。
+        for tick in 1..=300_u64 {
+            let now = start + std::time::Duration::from_millis(tick * 100);
+            if tick % cadence_ticks == 0 {
+                let uploaded = i64::try_from(tick).unwrap_or_default() * MIB / 10;
+                accounting.apply(&traffic_progress("seed", 3, 10 * MIB, uploaded), now);
+            }
+            if tick >= 40 {
+                assert_eq!(accounting.rates(now), (0, MIB), "tick {tick}");
+            }
+        }
     }
 
     #[test]
@@ -1863,5 +2079,38 @@ mod tests {
             panic!("daemon snapshot")
         };
         assert_eq!(body.task_runtime["shared"].active_transfers, Some(1));
+    }
+
+    #[test]
+    fn completed_tasks_never_accumulate_runtime_in_the_snapshot_header() {
+        let hub = DaemonEventHub::new(DaemonSnapshot::default(), 4096);
+        let task = |id: &str, status: i32| -> TaskDto {
+            serde_json::from_value(serde_json::json!({
+                "taskId": id, "url": "https://example.com/x", "fileName": "x", "saveDir": "/tmp",
+                "status": status, "downloadedBytes": 0, "totalBytes": 100, "errorMessage": "",
+                "createdAt": "1", "proxyUrl": "", "queueId": "main", "checksum": ""
+            }))
+            .expect("task fixture")
+        };
+        let sample = |id: &str, sequence: u64| fluxdown_protocol::TaskRuntimeDto {
+            task_id: id.into(),
+            sample_sequence: sequence,
+            active_transfers: Some(1),
+            ..Default::default()
+        };
+        for index in 0..300_u64 {
+            let id = format!("t{index}");
+            hub.publish(DaemonEvent::TaskChanged(task(&id, 1)));
+            hub.publish(DaemonEvent::TaskRuntimeChanged(sample(&id, index + 1)));
+            hub.publish(DaemonEvent::TaskChanged(task(&id, 3)));
+            // 完成后迟到的采样不得把条目加回快照。
+            hub.publish(DaemonEvent::TaskRuntimeChanged(sample(&id, index + 10_000)));
+        }
+        let SnapshotBody::Daemon(body) = hub.snapshot().body else {
+            panic!("daemon snapshot")
+        };
+        assert_eq!(body.tasks.len(), 300);
+        assert!(body.task_runtime.is_empty());
+        assert!(body.paged_header().task_runtime.is_empty());
     }
 }

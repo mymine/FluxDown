@@ -1,6 +1,6 @@
 // 外壳布局模型（纯函数）：
-// 标题栏 / 活动栏 / 状态栏共六个区域（zone），条目可在允许的区域间拖动重排。
-// normalize / move 的语义由共享用例 `crates/shell/tests/fixtures/chrome_layout_cases.json` 约束，
+// 标题栏 / 活动栏 / 状态栏共六个区域（zone），条目可在允许的区域间拖动重排，也可手动隐藏（`fixed` 条目除外）。
+// normalize / move / setHidden 的语义由共享用例 `crates/shell/tests/fixtures/chrome_layout_cases.json` 约束，
 // GPUI 与 Web 两端都必须通过；改语义要同时改两端与用例。
 
 /** 区域线上键，规范顺序（归一化时按此顺序消费存储值）。 */
@@ -14,10 +14,15 @@ export interface ChromeItemSpec {
   id: string
   defaultZone: ChromeZone
   families: readonly ChromeFamily[]
+  /** 固定条目：可移动，但不能被隐藏。 */
+  fixed?: boolean
 }
 
-/** 完整布局：六个区域一个不缺。 */
-export type ChromeLayout = Readonly<Record<ChromeZone, readonly string[]>>
+/** 完整布局：六个区域一个不缺；`hidden` 为手动隐藏的条目 id（目录顺序，与摆放位置无关）。 */
+export type ChromeLayout = Readonly<Record<ChromeZone, readonly string[]>> & { readonly hidden: readonly string[] }
+
+/** 序列化后的存储值：六个区域必写，`hidden` 仅在非空时写入。 */
+export type StoredChromeLayout = Record<ChromeZone, string[]> & { hidden?: string[] }
 
 export function zoneFamily(zone: ChromeZone): ChromeFamily {
   if (zone.startsWith('title')) return 'title'
@@ -38,7 +43,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * 存储值 → 完整布局：
  * 1. 非普通对象 → 默认布局；
  * 2. 按规范区域顺序，数组区域内仅保留「字符串、目录内 id、尚未放置、允许放入该区域」的元素；未知区域键与非数组值忽略；
- * 3. 未被放置的目录条目按目录顺序追加到各自默认区域末尾。
+ * 3. 未被放置的目录条目按目录顺序追加到各自默认区域末尾；
+ * 4. `hidden` 须为数组，仅保留「字符串、目录内、非 fixed」的 id，去重并按目录顺序输出。
  */
 export function normalizeLayout(stored: unknown, catalog: readonly ChromeItemSpec[]): ChromeLayout {
   const specs = new Map(catalog.map((spec) => [spec.id, spec]))
@@ -51,6 +57,7 @@ export function normalizeLayout(stored: unknown, catalog: readonly ChromeItemSpe
     statusLeading: [],
     statusTrailing: [],
   }
+  let hiddenStored: unknown[] = []
   if (isPlainObject(stored)) {
     for (const zone of CHROME_ZONES) {
       const items = stored[zone]
@@ -63,15 +70,23 @@ export function normalizeLayout(stored: unknown, catalog: readonly ChromeItemSpe
         zones[zone].push(id)
       }
     }
+    if (Array.isArray(stored.hidden)) hiddenStored = stored.hidden
   }
   for (const spec of catalog) {
     if (!placed.has(spec.id)) zones[spec.defaultZone].push(spec.id)
   }
-  return zones
+  const hiddenSet = new Set(hiddenStored)
+  const hidden = catalog.filter((spec) => !spec.fixed && hiddenSet.has(spec.id)).map((spec) => spec.id)
+  return { ...zones, hidden }
 }
 
 export function defaultLayout(catalog: readonly ChromeItemSpec[]): ChromeLayout {
   return normalizeLayout(null, catalog)
+}
+
+/** 条目是否被手动隐藏。 */
+export function isHidden(layout: ChromeLayout, id: string): boolean {
+  return layout.hidden.includes(id)
 }
 
 function sameLayout(left: ChromeLayout, right: ChromeLayout): boolean {
@@ -83,7 +98,7 @@ function sameLayout(left: ChromeLayout, right: ChromeLayout): boolean {
 }
 
 /**
- * 把 `id` 移到 `zone`：
+ * 把 `id` 移到 `zone`（隐藏状态不受影响）：
  * - `id` 未知或不允许放入 `zone` → 不变；`target === id` → 不变；
  * - `target` 非空且当前在 `zone` 内：按移除前的下标 `ti` 取位，移除 `id` 后插到 `ti`
  *   （同区域向后拖落在 target 之后，向前 / 跨区域落在 target 之前）；
@@ -99,17 +114,36 @@ export function moveItem(
   const spec = catalog.find((item) => item.id === id)
   if (!spec || !itemAllowedIn(spec, zone) || target === id) return { layout, changed: false }
   const ti = target === null ? -1 : layout[zone].indexOf(target)
-  const next = {} as Record<ChromeZone, string[]>
-  for (const name of CHROME_ZONES) next[name] = layout[name].filter((item) => item !== id)
-  if (ti >= 0) next[zone].splice(ti, 0, id)
-  else next[zone].push(id)
+  const zones = {} as Record<ChromeZone, string[]>
+  for (const name of CHROME_ZONES) zones[name] = layout[name].filter((item) => item !== id)
+  if (ti >= 0) zones[zone].splice(ti, 0, id)
+  else zones[zone].push(id)
+  const next: ChromeLayout = { ...zones, hidden: layout.hidden }
   const changed = !sameLayout(layout, next)
   return { layout: changed ? next : layout, changed }
 }
 
-/** 序列化为存储值：始终写全六个区域。 */
-export function serializeLayout(layout: ChromeLayout): Record<ChromeZone, string[]> {
-  return {
+/**
+ * 显示 / 隐藏 `id`：未知条目、`fixed` 条目、状态未变 → 不变；
+ * 隐藏时按目录顺序插入 `hidden`，显示时移除。摆放位置不变。
+ */
+export function setHidden(
+  layout: ChromeLayout,
+  catalog: readonly ChromeItemSpec[],
+  id: string,
+  hidden: boolean,
+): { layout: ChromeLayout; changed: boolean } {
+  const spec = catalog.find((item) => item.id === id)
+  if (!spec || spec.fixed || isHidden(layout, id) === hidden) return { layout, changed: false }
+  const nextHidden = hidden
+    ? catalog.filter((item) => item.id === id || layout.hidden.includes(item.id)).map((item) => item.id)
+    : layout.hidden.filter((item) => item !== id)
+  return { layout: { ...layout, hidden: nextHidden }, changed: true }
+}
+
+/** 序列化为存储值：始终写全六个区域，`hidden` 仅在非空时写入。 */
+export function serializeLayout(layout: ChromeLayout): StoredChromeLayout {
+  const stored: StoredChromeLayout = {
     titleLeading: [...layout.titleLeading],
     titleTrailing: [...layout.titleTrailing],
     railTop: [...layout.railTop],
@@ -117,4 +151,6 @@ export function serializeLayout(layout: ChromeLayout): Record<ChromeZone, string
     statusLeading: [...layout.statusLeading],
     statusTrailing: [...layout.statusTrailing],
   }
+  if (layout.hidden.length > 0) stored.hidden = [...layout.hidden]
+  return stored
 }

@@ -31,6 +31,13 @@ describe("computeConfidence", () => {
     expect(computeConfidence("video", 1024, "webRequest")).toBe("low");
   });
 
+  test("不设大小下限的类型（文档 / 压缩包）：大小已知即 high，不会因有 Content-Length 被默认视图隐藏", () => {
+    expect(computeConfidence("document", 1, "webRequest")).toBe("high");
+    expect(computeConfidence("document", 5 * 1024 * 1024, "webRequest")).toBe("high");
+    expect(computeConfidence("archive", 300 * 1024, "webRequest")).toBe("high");
+    expect(computeConfidence("document", -1, "webRequest")).toBe("medium");
+  });
+
   test("图片与 other 的分档", () => {
     expect(computeConfidence("image", 200 * 1024, "webRequest")).toBe("medium");
     expect(computeConfidence("image", 20 * 1024, "webRequest")).toBe("low");

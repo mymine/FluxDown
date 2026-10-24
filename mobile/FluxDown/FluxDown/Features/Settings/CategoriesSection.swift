@@ -85,6 +85,13 @@ struct GeneralCategoryStore {
     }
 }
 
+/// 「自定义分类」行目录（下载设置页）；行 id 供设置搜索定位。
+nonisolated enum CategoriesRow {
+    static let id = "download.categories"
+    static let titleKey = "customCategories"
+    static let detailKey = "categoryPriorityDragNote"
+}
+
 /// 「自定义分类」分组：列表（点按编辑 / 左滑删除 / 长按菜单 / 编辑模式拖动重排）+ 页脚三按钮。
 struct CategoriesSection: View {
     @Binding var editing: GeneralCategoryTarget?
@@ -103,11 +110,11 @@ struct CategoriesSection: View {
         let hasBase = !store.defaultSaveDir.isEmpty
         Section {
             SettingsText(
-                title: L(GeneralRow.categories.titleKey),
-                detail: GeneralRow.categories.detailKey.map { L($0) },
+                title: L(CategoriesRow.titleKey),
+                detail: L(CategoriesRow.detailKey),
                 synced: true
             )
-            .settingsRow(GeneralRow.categories.id, failureKey: CustomCategoryDto.preferenceKey)
+            .settingsRow(CategoriesRow.id, failureKey: CustomCategoryDto.preferenceKey)
 
             ForEach(list) { entry in
                 Button {

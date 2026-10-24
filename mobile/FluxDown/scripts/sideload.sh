@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 打包原生 iOS App（mobile/FluxDown）的侧载（full flavor）**未签名** IPA，供 AltStore / SideStore / Sideloadly 等用户自签安装。
-# 与 testflight.sh 的区别：full flavor（本机引擎含 BitTorrent / eD2K，App 定义 FULL_P2P）、不签名、不上传。
+# 与 testflight.sh 的区别：full flavor（本机引擎含 BitTorrent / eD2K，App 定义 FULL_FLAVOR）、不签名、不上传。
 # 本机与 CI（.github/workflows/ios-testflight.yml 的 sideload job）共用这一份流程。
 #
 # 用法：mobile/FluxDown/scripts/sideload.sh --version X.Y.Z --build N [--out DIR] [--skip-core]
@@ -47,13 +47,13 @@ CORE_FLAVOR="$(cat "$IOS_ROOT/FluxKit/Artifacts/flavor" 2>/dev/null || true)"
 rm -rf "$ARCHIVE" "$IPA"
 mkdir -p "$OUT"
 
-# 不签名归档：描述文件 / 证书由侧载工具在安装时重签。FLUX_FLAVOR_CONDITIONS 显式给 FULL_P2P，不依赖工程默认值。
+# 不签名归档：描述文件 / 证书由侧载工具在安装时重签。FLUX_FLAVOR_CONDITIONS 显式给 FULL_FLAVOR，不依赖工程默认值。
 echo "==> xcodebuild archive $VERSION ($BUILD) unsigned"
 xcodebuild archive -quiet \
   -project "$IOS_ROOT/FluxDown.xcodeproj" -scheme FluxDown -configuration Release \
   -destination "generic/platform=iOS" -archivePath "$ARCHIVE" \
   MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD" \
-  FLUX_FLAVOR_CONDITIONS=FULL_P2P \
+  FLUX_FLAVOR_CONDITIONS=FULL_FLAVOR \
   CODE_SIGNING_ALLOWED=NO
 
 APP="$ARCHIVE/Products/Applications/FluxDown.app"

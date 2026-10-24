@@ -24,8 +24,8 @@ export {
   OptionRow,
   SectionHeader,
 } from './Form'
-export { COARSE_QUERY, MOBILE_QUERY, NARROW_QUERY, useIsCoarsePointer, useIsMobile, useIsNarrow, useMediaQuery } from './hooks'
-export { Icon } from './Icon'
+export { COARSE_QUERY, MOBILE_QUERY, NARROW_QUERY, useIsCoarsePointer, useIsMobile, useMediaQuery } from './hooks'
+export { Icon, MaskIcon } from './Icon'
 export type { IconSize } from './Icon'
 export { Input, Textarea } from './Input'
 export type { InputProps, TextareaProps } from './Input'

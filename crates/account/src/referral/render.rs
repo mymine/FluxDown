@@ -6,7 +6,7 @@ use fluxdown_protocol::{
 };
 use fluxdown_ui_components::{
     ButtonVariant, ControlExt as _, FluxIcon, button, caption_number, card, icon_button,
-    segmented_tabs, tabular_numbers,
+    segmented_tabs, tabular_numbers, tooltip_view,
 };
 use fluxdown_ui_theme::{ExtendedTokens, SemanticThemeTokens, active_theme};
 use gpui::{
@@ -16,7 +16,7 @@ use gpui::{
 };
 use gpui_component::{
     Icon, IconName, h_flex, input::Input, scroll::ScrollableElement as _, skeleton::Skeleton,
-    text::TextView, tooltip::Tooltip, v_flex,
+    text::TextView, v_flex,
 };
 
 use super::{Load, ReferralView, Tab, codes_full, page_count};
@@ -541,7 +541,7 @@ impl ReferralView {
                             ButtonVariant::Ghost,
                             cx,
                         )
-                        .tooltip(move |window, cx| Tooltip::new(copy_tip.clone()).build(window, cx))
+                        .tooltip(move |window, cx| tooltip_view(copy_tip.clone(), window, cx))
                         .on_click(cx.listener(
                             move |this, _: &ClickEvent, window, cx| {
                                 this.copy_code(&copy_value, window, cx);
@@ -559,9 +559,7 @@ impl ReferralView {
                             cx,
                         )
                         .disabled(disconnected || deleting)
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(delete_tip.clone()).build(window, cx)
-                        })
+                        .tooltip(move |window, cx| tooltip_view(delete_tip.clone(), window, cx))
                         .on_click(cx.listener(
                             move |this, _: &ClickEvent, window, cx| {
                                 this.confirm_delete(delete_id.clone(), window, cx);

@@ -23,7 +23,6 @@ directories = "6.0.0"
 encoding_rs = "0.8"
 feed-rs = "2.4"
 flate2 = "1"
-fluxdown_link = { version = "0.1.0", path = "../link", optional = true }
 futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
@@ -48,7 +47,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 ts2mp4 = "0.3"
 url = "2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 # 插件 zip 安装（跨桌面/服务端；仅 plugins feature 开启时启用）
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
@@ -80,9 +79,6 @@ http = "1.4.0"
 plugins = ["dep:rquickjs", "dep:zip"]
 # 组件托管安装（ffmpeg 下载/解压）；desktop/server 开启，mobile/CLI 关闭。
 components = ["dep:zip"]
-# 冻结的 native/server 使用的引擎数据库存储后端（`link::DbLinkStorage`）。
-# 当前 agent 的互联状态独立持久化；保留此 feature 以维持旧 server 的源码契约。
-link = ["dep:fluxdown_link"]
 # P2P 能力（BitTorrent / eD2K）。默认开启；App Store 的 iOS 商店构建通过
 # `--no-default-features` 在**编译期**整体剔除（不链接 librqbit，也不残留休眠的 P2P 代码）。
 # 关闭后 magnet / .torrent / ed2k 任务一律被明确拒绝（见 `download_manager::UNSUPPORTED_PROTOCOL_MESSAGE`），

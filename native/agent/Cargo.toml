@@ -65,7 +65,7 @@ reqwest = { version = "0.12", features = ["json", "stream", "socks"] }
 # 固定 0.59：0.61 引入 windows-link(raw-dylib)，与 cdylib 构建在 CI 上不兼容
 winreg = "0.55"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
-windows = { version = "0.61.3", features = ["Data_Xml_Dom", "Foundation", "UI_Notifications", "Win32_Graphics_Gdi", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61.3", features = ["Data_Xml_Dom", "Foundation", "Media_Core", "Media_Playback", "UI_Notifications", "Win32_Graphics_Gdi", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 # notify-rust 仅用于 Linux D-Bus 通知（macOS / Windows 用原生通知；Android / iOS 不编译）。
 # x11rb（X11 XGrabKey + XInput2 原始键盘事件）与 ashpd（Wayland GlobalShortcuts portal）

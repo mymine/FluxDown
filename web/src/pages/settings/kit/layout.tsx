@@ -2,11 +2,11 @@
 // 页面内容在 SettingsLayout 的滚动容器里；这里只负责标题、Tab、分组与行。
 
 import { Info } from 'lucide-react'
-import { Children, useState } from 'react'
+import { Children, useLayoutEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useT } from '../../../i18n'
 import { cn } from '../../../lib/cn'
-import { Card, Icon, SegmentedTabs, useIsMobile } from '../../../ui'
+import { Card, Icon, SegmentedTabs, Tooltip, useIsCoarsePointer, useIsMobile } from '../../../ui'
 import { SETTINGS_ERROR_KEYS, clearSettingsError, useSettingsError, useSettingsReadOnly } from './writeStore'
 
 export interface SettingsTabDef {
@@ -102,27 +102,61 @@ export function SettingsSection({
   )
 }
 
-/** 行标题 + 说明；`help` 是点击展开的长说明（触屏无 hover，不用 tooltip）。 */
+/**
+ * 行标题 + 说明。说明只占一行，超出时截断；超出或有 `help`（长说明）时标题旁显示信息图标，
+ * 鼠标悬浮图标即显示完整说明。触屏无 hover，改为点击图标原地展开。
+ * 对齐 GPUI `SettingsRow` 的单行说明规则。
+ */
 function RowLabel({ title, description, help }: { title: ReactNode; description?: ReactNode; help: string | undefined }) {
+  const coarse = useIsCoarsePointer()
   const [open, setOpen] = useState(false)
+  const [overflows, setOverflows] = useState(false)
+  const descriptionRef = useRef<HTMLDivElement>(null)
+  const expanded = coarse && open
+  useLayoutEffect(() => {
+    const node = descriptionRef.current
+    // 展开时说明不截断，无从测量；保留收起时的结论。
+    if (!node || expanded) return
+    const measure = () => setOverflows(node.scrollWidth > node.clientWidth)
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [expanded, description])
+  const expandable = Boolean(help) || overflows
+  const details = (
+    <div className="flex flex-col gap-2 whitespace-pre-line">
+      {overflows && description ? <div>{description}</div> : null}
+      {help ? <div>{help}</div> : null}
+    </div>
+  )
   return (
     <div className="flex min-w-0 flex-col gap-0.5">
       <div className="flex items-center gap-1 text-sm text-foreground">
         <span className="min-w-0">{title}</span>
-        {help ? (
-          <button
-            type="button"
-            aria-expanded={open}
-            aria-label={help}
-            onClick={() => setOpen((value) => !value)}
-            className="inline-flex items-center justify-center rounded-sm text-text-tertiary hover:text-foreground coarse:size-8"
-          >
-            <Icon icon={Info} />
-          </button>
+        {expandable ? (
+          <Tooltip content={details}>
+            <button
+              type="button"
+              aria-expanded={coarse ? open : undefined}
+              aria-label={help ?? (typeof description === 'string' ? description : undefined)}
+              onClick={coarse ? () => setOpen((value) => !value) : undefined}
+              className="inline-flex cursor-help items-center justify-center rounded-sm text-text-tertiary hover:text-foreground coarse:size-8"
+            >
+              <Icon icon={Info} />
+            </button>
+          </Tooltip>
         ) : null}
       </div>
-      {description ? <div className="text-xs text-muted-foreground">{description}</div> : null}
-      {help && open ? <div className="whitespace-pre-line text-xs text-muted-foreground">{help}</div> : null}
+      {description ? (
+        <div
+          ref={descriptionRef}
+          className={cn('text-xs text-muted-foreground', !expanded && 'truncate')}
+        >
+          {description}
+        </div>
+      ) : null}
+      {help && expanded ? <div className="whitespace-pre-line text-xs text-muted-foreground">{help}</div> : null}
     </div>
   )
 }

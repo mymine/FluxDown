@@ -35,7 +35,7 @@ use gpui_component::{
 use serde_json::{Value, json};
 
 use super::cloud_push::failure_text;
-use super::webhook::WEBHOOK_EVENTS;
+use super::webhook::cloud_events;
 use crate::model::cloud_notify::{
     AddMode, AddressIssue, BindPhase, ChannelKind, DEFAULT_EVENTS, MAX_RECIPIENTS, RecipientBadge,
     add_mode, add_recipient, address_issue, bind_phase, can_add_direct, can_add_more, can_remove,
@@ -393,7 +393,7 @@ impl CloudChannelDialog {
         if self.saving || !self.can_save(cx) {
             return;
         }
-        let events = ordered_events(&self.events, WEBHOOK_EVENTS.iter().map(|(wire, _)| *wire));
+        let events = ordered_events(&self.events, cloud_events().map(|(wire, _)| *wire));
         let name = self.name.read(cx).value().trim().to_owned();
         // 邮件保存整个收件列表；Telegram 没有收件地址。
         let is_email = self.kind == ChannelKind::Email;
@@ -891,7 +891,7 @@ impl CloudChannelDialog {
         let tokens = active_theme(cx).tokens().clone();
         let view = cx.entity();
         let mut grid = div().flex().flex_wrap().w_full().p(tokens.spacing.xs);
-        for (wire, label_key) in WEBHOOK_EVENTS {
+        for (wire, label_key) in cloud_events() {
             let wire = *wire;
             let view = view.clone();
             grid = grid.child(div().w(relative(0.5)).min_w_0().child(check_row(

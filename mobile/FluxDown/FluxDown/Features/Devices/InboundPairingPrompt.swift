@@ -31,6 +31,8 @@ final class PairingPromptGate {
 
     /// 当前负责呈现的实例。
     private(set) var presenter: UUID?
+    /// 请求首次出现时算好的过期时刻（sessionId → 本机 Unix 毫秒）；只在视图 body 里读写，不参与观察。
+    @ObservationIgnored private var receivedDeadlines: [String: Int64] = [:]
     /// 已由用户 / 到期处理过、等待分区移除的请求（乐观关闭，避免等主机回写前重复呈现）。
     private(set) var handled: Set<String> = []
     @ObservationIgnored private var entries: [Entry] = []
@@ -95,6 +97,20 @@ final class PairingPromptGate {
         let stale = handled.subtracting(live)
         if !stale.isEmpty { handled.subtract(stale) }
         announced.formIntersection(live)
+        receivedDeadlines = receivedDeadlines.filter { live.contains($0.key) }
+    }
+
+    /// 请求的过期时刻（本机 Unix 毫秒）：**第一次见到该请求的本机时刻** + `ttlMs`（旧主机缺 `ttlMs` 才回退主机时钟的
+    /// `expiresAtUnixMs`），之后固定不变——倒计时 / 自动拒绝都不受主机与本机时钟偏差影响。
+    func deadlineMs(for request: LinkPairingRequestDto) -> Int64 {
+        if let known = receivedDeadlines[request.sessionId] { return known }
+        let value = LinkRules.deadlineMs(
+            ttlMs: request.ttlMs,
+            expiresAtUnixMs: request.expiresAtUnixMs,
+            receivedAtMs: AccountText.nowMs()
+        )
+        receivedDeadlines[request.sessionId] = value
+        return value
     }
 
     /// 首次提示返回 true（同一请求只弹一次「有配对请求」Toast）。
@@ -173,6 +189,7 @@ private struct PairingPromptModifier: ViewModifier {
             .fullScreenCover(item: Binding(get: { shown }, set: { _ in })) { request in
                 InboundPairingPrompt(
                     request: request,
+                    deadlineMs: gate.deadlineMs(for: request),
                     queued: max(queue.count - 1, 0),
                     respond: { accept, automatic in respond(to: request, accept: accept, automatic: automatic, gate: gate) }
                 )
@@ -228,6 +245,8 @@ private struct PairingPromptModifier: ViewModifier {
 /// 到期自动拒绝恰好一次；触感：出现 `.warning`，确认 `.success`，拒绝 `.rigid`。
 struct InboundPairingPrompt: View {
     let request: LinkPairingRequestDto
+    /// 过期时刻（本机 Unix 毫秒）：收到请求的本机时刻 + `ttlMs`（见 ``PairingPromptGate/deadlineMs(for:)``）。
+    let deadlineMs: Int64
     /// 排在后面等待的请求数。
     let queued: Int
     /// `(accept, automatic)`：`automatic` = 到期自动拒绝。
@@ -235,16 +254,17 @@ struct InboundPairingPrompt: View {
 
     @State private var total: TimeInterval
 
-    init(request: LinkPairingRequestDto, queued: Int, respond: @escaping (Bool, Bool) -> Void) {
+    init(request: LinkPairingRequestDto, deadlineMs: Int64, queued: Int, respond: @escaping (Bool, Bool) -> Void) {
         self.request = request
+        self.deadlineMs = deadlineMs
         self.queued = queued
         self.respond = respond
-        let remaining = LinkRules.secondsUntil(expiresAtUnixMs: request.expiresAtUnixMs, nowMs: AccountText.nowMs())
+        let remaining = LinkRules.secondsUntil(expiresAtUnixMs: deadlineMs, nowMs: AccountText.nowMs())
         // 对端有 60 秒确认窗口；先看到时剩余更长就以剩余为准。
         _total = State(initialValue: max(60, TimeInterval(remaining)))
     }
 
-    private var deadline: Date { Date(timeIntervalSince1970: Double(request.expiresAtUnixMs) / 1000) }
+    private var deadline: Date { Date(timeIntervalSince1970: Double(deadlineMs) / 1000) }
 
     var body: some View {
         ScrollView {
@@ -274,6 +294,20 @@ struct InboundPairingPrompt: View {
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if request.requestsControl {
+                    // 对端请求完全控制本机：批准后它能看到并管理全部下载、改设置——必须醒目地警示。
+                    VStack(spacing: 8) {
+                        StatusBadge(text: L("linkControlRequestTag"), tone: .warning)
+                        Text(L("linkControlRequestWarning"))
+                            .font(.subheadline.weight(.medium))
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity)
+                    .background(Color.fdStatusWarning.opacity(0.15), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .accessibilityElement(children: .combine)
+                }
                 SasDigitsView(sas: request.sas, size: 64)
                 countdown
             }
@@ -294,7 +328,7 @@ struct InboundPairingPrompt: View {
         VStack(spacing: 8) {
             CountdownRing(deadline: deadline, total: total) { L("incomingPairingCountdown", ["seconds": $0]) }
             TimelineView(.periodic(from: .now, by: 1)) { _ in
-                let seconds = Int(LinkRules.secondsUntil(expiresAtUnixMs: request.expiresAtUnixMs, nowMs: AccountText.nowMs()))
+                let seconds = Int(LinkRules.secondsUntil(expiresAtUnixMs: deadlineMs, nowMs: AccountText.nowMs()))
                 Text(L("incomingPairingCountdown", ["seconds": seconds]))
                     .font(.subheadline.weight(.medium))
                     .monospacedDigit()
@@ -315,7 +349,7 @@ struct InboundPairingPrompt: View {
     /// 出现时 `.warning` 触感；到期时自动拒绝一次（任务随确认页消失被取消，不会误拒别的请求）。
     private func watchExpiry() async {
         FluxHaptic.warning.play()
-        let remaining = request.expiresAtUnixMs - AccountText.nowMs()
+        let remaining = deadlineMs - AccountText.nowMs()
         if remaining > 0 {
             do {
                 try await Task.sleep(for: .milliseconds(remaining))
@@ -357,7 +391,7 @@ struct InboundPairingPrompt: View {
             FluxHaptic.success.play()
             respond(true, false)
         } label: {
-            Text(L("incomingPairingAccept"))
+            Text(L(request.requestsControl ? "linkControlApprove" : "incomingPairingAccept"))
                 .frame(maxWidth: .infinity)
                 .fixedSize(horizontal: false, vertical: true)
         }

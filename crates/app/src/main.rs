@@ -28,6 +28,8 @@ mod power;
 mod preference_writes;
 mod progress_windows;
 mod service_bootstrap;
+mod service_failure;
+mod service_notices;
 mod session;
 mod settings_port;
 #[cfg(windows)]

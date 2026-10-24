@@ -90,6 +90,7 @@ fn task_tabs(contributions: &Contributions) -> Vec<PluginTaskTab> {
         .iter()
         .map(|view| PluginTaskTab {
             title: SharedString::from(view.view.title.clone()),
+            revision: view.package_revision,
         })
         .collect()
 }
@@ -199,7 +200,10 @@ pub(crate) fn install(cx: &mut App) {
             fluxdown_ui_plugin_ui::portable::resync_all(cx);
         }
         SessionSignal::Event(frame) => handle_event(&frame.event, cx),
-        SessionSignal::Stale | SessionSignal::Fatal(_) | SessionSignal::ServiceStopped => {}
+        SessionSignal::Stale
+        | SessionSignal::Fatal(_)
+        | SessionSignal::ServiceStopped
+        | SessionSignal::ServiceFailed(_) => {}
     })
     .detach();
 }
@@ -231,8 +235,9 @@ fn handle_event(event: &ServiceEvent, cx: &mut App) {
     }
 }
 
-/// 插件列表到达：贡献变化才重新应用。
+/// 插件列表到达：已开插件窗口按包修订号原地重挂；贡献（含包修订号）变化才重新装配路由与 tab。
 fn plugins_updated(plugins: &[fluxdown_protocol::PluginDto], cx: &mut App) {
+    crate::windows::plugin::remount_changed(plugins, cx);
     let Some(next) =
         changed_contributions(&cx.global::<PluginContributionState>().current, plugins)
     else {
@@ -312,9 +317,14 @@ fn build_routes(cx: &mut App) -> Vec<ShellRoute> {
             }
         };
         let weak = entity.downgrade();
+        let icon = match &spec.view.view.icon_svg {
+            Some(svg) => Icon::default().data(svg.as_bytes()),
+            None => Icon::new(FluxIcon::Sparkles),
+        };
         let route = ShellRoute::plugin(
             RouteId::plugin(&spec.view.identity, &spec.view.view.id),
             SharedString::from(spec.label),
+            icon,
             entity.clone().into(),
         )
         .on_activate(Rc::new(move |window, cx| {
@@ -362,6 +372,7 @@ pub(crate) fn settings_view_factory() -> PluginViewFactory {
             plugin_name: plugin.name.clone(),
             view: view.clone(),
             package_dir: plugin.package_dir.clone(),
+            package_revision: plugin.package_revision,
         };
         view_for(&view, task_id, window, cx)
     })
@@ -521,6 +532,31 @@ mod tests {
         let next = changed_contributions(&current, &disabled).expect("changed");
         assert!(next.activity.is_empty());
         assert!(changed_contributions(&next, &disabled).is_none());
+    }
+
+    #[test]
+    fn package_revision_change_invalidates_cached_views() {
+        let current = Contributions::from_plugins(&[
+            plugin("d@x", json!({"packageRevision": 1})),
+            plugin("e@x", json!({"packageRevision": 1})),
+        ]);
+        let reloaded = [
+            plugin("d@x", json!({"packageRevision": 2})),
+            plugin("e@x", json!({"packageRevision": 1})),
+        ];
+        let next = changed_contributions(&current, &reloaded).expect("revision change applies");
+
+        // build_routes 按 (id, ViewRef) 复用路由实体：只有被重载插件的声明不再相等。
+        let before = route_specs(&current);
+        let after = route_specs(&next);
+        let same = |id: &str| {
+            let find = |specs: &[RouteSpec]| specs.iter().find(|s| s.id == id).cloned();
+            find(&before) == find(&after)
+        };
+        assert!(!same("plugin:d@x:a"));
+        assert!(same("plugin:e@x:a"));
+        // 详情 tab 列表随之不等，详情面板据此丢弃旧视图缓存。
+        assert_ne!(task_tabs(&current), task_tabs(&next));
     }
 
     #[test]

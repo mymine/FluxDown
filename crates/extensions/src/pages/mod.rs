@@ -4,6 +4,7 @@ use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::{ComponentTokens, ExtendedTokens, SemanticThemeTokens};
 
 pub mod managed_components;
+pub mod market_favorites;
 pub mod plugins;
 pub mod site_defaults;
 

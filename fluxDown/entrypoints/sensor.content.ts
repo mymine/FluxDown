@@ -10,8 +10,7 @@
  */
 import { browser } from "wxt/browser";
 import { defineContentScript } from "wxt/utils/define-content-script";
-import { injectScript } from "wxt/utils/inject-script";
-import type { ContentMessage, HooksInfo, ProbeReply } from "@/background/protocol";
+import type { BrowserDownloadNotice, ContentMessage, HooksInfo, ProbeReply } from "@/background/protocol";
 import {
   EV_CONFIG,
   EV_MEDIA,
@@ -36,6 +35,7 @@ import {
 import { MediaTracker } from "@/page/media-tracker";
 import { compileBundled, createClassifier } from "@/rules/engine";
 import { createFloatButton, type FloatButtonController } from "@/ui/features/FloatButton";
+import { createDownloadNotice } from "@/ui/features/DownloadNotice";
 import { normalizeDashManifest, parseDashManifestText } from "@/utils/dash-manifest";
 import { isHttpUrl } from "@/utils/media-sniff";
 import { sendAction } from "@/utils/messaging";
@@ -376,6 +376,8 @@ export default defineContentScript({
 
     // ===== PageConfig：拉取并下发给 MAIN =====
     let float: FloatButtonController | null = null;
+    // 浏览器下载提示卡（仅顶层帧会收到消息，首次提示才挂载）
+    const downloadNotice = createDownloadNotice(ctx);
 
     function applyConfig(next: PageConfig): void {
       config = next;
@@ -556,6 +558,16 @@ export default defineContentScript({
           tracker.resendAll();
           return true;
         }
+        case "browserDownload": {
+          // 只有顶层帧显示；background 也只发 frameId 0
+          if (!top) return undefined;
+          const notice = message as BrowserDownloadNotice;
+          downloadNotice
+            .handle(notice)
+            .then((ok) => sendResponse({ ok }))
+            .catch(() => sendResponse({ ok: false }));
+          return true;
+        }
         default:
           return undefined;
       }
@@ -603,25 +615,19 @@ export default defineContentScript({
       browser.runtime.onMessage.removeListener(onMessage);
       domSniff.stop();
       tracker.stop();
+      downloadNotice.destroy();
       float?.destroy();
       window.clearTimeout(flushTimer);
       window.clearTimeout(hooksTimer);
     });
 
     // ===== 启动序列 =====
-    // 1. Firefox：MV2 不支持 world: MAIN，经 unlisted script 注入页面环境
-    if (import.meta.env.FIREFOX) {
-      try {
-        await injectScript("/page-hooks-main.js", { keepInDom: true });
-      } catch (e) {
-        console.warn("[FluxDown] Failed to inject page hooks:", e);
-      }
-    }
-
-    // 2. 浮钮
+    // MAIN world 钩子由清单声明式注入（page-hooks.content.ts，document_start），先于页面脚本运行；
+    // 本脚本无需注入或等待它，配置下发后经 hooks 握手确认。
+    // 1. 浮钮
     float = createFloatButton({ ctx, tracker, pageUrl: () => matchPageUrl(top) });
 
-    // 3. 拉取配置（之后 DOM 扫描 / 跟踪 / 浮钮才真正启用）
+    // 2. 拉取配置（之后 DOM 扫描 / 跟踪 / 浮钮才真正启用）
     await loadConfig();
   },
 });

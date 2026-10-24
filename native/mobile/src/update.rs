@@ -1,5 +1,5 @@
 //! 应用自更新（原生 Android）：复用 agent 的 `UpdateService` 状态机（多站点检查 / 续传下载 /
-//! SHA-256 校验 / 安装对账），只把安装交给 App（PackageInstaller）。
+//! SHA-256 校验 / 安装对账），只把安装交给 App（App 再交给用户默认的 APK 安装程序）。
 //!
 //! 与主机会话无关：本机与远端模式下更新的都是 App 本身。调度（何时检查、何时自动下载）由
 //! App 按前后台 / 网络计量 / 用户偏好决定；这里不起任何周期任务（空闲静默）。
@@ -61,7 +61,7 @@ pub enum UpdateManualReasonDto {
     Unknown,
 }
 
-/// `UpdateFailure`。`ElevationCancelled` 在 Android 上表示用户在系统安装确认中取消。
+/// `UpdateFailure`。`ElevationCancelled` 在 Android 上表示安装前用户放弃（如「安装会中断下载」确认里取消）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum UpdateFailureDto {
     Network,
@@ -107,8 +107,8 @@ pub struct AppUpdateStatusDto {
 pub enum AppUpdateSignalDto {
     /// 状态变化（只保留最新；下载进度已节流）。
     Status { status: AppUpdateStatusDto },
-    /// 已校验的 APK 就绪且用户已确认安装：App 提交系统安装会话；失败 / 取消经
-    /// [`AppUpdater::report_install_failure`] 回报，成功时系统替换应用并结束进程。
+    /// 已校验的 APK 就绪且用户已确认安装：App 交给安装程序；本状态机停在 `Installing`，成功时系统替换
+    /// 应用并结束进程（下次启动对账），安装前被拒 / 放弃经 [`AppUpdater::report_install_failure`] 回报。
     InstallRequested {
         package_path: String,
         version: String,

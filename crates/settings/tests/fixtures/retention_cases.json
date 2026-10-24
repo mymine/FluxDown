@@ -1,0 +1,21 @@
+{
+  "presets": [0, 1, 7, 30],
+  "customStart": 14,
+  "mode": [
+    { "days": 0, "customFlag": false, "expect": "0" },
+    { "days": 1, "customFlag": false, "expect": "1" },
+    { "days": 7, "customFlag": false, "expect": "7" },
+    { "days": 30, "customFlag": false, "expect": "30" },
+    { "days": 14, "customFlag": false, "expect": "custom" },
+    { "days": 365, "customFlag": false, "expect": "custom" },
+    { "days": 7, "customFlag": true, "expect": "custom" },
+    { "days": 0, "customFlag": true, "expect": "0" }
+  ],
+  "customTarget": [
+    { "current": 0, "max": 3650, "expect": 14 },
+    { "current": 7, "max": 3650, "expect": 14 },
+    { "current": 30, "max": 3650, "expect": 14 },
+    { "current": 90, "max": 3650, "expect": 90 },
+    { "current": 99999, "max": 3650, "expect": 3650 }
+  ]
+}

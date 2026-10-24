@@ -1,11 +1,11 @@
 ---
-/** 命令行与 Android 两组构建,并排显示。 */
+/** 命令行、Android 与 iOS(TestFlight 公测)构建。 */
 import { SquareTerminal } from "lucide-react";
 import AssetGroup, { type RowSpec } from "./AssetGroup.astro";
 import { BrandIcon } from "@/components/icons/brand";
 import { download } from "@/i18n/messages/download";
 import type { Lang } from "@/i18n/config";
-import { GITHUB_URL } from "@/lib/site-nav";
+import { GITHUB_URL, TESTFLIGHT_URL } from "@/lib/site-nav";
 import { withBase } from "@/lib/base";
 
 interface Props {
@@ -33,14 +33,18 @@ const android: RowSpec[] = [
 ];
 ---
 
-<section class="frame" aria-label={`${t.cli.title} · ${t.android.title}`}>
+<section class="frame" aria-label={`${t.cli.title} · ${t.android.title} · ${t.ios.title}`}>
   <div class="cells tools">
     <AssetGroup lang={lang} id="cli" title={t.cli.title} desc={t.cli.desc} versionPath="cli.version" fallback={fallback} rows={cli}>
       <Fragment slot="icon"><SquareTerminal size={16} strokeWidth={1.75} /></Fragment>
       <a class="link mt-auto self-start text-[13px]" href={withBase(`/docs/${lang}/api/cli/`)}>{t.cli.docs}</a>
     </AssetGroup>
-    <AssetGroup lang={lang} id="android" os="android" title={t.android.title} desc={t.android.desc} versionPath="mobile.version" fallback={fallback} rows={android} notifyHref="#subscribe">
+    <AssetGroup lang={lang} id="android" os="android" title={t.android.title} desc={t.android.desc} versionPath="mobile.version" fallback={fallback} rows={android}>
       <Fragment slot="icon"><BrandIcon name="android" size={16} /></Fragment>
+    </AssetGroup>
+    <AssetGroup lang={lang} id="ios" os="ios" title={t.ios.title} desc={t.ios.desc} fallback={fallback} rows={[]}>
+      <Fragment slot="icon"><BrandIcon name="apple" size={16} /></Fragment>
+      <a class="link mt-auto self-start text-[13px]" href={TESTFLIGHT_URL} target="_blank" rel="noopener">{t.ios.join}</a>
     </AssetGroup>
   </div>
   <div class="rule"></div>
@@ -53,6 +57,17 @@ const android: RowSpec[] = [
   @media (min-width: 760px) {
     .tools {
       grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .tools > :global(:last-child:nth-child(odd)) {
+      grid-column: 1 / -1;
+    }
+  }
+  @media (min-width: 1100px) {
+    .tools {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .tools > :global(:last-child:nth-child(odd)) {
+      grid-column: auto;
     }
   }
 </style>

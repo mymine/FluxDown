@@ -5,6 +5,7 @@ import com.fluxdown.core.model.CloudDevice
 import com.fluxdown.core.model.HostInfo
 import com.fluxdown.core.model.LinkDevice
 import com.fluxdown.core.model.Queue
+import com.fluxdown.core.model.QueueOrderEntry
 import com.fluxdown.core.model.RssSource
 import com.fluxdown.core.model.RuntimeStats
 import com.fluxdown.core.model.SelectionOutcome
@@ -88,6 +89,10 @@ data class CreateTaskRequest(
     val httpUser: String = "",
     val httpPassword: String = "",
     val saveSiteAuth: Boolean = false,
+    /** null = 不按分类路由；非 null = 新建表单 / 外部唤起给出的默认目录，Rust 按分类规则决定是否路由。 */
+    val offeredSaveDir: String? = null,
+    /** 免打扰外部捕获：跳过 BT 文件 / 画质 / 变体二次选择（同 `daemon.task.create.unattended`）。 */
+    val unattended: Boolean = false,
 )
 
 /** 主机推送给 UI 仓库的信号（对应 UniFFI `HostSignal`）。 */
@@ -112,8 +117,8 @@ data class HostSnapshot(
     val tasks: List<Task>,
     val runtime: Map<String, TaskRuntime>,
     val queues: List<Queue>,
-    /** taskId → 排队序号（1 起）。 */
-    val queuePositions: Map<String, Int>,
+    /** 排队任务的排序键，按键升序（名次 = 下标 + 1 即「排队 #n」）。 */
+    val queueOrder: List<QueueOrderEntry>,
     val groups: List<TaskGroup>,
     val stats: RuntimeStats,
     /** 0 或 1 个优先任务。 */
@@ -129,6 +134,13 @@ data class HostSnapshot(
     val categories: List<Category> = Category.BUILTIN,
     /** 其余 `AgentSnapshot` / `DaemonSnapshot` 分区：键见 `sections.rs`，值为协议 serde wire 的 JSON 字符串。 */
     val sections: Map<String, String> = emptyMap(),
+    /**
+     * 任务表尚在分页载入（协议 v17 `taskTotal` 存在）：[tasks] 此时为空，不是“没有任务”。
+     * 载入完成后主机会再推送一份 `tasksLoading == false` 的完整快照。
+     */
+    val tasksLoading: Boolean = false,
+    /** 主机上的任务总数；仅 [tasksLoading] 为 true 时有意义（进度文案用）。 */
+    val taskTotal: Long = 0,
 )
 
 /** 移动端订阅的事件子集（`DaemonEvent` / `WsServerMsg` 经 Rust 侧归一）。 */
@@ -152,7 +164,12 @@ sealed interface HostEvent {
 
     data class TaskRuntimeChanged(val runtime: TaskRuntime) : HostEvent
     data class QueuesChanged(val queues: List<Queue>) : HostEvent
-    data class QueuePositionsChanged(val positions: Map<String, Int>) : HostEvent
+
+    /** 队列顺序整表替换（首次 / 用户重排）：[order] 按键升序。 */
+    data class QueuePositionsChanged(val order: List<QueueOrderEntry>) : HostEvent
+
+    /** 队列顺序增量：先移除 [removed]，再按键插入 / 更新 [added]。 */
+    data class QueueOrderChanged(val removed: List<String>, val added: List<QueueOrderEntry>) : HostEvent
     data class GroupsChanged(val groups: List<TaskGroup>) : HostEvent
     data class FileMissingChanged(val updates: Map<String, Boolean>) : HostEvent
     data class PriorityTaskChanged(val taskId: String?) : HostEvent

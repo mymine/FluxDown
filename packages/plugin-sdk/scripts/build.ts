@@ -1,6 +1,6 @@
 // Builds dist/: zero-dependency manifest.mjs, library entries, the CLI, and declarations.
 import * as esbuild from "esbuild";
-import { chmodSync, cpSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 const root = new URL("..", import.meta.url).pathname;
@@ -10,7 +10,9 @@ mkdirSync(dist, { recursive: true });
 
 const common = { absWorkingDir: root, bundle: true, logLevel: "info", legalComments: "none" } as const;
 
-// Zero-dependency validator: the plugin index vendors this single file.
+// Zero-dependency validator: the plugin index vendors this single file from the published npm
+// package. The first line names the exact release; the index's sync workflow reads it.
+const { version } = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { version: string };
 await esbuild.build({
   ...common,
   entryPoints: ["src/manifest.ts"],
@@ -18,6 +20,7 @@ await esbuild.build({
   format: "esm",
   platform: "neutral",
   target: "es2020",
+  banner: { js: `// fluxdown-plugin-sdk@${version} manifest validator (generated; do not edit)` },
 });
 
 const libraryEntries: Record<string, string> = {

@@ -811,6 +811,7 @@ pub(crate) async fn ping(State(state): State<AppState>) -> Response {
         body["linkFingerprint"] = json!(info.fingerprint);
         body["linkName"] = json!(info.name);
         body["linkProtocol"] = json!(info.link_protocol);
+        body["linkControl"] = json!(info.link_control);
         if !info.platform.is_empty() {
             body["linkPlatform"] = json!(info.platform);
         }

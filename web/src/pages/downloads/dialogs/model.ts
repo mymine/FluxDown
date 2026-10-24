@@ -1,7 +1,7 @@
 // 「新建下载」表单的纯模型：链接解析、代理 / UA / 线程预设与请求构建。
 // 与 crates/downloads/src/model/new_download.rs 的桌面端规则保持同步。
 
-import { emptyHints, joinContinuations, parseCommand, rustTrim } from './aria2c'
+import { emptyHints, joinContinuations, parseCommand, rustTrim, startsWithLink } from './aria2c'
 import type { ParsedInput, RequestHints } from './aria2c'
 import type { CreateTaskItem, CreateTaskRequest } from '../../../lib/rpc'
 import { MAX_TASK_SEGMENTS } from '../../../lib/threadsRisk'
@@ -57,9 +57,14 @@ function trimUrlTail(url: string): string {
   return url.replace(/[.,;:!?()[\]{}]+$/, '')
 }
 
+/** 零宽字符与 BOM（U+200B/C/D、U+2060、U+FEFF）：不可见且不属于链接，解析前剔除。 */
+const INVISIBLE = /[\u200B\u200C\u200D\u2060\uFEFF]/g
+
 /**
  * 解析多行文本为下载条目。
- * - 原始行以空格 / Tab 开头 = 选项行，附着到上一条（`out=` / `checksum=`）；
+ * - 原始行以空格 / Tab 开头且不以链接开头 = 选项行，附着到上一条（`out=` / `checksum=`）；
+ *   以链接开头的缩进行（从网页 / 聊天复制常带前导空白）按普通行解析；
+ * - 零宽字符与 BOM 先整体剔除；
  * - `#` 开头为注释，空行跳过；
  * - 含 `magnet:?` / `ed2k://` 时从该位置截取到行尾；
  * - 其余行：`loose` 时取行内首个 http(s)/ftp 链接并去掉尾部标点（TXT 导入），否则要求链接位于行首。
@@ -74,12 +79,12 @@ export function parseEntries(text: string, loose: boolean): UrlEntry[] {
  * 其余行的行为不变。
  */
 export function parseInput(text: string, loose: boolean): ParsedInput {
-  const joined = joinContinuations(text)
+  const joined = joinContinuations(text.replace(INVISIBLE, ''))
   const entries: UrlEntry[] = []
   let hints: RequestHints | null = null
   let current: UrlEntry | null = null
   for (const line of joined.split('\n')) {
-    if (line.startsWith(' ') || line.startsWith('\t')) {
+    if ((line.startsWith(' ') || line.startsWith('\t')) && !startsWithLink(rustTrim(line))) {
       if (!current) continue
       const trimmed = line.trim()
       if (trimmed.startsWith('out=')) current.fileName = trimmed.slice(4)

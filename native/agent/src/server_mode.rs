@@ -34,6 +34,8 @@ use tokio_util::sync::CancellationToken;
 use crate::capture::{BlobError, BlobKind, DaemonBlobClient};
 use crate::daemon_client::DaemonClientConfig;
 use crate::event_hub::AgentEventHub;
+use crate::gateway::RpcCredential;
+use crate::link::LinkService;
 use crate::runtime::AgentResult;
 use crate::state::{AgentState, StateStore};
 
@@ -348,12 +350,12 @@ pub fn authorize_rpc(
 }
 
 /// 空访问密钥永远不匹配（未初始化时不能用空串登录）。
-fn key_matches(access_key: &TokenCell, presented: &str) -> bool {
+pub(crate) fn key_matches(access_key: &TokenCell, presented: &str) -> bool {
     let expected = access_key.get();
     !expected.is_empty() && !presented.is_empty() && constant_time_eq(presented, &expected)
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)?
         .to_str()
@@ -629,6 +631,8 @@ pub struct ServerHandleParts {
     pub demo: bool,
     /// [`ServerConfig::allow_local_platform`]。
     pub allow_local_platform: bool,
+    /// 互联服务：接受局域网配对签发的设备控制凭据（`/rpc` 与 `/api/web/*`）。
+    pub link: Option<Arc<LinkService>>,
     pub diagnostics: Arc<crate::diagnostics::DiagnosticsService>,
 }
 
@@ -645,6 +649,7 @@ pub struct ServerHandle {
     webroot: Option<PathBuf>,
     demo: bool,
     allow_local_platform: bool,
+    link: Option<Arc<LinkService>>,
     throttle: AuthThrottle,
 }
 
@@ -671,6 +676,7 @@ impl ServerHandle {
             webroot: parts.webroot,
             demo: parts.demo,
             allow_local_platform: parts.allow_local_platform,
+            link: parts.link,
             throttle: AuthThrottle::default(),
         })
     }
@@ -715,90 +721,123 @@ impl ServerHandle {
         }
         let gateway = state.gateway.clone();
         drop(state);
+        // 首次设置只发生在密钥为空时，而空密钥永不匹配：此刻没有以访问密钥认证的 `/rpc` 会话，
+        // 不需要撤销任何会话（之后的改密钥走 `agent.gateway.patch`，会断开旧密钥的会话）。
         self.token.set(token);
         self.events.publish(AgentEvent::GatewayChanged(gateway));
         SetupOutcome::Done
     }
 
-    /// `Authorization: Bearer <访问密钥>` 或 `?token=<访问密钥>`；空密钥永远拒绝。
-    /// 同一来源连续失败过多后进入锁定（429），锁定期内连正确密钥也不受理。
-    fn browser_authorized(
+    /// 浏览器文件面（`/api/web/*`）鉴权：`Authorization: Bearer` 携带访问密钥或设备控制凭据，
+    /// 或 `?token=<访问密钥>`（设备凭据只认 Bearer）；空密钥永远拒绝。三者共用同一份按来源节流：
+    /// 同一来源连续失败过多后进入锁定（429），锁定期内连正确凭据也不受理。
+    async fn browser_authorized(
         &self,
         peer: IpAddr,
         headers: &HeaderMap,
         query_token: Option<&str>,
     ) -> Result<(), StatusCode> {
         let bearer = bearer_token(headers);
-        self.throttled_check(peer, bearer.is_some() || query_token.is_some(), |key| {
-            bearer.is_some_and(|presented| key_matches(key, presented))
-                || query_token.is_some_and(|presented| key_matches(key, presented))
-        })
+        self.authorize(
+            peer,
+            bearer,
+            bearer.is_some() || query_token.is_some(),
+            |key| {
+                [bearer, query_token]
+                    .into_iter()
+                    .flatten()
+                    .find(|presented| key_matches(key, presented))
+                    .map(|presented| RpcCredential::AccessKey(presented.to_owned()))
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     /// `/rpc` 升级鉴权（带按来源失败节流）；网关应在有对端地址时用它取代 [`authorize_rpc`]。
-    pub fn authorize_rpc_from(
+    ///
+    /// 接受的凭据：`agent.token`、访问密钥（`Authorization: Bearer` 或子协议携带），以及互联服务存在时
+    /// 的设备控制凭据（仅 `Authorization: Bearer`，由局域网配对签发，见
+    /// [`LinkService::verify_control_credential`]）。三者失败都计入同一份按来源节流。返回通过的
+    /// 凭据种类，会话据此在撤销事件之后重新校验。
+    pub(crate) async fn authorize_rpc_from(
         &self,
         peer: IpAddr,
         headers: &HeaderMap,
         agent_bearer: &str,
-    ) -> Result<(), StatusCode> {
+    ) -> Result<RpcCredential, StatusCode> {
         if !origin_allowed(headers) {
             return Err(StatusCode::FORBIDDEN);
         }
-        let presented = bearer_token(headers)
+        let bearer = bearer_token(headers);
+        let presented = bearer
             .map(str::to_owned)
             .or_else(|| subprotocol_token(headers));
-        self.throttled_check(peer, presented.is_some(), |key| {
-            presented.as_deref().is_some_and(|presented| {
-                constant_time_eq(presented, agent_bearer) || key_matches(key, presented)
-            })
+        self.authorize(peer, bearer, presented.is_some(), |key| {
+            let presented = presented.as_deref()?;
+            if constant_time_eq(presented, agent_bearer) {
+                Some(RpcCredential::Agent)
+            } else if key_matches(key, presented) {
+                Some(RpcCredential::AccessKey(presented.to_owned()))
+            } else {
+                None
+            }
         })
+        .await
     }
 
-    fn throttled_check(
+    /// 节流 + 凭据判定的共同核心：先看来源是否被锁定，再依次试静态凭据（`agent.token` / 访问
+    /// 密钥，由 `static_credential` 判定）与设备控制凭据（`device_bearer`）；成功清空该来源的失败
+    /// 记录，失败且确实出示过凭据才计一次失败。
+    async fn authorize(
         &self,
         peer: IpAddr,
+        device_bearer: Option<&str>,
         credential_presented: bool,
-        matches: impl FnOnce(&TokenCell) -> bool,
-    ) -> Result<(), StatusCode> {
+        static_credential: impl FnOnce(&TokenCell) -> Option<RpcCredential>,
+    ) -> Result<RpcCredential, StatusCode> {
         let now = std::time::Instant::now();
         if self.throttle.is_locked(peer, now) {
             return Err(StatusCode::TOO_MANY_REQUESTS);
         }
-        if matches(&self.token) {
-            self.throttle.record_success(peer);
-            return Ok(());
+        let credential = match static_credential(&self.token) {
+            Some(credential) => Some(credential),
+            None => self.device_credential(device_bearer).await,
+        };
+        match credential {
+            Some(credential) => {
+                self.throttle.record_success(peer);
+                Ok(credential)
+            }
+            None => {
+                if credential_presented {
+                    self.throttle.record_failure(peer, now);
+                }
+                Err(StatusCode::UNAUTHORIZED)
+            }
         }
-        if credential_presented {
-            self.throttle.record_failure(peer, now);
-        }
-        Err(StatusCode::UNAUTHORIZED)
+    }
+
+    /// 设备控制凭据：互联服务存在且按名册校验通过（授权控制本机、未撤销、HMAC 一致）。
+    async fn device_credential(&self, bearer: Option<&str>) -> Option<RpcCredential> {
+        let token = bearer?;
+        let fingerprint = self.link.as_ref()?.verify_control_credential(token).await?;
+        Some(RpcCredential::Device {
+            token: token.to_owned(),
+            fingerprint,
+        })
     }
 }
 
 /// daemon loopback HTTP 的流式转发客户端（无整体超时：大文件下载可以很久）。
-/// 鉴权用已认证 WebSocket 会话派生的会话级凭据，见 `DaemonClientConfig::http_session`。
+/// 鉴权与目标地址取自已认证 WebSocket 会话，见 `DaemonClientConfig::http_session`。
 struct DaemonHttp {
-    base_url: reqwest::Url,
     session: crate::daemon_client::HttpSession,
     client: reqwest::Client,
 }
 
 impl DaemonHttp {
     fn new(config: &DaemonClientConfig) -> Result<Self, BlobError> {
-        let mut base_url = reqwest::Url::parse(&config.rpc_url)
-            .map_err(|error| BlobError::Url(error.to_string()))?;
-        let scheme = match base_url.scheme() {
-            "ws" | "http" => "http",
-            "wss" | "https" => "https",
-            other => return Err(BlobError::Url(format!("unsupported scheme {other}"))),
-        };
-        base_url
-            .set_scheme(scheme)
-            .map_err(|()| BlobError::Url("scheme is not settable".to_owned()))?;
-        base_url.set_path("");
-        base_url.set_query(None);
-        base_url.set_fragment(None);
         // 只连本机回环 daemon：跳过系统根证书加载（见 `DaemonBlobClient::new`）。
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -806,7 +845,6 @@ impl DaemonHttp {
             .connect_timeout(Duration::from_secs(5))
             .build()?;
         Ok(Self {
-            base_url,
             session: config.http_session(),
             client,
         })
@@ -826,18 +864,24 @@ impl DaemonHttp {
         {
             return StatusCode::NOT_FOUND.into_response();
         }
-        let mut url = self.base_url.clone();
+        // 没有已认证的 daemon 会话时 daemon 视为不可用，绝不退回长期 token。
+        let Some(access) = self.session.access() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let mut url = access.base_url;
         match url.path_segments_mut() {
             Ok(mut path) => {
                 path.clear().extend(segments);
             }
             Err(()) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
-        // 没有已认证的 daemon 会话时 daemon 视为不可用，绝不退回长期 token。
-        let Some(credential) = self.session.credential() else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
-        let upstream = match self.client.get(url).bearer_auth(credential).send().await {
+        let upstream = match self
+            .client
+            .get(url)
+            .bearer_auth(access.credential)
+            .send()
+            .await
+        {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(error = %error, "daemon file proxy request failed");
@@ -1031,7 +1075,7 @@ async fn upload_blob(
     body: Body,
 ) -> Response {
     // 先鉴权再读体：未授权请求不会让服务器缓冲 4 MiB。
-    if let Err(status) = handle.browser_authorized(peer, headers, query_token) {
+    if let Err(status) = handle.browser_authorized(peer, headers, query_token).await {
         return status.into_response();
     }
     let Ok(bytes) = axum::body::to_bytes(body, BLOB_UPLOAD_LIMIT).await else {
@@ -1054,7 +1098,10 @@ async fn download_task_file(
     headers: HeaderMap,
     AxumPath(task_id): AxumPath<String>,
 ) -> Response {
-    if let Err(status) = handle.browser_authorized(addr.ip(), &headers, query.token.as_deref()) {
+    if let Err(status) = handle
+        .browser_authorized(addr.ip(), &headers, query.token.as_deref())
+        .await
+    {
         return status.into_response();
     }
     // 文件名 / 长度 / 类型都由 daemon 给出（含 RFC 5987 `filename*`），原样透传。
@@ -1071,7 +1118,10 @@ async fn download_export(
     headers: HeaderMap,
     AxumPath(export_id): AxumPath<String>,
 ) -> Response {
-    if let Err(status) = handle.browser_authorized(addr.ip(), &headers, query.token.as_deref()) {
+    if let Err(status) = handle
+        .browser_authorized(addr.ip(), &headers, query.token.as_deref())
+        .await
+    {
         return status.into_response();
     }
     // daemon 的日志导出是其诊断快照（JSON），响应头不带文件名：这里补上下载语义。
@@ -1098,7 +1148,10 @@ async fn download_logs(
     Query(query): Query<TokenQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(status) = handle.browser_authorized(addr.ip(), &headers, query.token.as_deref()) {
+    if let Err(status) = handle
+        .browser_authorized(addr.ip(), &headers, query.token.as_deref())
+        .await
+    {
         return status.into_response();
     }
     let temp = handle
@@ -1648,6 +1701,7 @@ mod tests {
                     webroot: None,
                     demo: false,
                     allow_local_platform,
+                    link: None,
                 })
                 .unwrap(),
             );
@@ -1858,6 +1912,61 @@ mod tests {
         harness.ready.send(true).unwrap();
         assert_eq!(pending.await.unwrap(), 200);
         drop(client);
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn failed_device_credentials_feed_the_same_throttle_as_every_other_credential() {
+        let harness = Harness::new("device_throttle", "flux2026").await;
+        let remote: IpAddr = "203.0.113.9".parse().unwrap();
+        let bearer = |value: &str| headers(&[("authorization", &format!("Bearer {value}"))]);
+        // 形状正确但没有任何名册背书的设备凭据（本机没有互联服务 / 名册里没有该设备）。
+        let forged = format!("fdl1.{}.{}", "a".repeat(64), "b".repeat(43));
+        for _ in 0..THROTTLE_MAX_FAILURES {
+            assert_eq!(
+                harness
+                    .handle
+                    .authorize_rpc_from(remote, &bearer(&forged), "agent")
+                    .await,
+                Err(StatusCode::UNAUTHORIZED)
+            );
+        }
+        // 锁定：`/rpc` 与浏览器文件面都拒绝，连正确的访问密钥也不受理；本机来源不受节流。
+        assert_eq!(
+            harness
+                .handle
+                .authorize_rpc_from(remote, &bearer("flux2026"), "agent")
+                .await,
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert_eq!(
+            harness
+                .handle
+                .browser_authorized(remote, &bearer("flux2026"), None)
+                .await,
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        );
+        let local: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(
+            harness
+                .handle
+                .authorize_rpc_from(local, &bearer("flux2026"), "agent")
+                .await,
+            Ok(RpcCredential::AccessKey("flux2026".to_owned()))
+        );
+        // 设备凭据不走子协议：子协议里的同一串只会被当成（错误的）访问密钥。
+        let subprotocol = format!("{RPC_SUBPROTOCOL}, {}", token_protocol(&forged));
+        assert_eq!(
+            harness
+                .handle
+                .authorize_rpc_from(
+                    local,
+                    &headers(&[("sec-websocket-protocol", &subprotocol)]),
+                    "agent"
+                )
+                .await,
+            Err(StatusCode::UNAUTHORIZED)
+        );
         harness.finish().await;
     }
 }

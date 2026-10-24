@@ -55,8 +55,7 @@ import { ensureRemoteSettingsVerified } from "./settings";
 import type { FluxDownSettings, RemoteMode } from "./settings";
 
 // NMH 侧代表"不可达"（连接层/瞬态失败）而非 App 业务拒绝的 message 集合，
-// 与 native-messaging.ts 内部 sendMessage/sendWithRetry 的失败分支一一对应
-// （见该文件 getPort/sendMessage/sendWithRetry 的 resolve({ success:false, message:... })）。
+// 与 nmh-shared.ts 的连接层失败（SharedFailure）及中继应答的 app_not_running 一一对应。
 // 只有命中此集合，fallback 模式才允许改投远程；其余失败视为 App 已收到请求
 // 并主动拒绝，原样返回，不重复投递。
 const NMH_UNREACHABLE_MESSAGES = new Set<string>([
@@ -365,6 +364,14 @@ export async function checkFluxDownAvailable(): Promise<boolean> {
       .catch(() => false),
   ]);
   return nmhUp || remoteUp;
+}
+
+/** 远程通道（已配置且已验证、remoteMode 非 off）当前是否可达；不探测 NMH。 */
+export async function checkRemoteAvailable(): Promise<boolean> {
+  const cfg = toRoutingConfig(await getRoutingSettings());
+  if (effectiveMode(cfg) === "off") return false;
+  const result = await remotePing(cfg.remote);
+  return result.success === true;
 }
 
 /**

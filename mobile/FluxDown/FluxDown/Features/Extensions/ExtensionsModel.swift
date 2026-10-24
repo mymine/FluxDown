@@ -3,6 +3,7 @@ import FluxUI
 import Foundation
 import Observation
 import SwiftUI
+#if FULL_FLAVOR
 
 /// S11 插件页的状态与操作（Web `PluginsTab` / `MarketSection` 的逻辑层）。
 ///
@@ -316,28 +317,13 @@ enum PluginBlobUploader {
         let error: String?
     }
 
-    /// 主机 HTTP 根：`http(s)://host:port`（`ws(s)` 视同，路径 / 查询丢弃）。
-    static func baseURL(_ endpoint: String) -> URL? {
-        guard var components = URLComponents(string: endpoint.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
-        switch components.scheme?.lowercased() {
-        case "ws": components.scheme = "http"
-        case "wss": components.scheme = "https"
-        case "http", "https": break
-        default: return nil
-        }
-        components.path = ""
-        components.query = nil
-        components.fragment = nil
-        return components.url
-    }
-
     static func upload(
         _ data: Data,
         endpoint: String,
         accessKey: String,
         progress: @escaping @Sendable (Double) -> Void
     ) async throws(HostError) -> String {
-        guard let base = baseURL(endpoint) else {
+        guard let base = ApiAddress.baseURL(endpoint) else {
             throw HostError(.invalidArgument, message: "invalid host address")
         }
         var request = URLRequest(url: base.appendingPathComponent("api/web/blobs/plugins"))
@@ -429,3 +415,4 @@ extension View {
         modifier(PluginAutoDisabledToasts())
     }
 }
+#endif

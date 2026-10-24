@@ -5,6 +5,9 @@ export default defineConfig({
   // 曾因同名导出触发 "Duplicated imports" 警告；全项目已改为显式导入
   // （browser 来自 wxt/browser，define* 来自 wxt/utils/*），不再需要魔法全局。
   imports: false,
+  // 两个浏览器统一产出 MV3（输出目录 .output/{chrome,firefox}-mv3[-dev]）；
+  // Firefox 的 background 为非持久 event page（manifest 的 background.scripts），不是 service worker。
+  manifestVersion: 3,
   // UI 使用 Preact：esbuild 的 automatic JSX 运行时指向 preact/jsx-runtime。
   vite: () => ({
     esbuild: { jsx: "automatic", jsxImportSource: "preact" },
@@ -52,15 +55,15 @@ export default defineConfig({
       : {}),
     permissions: [
       "downloads",
-      "downloads.shelf", // setShelfEnabled 隐藏下载栏
+      // setShelfEnabled 隐藏下载栏；Firefox 没有该 API，声明会被判为无效权限。
+      ...(browser === "firefox" ? [] : ["downloads.shelf"]),
       "cookies",
       "webRequest",
       // Firefox MV3 仍支持 blocking webRequest：用 onHeadersReceived {cancel:true}
-      // 从源头拦截下载，避免残留"已取消"记录（issue #21）。Chrome MV3 已弃用，故仅 Firefox 加。
+      // 从源头拦截下载，避免残留"已取消"记录。Chrome MV3 已弃用，故仅 Firefox 加。
       ...(browser === "firefox" ? ["webRequestBlocking"] : []),
       // 扩展安装 / 更新后给已打开的页面补注入 sensor 与 MAIN 钩子（background/probe.ts）。
-      // Firefox MV2 用 tabs.executeScript，不需要该权限。
-      ...(browser === "firefox" ? [] : ["scripting"]),
+      "scripting",
       "storage",
       "alarms",
       "notifications",
@@ -70,18 +73,8 @@ export default defineConfig({
       "contextMenus",
     ],
     host_permissions: ["<all_urls>"],
-    // 仅 Firefox：sensor 以 injectScript 注入 /page-hooks-main.js（MV2 无 world: MAIN）。
-    // Chrome 由 page-hooks.content.ts 直接以 MAIN world 注入，无需暴露任何资源。
-    ...(browser === "firefox"
-      ? {
-          web_accessible_resources: [
-            {
-              resources: ["/page-hooks-main.js"],
-              matches: ["<all_urls>"],
-            },
-          ],
-        }
-      : {}),
+    // 插件页面脚本经 userScripts API 注册；该权限只能在用户手势内按需申请（Firefox 仅支持可选）。
+    optional_permissions: ["userScripts"],
     action: {
       default_icon: {
         16: "/icon/16.png",
@@ -131,8 +124,8 @@ export default defineConfig({
   }),
   // WXT bug: addDevModeCsp() 只给 script-src 加了 localhost，未加 style-src，
   // 导致 Firefox 严格执行默认 style-src 'self' 拦截 dev server 的 CSS 加载。
-  // 此 hook 在 addDevModeCsp() 之后、convertCspToMv2() 之前执行，
-  // 在对象格式的 CSP 上补充 style-src 白名单。
+  // MV3 清单的 content_security_policy 是对象格式（extension_pages / sandbox），
+  // 此 hook 在 addDevModeCsp() 之后执行，给 extension_pages 补充 style-src 白名单。
   hooks: {
     "build:manifestGenerated"(wxt, manifest) {
       if (wxt.config.command !== "serve") return;

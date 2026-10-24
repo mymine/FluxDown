@@ -21,6 +21,7 @@ import com.fluxdown.core.model.PluginCandidate
 import com.fluxdown.core.model.HostInfo
 import com.fluxdown.core.model.LinkDevice
 import com.fluxdown.core.model.Queue
+import com.fluxdown.core.model.QueueOrderEntry
 import com.fluxdown.core.model.RssSource
 import com.fluxdown.core.model.RuntimeStats
 import com.fluxdown.core.model.SeedingStatus
@@ -93,7 +94,7 @@ internal fun HostSnapshotDto.toCore() = HostSnapshot(
     tasks = tasks.map { it.toCore() },
     runtime = runtime.associate { it.taskId to it.toCore() },
     queues = queues.map { it.toCore() },
-    queuePositions = queuePositions,
+    queueOrder = queueOrder.map { it.toCore() },
     groups = groups.map { it.toCore() },
     stats = stats.toCore(),
     priorityTaskId = priorityTaskId,
@@ -105,6 +106,8 @@ internal fun HostSnapshotDto.toCore() = HostSnapshot(
     linkDevices = linkDevices.map { it.toCore() },
     categories = categories.map { it.toCore() },
     sections = sections,
+    tasksLoading = tasksLoading,
+    taskTotal = taskTotal.toLong(),
 )
 
 internal fun HostEventDto.toCore(): HostEvent = when (this) {
@@ -124,7 +127,8 @@ internal fun HostEventDto.toCore(): HostEvent = when (this) {
     )
     is HostEventDto.TaskRuntimeChanged -> HostEvent.TaskRuntimeChanged(runtime.toCore())
     is HostEventDto.QueuesChanged -> HostEvent.QueuesChanged(queues.map { it.toCore() })
-    is HostEventDto.QueuePositionsChanged -> HostEvent.QueuePositionsChanged(positions)
+    is HostEventDto.QueuePositionsChanged -> HostEvent.QueuePositionsChanged(order.map { it.toCore() })
+    is HostEventDto.QueueOrderChanged -> HostEvent.QueueOrderChanged(removed, added.map { it.toCore() })
     is HostEventDto.GroupsChanged -> HostEvent.GroupsChanged(groups.map { it.toCore() })
     is HostEventDto.FileMissingChanged -> HostEvent.FileMissingChanged(updates)
     is HostEventDto.PriorityTaskChanged -> HostEvent.PriorityTaskChanged(taskId)
@@ -203,6 +207,8 @@ internal fun QueueDto.toCore() = Queue(
     scheduleStop = scheduleStop,
     scheduleDays = scheduleDays,
 )
+
+internal fun QueueOrderDto.toCore() = QueueOrderEntry(taskId = taskId, order = order)
 
 internal fun GroupDto.toCore() = TaskGroup(
     groupId = groupId,
@@ -321,6 +327,8 @@ internal fun LinkDeviceDto.toCore() = LinkDevice(
     revoked = revoked,
     pairedAt = pairedAt,
     lastSeenAt = lastSeenAt,
+    grantsControl = grantsControl,
+    controllable = controllable,
 )
 
 internal fun CategoryDto.toCore() = Category(
@@ -439,6 +447,8 @@ internal fun CreateTaskRequest.toDto() = CreateTaskRequestDto(
     httpUser = httpUser,
     httpPassword = httpPassword,
     saveSiteAuth = saveSiteAuth,
+    offeredSaveDir = offeredSaveDir,
+    unattended = unattended,
 )
 
 internal fun ImportBatch.toDto() = ImportBatchDto(

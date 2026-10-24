@@ -1,9 +1,9 @@
 // 重命名文件 / 更换下载链接：单字段对话框，引擎稳定错误码映射为本地化文案。
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useT } from '../../../i18n'
-import { RpcError, TASK_STATUS, rpc, useTask } from '../../../lib/rpc'
+import { RpcError, TASK_STATUS, rpc, useTask, useTasksLoading } from '../../../lib/rpc'
 import { rpcErrorText } from '../../../lib/rpcErrorText'
 import type { TaskDto } from '../../../lib/rpc'
 import { ThreadsRiskCallout } from '../../../lib/ThreadsRiskCallout'
@@ -239,11 +239,18 @@ function ChangeSegmentsBody({ taskId, failed }: { taskId: string; failed: boolea
   )
 }
 
-/** 任务被删除（快照里消失）时自动关闭；表单初值只在首次渲染时取。 */
+/**
+ * 任务被删除（快照里消失）时自动关闭；表单初值只在首次渲染时取。
+ * 任务表重新载入期间任务暂时不在快照里，不代表被删：保持最后一次见到的任务（表单状态不丢），不关闭。
+ */
 function TaskScoped({ taskId, onClose, render }: TaskScopedProps) {
   const task = useTask(taskId)
+  const loading = useTasksLoading()
+  const lastTask = useRef(task)
+  if (task) lastTask.current = task
   useEffect(() => {
-    if (!task) onClose()
-  }, [task, onClose])
-  return task ? render(task) : null
+    if (!task && !loading) onClose()
+  }, [task, loading, onClose])
+  const shown = task ?? (loading ? lastTask.current : undefined)
+  return shown ? render(shown) : null
 }

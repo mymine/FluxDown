@@ -225,7 +225,7 @@ const startsWithScheme = (text: string, schemes: readonly string[]): boolean => 
 }
 
 /** 是否以可建任务的链接开头（忽略大小写）。 */
-const startsWithLink = (text: string): boolean => startsWithScheme(text, LINK_SCHEMES)
+export const startsWithLink = (text: string): boolean => startsWithScheme(text, LINK_SCHEMES)
 
 /** http(s) / ftp 才可能是同一文件的镜像；磁力 / ed2k / thunder 自成一个下载。 */
 export const isMirrorable = (uri: string): boolean => startsWithScheme(uri, MIRROR_SCHEMES)

@@ -3,9 +3,9 @@
 
 use fluxdown_engine::plugin::PluginError;
 use fluxdown_protocol::{
-    PluginCommandParams, PluginInvokeParams, PluginViewEventParams, PluginViewKeepaliveParams,
-    PluginViewOpenParams, PluginViewOpenedDto, PluginViewSessionParams, PluginViewSnapshotDto,
-    RpcErrorObject, method, normalize_view,
+    PluginCommandParams, PluginInvokeParams, PluginPageInvokeParams, PluginPageInvokeResultDto,
+    PluginViewEventParams, PluginViewKeepaliveParams, PluginViewOpenParams, PluginViewOpenedDto,
+    PluginViewSessionParams, PluginViewSnapshotDto, RpcErrorObject, method, normalize_view,
 };
 use serde_json::{Map, Value, json};
 
@@ -115,6 +115,23 @@ impl DaemonService {
                     .await
                     .map_err(|error| host_error("name", &error))
             }
+            method::DAEMON_PLUGIN_PAGE_INVOKE => {
+                let params = parse_params::<PluginPageInvokeParams>(params)?;
+                let (value, started) = manager
+                    .invoke_from_page(
+                        &params.identity,
+                        &params.name,
+                        params.args,
+                        &params.page_url,
+                    )
+                    .await
+                    .map_err(|error| host_error("name", &error))?;
+                to_value(PluginPageInvokeResultDto {
+                    value,
+                    created_task_ids: started.created,
+                    resumed_task_ids: started.resumed,
+                })
+            }
             other => Err(internal_error(format!(
                 "unrouted plugin host method: {other}"
             ))),
@@ -202,14 +219,7 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
     }
 
     async fn fixture() -> Fixture {
-        let base =
-            std::env::temp_dir().join(format!("fluxdown-plugin-views-{}", uuid::Uuid::new_v4()));
-        let root = base.join("plugins");
-        let source = base.join("source");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&source).unwrap();
-        std::fs::write(
-            source.join("manifest.json"),
+        fixture_with(
             json!({
                 "identity": ID, "name": "Views", "version": "1.0.0",
                 "main": { "entry": "main.js" },
@@ -217,12 +227,27 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
                     "views": [{ "id": "counter", "title": "Counter", "location": "activity" }],
                     "commands": [{ "id": "noop", "title": "Noop" }],
                 },
-            })
-            .to_string(),
+            }),
+            MAIN_JS,
+            &[],
         )
-        .unwrap();
-        std::fs::write(source.join("main.js"), MAIN_JS).unwrap();
+        .await
+    }
 
+    async fn fixture_with(manifest: Value, main_js: &str, files: &[(&str, &str)]) -> Fixture {
+        let base =
+            std::env::temp_dir().join(format!("fluxdown-plugin-views-{}", uuid::Uuid::new_v4()));
+        let root = base.join("plugins");
+        let source = base.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("manifest.json"), manifest.to_string()).unwrap();
+        std::fs::write(source.join("main.js"), main_js).unwrap();
+        for (name, content) in files {
+            let path = source.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
         let db = fluxdown_engine::db::Db::connect("sqlite::memory:")
             .await
             .unwrap();
@@ -236,6 +261,8 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
             "1.0.0".to_owned(),
             Arc::new(DaemonEngineEventSink(events.clone())),
         ));
+        // 先完成一次加载（含「升级前已装插件视为已授权」的一次性迁移），之后安装的插件才需授权。
+        manager.load_all().await;
         manager.install_from_dir(&source).await.unwrap();
         let selections = crate::selection::DaemonSelection::new(events.clone());
         let blobs = Arc::new(
@@ -437,6 +464,159 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
         assert_eq!(
             error.data.expect("application error data").code,
             ApplicationErrorCode::InvalidArgument
+        );
+    }
+
+    const PAGE_MAIN_JS: &str = r#"
+flux.rpc.handle("echo", async (a, ctx) => ({ got: a, ctx }), { page: true });
+flux.rpc.handle("hidden", async () => "secret");
+const optsErrors = [];
+for (const bad of [null, 5, [], { page: "yes" }]) {
+  try {
+    flux.rpc.handle("x", async () => 1, bad);
+    optsErrors.push("accepted");
+  } catch (e) {
+    optsErrors.push(e instanceof TypeError ? "TypeError" : "other");
+  }
+}
+flux.rpc.handle("optsErrors", async () => optsErrors);
+"#;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn page_scripts_index_source_and_page_invoke() {
+        let f = fixture_with(
+            json!({
+                "identity": ID, "name": "Views", "version": "1.0.0",
+                "permissions": ["pageScripts"],
+                "main": { "entry": "main.js" },
+                "contributes": {
+                    "pageScripts": [{
+                        "id": "demo", "title": "Demo",
+                        "matches": ["https://*.example.com/*"],
+                        "js": ["page/a.js", "page/b.js"],
+                    }],
+                },
+            }),
+            PAGE_MAIN_JS,
+            &[("page/a.js", "var a = 1;"), ("page/b.js", "var b = 2;")],
+        )
+        .await;
+
+        // 未授权：不入索引，源码与页面调用都被拒。
+        let index = call(&f, "daemon.plugin.pageScripts", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(index["scripts"], json!([]));
+        assert_eq!(index["sequence"], 0);
+        assert!(
+            call(
+                &f,
+                "daemon.plugin.pageScriptSource",
+                json!({ "identity": ID, "id": "demo" })
+            )
+            .await
+            .is_err()
+        );
+        let denied = call(
+            &f,
+            "daemon.plugin.pageInvoke",
+            json!({ "identity": ID, "name": "echo", "args": 1, "pageUrl": "https://a.example.com/" }),
+        )
+        .await;
+        assert!(denied.is_err());
+
+        f.service
+            .plugin_manager()
+            .unwrap()
+            .grant_consent(ID, &["pageScripts".to_owned()], &[])
+            .await
+            .unwrap();
+
+        let index = call(&f, "daemon.plugin.pageScripts", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(index["sequence"], 1);
+        let scripts = index["scripts"].as_array().unwrap();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts[0]["identity"], ID);
+        assert_eq!(scripts[0]["id"], "demo");
+        assert_eq!(scripts[0]["runAt"], "document_idle");
+        assert_eq!(scripts[0]["world"], "isolated");
+        assert_eq!(scripts[0]["bytes"], "var a = 1;\n;\nvar b = 2;".len());
+
+        let source = call(
+            &f,
+            "daemon.plugin.pageScriptSource",
+            json!({ "identity": ID, "id": "demo" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(source["code"], "var a = 1;\n;\nvar b = 2;");
+        assert_eq!(source["sha256"], scripts[0]["sha256"]);
+        assert!(
+            call(
+                &f,
+                "daemon.plugin.pageScriptSource",
+                json!({ "identity": ID, "id": "nope" })
+            )
+            .await
+            .is_err()
+        );
+
+        let echoed = call(
+            &f,
+            "daemon.plugin.pageInvoke",
+            json!({ "identity": ID, "name": "echo", "args": { "k": 1 }, "pageUrl": "https://a.example.com/x" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(echoed["value"]["got"], json!({ "k": 1 }));
+        assert_eq!(
+            echoed["value"]["ctx"],
+            json!({ "caller": "page", "pageUrl": "https://a.example.com/x" })
+        );
+
+        let hidden = call(
+            &f,
+            "daemon.plugin.pageInvoke",
+            json!({ "identity": ID, "name": "hidden", "args": null, "pageUrl": "https://a.example.com/" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            hidden.message.contains("rpc not exposed to page: hidden"),
+            "{}",
+            hidden.message
+        );
+
+        // 桌面 invoke 仍可调用任何处理器，ctx 为 desktop。
+        let desktop = call(
+            &f,
+            "daemon.plugin.invoke",
+            json!({ "identity": ID, "name": "echo", "args": 7 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(desktop["ctx"], json!({ "caller": "desktop" }));
+        assert_eq!(
+            call(
+                &f,
+                "daemon.plugin.invoke",
+                json!({ "identity": ID, "name": "hidden" })
+            )
+            .await
+            .unwrap(),
+            json!("secret")
+        );
+        assert_eq!(
+            call(
+                &f,
+                "daemon.plugin.invoke",
+                json!({ "identity": ID, "name": "optsErrors" })
+            )
+            .await
+            .unwrap(),
+            json!(["TypeError", "TypeError", "TypeError", "TypeError"])
         );
     }
 }

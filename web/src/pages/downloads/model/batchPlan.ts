@@ -2,6 +2,7 @@
 // 避免逐任务并发请求撑满 agent 的 daemon 通道并造成 N 次快照重发。
 
 import type { RemoteCommandParams } from '../../../lib/rpc'
+import { canResumeSeeding } from './task'
 import type { DownloadTaskView } from './task'
 
 export type LocalTaskAction = 'pause' | 'resume' | 'delete'
@@ -36,6 +37,10 @@ export interface TaskCommandPlan {
   remote: DownloadTaskView[]
 }
 
+/**
+ * 已完成的本地任务只有处于可恢复做种态（`canResumeSeeding`）才参与「继续」：引擎对其余完成态的
+ * resume 会从头重新下载（#935，镜像 crates/downloads `task_command`）。
+ */
 export function planTaskCommand(views: readonly DownloadTaskView[], action: LocalTaskAction): TaskCommandPlan {
   const localIds: string[] = []
   const seen = new Set<string>()
@@ -43,6 +48,7 @@ export function planTaskCommand(views: readonly DownloadTaskView[], action: Loca
   for (const view of views) {
     if (!remoteCan(view, action)) continue
     if (view.source === 'local') {
+      if (action === 'resume' && view.state === 'completed' && !canResumeSeeding(view)) continue
       if (!seen.has(view.taskId)) {
         seen.add(view.taskId)
         localIds.push(view.taskId)

@@ -1,0 +1,73 @@
+---
+description: GPUI 下载页纯模型（新建/菜单/排序/任务组/来源构成/设备/做种等）改动须同步 Web 与移动端镜像
+condition: '[\s\S]'
+scope: "tool:edit, tool:write"
+globs:
+  - '**/crates/downloads/src/model/{new_download,aria2c,save_dir_history,speed_limit_recent,dispatch,mod,view_prefs,row_order,group_tree,source_composition,devices,file_rescan}.rs'
+  - '**/crates/downloads/src/components/{task_table,task_table_groups}.rs'
+  - '**/crates/downloads/src/pages/{task_edit,task_verify,task_detail}.rs'
+  - '**/crates/downloads/tests/fixtures/**'
+  - '**/web/src/pages/downloads/**'
+  - '**/web/src/lib/{saveDirHistory,speedLimitRecent,rescanThrottle}.ts'
+  - '**/mobile/Android/core/src/main/java/com/fluxdown/core/model/Models.kt'
+  - '**/mobile/Android/core/src/main/java/com/fluxdown/core/protocol/Devices.kt'
+  - '**/mobile/Android/app/src/main/java/com/fluxdown/app/feature/downloads/DownloadsModel.kt'
+  - '**/mobile/FluxDown/FluxKit/Sources/FluxDomain/Model/Models.swift'
+  - '**/mobile/FluxDown/FluxKit/Sources/FluxDomain/Protocol/Devices.swift'
+  - '**/mobile/FluxDown/FluxDown/Features/Downloads/DownloadsModel.swift'
+interruptMode: never
+---
+
+你正在改动下载页纯模型（`crates/downloads` ↔ Web / 移动端）的一侧。下列条目里，标题是事实源一侧、「→」后是必须同回合同步的镜像端：改任一侧都要把另一侧过一遍；有共享夹具的先改夹具用例，再改两侧实现，两侧测试都要跑（`/verify` 第 3 步）。只改了一侧就交付 = 不完整。
+
+## `crates/downloads/src/model/new_download.rs::capture_entry`（捕获名与 URL 末段百分号解码后相同则省略 `out=`）
+
+→ `web/src/pages/downloads/dialogs/model.ts::captureEntry`：同一判定逐条对齐（`a%20b.zip` 与 `a b.zip` 视为相同），两端新建框显示一致
+
+## `crates/downloads/src/model/save_dir_history.rs`（新建下载保存目录历史：设备本地偏好 `download.save_dir_history` 字符串数组，最新在前 / 去重 / 封顶 10；`download.save_dir_history_enabled` 缺省开，关闭即不列出不记录；只记本机提交）
+
+→ `web/src/lib/saveDirHistory.ts` 逐条对齐，Rust 与 `saveDirHistory.test.ts` 共用 `crates/downloads/tests/fixtures/save_dir_history_cases.json`；两端设置「保存位置」分组同位（开关 + 清空 = 写 null）
+
+## `crates/downloads/src/model/speed_limit_recent.rs`（状态栏限速最近自定义值：设备本地偏好 `download.speed_limit_recent_kbps` / `download.upload_limit_recent_kbps` 整数数组 KB/s，最新在前 / 去重 / 封顶 3，丢弃 ≤0 与内置预设 1/5/10/50 MB/s，非法项丢弃）
+
+→ `web/src/lib/speedLimitRecent.ts` 逐条对齐，Rust 与 `speedLimitRecent.test.ts` 共用 `crates/downloads/tests/fixtures/speed_limit_recent_cases.json`
+
+## `crates/downloads/src/model/new_download.rs::parse_entries` / `parse_input` + `model/aria2c.rs`（aria2c 命令切词 / 续行合并 / 镜像 URI 只取首个、`-Z` 拆分 / 带值选项表 / 头部回填 `plan_field_fill`）
+
+→ `web/src/pages/downloads/dialogs/model.ts::parseEntries` + `aria2c.ts`（`parseCommand` / `joinContinuations` / `planFieldFill`）逐条对齐，`aria2c.test.ts` 覆盖同组行为；TXT 导入两端都用「原文保留、按 URL 去重追加」（`append_entries` ↔ `appendEntries`）
+
+## `crates/downloads/src/components/task_table.rs::TaskMenuFacts::{can_change_url, can_change_segments, can_verify_integrity}`（`task_menu_facts_for` 为右键 / 应用菜单与详情常规页按钮共用事实源）+ `pages/task_edit.rs`（`open_change_url_dialog` / `open_change_segments_dialog`，下载页与 `task_detail.rs` 常规页共用；失败任务换链 / 改线程数成功后串行 Resume）+ `pages/task_verify.rs`（BT 完整性校验结果通知：损坏文件列前 3 个、其余折叠计数，`conflict` = 已在校验）
+
+→ `web/src/pages/downloads/model/taskEdit.ts::{canChangeUrl, canChangeSegments, canVerifyIntegrity, parseTaskSegments}` + `table/menus.ts` 与 `detail/GeneralTab.tsx` 两处入口 + `dialogs/TaskEditDialogs.tsx`（`resumeIfFailed`）+ `model/actions.ts::verifyTaskIntegrity`；换链源仅 http(s)/ftp（对齐引擎 `change_task_url`）
+
+## `crates/downloads/src/model/dispatch.rs::remote_action_applies`（远程命令适用状态）
+
+→ `web/src/pages/downloads/model/batchPlan.ts::remoteCan`；未知状态一律不可控制
+
+## `crates/downloads/src/model/mod.rs::DownloadTaskView::{is_seeding, can_resume_seeding, is_resume_all_seed}` + `DownloadStatusFilter::Seeding`（做种交互对齐 qBittorrent：做种中 = 完成且 `seeding_status` ∈ {1, 8}，侧栏「做种中」紧随「已完成」且同时计入后者；可恢复做种 = 完成且 2..=7 且文件在；仅本机任务；做种行可暂停、可恢复行可继续，其余完成态继续仍禁止 #935；引擎侧见 `.omp/knowledge/engine.md`「做种交互」）
+
+→ Web `web/src/pages/downloads/model/task.ts::{isSeeding, canResumeSeeding}` + `filters.ts`、Android `core/.../model/Models.kt`（`Task.isSeeding` / `canResumeSeeding` / `allTasksPaused`）+ `feature/downloads/DownloadsModel.kt::StatusFolder.Seeding`、iOS `FluxDomain/Model/Models.swift`（`isSeeding` / `canResumeSeeding` / `isAllPaused`）+ `Features/Downloads/DownloadsModel.swift::StatusFolder.seeding`；各端测试覆盖同一组成员 / 资格用例
+
+## `crates/downloads/src/model/view_prefs.rs::compare`（智能排序档位 / 平局 / 自然序 / 表头三档）+ `model/row_order.rs`（行顺序保持期）
+
+→ `web/src/pages/downloads/model/viewPrefs.ts::compareViews` + `rowOrder.ts`（保持期判定）+ `rowEngine.ts`（增量行引擎，与 GPUI `task_table.rs` 的变更日志重放同构；逐条对齐，`viewPrefs.test.ts` / `rowOrder.test.ts` / `rowEngine.test.ts` 覆盖同一组行为）
+
+## `crates/downloads/src/model/group_tree.rs`（任务组文件夹行纯模型：成员计数 / 聚合状态、`member_dir`、`flatten` 目录树、`group_sort_view` 排序代理）+ `components/task_table_groups.rs`（归组并入顶层排序、展开、整组选择）
+
+→ `web/src/pages/downloads/model/groupTree.ts` + `groupRows.ts`：逐条对齐，纯模型两端测试共用 `crates/downloads/tests/fixtures/group_tree_cases.json`（改规则先改用例）；聚合只覆盖当前筛选 + 搜索范围内的成员，组命令与停靠面板组概览按全组
+
+## `crates/downloads/src/components/task_table.rs` 宽松密度列表视图（`relaxed_meta` 副标题；宽松不合并列、状态列同舒适，行高 = max(64, 舒适)）
+
+→ `web/src/pages/downloads/table/text.ts::relaxedMeta` + `table/cells.tsx` / `rowMetrics.ts`：副标题字段与顺序逐条对齐（`text.test.ts`）
+
+## `crates/downloads/src/model/source_composition.rs`（详情常规页「来源构成」区块：P2P 判定 / 超额按比例缩放 / 行纳入规则 / 百分比格式；常规页信息列 300 + 来源区块 360 按可用宽度折行）
+
+→ `web/src/pages/downloads/model/sourceComposition.ts` + `detail/GeneralTab.tsx` / `SourcesSection.tsx`（逐条对齐，`sourceComposition.test.ts` 复用同一组用例）；数据源 `tasks.src_{cdn,proxy,nic}_bytes` 只记加速路径，源站 = 已下载 − 三者之和，进度复位时同步清零
+
+## `crates/downloads/src/model/devices.rs::other_devices`（云设备 + 直连设备合并：`cloud_device_id` 命中云名册即挂接为一条、在线取任一、直连在线优先走直连下发、revoked 排除、合并后同名消歧；侧栏云条目可选中筛选，独立直连条目排在其后、点击打开新建下载并预选该设备、右键下发 / 重命名 / 解除配对；设备区默认可见性按其他设备总数含独立直连）
+
+→ Web `web/src/pages/downloads/model/devices.ts` + `dialogs/target.ts` + `sidebar/Sidebar.tsx`、iOS `FluxKit/Sources/FluxDomain/Protocol/Devices.swift`、Android `mobile/Android/core/.../protocol/Devices.kt` 逐条对齐，各端测试覆盖同一组行为；直连设备不注册 FluxCloud、不计入云设备数 / 在线名额
+
+## 文件跟踪重扫节流（`crates/downloads/src/model/file_rescan.rs::RescanThrottle`）
+
+→ `web/src/lib/rescanThrottle.ts`（`RescanThrottle`）：逐条对齐 10s 冷却 / 尾沿排队 / 合并 / 尾沿后重计冷却；测试复用同组用例（`rescanThrottle.test.ts`）

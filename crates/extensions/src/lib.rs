@@ -9,7 +9,7 @@ mod ui;
 use std::{future::Future, pin::Pin, rc::Rc, sync::Arc};
 
 use fluxdown_protocol::{
-    AgentSnapshot, ApplicationErrorCode, ErrorReason, RpcErrorData, ServiceEvent,
+    AgentEvent, AgentSnapshot, ApplicationErrorCode, ErrorReason, RpcErrorData, ServiceEvent,
 };
 use fluxdown_ui_components::segmented_tabs;
 use fluxdown_ui_i18n::Translator;
@@ -114,6 +114,10 @@ impl ExtensionsView {
         self.last_error = None;
         self.controller.replace_snapshot(snapshot);
         self.prune_awaiting_consent();
+        self.plugins
+            .market
+            .favorites
+            .observe_session(snapshot.session.is_some());
         cx.notify();
     }
 
@@ -142,12 +146,21 @@ impl ExtensionsView {
             Some(ExtensionsSignal::PluginAutoDisabled { .. }) => {}
             None => {}
         }
+        // 登录 / 登出以增量事件到达：刷新收藏（星标、「我的收藏」）无需重进设置页。
+        let session_changed = match event {
+            ServiceEvent::Agent(AgentEvent::SessionChanged(session)) => self
+                .plugins
+                .market
+                .favorites
+                .observe_session(session.is_some()),
+            _ => false,
+        };
         if ExtensionsController::replaces_plugins(event) {
             self.prune_awaiting_consent();
         }
         let cleared_error = !self.controller.is_stale() && self.last_error.take().is_some();
         // 无关事件（如下载进度帧）不重绘，保住 retained 渲染的复用。
-        if relevant || cleared_error {
+        if relevant || cleared_error || session_changed {
             cx.notify();
         }
     }

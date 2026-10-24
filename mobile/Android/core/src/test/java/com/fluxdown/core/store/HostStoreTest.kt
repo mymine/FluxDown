@@ -6,6 +6,7 @@ import com.fluxdown.core.host.HostSnapshot
 import com.fluxdown.core.model.HostInfo
 import com.fluxdown.core.model.RuntimeStats
 import com.fluxdown.core.model.Segment
+import com.fluxdown.core.model.QueueOrderEntry
 import com.fluxdown.core.model.Task
 import com.fluxdown.core.model.TaskRuntime
 import com.fluxdown.core.model.TaskStatus
@@ -31,7 +32,7 @@ class HostStoreTest {
     private fun snapshot(vararg tasks: Task, runtime: Map<String, TaskRuntime> = emptyMap()) = HostSignal.Snapshot(
         HostSnapshot(
             info = HostInfo("t", "1", 7, emptySet()), daemonConnected = true, tasks = tasks.toList(), runtime = runtime,
-            queues = emptyList(), queuePositions = emptyMap(), groups = emptyList(), stats = RuntimeStats(), priorityTaskId = null,
+            queues = emptyList(), queueOrder = emptyList(), groups = emptyList(), stats = RuntimeStats(), priorityTaskId = null,
             pendingSelections = emptyList(), config = emptyMap(), configRevision = 1, rssSources = emptyList(),
             cloudDevices = emptyList(), linkDevices = emptyList(),
         ),
@@ -85,6 +86,50 @@ class HostStoreTest {
     }
 
     @Test
+    fun completedTasksLeaveNoRuntimeAndLateSamplesCannotReaddIt() = runTest {
+        val s = store()
+        s.apply(snapshot())
+        for (index in 0 until 600) {
+            val id = "t$index"
+            s.apply(HostSignal.Event(HostEvent.TaskChanged(task(id, TaskStatus.Downloading))))
+            s.apply(HostSignal.Event(HostEvent.TaskRuntimeChanged(runtime(id, index + 1L, listOf(seg(0, true))))))
+            advanceUntilIdle()
+            assertEquals(setOf(id), s.state.value.runtime.keys)
+            // 两条完成路径：TaskChanged / TaskProgress。
+            if (index % 2 == 0) {
+                s.apply(HostSignal.Event(HostEvent.TaskChanged(task(id, TaskStatus.Completed))))
+            } else {
+                s.apply(progress(id, TaskStatus.Completed, 0))
+            }
+            advanceUntilIdle()
+            assertTrue(id, s.state.value.runtime.isEmpty())
+            // 迟到的采样（序号更高也一样）不得把条目加回来。
+            s.apply(HostSignal.Event(HostEvent.TaskRuntimeChanged(runtime(id, index + 10_000L, listOf(seg(0, true))))))
+            advanceUntilIdle()
+            assertTrue(id, s.state.value.runtime.isEmpty())
+        }
+        assertEquals(600, s.state.value.tasks.size)
+    }
+
+    @Test
+    fun snapshotRuntimeOfCompletedTasksIsDroppedButPausedAndFailedKeepSegments() = runTest {
+        val s = store()
+        s.apply(
+            snapshot(
+                task("run", TaskStatus.Downloading), task("paused", TaskStatus.Paused),
+                task("failed", TaskStatus.Failed), task("done", TaskStatus.Completed),
+                runtime = listOf("run", "paused", "failed", "done", "gone").associateWith { runtime(it, 1, listOf(seg(0, true))) },
+            ),
+        )
+        assertEquals(setOf("run", "paused", "failed"), s.state.value.runtime.keys)
+        s.apply(progress("paused", TaskStatus.Completed, 0))
+        s.apply(progress("failed", TaskStatus.Paused, 0))
+        advanceUntilIdle()
+        assertEquals(setOf("run", "failed"), s.state.value.runtime.keys)
+        assertTrue(s.state.value.runtime.getValue("failed").segments.all { it.active == false })
+    }
+
+    @Test
     fun staleSignalMakesStateReadOnlyAndDropsRuntimeAndSpeeds() = runTest {
         val s = store()
         s.apply(snapshot(task("a", TaskStatus.Downloading), runtime = mapOf("a" to runtime("a", 1, listOf(seg(0, true))))))
@@ -119,7 +164,7 @@ class HostStoreTest {
                     tasks = emptyList(),
                     runtime = emptyMap(),
                     queues = emptyList(),
-                    queuePositions = emptyMap(),
+                    queueOrder = emptyList(),
                     groups = emptyList(),
                     stats = RuntimeStats(),
                     priorityTaskId = null,
@@ -140,5 +185,116 @@ class HostStoreTest {
         s.apply(HostSignal.Event(HostEvent.Notice("captureTasksStarted", """["t1"]""")))
         advanceUntilIdle()
         assertEquals(before, s.state.value)
+    }
+
+    private fun keys(vararg pairs: Pair<String, Long>) = pairs.map { QueueOrderEntry(it.first, it.second) }
+
+    private fun HostStore.rank(id: String) = state.value.queueOrder.rank(id)
+
+    @Test
+    fun queueOrderDeltaKeepsRanksByKeyAndDoesNotRekeyOthers() = runTest {
+        val s = store()
+        s.apply(snapshot(task("a", TaskStatus.Pending), task("b", TaskStatus.Pending), task("c", TaskStatus.Pending)))
+        s.apply(HostSignal.Event(HostEvent.QueuePositionsChanged(keys("a" to 10, "b" to 20, "c" to 30))))
+        advanceUntilIdle()
+        assertEquals(listOf(1, 2, 3), listOf("a", "b", "c").map { s.rank(it) })
+
+        // 队首出队：其余任务的键不变，名次整体前移。
+        s.apply(HostSignal.Event(HostEvent.QueueOrderChanged(listOf("a"), emptyList())))
+        advanceUntilIdle()
+        assertEquals(listOf(0, 1, 2), listOf("a", "b", "c").map { s.rank(it) })
+        assertEquals(20L, s.state.value.queueOrder.orderOf("b"))
+
+        // 新增排在键的名次位置；同任务多次出现以最后一项为准；已有任务按新键移动。
+        s.apply(
+            HostSignal.Event(
+                HostEvent.QueueOrderChanged(emptyList(), keys("d" to 5, "d" to 25, "b" to 40)),
+            ),
+        )
+        advanceUntilIdle()
+        assertEquals(listOf("d", "c", "b"), s.state.value.queueOrder.entries.map { it.taskId })
+        assertEquals(listOf(1, 2, 3), listOf("d", "c", "b").map { s.rank(it) })
+
+        // 全量消息整表替换。
+        s.apply(HostSignal.Event(HostEvent.QueuePositionsChanged(keys("c" to 1, "b" to 2))))
+        advanceUntilIdle()
+        assertEquals(listOf(0, 2, 1), listOf("d", "b", "c").map { s.rank(it) })
+    }
+
+    @Test
+    fun queueOrderInstanceIsReusedWhenOrderUnchanged() = runTest {
+        val s = store()
+        s.apply(snapshot(task("a", TaskStatus.Pending), task("b", TaskStatus.Downloading)))
+        s.apply(HostSignal.Event(HostEvent.QueuePositionsChanged(keys("a" to 1))))
+        advanceUntilIdle()
+        val before = s.state.value.queueOrder
+        s.apply(progress("b", TaskStatus.Downloading, 5))
+        advanceUntilIdle()
+        assertTrue(s.state.value.queueOrder === before)
+    }
+
+    private fun loadingSnapshot(total: Long) = HostSignal.Snapshot(
+        HostSnapshot(
+            info = HostInfo("t", "1", 17, emptySet()), daemonConnected = true, tasks = emptyList(), runtime = emptyMap(),
+            queues = emptyList(), queueOrder = emptyList(), groups = emptyList(), stats = RuntimeStats(), priorityTaskId = null,
+            pendingSelections = emptyList(), config = emptyMap(), configRevision = 1, rssSources = emptyList(),
+            cloudDevices = emptyList(), linkDevices = emptyList(),
+            tasksLoading = true, taskTotal = total,
+        ),
+    )
+
+    @Test
+    fun loadingSnapshotIsLoadingPhaseNotAnEmptyList() = runTest {
+        val s = store()
+        assertEquals(TaskTable.Ready, s.state.value.taskTable)
+
+        s.apply(loadingSnapshot(230_000))
+        val loading = s.state.value
+        assertEquals(Connection.Live, loading.connection)
+        assertTrue(loading.tasks.isEmpty())
+        assertTrue(loading.tasksLoading)
+        assertEquals(TaskTable.Loading(230_000), loading.taskTable)
+
+        s.apply(snapshot(task("a", TaskStatus.Downloading), task("b", TaskStatus.Completed)))
+        val ready = s.state.value
+        assertFalse(ready.tasksLoading)
+        assertEquals(TaskTable.Ready, ready.taskTable)
+        assertEquals(listOf("a", "b"), ready.tasks.map { it.taskId })
+    }
+
+    @Test
+    fun resyncReloadDropsTheStaleListInsteadOfPresentingItAsComplete() = runTest {
+        val s = store()
+        s.apply(snapshot(task("a", TaskStatus.Downloading)))
+        assertEquals(TaskTable.Ready, s.state.value.taskTable)
+
+        s.apply(loadingSnapshot(1))
+        assertEquals(TaskTable.Loading(1), s.state.value.taskTable)
+        assertTrue("半份 / 旧列表不得在载入期间继续当作完整列表", s.state.value.tasks.isEmpty())
+    }
+
+    @Test
+    fun taskSpeedHistorySurvivesALoadingSnapshot() = runTest {
+        val s = store()
+        s.apply(snapshot(task("a", TaskStatus.Downloading)))
+        s.apply(progress("a", TaskStatus.Downloading, 4096))
+        advanceUntilIdle()
+        assertTrue("a" in s.state.value.taskSpeedHistory)
+
+        s.apply(loadingSnapshot(1))
+        s.apply(snapshot(task("a", TaskStatus.Downloading)))
+        assertTrue("a" in s.state.value.taskSpeedHistory)
+    }
+
+    @Test
+    fun taskSpeedHistoryIsPrunedWhenTheCompleteSnapshotLacksTheTask() = runTest {
+        val s = store()
+        s.apply(snapshot(task("a", TaskStatus.Downloading)))
+        s.apply(progress("a", TaskStatus.Downloading, 4096))
+        advanceUntilIdle()
+
+        s.apply(loadingSnapshot(1))
+        s.apply(snapshot(task("b", TaskStatus.Downloading)))
+        assertFalse("a" in s.state.value.taskSpeedHistory)
     }
 }

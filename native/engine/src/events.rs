@@ -4,7 +4,7 @@
 //! 引擎事件不依赖 UI、FFI 或具体传输协议。
 
 use crate::model::{
-    GroupInfo, ManifestItemInfo, QueueInfo, QueuePosition, SegmentDetail, TaskInfo,
+    GroupInfo, ManifestItemInfo, QueueInfo, QueueOrderEntry, QueuePosition, SegmentDetail, TaskInfo,
 };
 use crate::rss::model::{RssItemInfo, RssSourceInfo};
 use crate::transfer_activity::TaskRuntime;
@@ -109,8 +109,15 @@ pub enum EngineEvent {
         total_bytes: i64,
     },
 
-    /// 队列位置批量更新——每次队列变化时广播。
+    /// 队列位置全量替换——首次发布与用户调序（已发布键的相对顺序被破坏）时发送。
     QueuePositionsChanged(Vec<QueuePosition>),
+
+    /// 队列顺序增量——先移除 `removed`，再按 `order` 插入 / 更新 `added`。
+    /// 队首出队只携带被移除的任务，其余任务的键不变。
+    QueueOrderChanged {
+        removed: Vec<String>,
+        added: Vec<QueueOrderEntry>,
+    },
 
     /// 全部命名队列——启动时与任意队列变化后发送。
     QueuesChanged(Vec<QueueInfo>),

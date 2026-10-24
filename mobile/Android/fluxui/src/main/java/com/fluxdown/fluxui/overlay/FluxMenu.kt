@@ -41,6 +41,7 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.dp
 import com.fluxdown.fluxui.icons.FluxIcon
@@ -62,6 +63,7 @@ import kotlin.math.roundToInt
 sealed interface FluxMenuItem {
     /**
      * @param hint 标签下方的次要说明（sm inkMuted）
+     * @param hintIsPath [hint] 是路径：单行中间省略，保留开头与末段目录名
      * @param trailing 行尾等宽小字（如快捷键）
      * @param destructive 危险动作（coral 文字 / 图标）
      * @param keepOpen 点击后不关闭菜单
@@ -79,6 +81,7 @@ sealed interface FluxMenuItem {
         val enabled: Boolean = true,
         val keepOpen: Boolean = false,
         val indent: Boolean = false,
+        val hintIsPath: Boolean = false,
     ) : FluxMenuItem
 
     @Immutable
@@ -252,7 +255,13 @@ private fun MenuRow(item: FluxMenuItem.Action, state: FluxOverlayState) {
         item.icon?.let { FluxIcon(it, null, size = 18.dp, tint = iconColor) }
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.Center) {
             FluxText(item.label, style = type.body, color = fg, maxLines = 2)
-            item.hint?.let { FluxText(it, style = type.sm, color = colors.inkMuted, maxLines = 2) }
+            item.hint?.let {
+                if (item.hintIsPath) {
+                    FluxText(it, style = type.sm, color = colors.inkMuted, maxLines = 1, overflow = TextOverflow.MiddleEllipsis)
+                } else {
+                    FluxText(it, style = type.sm, color = colors.inkMuted, maxLines = 2)
+                }
+            }
         }
         item.trailing?.let { FluxText(it, style = type.weight(type.monoS, 500, mono = true), color = colors.inkFaint, maxLines = 1) }
         if (item.checked) FluxIcon(FluxIcons.Check, null, size = 18.dp, tint = colors.accentHi)

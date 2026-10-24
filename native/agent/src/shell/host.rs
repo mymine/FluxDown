@@ -32,7 +32,11 @@ use crate::runtime::AgentResult;
 const SESSION_END_BUDGET: Duration = Duration::from_millis(4500);
 /// 菜单位置：显示窗口、分隔线、全部暂停、全部恢复之后插入「取消完成后关机」。
 const CANCEL_SHUTDOWN_POSITION: usize = 4;
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_TOOLTIP: &str = "FluxDown";
+/// 托盘固定标识。Linux 上 tray-icon 把它拼成 SNI `Id`（`tray-icon tray app fluxdown`），
+/// GNOME 顶栏整理类扩展按 `Id` 记住托盘项位置；缺省的 `<pid>-<序号>` 每次启动都会变（#269）。
+const TRAY_ID: &str = "fluxdown";
 
 #[cfg(target_os = "macos")]
 const ICON_BYTES: &[u8] = include_bytes!("../../../../assets/logo/tray_iconTemplate.png");
@@ -55,6 +59,9 @@ enum HostEvent {
     /// 向主线程的全局热键后端整表下发绑定（仅 macOS）。
     #[cfg(target_os = "macos")]
     HotkeyApply(Vec<HotkeyBinding>),
+    /// 右键点击托盘图标后在主线程弹出菜单（仅 macOS，见 [`TrayUi::pop_up_menu`]）。
+    #[cfg(target_os = "macos")]
+    ShowMenu,
 }
 
 struct ProxyPort(Mutex<EventLoopProxy<HostEvent>>);
@@ -165,7 +172,7 @@ where
                 let Some((run_runtime, actions_rx)) = pending.take() else {
                     return;
                 };
-                let availability = match TrayUi::create(&actions_tx) {
+                let availability = match TrayUi::create(&actions_tx, &proxy) {
                     Ok(created) => {
                         ui = Some(created);
                         TrayAvailability::Available
@@ -249,6 +256,12 @@ where
                 Some(backend) => backend.apply(bindings),
                 None => tracing::debug!("global hotkey table dropped: backend not running"),
             },
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(HostEvent::ShowMenu) => {
+                if let Some(ui) = ui.as_ref() {
+                    ui.pop_up_menu();
+                }
+            }
             Event::UserEvent(HostEvent::Apply(model)) => {
                 if let Some(ui) = ui.as_mut() {
                     ui.apply(&model);
@@ -360,7 +373,10 @@ impl MenuIds {
 }
 
 struct TrayUi {
+    /// 字段按声明顺序析构：托盘（删除图标文件）必须先于 `_icon_dir`（删除目录）释放。
     icon: TrayIcon,
+    #[cfg(target_os = "linux")]
+    _icon_dir: linux::IconDir,
     menu: Menu,
     show: MenuItem,
     settings: MenuItem,
@@ -376,7 +392,10 @@ struct TrayUi {
 }
 
 impl TrayUi {
-    fn create(actions: &mpsc::UnboundedSender<TrayAction>) -> Result<Self, TrayUnavailableReason> {
+    fn create(
+        actions: &mpsc::UnboundedSender<TrayAction>,
+        proxy: &EventLoopProxy<HostEvent>,
+    ) -> Result<Self, TrayUnavailableReason> {
         #[cfg(target_os = "linux")]
         if !linux::status_notifier_host_present() {
             tracing::info!("no StatusNotifier host on the session bus; tray disabled");
@@ -413,18 +432,48 @@ impl TrayUi {
             }
         }));
         let click_actions = actions.clone();
+        #[cfg(target_os = "macos")]
+        let click_proxy = Mutex::new(proxy.clone());
+        #[cfg(not(target_os = "macos"))]
+        let _ = proxy;
         TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
+            let TrayIconEvent::Click {
+                button,
+                button_state,
                 ..
             } = event
-                && click_actions.send(TrayAction::ShowWindow).is_err()
-            {
-                tracing::trace!("agent runtime closed before tray click action");
+            else {
+                return;
+            };
+            match (button, button_state) {
+                (MouseButton::Left, MouseButtonState::Up) => {
+                    if click_actions.send(TrayAction::ShowWindow).is_err() {
+                        tracing::trace!("agent runtime closed before tray click action");
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                (MouseButton::Right, MouseButtonState::Down) => {
+                    let proxy = click_proxy
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if proxy.send_event(HostEvent::ShowMenu).is_err() {
+                        tracing::trace!("tray event loop closed before menu request");
+                    }
+                }
+                _ => {}
             }
         }));
         Ok(ui)
+    }
+
+    /// macOS：`NSStatusItem` 一旦挂了菜单，AppKit 对任何点击都直接弹菜单，
+    /// `menu_on_left_click(false)` 拦不住。因此平时不挂菜单，右键时临时挂上、弹出
+    /// （`performClick` 在菜单关闭后才返回），再摘掉，左键才能走「显示窗口」。
+    #[cfg(target_os = "macos")]
+    fn pop_up_menu(&self) {
+        self.icon.set_menu(Some(Box::new(self.menu.clone())));
+        self.icon.show_menu();
+        self.icon.set_menu(None);
     }
 
     fn build() -> Result<Self, String> {
@@ -456,9 +505,19 @@ impl TrayUi {
         };
         #[cfg(not(windows))]
         let bytes = ICON_BYTES;
-        let icon = TrayIconBuilder::new()
-            .with_menu(Box::new(menu.clone()))
-            .with_tooltip(DEFAULT_TOOLTIP)
+        let builder = TrayIconBuilder::new().with_id(TRAY_ID);
+        #[cfg(target_os = "linux")]
+        let icon_dir = linux::IconDir::for_process();
+        #[cfg(target_os = "linux")]
+        let builder = builder.with_temp_dir_path(icon_dir.path());
+        // macOS 不在状态栏项上常挂菜单，见 [`TrayUi::pop_up_menu`]。
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.with_menu(Box::new(menu.clone()));
+        // macOS 不设 tooltip：macOS 27 上状态栏 tooltip 收不到移出事件会常驻（#953），
+        // 倒计时改由菜单项展示（见 `tray_model::COUNTDOWN_IN_MENU`）。
+        #[cfg(not(target_os = "macos"))]
+        let builder = builder.with_tooltip(DEFAULT_TOOLTIP);
+        let icon = builder
             .with_menu_on_left_click(false)
             .with_icon(decode_icon(bytes)?)
             .with_icon_as_template(cfg!(target_os = "macos"))
@@ -468,6 +527,8 @@ impl TrayUi {
         icon.set_visible(false).map_err(|error| error.to_string())?;
         Ok(Self {
             icon,
+            #[cfg(target_os = "linux")]
+            _icon_dir: icon_dir,
             menu,
             show,
             settings,
@@ -512,6 +573,7 @@ impl TrayUi {
             },
             (None, false) => {}
         }
+        #[cfg(not(target_os = "macos"))]
         if let Err(error) = self.icon.set_tooltip(Some(&model.tooltip)) {
             tracing::debug!(error = %error, "tray tooltip unsupported");
         }
@@ -570,9 +632,46 @@ mod windows_theme {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::path::{Path, PathBuf};
+
     use gtk::gio;
     use gtk::glib;
     use gtk::glib::prelude::ToVariant;
+
+    /// 本进程托盘图标的临时目录，随托盘释放删除。
+    ///
+    /// tray-icon 按托盘 id 给图标文件命名并在析构时删除；id 固定后，并存的另一个 agent
+    /// （拿 `agent.lock` 失败退出前已建过托盘的重复启动、开发版与正式版并行）会写同一个
+    /// 文件，先退出的一方删掉另一方仍在引用的图标。按 PID 分目录让文件只归本进程。
+    pub struct IconDir(PathBuf);
+
+    impl IconDir {
+        /// `$XDG_RUNTIME_DIR/fluxdown-tray-<pid>`，无运行时目录时落在系统临时目录（同 tray-icon）。
+        pub fn for_process() -> Self {
+            let base = directories::BaseDirs::new()
+                .and_then(|dirs| dirs.runtime_dir().map(Path::to_path_buf))
+                .unwrap_or_else(std::env::temp_dir);
+            Self(base.join(format!("fluxdown-tray-{}", std::process::id())))
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for IconDir {
+        fn drop(&mut self) {
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %self.0.display(),
+                    %error,
+                    "could not remove tray icon directory"
+                ),
+            }
+        }
+    }
 
     /// 会话总线上是否有 StatusNotifier 宿主（KDE、带 AppIndicator 扩展的 GNOME 等）；
     /// 没有时 appindicator 图标不可见，关闭窗口会让应用「消失」。

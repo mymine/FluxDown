@@ -91,6 +91,10 @@ final class RustHostSession: FluxDomain.HostSession, @unchecked Sendable {
 
     func close() { inner.disconnect() }
 
+    func categorySaveDir(fileName: String, url: String) -> String? {
+        inner.categorySaveDir(fileName: fileName, url: url)
+    }
+
     private func call<T>(_ body: () async throws -> T) async throws(HostError) -> T {
         do {
             return try await body()

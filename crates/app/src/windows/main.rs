@@ -142,7 +142,7 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
             }
         }
         let chrome = ShellChrome {
-            widgets: crate::chrome_layout::widgets(&downloads.downgrade()),
+            widgets: crate::chrome_layout::widgets(&downloads, cx),
             catalog: crate::chrome_layout::catalog(),
             on_layout_change: Rc::new(|value, cx| {
                 Desktop::set_pref(cx, crate::chrome_layout::CHROME_LAYOUT_PREF, value);
@@ -154,6 +154,7 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
             let preferences = Desktop::preferences(cx).clone();
             activity::apply_visibility(shell, &preferences, cx);
             crate::chrome_layout::apply(shell, &preferences, cx);
+            crate::menus::apply_menu_bar_visibility(shell, &preferences, cx);
         });
 
         let settings_for_categories = settings_store.clone();
@@ -175,6 +176,8 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
                     crate::windows::queue_manager::open(cx);
                 })),
                 open_add_device: Some(Rc::new(crate::account_host::open_add_device_dialog)),
+                rename_linked_device: Some(Rc::new(crate::account_host::open_link_rename_dialog)),
+                unpair_linked_device: Some(Rc::new(crate::account_host::confirm_link_unpair)),
                 open_file_conflicts: Some(Rc::new(|window, cx| {
                     crate::windows::file_conflict::open_from_window(window, cx);
                 })),
@@ -215,6 +218,7 @@ fn open_with(cx: &mut App, focus: bool) -> Option<WindowHandle<Root>> {
         cx.defer(crate::account_host::replay_pending);
         cx.defer(crate::plugin_notices::replay_pending);
         cx.defer(crate::update_notices::replay_pending);
+        cx.defer(crate::service_notices::replay_pending);
     }
     handle
 }

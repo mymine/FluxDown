@@ -29,6 +29,8 @@ import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
 import { getCached, setCached } from "../../lib/api-cache";
 import { withBase } from "@/lib/base";
+import { getClientIp } from "@/lib/client-ip";
+import { markReleaseViewer } from "@/lib/download-gate";
 import { cmpReleaseTag, stripReleaseHeader } from "@/lib/release-assets";
 
 export const prerender = false;
@@ -224,7 +226,9 @@ async function getCachedReleases(
   return releases;
 }
 
-export const GET: APIRoute = async ({ url }) => {
+export const GET: APIRoute = async ({ url, request, clientAddress }) => {
+  // 更新日志页的下载入口与 /api/release 同样准入 CDN（见 download-gate.ts）。
+  markReleaseViewer(getClientIp(request, clientAddress));
   const sinceParam = url.searchParams.get("since")?.trim() || "";
   // 渠道：缺省 stable（与 /api/release 一致，未知值一律回落稳定版）
   const channel =

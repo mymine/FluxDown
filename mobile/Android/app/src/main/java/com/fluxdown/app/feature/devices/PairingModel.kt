@@ -15,6 +15,9 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.joinAll
+import java.util.concurrent.ConcurrentHashMap
 
 /** 表单 / 核对页的内联错误：本地输入不合法，或主机拒绝（文案由视图按 `AccountText.error(.., Pairing)` 本地化）。 */
 internal sealed interface PairingIssue {
@@ -38,12 +41,17 @@ internal class PairingModel(
     private val scope: CoroutineScope,
     private val api: LinkApi,
     private val nowMs: () -> Long = System::currentTimeMillis,
-    /** 配对完成（参数 = 对端设备名）。 */
-    private val onPaired: (String) -> Unit,
+    /** 发起配对时同时请求完全控制对端（添加主机的局域网配对）；false = 普通设备配对。 */
+    private val requestControl: Boolean = false,
+    /** 配对完成。 */
+    private val onPaired: (Paired) -> Unit,
     /** 发起流程失败（触感 / 提示）。 */
     private val onFailure: () -> Unit,
 ) {
     data class Verify(val token: String, val sas: String, val peerName: String, val peerFingerprint: String)
+
+    /** 已配对的对端：设备名 + 指纹（添加主机据此取控制凭据）。 */
+    data class Paired(val name: String, val fingerprint: String)
 
     sealed interface Step {
         /** 表单（本机配对码 + 发现列表 + 手动地址）。 */
@@ -68,6 +76,10 @@ internal class PairingModel(
     var step by mutableStateOf<Step>(Step.Form)
         private set
     var connecting by mutableStateOf(false)
+        private set
+
+    /** 核对页的「拒绝 / 确认」已提交、等待结果（防重复点击）。 */
+    var deciding by mutableStateOf(false)
         private set
     var message by mutableStateOf<PairingIssue?>(null)
         private set
@@ -97,9 +109,25 @@ internal class PairingModel(
 
     private val ops = Channel<suspend () -> Unit>(Channel.UNLIMITED)
 
-    init {
-        // 所有 agent 调用串行执行（重新搜索的 stop→start、拆除顺序依赖它）
-        scope.launch { for (op in ops) op() }
+    private val worker: Job = scope.launch { for (op in ops) op() }
+
+    /** 在途的发起 / 确认 / 释放调用（拆除时等它们落定，再关会话）。 */
+    private val inflight: MutableSet<Job> = ConcurrentHashMap.newKeySet()
+
+    private fun track(block: suspend () -> Unit) {
+        val job = scope.launch(start = CoroutineStart.LAZY) { block() }
+        inflight += job
+        job.invokeOnCompletion { inflight -= job }
+        job.start()
+    }
+
+    /**
+     * 已 [dismissed] 后等待所有排队的拆除调用（关发现 / 作废配对码）与在途的发起 / 释放调用落定。
+     * 之后才能安全关闭这个模型所用的会话，否则这些调用会打在已关闭的会话上而丢失。
+     */
+    suspend fun awaitTeardown() {
+        worker.join()
+        inflight.toList().joinAll()
     }
 
     /** 配对码 / 发现是否正在运行（= 页签可见 && 未关闭）。 */
@@ -107,6 +135,9 @@ internal class PairingModel(
     private var visible = false
     private var closed = false
     private var pairingStarted = false
+
+    /** 本机当前展示的配对码（`stopPairing` 带上它，只作废自己的码）。 */
+    private var ownCode: String? = null
 
     /** 发起流程代次：放弃流程（离开页签 / 关闭 / 取消等待）时自增，迟到的响应据此丢弃。 */
     private var flowGeneration = 0
@@ -149,11 +180,13 @@ internal class PairingModel(
         } else if (pairingStarted || own != null || ownError != null) {
             expiryJob?.cancel()
             expiryJob = null
+            val code = ownCode
+            ownCode = null
             own = null
             ownError = null
-            val stopCode = pairingStarted
             pairingStarted = false
-            if (stopCode) enqueue { stopPairing() }
+            // 只作废自己拿到的那个码（多客户端互不干扰）；码还在途中的由 runRefreshOwn 返回时自行作废。
+            if (code != null) enqueue { stopPairing(code) }
         }
     }
 
@@ -175,6 +208,7 @@ internal class PairingModel(
     private fun abandonFlow() {
         flowGeneration++
         connecting = false
+        deciding = false
         val pending = when (val s = step) {
             is Step.Check -> s.verify
             is Step.Finishing -> s.verify
@@ -182,16 +216,19 @@ internal class PairingModel(
         }
         if (pending != null) {
             step = Step.Form
-            scope.launch { rejectSilently(pending.token) }
+            track { rejectSilently(pending.token) }
         }
     }
 
     /** 等待对方确认阶段点「取消」：回到表单并放弃等待。 */
     fun cancelFinishing() {
-        if (step !is Step.Finishing) return
+        val verify = (step as? Step.Finishing)?.verify ?: return
         flowGeneration++
         step = Step.Form
         message = null
+        deciding = false
+        // 在途的确认调用由主机中止；token 保留到此刻，显式 accept=false 让对端立即收到取消。
+        track { rejectSilently(verify.token) }
     }
 
     private fun beginSearching() {
@@ -217,7 +254,12 @@ internal class PairingModel(
         try {
             if (!active || lan != LinkLan.Active) return
             val result = api.pairingCode()
-            if (!active || lan != LinkLan.Active) return
+            if (!active || lan != LinkLan.Active) {
+                // 等待期间已离开：这个码没人展示，立刻作废。
+                stopPairing(result.code)
+                return
+            }
+            ownCode = result.code
             own = result
             ownError = null
             ownTotal = maxOf(1L, LinkRules.secondsUntil(result.expiresAtUnixMs, nowMs()))
@@ -272,9 +314,9 @@ internal class PairingModel(
         }
     }
 
-    private suspend fun stopPairing() {
+    private suspend fun stopPairing(code: String) {
         try {
-            api.stopPairing()
+            api.stopPairing(code)
         } catch (e: HostException) {
             Log.w(TAG, "link stopPairing failed: ${e.message}")
         }
@@ -294,13 +336,13 @@ internal class PairingModel(
     /** 校验输入并发起配对（`agent.link.pairBegin`），成功进入 SAS 核对。 */
     fun begin() {
         if (connecting || step != Step.Form) return
-        when (val v = LinkRules.validate(address, code)) {
+        when (val v = LinkRules.validate(address, code, requestControl)) {
             is LinkRules.Validation.Failed -> message = PairingIssue.Input(v.error)
             is LinkRules.Validation.Ok -> {
                 connecting = true
                 message = null
                 val generation = flowGeneration
-                scope.launch {
+                track {
                     try {
                         val r = api.pairBegin(v.params)
                         if (closed || generation != flowGeneration) {
@@ -325,14 +367,16 @@ internal class PairingModel(
     /** SAS 核对后的决定：确认 → 等待对端；拒绝 → 回到表单。 */
     fun finish(accept: Boolean) {
         val verify = (step as? Step.Check)?.verify ?: return
+        if (deciding) return
+        deciding = true
         message = null
         val generation = flowGeneration
         if (accept) step = Step.Finishing(verify)
-        scope.launch {
+        track {
             try {
                 val r = api.pairFinish(verify.token, accept)
                 // 等待期间被取消 / 离开：结果作废（配对若已成立，由已配对列表的推送体现）。
-                if (generation != flowGeneration) return@launch
+                if (generation != flowGeneration) return@track
                 when {
                     !accept -> {
                         step = Step.Form
@@ -341,17 +385,19 @@ internal class PairingModel(
                     r.paired -> {
                         val name = r.deviceName ?: verify.peerName
                         step = Step.Done(name)
-                        onPaired(name)
+                        onPaired(Paired(name, verify.peerFingerprint))
                     }
                     else -> step = Step.Rejected
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: HostException) {
-                if (generation != flowGeneration) return@launch
+                if (generation != flowGeneration) return@track
                 step = Step.Form
                 message = PairingIssue.Host(e)
                 onFailure()
+            } finally {
+                if (generation == flowGeneration) deciding = false
             }
         }
     }
@@ -361,6 +407,7 @@ internal class PairingModel(
         step = Step.Form
         message = null
         code = ""
+        deciding = false
     }
 
     private suspend fun rejectSilently(token: String) {

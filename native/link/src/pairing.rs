@@ -149,6 +149,8 @@ const HELLO_DOMAIN: &[u8] = b"fluxdown-link-hello-v2";
 const SESSION_DOMAIN: &[u8] = b"fluxdown-link-session-v2";
 const RESPONDER_SIG_DOMAIN: &[u8] = b"fluxdown-link-resp-v2";
 const RESPONDER_INFO_DOMAIN: &[u8] = b"fluxdown-link-resp-info-v2";
+/// 「请求完全控制」标志的签名域标签：仅当 hello 带 `request_control` 时追加进被签名字节。
+const CONTROL_DOMAIN: &[u8] = b"fluxdown-link-control-v1";
 
 /// 发起方 hello 的被签名字节：配对码、发起方身份公钥、临时公钥承诺，以及发起方自报的
 /// `name`/`platform`/`app_version`/`initiator_addrs`。后四者若不入签，明文
@@ -156,30 +158,30 @@ const RESPONDER_INFO_DOMAIN: &[u8] = b"fluxdown-link-resp-info-v2";
 /// 响应方原样写入 `PeerRecord.candidates` 长期生效，等于让中间人植入回连
 /// 地址。全部变长字段均按 `push_framed` 长度前缀分帧；`initiator_addrs` 额外
 /// 先写元素个数再逐个分帧写入；`platform`/`app_version` 用空串归一 `None`
-/// （发起方与响应方必须对同一个 `Option` 值算出完全相同的字节串，否则验签
+/// （发起方与响应方必须对同一组字段算出完全相同的字节串，否则验签
 /// 必然失败——两处调用点见 `PairingInitiator::build_hello` 与
 /// `PairingResponder::handle_hello`）。这段字节的摘要同时是完整转录里「配对码 +
 /// 发起方自报信息」的来源。
-fn hello_message(
-    code: &str,
-    init_id_pub: &[u8; 32],
-    init_commit: &[u8; 32],
-    name: &str,
-    platform: Option<&str>,
-    app_version: Option<&str>,
-    initiator_addrs: &[String],
-) -> Vec<u8> {
+///
+/// `request_control == false` 时输出与未引入该标志之前**逐字节相同**（旧版对端照常验签）；
+/// `true` 时在最后追加 `framed(CONTROL_DOMAIN)`——标志因此进入 `hello_digest` → 转录 →
+/// SAS / 链路密钥，被中间人增删或篡改都会让配对失败。签名不覆盖 `protocol_version` 与
+/// `initiator_sig`。
+fn hello_message(req: &HelloRequest) -> Vec<u8> {
     let mut t = Vec::with_capacity(256);
     t.extend_from_slice(HELLO_DOMAIN);
-    push_framed(&mut t, code.as_bytes());
-    t.extend_from_slice(init_id_pub);
-    t.extend_from_slice(init_commit);
-    push_framed(&mut t, name.as_bytes());
-    push_framed(&mut t, platform.unwrap_or("").as_bytes());
-    push_framed(&mut t, app_version.unwrap_or("").as_bytes());
-    t.extend_from_slice(&(initiator_addrs.len() as u32).to_le_bytes());
-    for addr in initiator_addrs {
+    push_framed(&mut t, req.code.as_bytes());
+    t.extend_from_slice(&req.initiator_id_pub);
+    t.extend_from_slice(&req.initiator_commit);
+    push_framed(&mut t, req.name.as_bytes());
+    push_framed(&mut t, req.platform.as_deref().unwrap_or("").as_bytes());
+    push_framed(&mut t, req.app_version.as_deref().unwrap_or("").as_bytes());
+    t.extend_from_slice(&(req.initiator_addrs.len() as u32).to_le_bytes());
+    for addr in &req.initiator_addrs {
         push_framed(&mut t, addr.as_bytes());
+    }
+    if req.request_control {
+        push_framed(&mut t, CONTROL_DOMAIN);
     }
     t
 }
@@ -274,6 +276,8 @@ pub struct HelloRequest {
     pub app_version: Option<String>,
     /// 发起方自报的可达候选地址（`ip:port`），供响应方存为回连候选。
     pub initiator_addrs: Vec<String>,
+    /// 发起方请求「完全控制」本机（受签名保护，见 [`hello_message`]）。
+    pub request_control: bool,
 }
 
 /// 响应方 `hello` 回复：本次会话的临时公钥与随机数。不含 SAS、不含签名——响应方此刻
@@ -314,6 +318,8 @@ pub struct RevealAccepted {
     pub peer_name: String,
     pub peer_platform: Option<String>,
     pub peer_id_pub: [u8; 32],
+    /// 发起方在 hello 里请求了「完全控制」本机。
+    pub request_control: bool,
 }
 
 /// 会话所处阶段。
@@ -352,6 +358,8 @@ struct ConfirmEntry {
     initiator_addrs: Vec<String>,
     /// hello 抵达时刻，会话总寿命（`SESSION_TTL`）与揭示时限（`REVEAL_TIMEOUT`）的锚点。
     created: Instant,
+    /// 发起方在（已验签的）hello 里请求了「完全控制」本机：本机用户批准即授权。
+    request_control: bool,
     stage: SessionStage,
 }
 
@@ -605,15 +613,7 @@ impl PairingResponder {
 
         // 验发起方身份签名：绑定其长期身份、临时公钥承诺，以及自报的
         // name/platform/app_version/initiator_addrs（防中间人篡改自报字段）。
-        let message = hello_message(
-            &req.code,
-            &req.initiator_id_pub,
-            &req.initiator_commit,
-            &req.name,
-            req.platform.as_deref(),
-            req.app_version.as_deref(),
-            &req.initiator_addrs,
-        );
+        let message = hello_message(req);
         if !LinkIdentity::verify(&req.initiator_id_pub, &message, &req.initiator_sig) {
             // 签名错误的 hello 不消费码，但同样计入节流：否则持码者可以无限次地用错误签名试探。
             self.record_failed_hello(source);
@@ -677,6 +677,7 @@ impl PairingResponder {
                     platform: peer_platform,
                     app_version: peer_version,
                     initiator_addrs,
+                    request_control: req.request_control,
                     created: Instant::now(),
                     stage: SessionStage::AwaitingReveal {
                         commit: req.initiator_commit,
@@ -726,6 +727,7 @@ impl PairingResponder {
             app_version,
             initiator_addrs,
             created,
+            request_control,
             stage:
                 SessionStage::AwaitingReveal {
                     commit,
@@ -778,6 +780,7 @@ impl PairingResponder {
                     platform: platform.clone(),
                     app_version,
                     initiator_addrs,
+                    request_control,
                     created,
                     stage: SessionStage::Revealed {
                         z,
@@ -795,6 +798,7 @@ impl PairingResponder {
             peer_name: name,
             peer_platform: platform,
             peer_id_pub: initiator_id_pub,
+            request_control,
         })
     }
 
@@ -908,6 +912,7 @@ impl PairingResponder {
             platform,
             app_version,
             initiator_addrs,
+            request_control,
             stage: SessionStage::Revealed {
                 z, transcript_hash, ..
             },
@@ -940,6 +945,7 @@ impl PairingResponder {
             paired_at: now,
             last_seen_at: now,
             app_version,
+            grants_control: request_control,
             ..PeerRecord::default()
         }))
     }
@@ -1007,6 +1013,9 @@ pub struct PairingInitiator {
     eph_secret: StaticSecret,
     eph_pub: [u8; 32],
     nonce: [u8; 32],
+    /// 本次配对是否请求「完全控制」对端；进入 hello 签名字节，配对完成后落成
+    /// `PeerRecord::controllable`。
+    request_control: bool,
     /// `build_hello` 之后填充：hello 被签名字节的摘要（转录里「配对码 + 发起方自报
     /// 信息」的来源）。
     hello_digest: Option<[u8; 32]>,
@@ -1041,15 +1050,24 @@ impl PairingInitiator {
             eph_secret,
             eph_pub,
             nonce,
+            request_control: false,
             hello_digest: None,
             pending: None,
             verified: None,
         }
     }
 
+    /// 让本次配对请求「完全控制」对端（默认不请求）。必须在 [`Self::build_hello`] 之前设置：
+    /// 标志进入 hello 签名字节与转录，对端用户批准才生效。
+    #[must_use]
+    pub fn request_control(mut self, request: bool) -> Self {
+        self.request_control = request;
+        self
+    }
+
     /// 构造 `hello` 请求：只带临时公钥与随机数的**承诺**，不带临时公钥本身。签名覆盖
     /// 配对码、发起方身份公钥、承诺，以及本次自报的 name/platform/app_version/
-    /// initiator_addrs，见 `hello_message`。
+    /// initiator_addrs（请求控制时还有控制标志），见 `hello_message`。
     #[must_use]
     pub fn build_hello(
         &mut self,
@@ -1057,29 +1075,22 @@ impl PairingInitiator {
         self_info: &SelfInfo,
         initiator_addrs: Vec<String>,
     ) -> HelloRequest {
-        let id_pub = self.identity.public_bytes();
-        let commit = eph_commitment(&self.eph_pub, &self.nonce);
-        let message = hello_message(
-            code,
-            &id_pub,
-            &commit,
-            &self_info.name,
-            self_info.platform.as_deref(),
-            self_info.app_version.as_deref(),
-            &initiator_addrs,
-        );
-        self.hello_digest = Some(hash_transcript(&message));
-        HelloRequest {
+        let mut hello = HelloRequest {
             protocol_version: PAIRING_PROTOCOL_VERSION,
             code: code.to_string(),
-            initiator_id_pub: id_pub,
-            initiator_commit: commit,
-            initiator_sig: self.identity.sign(&message),
+            initiator_id_pub: self.identity.public_bytes(),
+            initiator_commit: eph_commitment(&self.eph_pub, &self.nonce),
+            initiator_sig: [0u8; 64],
             name: self_info.name.clone(),
             platform: self_info.platform.clone(),
             app_version: self_info.app_version.clone(),
             initiator_addrs,
-        }
+            request_control: self.request_control,
+        };
+        let message = hello_message(&hello);
+        self.hello_digest = Some(hash_transcript(&message));
+        hello.initiator_sig = self.identity.sign(&message);
+        hello
     }
 
     /// 处理响应方 `hello` 回复：核版本 → 自配对守卫 → 与已知发现指纹比对 → 计算 `z` 与
@@ -1197,6 +1208,7 @@ impl PairingInitiator {
             paired_at: now,
             last_seen_at: now,
             app_version: n.responder_app_version.clone(),
+            controllable: self.request_control,
             ..PeerRecord::default()
         })
     }
@@ -1213,6 +1225,22 @@ mod tests {
             platform: Some("linux".to_string()),
             app_version: Some("0.1.0".to_string()),
             cloud_device_id: None,
+        }
+    }
+
+    /// 未签名的最小 hello（无自报平台 / 版本 / 地址，不请求控制）：测试按需覆盖字段后自行签名。
+    fn bare_hello(code: &str, initiator_id_pub: [u8; 32], commit: [u8; 32]) -> HelloRequest {
+        HelloRequest {
+            protocol_version: PAIRING_PROTOCOL_VERSION,
+            code: code.to_owned(),
+            initiator_id_pub,
+            initiator_commit: commit,
+            initiator_sig: [0u8; 64],
+            name: "L".to_owned(),
+            platform: None,
+            app_version: None,
+            initiator_addrs: Vec::new(),
+            request_control: false,
         }
     }
 
@@ -1615,20 +1643,11 @@ mod tests {
         let hello = initiator.build_hello(&code, &self_info("L"), vec!["10.0.0.2:1".into()]);
 
         let attacker = LinkIdentity::generate();
-        let forged_message = hello_message(
-            &hello.code,
-            &attacker.public_bytes(),
-            &hello.initiator_commit,
-            &hello.name,
-            hello.platform.as_deref(),
-            hello.app_version.as_deref(),
-            &hello.initiator_addrs,
-        );
-        let forged = HelloRequest {
+        let mut forged = HelloRequest {
             initiator_id_pub: attacker.public_bytes(),
-            initiator_sig: attacker.sign(&forged_message),
             ..hello
         };
+        forged.initiator_sig = attacker.sign(&hello_message(&forged));
         let hello_resp = responder.handle_hello(&forged, None).unwrap();
         let reveal = initiator
             .on_hello_response(&hello_resp, "10.0.0.1:1", &[])
@@ -1752,7 +1771,11 @@ mod tests {
         let id = [1u8; 32];
         let commit = [2u8; 32];
         let msg = |code: &str, platform: &str, version: &str| {
-            hello_message(code, &id, &commit, "L", Some(platform), Some(version), &[])
+            hello_message(&HelloRequest {
+                platform: Some(platform.to_owned()),
+                app_version: Some(version.to_owned()),
+                ..bare_hello(code, id, commit)
+            })
         };
         assert_ne!(msg("111111", "a", "b"), msg("222222", "a", "b"));
         // 相邻变长字段的边界变化不能产生相同字节串。
@@ -1968,27 +1991,11 @@ mod tests {
         let degenerate_eph_pub = [0u8; 32];
         let nonce = [7u8; 32];
         let commit = eph_commitment(&degenerate_eph_pub, &nonce);
-        let addrs: Vec<String> = Vec::new();
-        let message = hello_message(
-            &code,
-            &initiator_id.public_bytes(),
-            &commit,
-            "L",
-            None,
-            None,
-            &addrs,
-        );
-        let hello = HelloRequest {
-            protocol_version: PAIRING_PROTOCOL_VERSION,
-            code,
-            initiator_id_pub: initiator_id.public_bytes(),
-            initiator_commit: commit,
-            initiator_sig: initiator_id.sign(&message),
+        let mut hello = HelloRequest {
             name: "L".to_string(),
-            platform: None,
-            app_version: None,
-            initiator_addrs: vec![],
+            ..bare_hello(&code, initiator_id.public_bytes(), commit)
         };
+        hello.initiator_sig = initiator_id.sign(&hello_message(&hello));
         let hello_resp = responder.handle_hello(&hello, None).unwrap();
         let reveal = RevealRequest {
             session_id: hello_resp.session_id,
@@ -2257,5 +2264,97 @@ mod tests {
             &mut PairingInitiator::new(LinkIdentity::generate()),
         );
         assert_eq!(resp2.name, "NAS-renamed");
+    }
+
+    // ── 控制请求（request_control）──────────────────────────────────────────
+
+    /// 引入控制标志之前的 hello 被签名字节：按旧布局手工拼出，独立于 `hello_message`，
+    /// 用来钉死「不请求控制时与旧版逐字节一致」。
+    fn legacy_hello_bytes(req: &HelloRequest) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(b"fluxdown-link-hello-v2");
+        push_framed(&mut t, req.code.as_bytes());
+        t.extend_from_slice(&req.initiator_id_pub);
+        t.extend_from_slice(&req.initiator_commit);
+        push_framed(&mut t, req.name.as_bytes());
+        push_framed(&mut t, req.platform.as_deref().unwrap_or("").as_bytes());
+        push_framed(&mut t, req.app_version.as_deref().unwrap_or("").as_bytes());
+        t.extend_from_slice(&(req.initiator_addrs.len() as u32).to_le_bytes());
+        for addr in &req.initiator_addrs {
+            push_framed(&mut t, addr.as_bytes());
+        }
+        t
+    }
+
+    #[test]
+    fn hello_bytes_without_control_request_match_the_legacy_layout() {
+        let mut req = HelloRequest {
+            platform: Some("macos".to_owned()),
+            app_version: Some("1.2.3".to_owned()),
+            initiator_addrs: vec!["10.0.0.2:17800".to_owned(), "[fe80::1]:1".to_owned()],
+            ..bare_hello("123456", [3u8; 32], [4u8; 32])
+        };
+        let legacy = legacy_hello_bytes(&req);
+        assert_eq!(hello_message(&req), legacy);
+
+        // 请求控制：只在 addrs 之后追加 framed("fluxdown-link-control-v1")，其余字节不变。
+        req.request_control = true;
+        let mut expected = legacy;
+        expected.extend_from_slice(&24u32.to_le_bytes());
+        expected.extend_from_slice(b"fluxdown-link-control-v1");
+        assert_eq!(hello_message(&req), expected);
+    }
+
+    #[test]
+    fn control_flag_is_covered_by_the_hello_signature() {
+        for request in [true, false] {
+            let responder = PairingResponder::new(LinkIdentity::generate(), self_info("NAS"));
+            let mut initiator =
+                PairingInitiator::new(LinkIdentity::generate()).request_control(request);
+            let code = responder.generate_code();
+            let mut hello = initiator.build_hello(&code, &self_info("L"), vec![]);
+            assert_eq!(hello.request_control, request);
+            // 中间人增删控制标志：签名失败，且不烧掉配对码。
+            hello.request_control = !request;
+            assert!(
+                matches!(
+                    responder.handle_hello(&hello, None),
+                    Err(LinkError::BadSignature)
+                ),
+                "flipping request_control from {request} must break the signature"
+            );
+            hello.request_control = request;
+            assert!(responder.handle_hello(&hello, None).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn control_is_granted_only_when_requested_and_approved() {
+        for (request, approve) in [(true, true), (true, false), (false, true), (false, false)] {
+            let responder = PairingResponder::new(LinkIdentity::generate(), self_info("NAS"));
+            let mut initiator =
+                PairingInitiator::new(LinkIdentity::generate()).request_control(request);
+            let run = run_handshake(&responder, &mut initiator, vec![]);
+            assert_eq!(
+                run.accepted.request_control, request,
+                "the incoming request must tell the user whether control is requested"
+            );
+            let session_id = &run.hello_resp.session_id;
+            responder.set_local_decision(session_id, approve).unwrap();
+            let outcome = responder.handle_confirm(session_id, true).await;
+            if !approve {
+                assert!(matches!(outcome, Err(LinkError::RejectedByPeer)));
+                continue;
+            }
+            let host_side = outcome.unwrap().unwrap();
+            assert_eq!(
+                host_side.grants_control, request,
+                "grants_control needs both the request and the approval"
+            );
+            assert!(!host_side.controllable);
+            let controller_side = initiator.finalize().unwrap();
+            assert_eq!(controller_side.controllable, request);
+            assert!(!controller_side.grants_control);
+        }
     }
 }

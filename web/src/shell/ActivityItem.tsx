@@ -8,7 +8,7 @@ import type { PluginActivityEntry } from '../pages/plugins/contributions'
 import { cn } from '../lib/cn'
 import { ACTION_BUTTON, RAIL_BUTTON, resolveSide } from '../pages/downloads/statusbar/widget'
 import type { WidgetProps } from '../pages/downloads/statusbar/widget'
-import { Icon, Tooltip } from '../ui'
+import { Icon, MaskIcon, Tooltip } from '../ui'
 import { AccountAvatar } from './AccountAvatar'
 import { useAccountAvatar } from './accountAvatarState'
 import { AccountMenu } from './AccountMenu'
@@ -38,7 +38,7 @@ export function RouteItem({ entry, orientation = 'horizontal', side }: WidgetPro
   )
 }
 
-/** 插件活动页入口：标签是插件视图标题原文，图标固定 Sparkles。 */
+/** 插件活动页入口：标签是插件视图标题原文，图标为插件声明的 SVG（未声明时 Sparkles）。 */
 export function PluginItem({ entry, orientation = 'horizontal', side }: WidgetProps & { entry: PluginActivityEntry }) {
   const { pathname } = useLocation()
   const active = isPluginEntryActive(entry, pathname)
@@ -52,7 +52,11 @@ export function PluginItem({ entry, orientation = 'horizontal', side }: WidgetPr
         aria-current={active ? 'page' : undefined}
         className={cn(rail ? RAIL_BUTTON : ACTION_BUTTON, active && BUTTON_ACTIVE)}
       >
-        <Icon icon={entry.icon} size={rail ? 'xl' : 'lg'} className={cn(active && 'text-nav-selected-icon')} />
+        {entry.iconMask === null ? (
+          <Icon icon={entry.icon} size={rail ? 'xl' : 'lg'} className={cn(active && 'text-nav-selected-icon')} />
+        ) : (
+          <MaskIcon mask={entry.iconMask} size={rail ? 'xl' : 'lg'} className={cn(active && 'text-nav-selected-icon')} />
+        )}
       </Link>
     </Tooltip>
   )

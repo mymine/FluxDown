@@ -310,11 +310,13 @@ mod tests {
                 sniff_rules: rules.map(str::to_string),
                 ..ContributesDecl::default()
             },
+            view_icons: Vec::new(),
             has_main: false,
             risk: PluginRisk::Elevated,
             network_hosts: Vec::new(),
             consent_pending: Vec::new(),
             consent_pending_hosts: Vec::new(),
+            package_revision: 0,
             package_dir: Some(dir.to_string_lossy().into_owned()),
         }
     }

@@ -1,59 +1,55 @@
 package com.fluxdown.app.update
 
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
-import android.os.Build
+import android.net.Uri
 import android.util.Log
+import androidx.core.content.FileProvider
 import androidx.core.content.pm.PackageInfoCompat
-import com.fluxdown.app.FluxApplication
+import com.fluxdown.app.R
+import com.fluxdown.app.i18n.str
 import com.fluxdown.core.update.UpdateFailure
 import com.fluxdown.core.update.UpdatePolicy
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.IOException
 
-/** [ApkInstaller.install] 的结果。 */
+/** [ApkInstaller.prepare] 的结果。 */
 internal sealed interface InstallOutcome {
-    /** 会话已提交；最终结果经 [InstallResultReceiver] 异步回报（成功时系统替换并结束进程）。 */
-    data object Submitted : InstallOutcome
+    /** 预检通过：[intent] 由前台界面拉起；[target] 为解析到的处理者（诊断用）。 */
+    data class Ready(val intent: Intent, val target: String) : InstallOutcome
 
-    /** 未授予「安装未知应用」：未提交，UI 引导授权后重试。 */
-    data object PermissionMissing : InstallOutcome
-
-    /** 未提交：包校验 / 写入失败，应回报给 Rust（[UpdateFailure.Verify] 会让 Rust 删除坏包）。 */
+    /** 未交接：包校验失败或无法授权读取，应回报给 Rust（[UpdateFailure.Verify] 会让 Rust 删除坏包）。 */
     data class Rejected(val failure: UpdateFailure, val detail: String) : InstallOutcome
 }
 
 /**
- * 经 `PackageInstaller` 会话安装已校验的更新包。用户必须点按确认系统安装界面
- * （本类从不绕过系统确认；`USER_ACTION_NOT_REQUIRED` 只在系统判定符合静默更新条件时才免确认）。
+ * 把已校验的更新包交给安装程序：`ACTION_VIEW` + FileProvider 只读 `content://`，与文件管理器打开 APK 同一入口，
+ * 因此走用户设定的默认安装程序；`chooser` = 忽略默认、弹出系统选择器。安装始终由安装程序向用户确认。
+ *
+ * 不用 `PackageInstaller` 会话：会话的确认界面固定交给系统安装器（无视用户设定的默认安装程序），部分国行 MIUI / HyperOS
+ * 安装器对第三方会话直接回 `INSTALL_FAILED_ABORTED`；本应用也未持有 `UPDATE_PACKAGES_WITHOUT_USER_ACTION`，会话同样要确认。
+ * 「安装未知应用」授权由安装程序自行引导（第三方安装程序不需要本应用的这项授权），这里不预检。
  */
 internal class ApkInstaller(private val context: Context, private val env: InstallEnvironment) {
-    fun canRequestInstalls(): Boolean = context.packageManager.canRequestPackageInstalls()
-
-    /** 预检 → 流式写入会话 → 提交。所有 IO 在 [Dispatchers.IO]。 */
-    suspend fun install(packagePath: String): InstallOutcome = withContext(Dispatchers.IO) {
-        if (!canRequestInstalls()) return@withContext InstallOutcome.PermissionMissing
+    /** 预检 → 生成交接 Intent。解析 APK 在 [Dispatchers.IO]。 */
+    suspend fun prepare(packagePath: String, chooser: Boolean): InstallOutcome = withContext(Dispatchers.IO) {
         val file = File(packagePath)
         precheck(file)?.let { return@withContext it }
-        try {
-            commit(file)
-            InstallOutcome.Submitted
-        } catch (e: IOException) {
-            Log.w(TAG, "write install session failed: ${e.message}")
-            InstallOutcome.Rejected(UpdateFailure.Storage, e.message.orEmpty())
-        } catch (e: SecurityException) {
-            Log.w(TAG, "commit install session denied: ${e.message}")
-            InstallOutcome.Rejected(UpdateFailure.Install, e.message.orEmpty())
-        } catch (e: IllegalStateException) {
-            Log.w(TAG, "install session state error: ${e.message}")
-            InstallOutcome.Rejected(UpdateFailure.Install, e.message.orEmpty())
+        val uri = try {
+            FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+        } catch (e: IllegalArgumentException) {
+            // 更新目录不在 FileProvider 根内（file_paths.xml 的 app_update 与 noBackupFilesDir 布局不符）
+            Log.w(TAG, "update package outside FileProvider roots: ${e.message}")
+            return@withContext InstallOutcome.Rejected(UpdateFailure.Install, e.message.orEmpty())
+        }
+        val view = viewIntent(uri)
+        if (chooser) {
+            InstallOutcome.Ready(Intent.createChooser(view, context.str(R.string.mobileUpdateChooserTitle)), CHOOSER)
+        } else {
+            InstallOutcome.Ready(view, describe(view.resolveActivity(context.packageManager)))
         }
     }
 
@@ -84,92 +80,22 @@ internal class ApkInstaller(private val context: Context, private val env: Insta
         return null
     }
 
-    private fun commit(file: File) {
-        val installer = context.packageManager.packageInstaller
-        val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
-            setAppPackageName(context.packageName)
-            setSize(file.length())
-            setInstallReason(PackageManager.INSTALL_REASON_USER)
-            // Android 12 以下不支持免确认更新，系统安装器总会弹确认（会话结果走同一 STATUS_PENDING_USER_ACTION 分支）
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                setPackageSource(PackageInstaller.PACKAGE_SOURCE_DOWNLOADED_FILE)
-            }
-        }
-        val sessionId = installer.createSession(params)
-        try {
-            installer.openSession(sessionId).use { session ->
-                file.inputStream().use { input ->
-                    session.openWrite(APK_NAME, 0, file.length()).use { out ->
-                        input.copyTo(out, COPY_BUFFER)
-                        session.fsync(out)
-                    }
-                }
-                session.commit(resultSender(sessionId))
-            }
-        } catch (e: Exception) {
-            runCatching { installer.abandonSession(sessionId) }
-            throw e
-        }
-    }
+    companion object {
+        private const val TAG = "FluxDown.update"
+        private const val APK_MIME = "application/vnd.android.package-archive"
+        private const val CHOOSER = "chooser"
 
-    /** 结果回到 [InstallResultReceiver]：必须可变（系统要往里填状态 extras），显式组件满足 Android 14+ 的限制。 */
-    private fun resultSender(sessionId: Int) = PendingIntent.getBroadcast(
-        context,
-        sessionId,
-        Intent(context, InstallResultReceiver::class.java).setAction(ACTION_RESULT),
-        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
-    ).intentSender
+        private fun viewIntent(uri: Uri): Intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(uri, APK_MIME)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
 
-    private companion object {
-        const val TAG = "FluxDown.update"
-        const val APK_NAME = "base.apk"
-        const val COPY_BUFFER = 1 shl 20
-        const val ACTION_RESULT = "com.fluxdown.app.action.INSTALL_RESULT"
-    }
-}
+        /**
+         * 打开 APK 的默认处理者（诊断用，同交接时的解析）：`包名/组件`；装有多个安装程序且没设默认时为系统选择器
+         * （`android/…ResolverActivity`）；无人处理为 `none`。
+         */
+        fun defaultHandler(context: Context): String =
+            describe(viewIntent(Uri.parse("content://${context.packageName}.files/probe.apk")).resolveActivity(context.packageManager))
 
-/**
- * 安装会话结果（non-exported）：待确认 → 拉起系统安装确认；成功时进程已被系统替换（不会走到这里）；
- * 失败 / 取消 → 回报给更新控制器（Rust 状态机转 Failed）。
- */
-class InstallResultReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) {
-        val status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)
-        val message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE).orEmpty()
-        when (status) {
-            PackageInstaller.STATUS_PENDING_USER_ACTION -> {
-                @Suppress("DEPRECATION")
-                val confirm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
-                } else {
-                    intent.getParcelableExtra(Intent.EXTRA_INTENT)
-                }
-                if (confirm == null) {
-                    report(context, status, "missing confirmation intent")
-                } else {
-                    try {
-                        context.startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    } catch (e: RuntimeException) {
-                        Log.w(TAG, "launch install confirmation failed: ${e.message}")
-                        report(context, PackageInstaller.STATUS_FAILURE, e.message.orEmpty())
-                    }
-                }
-            }
-            PackageInstaller.STATUS_SUCCESS -> Unit
-            else -> report(context, status, message)
-        }
-    }
-
-    private fun report(context: Context, status: Int, message: String) {
-        val failure = UpdatePolicy.installFailureFor(status) ?: UpdateFailure.Install
-        val container = (context.applicationContext as FluxApplication).container
-        container.appScope.launch { container.updates.onInstallFailed(failure, message) }
-    }
-
-    private companion object {
-        const val TAG = "FluxDown.update"
+        private fun describe(component: ComponentName?): String = component?.flattenToShortString() ?: "none"
     }
 }

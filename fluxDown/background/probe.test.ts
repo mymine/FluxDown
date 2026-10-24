@@ -10,7 +10,14 @@ interface FakeTab {
 const tabs = new Map<number, FakeTab>();
 /** 页面里存活的 sensor：有则应答 probe。 */
 const liveSensors = new Map<number, string>();
-const injected: { tabId: number; files: string[]; world?: string }[] = [];
+const injected: {
+  tabId: number;
+  files: string[];
+  world?: string;
+  allFrames?: boolean;
+  frameIds?: number[];
+  injectImmediately?: boolean;
+}[] = [];
 let injectFails = false;
 /** 补注入 sensor 后它会拉配置登记会话：由测试在 tab-state 加载后接上。 */
 let onSensorInjected: (tabId: number) => void = () => {};
@@ -38,8 +45,20 @@ mock.module("wxt/browser", () => ({
       onReplaced: { addListener: () => {} },
     },
     scripting: {
-      executeScript: async (opts: { target: { tabId: number }; files: string[]; world?: string }) => {
-        injected.push({ tabId: opts.target.tabId, files: opts.files, world: opts.world });
+      executeScript: async (opts: {
+        target: { tabId: number; allFrames?: boolean; frameIds?: number[] };
+        files: string[];
+        world?: string;
+        injectImmediately?: boolean;
+      }) => {
+        injected.push({
+          tabId: opts.target.tabId,
+          files: opts.files,
+          world: opts.world,
+          allFrames: opts.target.allFrames,
+          frameIds: opts.target.frameIds,
+          injectImmediately: opts.injectImmediately,
+        });
         if (injectFails) throw new Error("Cannot access contents of the page");
         if (opts.files[0]?.endsWith("/sensor.js")) queueMicrotask(() => onSensorInjected(opts.target.tabId));
         return [];
@@ -84,6 +103,12 @@ describe("页面探测恢复", () => {
       ["/content-scripts/panel.js", undefined],
     ]);
     expect(getSession(tab, 0)?.sid).toBe("reinjected");
+    // 钩子与 sensor 覆盖所有帧并立即注入；面板只进顶层帧
+    expect(injected.map((i) => [i.allFrames, i.frameIds, i.injectImmediately])).toEqual([
+      [true, undefined, true],
+      [true, undefined, true],
+      [undefined, [0], undefined],
+    ]);
     expect(probeStateOf(tab)).toBe("live");
   });
 

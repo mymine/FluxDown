@@ -6,8 +6,16 @@
 3. 刷新 release 说明头部：已发布组件清单 + 服务器 / CLI / Android 安装说明。头部位于第一个
    `<!-- fluxdown:lang:* -->` 标记之前，官网 / App 的双语解析只取标记区块，不会把安装说明
    混进更新日志；组件清单变化会让补发产生 release `edited` 事件，官网据此清缓存。
-4. 草稿 → 发布（至少一个组件完整）。稳定版且桌面端完整、且是最高稳定版本时才标 latest。
-5. 本次应发布但未完成的组件写入 job summary 并以非零退出，提示补发。
+4. 头部起始标记同时持久化本 tag 的发布状态：`expected=` 为历次运行（tag 推送 + 各次补发）应发布
+   组件的并集，`docker=ok|pending` 为 Server Docker 镜像是否已推送成功（仅 expected 含 server 时写）。
+   补发只构建单个组件，靠这份累计清单判断整个 release 是否齐全。
+5. 草稿 → 发布：expected 中每个组件都有完成哨兵且 Docker 不处于 pending 时才转正（转正才触发
+   release `published` webhook、官网 / 客户端可见与 Telegram 公告）；否则保持草稿，补发齐全后
+   由那次补发转正。已发布的 release 不会退回草稿。稳定版且桌面端完整、且是最高稳定版本时才标 latest。
+6. 未完成的组件写入 job summary 并以非零退出，提示补发。
+
+`--seed-notes <file>`（prepare-release 调用）：把本次应发布组件写进说明文件头部后由调用方建 /
+刷新草稿，保证 publish-release 未跑到时累计清单也已落盘，补发不会把缺组件的 release 提前转正。
 
 演练（`--rehearsal-dir <dir>`，release.yml rehearsal 模式）：release 不存在，改从该目录读取各组件
 `SHA256SUMS-<组件>.txt` 与 `RELEASE_NOTES.md`，按草稿状态走同一套判定，把 `SHA256SUMS.txt`、
@@ -36,6 +44,7 @@ LABELS = {
 HEADER_RE = re.compile(
     r"<!-- fluxdown:release:begin[^>]*-->.*?<!-- fluxdown:release:end -->\n*", re.S
 )
+BEGIN_RE = re.compile(r"<!-- fluxdown:release:begin([^>]*)-->")
 STABLE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -67,7 +76,8 @@ def install_sections(present: list[str], version: str, repo: str, owner: str) ->
 | Windows x64 / ARM64 | `FluxDown-Server-{version}-windows-{{x64,arm64}}.zip` |
 | macOS Intel / Apple Silicon | `FluxDown-Server-{version}-macos-{{x64,arm64}}.tar.gz` |
 | Linux x64 / ARM64（musl 静态链接，任意发行版可用） | `FluxDown-Server-{version}-linux-{{x64,arm64}}.tar.gz` |
-| OpenWrt 软路由（x86_64 / aarch64 各子架构） | `fluxdown-server_{version}_<arch>.ipk` + `luci-app-fluxdown_{version}_all.ipk` |
+| OpenWrt 软路由 24.10 及更早（opkg，x86_64 / aarch64 各子架构） | `fluxdown-server_{version}_<arch>.ipk` + `luci-app-fluxdown_{version}_all.ipk` |
+| OpenWrt 软路由 25.12 起（apk，x86_64 / aarch64 各子架构） | `fluxdown-server_{version}_<arch>.apk` + `luci-app-fluxdown_{version}_all.apk` |
 | QNAP NAS（QTS x86_64 / ARM64） | `FluxDown-Server-{version}-qnap-{{x64,arm64}}.qpkg` |
 | 群晖 NAS（DSM 7 / DSM 6，x86_64 / ARM64） | `FluxDown-Server-{version}-synology-{{dsm7,dsm6}}-{{x64,arm64}}.spk` |
 | 飞牛 fnOS NAS（x86 / ARM） | `FluxDown-Server-{version}-fnos-{{x64,arm64}}.fpk` |
@@ -76,7 +86,7 @@ def install_sections(present: list[str], version: str, repo: str, owner: str) ->
 **包内两个可执行文件必须放在同一目录**：`fluxdown-agent`（含 Web 控制台，已编译进二进制）与 `fluxdownd`（下载 daemon，由 agent 自动拉起、退出时一并关停），无需附带任何静态资源目录。
 首次启动请在浏览器里完成「初始化 FluxDown Server」向导设置访问密钥（无人值守部署可用 `FLUXDOWN_TOKEN` 预置）。
 
-**OpenWrt**：`opkg install fluxdown-server_*.ipk luci-app-fluxdown_*.ipk`，LuCI「服务 → FluxDown」页管理，Web 界面在 `http://路由器IP:17800`。agent 二进制含完整 Web UI，另附 fluxdownd，需 overlay 空间充足的软路由设备。
+**OpenWrt**：24.10 及更早用 `opkg install fluxdown-server_*.ipk luci-app-fluxdown_*.ipk`；25.12 起用 `apk add --allow-untrusted fluxdown-server_*.apk luci-app-fluxdown_*.apk`（包未用 OpenWrt 官方密钥签名）。`<arch>` 取路由器 `/etc/apk/arch`（或 `opkg print-architecture`）中的架构名。LuCI「服务 → FluxDown」页管理，Web 界面在 `http://路由器IP:17800`。agent 二进制含完整 Web UI，另附 fluxdownd，需 overlay 空间充足的软路由设备。
 **QNAP**：App Center → 手动安装 `.qpkg`（需在设置中允许安装未经验证的应用），装完点应用图标直达 Web 界面。
 **群晖**：套件中心 → 手动安装 `.spk`（需在「设置 → 信任来源」允许任何发行者）。DSM 7.x 装 `dsm7` 包（以套件专属用户运行），DSM 6.x 装 `dsm6` 包；Intel/AMD 机型选 x64，ARM 机型（rtd1296/rtd1619b 等）选 arm64。装完在套件中心点「打开」直达 Web 界面（端口 17800）。
 **飞牛 fnOS**：应用中心 → 手动安装 `.fpk`；x86 机型选 x64，ARM 机型选 arm64。以专用应用用户 `fluxdown` 运行，默认保存到安装时创建的 `fluxdown` 共享文件夹，其他目录在应用设置「授权目录」中添加。装完点桌面图标直达 Web 界面（端口 17800）。
@@ -125,17 +135,53 @@ fluxdown ls
 | 32 位 ARM | `FluxDown-{version}-android-armeabi-v7a.apk` |
 | x86_64（模拟器 / Chromebook） | `FluxDown-{version}-android-x86_64.apk` |
 
-⚠️ **从旧版（Flutter 版）升级**：新版 Android 客户端换用了新的签名证书，不能直接覆盖安装旧版（系统会提示「应用未安装」或签名冲突）。
+⚠️ **从旧版（Flutter 版）升级**：新版 Android 客户端换用了新的签名证书，不能直接覆盖安装旧版（系统可能提示「应用未安装」「软件包无效」「无法降级」或签名冲突）。
 请先在旧版中记下需要保留的下载任务与设置，卸载旧版后再安装新版；卸载会清除旧版的本地数据，已下载到公共目录的文件不受影响。
 """
         )
     return "\n".join(sections)
 
 
-def compose_body(body: str, present: list[str], version: str, repo: str, owner: str) -> str:
-    """去掉旧头部，按当前已发布组件重建头部，其后接原有更新说明。"""
+def header_attrs(body: str) -> dict[str, str]:
+    """读取说明头部起始标记上的 `key=value` 属性（无头部返回空）。"""
+    match = BEGIN_RE.search(body)
+    if not match:
+        return {}
+    return dict(kv.split("=", 1) for kv in match.group(1).split() if "=" in kv)
+
+
+def component_list(*groups: list[str]) -> list[str]:
+    """多组组件名取并集，按 COMPONENTS 规范顺序输出，丢弃未知名。"""
+    wanted = {c for group in groups for c in group}
+    return [c for c in COMPONENTS if c in wanted]
+
+
+def docker_state(
+    expected_all: list[str], run_expected: list[str], docker_result: str, previous: str | None
+) -> str | None:
+    """Server Docker 镜像状态：本次构建了 server 以本次结果为准，否则沿用记录；未知按 pending。"""
+    if "server" not in expected_all:
+        return None
+    if "server" in run_expected:
+        return "ok" if docker_result == "success" else "pending"
+    return previous if previous in ("ok", "pending") else "pending"
+
+
+def compose_body(
+    body: str,
+    present: list[str],
+    expected: list[str],
+    docker: str | None,
+    version: str,
+    repo: str,
+    owner: str,
+) -> str:
+    """去掉旧头部，按当前已发布组件与累计发布状态重建头部，其后接原有更新说明。"""
     notes = HEADER_RE.sub("", body).lstrip("\n")
-    header = f"<!-- fluxdown:release:begin components={','.join(present)} -->\n"
+    attrs = f"components={','.join(present)} expected={','.join(expected)}"
+    if docker:
+        attrs += f" docker={docker}"
+    header = f"<!-- fluxdown:release:begin {attrs} -->\n"
     sections = install_sections(present, version, repo, owner)
     if sections:
         header += (
@@ -155,7 +201,12 @@ def is_highest_stable(tag: str, tags: list[str]) -> bool:
 
 
 def write_summary(
-    tag: str, expected: list[str], present: list[str], failures: list[str], rehearsal: bool
+    tag: str,
+    expected: list[str],
+    present: list[str],
+    failures: list[str],
+    published: bool,
+    rehearsal: bool,
 ) -> None:
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
@@ -164,24 +215,36 @@ def write_summary(
         f"| {LABELS[c]} (`{c}`) | {'✔' if c in expected else ''} | {'✅' if c in present else '—'} |"
         for c in COMPONENTS
     ]
+    if rehearsal:
+        title = f"## Release {tag}（演练，未发布）"
+    else:
+        title = f"## Release {tag}（{'已发布' if published else '草稿'}）"
     lines = [
-        f"## Release {tag}（演练，未发布）" if rehearsal else f"## Release {tag}",
+        title,
         "",
-        "| 组件 | 本次应发布 | 已发布（完成哨兵） |",
+        "| 组件 | 应发布（tag + 历次补发累计） | 已上传（完成哨兵） |",
         "|---|---|---|",
         *rows,
     ]
     if failures and rehearsal:
-        lines += ["", f"**演练发现未完成：{', '.join(failures)}**。真实发布时这些组件会缺失，需先修复。"]
+        lines += ["", f"**演练发现未完成：{', '.join(failures)}**。真实发布时 release 会停在草稿，需先修复。"]
     elif failures:
+        state = (
+            "release 已发布，以下组件仍缺失"
+            if published
+            else "release 保持草稿（官网与客户端仍提供上一版本），全部组件补发完成后由那次补发自动转正并发布公告"
+        )
+        components = list(dict.fromkeys(c.split("(")[0] for c in failures))
         lines += [
             "",
-            f"**未完成：{', '.join(failures)}**。修复后补发（源码默认取 tag，修了代码时用 `source_ref` 指定包含修复的分支或提交）：",
+            f"**未完成：{', '.join(failures)}**。{state}。",
+            "",
+            "修复后补发（源码默认取 tag，修了代码时用 `source_ref` 指定包含修复的分支或提交）：",
             "",
             "```bash",
             *(
-                f"gh workflow run release.yml --ref main -f tag={tag} -f component={c.split('(')[0]} [-f source_ref=<branch|sha>]"
-                for c in failures
+                f"gh workflow run release.yml --ref main -f tag={tag} -f component={c} [-f source_ref=<branch|sha>]"
+                for c in components
             ),
             "```",
             "",
@@ -189,6 +252,32 @@ def write_summary(
         ]
     with open(path, "a", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def seed_notes(tag: str, notes_path: Path, expected: list[str], release_exists: bool) -> None:
+    """prepare-release：把累计应发布组件写进即将写入草稿的说明文件头部。"""
+    repo = os.environ["GITHUB_REPOSITORY"]
+    owner = os.environ["GITHUB_REPOSITORY_OWNER"]
+    old_body = (
+        json.loads(gh("release", "view", tag, "--json", "body"))["body"] or ""
+        if release_exists
+        else ""
+    )
+    attrs = header_attrs(old_body)
+    expected_all = component_list(attrs.get("expected", "").split(","), expected)
+    present = component_list(attrs.get("components", "").split(","))
+    docker = docker_state(expected_all, [], "", attrs.get("docker"))
+    body = compose_body(
+        notes_path.read_text(encoding="utf-8"),
+        present,
+        expected_all,
+        docker,
+        tag.removeprefix("v"),
+        repo,
+        owner,
+    )
+    notes_path.write_text(body, encoding="utf-8")
+    print(f"{tag}: seeded release header; expected={','.join(expected_all)}; docker={docker}")
 
 
 def main() -> int:
@@ -199,13 +288,23 @@ def main() -> int:
     parser.add_argument(
         "--rehearsal-dir", default="", help="演练：从该目录读哨兵与说明，只输出预览，不调用 gh"
     )
+    parser.add_argument(
+        "--seed-notes", default="", help="prepare-release：把累计应发布组件写进该说明文件头部后退出"
+    )
+    parser.add_argument(
+        "--release-exists", action="store_true", help="--seed-notes 时 release 已存在（合并其头部状态）"
+    )
     args = parser.parse_args()
 
     tag: str = args.tag
     version = tag.removeprefix("v")
+    expected = component_list(args.expected.split(","))
+    if args.seed_notes:
+        seed_notes(tag, Path(args.seed_notes), expected, args.release_exists)
+        return 0
+
     repo = os.environ["GITHUB_REPOSITORY"]
     owner = os.environ["GITHUB_REPOSITORY_OWNER"]
-    expected = [c for c in args.expected.split(",") if c]
     rehearsal_dir = Path(args.rehearsal_dir) if args.rehearsal_dir else None
 
     if rehearsal_dir:
@@ -221,6 +320,15 @@ def main() -> int:
         info = json.loads(gh("release", "view", tag, "--json", "assets,body,isDraft"))
     names = {a["name"] for a in info["assets"]}
     present = [c for c in COMPONENTS if f"SHA256SUMS-{c}.txt" in names]
+
+    old_body = info.get("body") or ""
+    attrs = header_attrs(old_body)
+    expected_all = component_list(attrs.get("expected", "").split(","), expected)
+    docker = docker_state(expected_all, expected, args.docker_result, attrs.get("docker"))
+    failures = [c for c in expected_all if c not in present]
+    if docker == "pending":
+        failures.append("server(docker)")
+    complete = bool(expected_all) and not failures
 
     if present and rehearsal_dir:
         merged = merge_checksums(
@@ -238,8 +346,7 @@ def main() -> int:
             gh("release", "upload", tag, str(total), "--clobber")
 
     edit_args: list[str] = []
-    old_body = info.get("body") or ""
-    new_body = compose_body(old_body, present, version, repo, owner)
+    new_body = compose_body(old_body, present, expected_all, docker, version, repo, owner)
     notes_dir = rehearsal_dir or Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
     notes_file = notes_dir / "release-body.md"
     if new_body != old_body:
@@ -252,8 +359,9 @@ def main() -> int:
     if tag not in tags:
         tags.append(tag)  # 演练的 tag 尚不存在；真实发布时它已在列表中，此处无变化
     should_latest = "app" in present and is_highest_stable(tag, tags)
+    published = not info["isDraft"] or complete
     if info["isDraft"]:
-        if present:
+        if complete:
             # 草稿首次发布时 GitHub 默认抢占 latest，必须显式给值
             edit_args += ["--draft=false", f"--latest={'true' if should_latest else 'false'}"]
     elif should_latest:
@@ -264,20 +372,25 @@ def main() -> int:
     elif edit_args:
         gh("release", "edit", tag, *edit_args)
 
-    failures = [c for c in expected if c not in present]
-    if "server" in expected and args.docker_result not in ("success", "skipped", ""):
-        failures.append("server(docker)")
-    write_summary(tag, expected, present, failures, rehearsal_dir is not None)
+    write_summary(tag, expected_all, present, failures, published, rehearsal_dir is not None)
 
-    state = "draft" if info["isDraft"] and not present else "published"
+    state = "published" if published else "draft"
     if rehearsal_dir:
         state = f"rehearsal (would be {state})"
-    print(f"{tag}: {state}; components={','.join(present) or '<none>'}; latest={should_latest}")
-    if not present:
-        print(f"::error::{tag} 没有任何组件上传完成，release 保持草稿")
+    print(
+        f"{tag}: {state}; components={','.join(present) or '<none>'}; "
+        f"expected={','.join(expected_all) or '<none>'}; docker={docker}; latest={should_latest}"
+    )
+    if not expected_all:
+        print(f"::error::{tag} 没有记录任何应发布组件，release 保持草稿")
         return 1
     if failures:
-        hint = "演练结果见 job summary" if rehearsal_dir else "见 job summary 的补发命令"
+        if rehearsal_dir:
+            hint = "演练结果见 job summary"
+        elif published:
+            hint = "release 已发布；见 job summary 的补发命令"
+        else:
+            hint = "release 保持草稿，全部补发完成后自动转正；见 job summary 的补发命令"
         print(f"::error::{tag} 未完成的组件：{', '.join(failures)}（{hint}）")
         return 1
     return 0

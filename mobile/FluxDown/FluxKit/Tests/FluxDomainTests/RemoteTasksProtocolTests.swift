@@ -251,8 +251,8 @@ struct RemoteTasksProtocolTests {
         #expect(targets[0].routesViaLink && targets[0].dispatchFingerprint == "fp-pc")
         #expect(!targets[1].routesViaLink && targets[1].dispatchFingerprint == nil)
         #expect(targets[2].routesViaLink && targets[2].dispatchFingerprint == "fp-pc2")
-        // 侧栏只列云条目（含挂接）。
-        #expect(DeviceRules.sidebarTargets(targets).map(\.id) == ["cloud:pc", "cloud:nas"])
+        // 账户页「同一账号」标签只给真正挂接的记录（后到的同 id、cloudDeviceId 不在名册、revoked 都不算）。
+        #expect(DeviceRules.attachedLinkFingerprints(cloud: cloud, link: link) == ["fp-pc"])
         // 持久化的 link:<fp> 解析为已挂接的云条目。
         #expect(DeviceRules.resolveTarget(id: "link:fp-pc", in: targets)?.id == "cloud:pc")
         #expect(DeviceRules.resolveTarget(id: "link:fp-rev", in: targets) == nil)

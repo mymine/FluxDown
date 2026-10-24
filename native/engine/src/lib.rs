@@ -6,6 +6,8 @@
 
 /// 插件通用认证凭据存储与请求注入。
 pub mod auth;
+/// `ProxyMode::Auto` 探测阶段的多路径竞速（Happy Eyeballs 式错峰并行探测）。
+pub(crate) mod auto_probe;
 /// `ProxyMode::Auto`：候选代理解析、多路径任务上下文与路由 wire 标签。
 pub mod auto_proxy;
 /// BitTorrent / 磁力配置与链接识别（始终编译；无 `bt` feature 时用于明确拒绝）。
@@ -24,6 +26,8 @@ pub mod bt_sparse;
 /// 已完成 BT 任务的完整性校验（按 piece 表重哈希落盘数据）。
 #[cfg(feature = "bt")]
 pub mod bt_verify;
+/// 外部捕获的分类保存目录路由：建任务时选初始目录，完成前按最终文件名复核落点。
+pub mod category_route;
 pub mod cdn;
 pub mod components;
 pub mod dash_downloader;
@@ -42,9 +46,6 @@ pub mod file_exists;
 pub mod ftp_downloader;
 pub mod hls_downloader;
 pub mod intercept;
-/// 设备互联（`fluxdown_link`）的引擎数据库存储后端。仅 `link` feature 下编译。
-#[cfg(feature = "link")]
-pub mod link;
 pub mod logger;
 /// 下载来源标记（Windows Zone.Identifier / macOS quarantine）。
 pub mod mark_of_the_web;
@@ -54,7 +55,11 @@ pub mod model;
 pub mod multi_nic;
 /// 下载文件名命名管线：Content-Disposition 解码、URL / 类型证据、sanitize、魔数嗅探。
 pub mod naming;
+/// 网络传输失败的类型化分类（换路 / 自动重试的唯一判据，平台与语言无关）。
+pub mod net_failure;
 pub(crate) mod output;
+/// 系统 PAC 脚本的代理端点提取（供 Auto 模式的系统代理候选使用）。
+pub(crate) mod pac;
 /// 多路径分段调度的纯判据（稳态速率采样、竞争集、均衡拆分、完成时间抢占）。
 pub(crate) mod path_scheduler;
 /// 插件系统（可选、可失败的下载中间层）。仅 `plugins` feature 下编译。
@@ -62,6 +67,8 @@ pub(crate) mod path_scheduler;
 pub mod plugin;
 mod proc;
 pub mod proxy_config;
+/// 排队顺序的增量发布（稳定排序键 + 差异计算）。
+pub mod queue_order;
 /// `ProxyMode::Auto` 各路径单连接速率的跨重启折扣先验。
 pub mod route_health;
 /// RSS 订阅自动下载（feed 轮询 → 规则过滤 → 建任务）。

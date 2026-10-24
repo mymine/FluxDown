@@ -57,7 +57,8 @@ final class LocalActivityMonitor {
             batch.reset()
             return .idle
         }
-        batch.observe(state.tasks)
+        // 任务表分页载入中：空表 / 半份表不是「成员被删除」，保持上一轮成员不动（载入完成后再 observe）。
+        if !state.tasksLoading { batch.observe(state.tasks) }
         return LocalActivity(stats: state.stats, progress: batch.progress)
     }
 

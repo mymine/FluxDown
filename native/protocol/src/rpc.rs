@@ -18,16 +18,25 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// v13 增加插件可移植视图事件（`DaemonEvent::PluginViewFrame` / `PluginViewClosed` /
 /// `PluginToast`），v14 增加多插件冲突选择（`SelectionKind::Plugin` /
 /// `SelectionOutcome::Plugin`）与站点默认插件方法（`daemon.plugin.siteDefaults` /
-/// `daemon.plugin.setSiteDefault`）。
-pub const PROTOCOL_VERSION: u32 = 14;
+/// `daemon.plugin.setSiteDefault`），v15 增加队列顺序增量（`WsServerMsg::QueueOrderChanged`、
+/// `QueuePositionDto.order`）与落后订阅者的帧合并（`EventFrame.previous`，按
+/// [`crate::judge_frame`] 判定），v16 增加外部恢复任务通知（`AgentEvent::CaptureTasksResumed`），
+/// v17 取消全量任务单帧：快照与替换事件只带任务总数（`DaemonSnapshot.taskTotal` /
+/// `queueTotal`），任务表经 `system.taskPage` 分页载入（`DaemonEvent::TablesReloading`），
+/// `TaskDto` 默认值字段不再上线（反序列化须容忍缺省）。
+pub const PROTOCOL_VERSION: u32 = 17;
 /// 旧客户端不能解析新增事件，必须在握手时拒绝混用而非运行中断连。
-pub const MIN_PROTOCOL_VERSION: u32 = 14;
+pub const MIN_PROTOCOL_VERSION: u32 = 17;
 /// 服务收到 `system.shutdown` 而退出时的 WebSocket 关闭原因：客户端据此停止重连与重拉。
 pub const CLOSE_REASON_SERVICE_QUIT: &str = "service-quit";
 /// headless 服务为应用更新而重启时的 WebSocket 关闭原因：浏览器客户端保持重连，
 /// 重连后服务版本变化即重新加载页面（SPA 内嵌于新二进制）。桌面形态的更新重启仍以
 /// [`CLOSE_REASON_SERVICE_QUIT`] 关闭，由 agent 退出后重新拉起桌面界面。
 pub const CLOSE_REASON_SERVICE_RESTART: &str = "service-restart";
+/// 客户端接收服务端 WebSocket 消息（含单帧）的上限。快照与整表替换都只带头部、任务表经
+/// `system.taskPage` 分页（每页 ≤ [`crate::TASK_PAGE_MAX_LIMIT`] 行，约 4 MB），任务数再多单帧
+/// 也不随之增长；上限留足 RSS 条目、日志等大应答的余量，同时让异常大帧尽早失败而不是吃满内存。
+pub const MAX_INBOUND_RPC_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 /// 产品版本：发布流水线经 `FLUXDOWN_APP_VERSION` 注入 tag 版本，本地构建回退到本 crate 的
 /// `CARGO_PKG_VERSION`。daemon / agent 对外自报版本、更新检查与诊断都以它为准，
 /// 各 crate 自己的 `Cargo.toml` 版本不代表产品版本。

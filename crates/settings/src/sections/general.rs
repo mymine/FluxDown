@@ -1,11 +1,11 @@
-//! 通用：启动与托盘、系统集成、侧边栏与活动栏可见性、自定义分类。
+//! 通用：启动与托盘、系统集成、侧边栏与活动栏可见性。
 
 use fluxdown_protocol::capture_link::OpenAssociation;
 use fluxdown_protocol::{PlatformIntegrationDto, ShellStatusDto, TrayUnavailableReason};
 use fluxdown_ui_components::FluxIcon;
 use gpui::App;
 
-use super::{SectionContext, categories};
+use super::SectionContext;
 use crate::ActivityBarToggle;
 use crate::ui::{Control, SettingsPage, SettingsSection};
 
@@ -28,19 +28,34 @@ pub(crate) fn page(
         ctx.store.update(cx, |store, cx| store.load_integration(cx));
     }
 
-    SettingsPage::new(
+    let page = SettingsPage::new(
         "general",
         ctx.t("settingsCatGeneral"),
         ctx.t("settingsCatGeneralDesc"),
         FluxIcon::Settings,
-    )
-    .sections([
-        startup_section(ctx, cx),
-        system_section(ctx, cx),
+    );
+    let mut sections = vec![startup_section(ctx, cx), system_section(ctx, cx)];
+    // macOS 应用菜单恒在系统菜单栏，开关只对 Windows / Linux 标题栏菜单栏有意义。
+    if !cfg!(target_os = "macos") {
+        sections.push(title_bar_section(ctx));
+    }
+    sections.extend([
         sidebar_section(ctx),
         activity_bar_section(ctx, activity_bar),
-        categories::group(ctx, cx),
-    ])
+    ]);
+    page.sections(sections)
+}
+
+/// 标题栏应用菜单栏显隐：设备本地偏好 `ui.show_menu_bar`（不进同步目录，缺省隐藏），
+/// 由 app 投影到 shell。
+fn title_bar_section(ctx: &SectionContext) -> SettingsSection {
+    SettingsSection::new()
+        .title(ctx.t("settingsGroupInterface"))
+        .row(ctx.item(
+            "showMenuBar",
+            Some("showMenuBarDesc"),
+            ctx.pref_switch("ui.show_menu_bar", false),
+        ))
 }
 
 fn startup_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {

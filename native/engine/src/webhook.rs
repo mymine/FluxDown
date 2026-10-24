@@ -93,18 +93,21 @@ pub enum WebhookEventKind {
     TaskFailed,
     /// 用户显式暂停单任务（全局暂停/退出保存不触发，防通知风暴）。
     TaskPaused,
+    /// 某队列由空闲转为有活跃 / 待启动任务（启动恢复不触发）。
+    QueueStarted,
     /// 某队列活跃 + 待启动任务清零。
     QueueDrained,
 }
 
 impl WebhookEventKind {
     /// 全部事件，顺序即 UI 展示顺序。
-    pub const ALL: [WebhookEventKind; 6] = [
+    pub const ALL: [WebhookEventKind; 7] = [
         WebhookEventKind::TaskCreated,
         WebhookEventKind::TaskStarted,
         WebhookEventKind::TaskCompleted,
         WebhookEventKind::TaskFailed,
         WebhookEventKind::TaskPaused,
+        WebhookEventKind::QueueStarted,
         WebhookEventKind::QueueDrained,
     ];
 
@@ -116,6 +119,7 @@ impl WebhookEventKind {
             WebhookEventKind::TaskCompleted => "task.completed",
             WebhookEventKind::TaskFailed => "task.failed",
             WebhookEventKind::TaskPaused => "task.paused",
+            WebhookEventKind::QueueStarted => "queue.started",
             WebhookEventKind::QueueDrained => "queue.drained",
         }
     }
@@ -136,6 +140,7 @@ impl WebhookEventKind {
             WebhookEventKind::TaskCompleted => "Download completed",
             WebhookEventKind::TaskFailed => "Download failed",
             WebhookEventKind::TaskPaused => "Download paused",
+            WebhookEventKind::QueueStarted => "Queue started",
             WebhookEventKind::QueueDrained => "Queue drained",
         }
     }
@@ -175,6 +180,16 @@ impl WebhookEvent {
         Self {
             kind,
             task: Some(task),
+            queue_id,
+            queue_name,
+        }
+    }
+
+    /// 队列开始事件（队列由空闲转为有活跃/待启动任务）。
+    pub fn queue_started(queue_id: String, queue_name: String) -> Self {
+        Self {
+            kind: WebhookEventKind::QueueStarted,
+            task: None,
             queue_id,
             queue_name,
         }
@@ -1744,13 +1759,17 @@ fn build_webhook_client(proxy_config: &ProxyConfig) -> Result<Client, reqwest::E
 /// `{event.summary}` 的默认取值——一行人类可读摘要。
 fn event_summary(event: &WebhookEvent) -> String {
     match (&event.task, event.kind) {
-        (_, WebhookEventKind::QueueDrained) => {
+        (_, WebhookEventKind::QueueStarted | WebhookEventKind::QueueDrained) => {
             let name = if event.queue_name.is_empty() {
                 event.queue_id.as_str()
             } else {
                 event.queue_name.as_str()
             };
-            format!("Queue \"{name}\" has no active or pending tasks")
+            if event.kind == WebhookEventKind::QueueStarted {
+                format!("Queue \"{name}\" started processing tasks")
+            } else {
+                format!("Queue \"{name}\" has no active or pending tasks")
+            }
         }
         (Some(task), WebhookEventKind::TaskFailed) => {
             if task.error_message.is_empty() {
@@ -2643,11 +2662,12 @@ mod tests {
         let d = dispatcher();
         d.reload_endpoints(&format!(
             r#"[{{"id":"a","name":"mock","url":"http://{}/h","enabled":true,"allowHttp":true,
-                 "events":["task.created","task.started","task.completed","queue.drained"]}}]"#,
+                 "events":["task.created","queue.started","task.started","task.completed","queue.drained"]}}]"#,
             server.addr
         ));
         let order = [
             WebhookEventKind::TaskCreated,
+            WebhookEventKind::QueueStarted,
             WebhookEventKind::TaskStarted,
             WebhookEventKind::TaskCompleted,
             WebhookEventKind::QueueDrained,
@@ -2832,6 +2852,27 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
         assert!(parsed.get("task").is_none());
         assert_eq!(parsed["queue"]["name"], "Anime");
+    }
+
+    #[test]
+    fn queue_started_envelope_has_no_task_and_summary_names_queue() {
+        let d = dispatcher();
+        let event = WebhookEvent::queue_started("anime".to_string(), "Anime".to_string());
+        assert_eq!(event.kind.wire(), "queue.started");
+        assert!(event.task.is_none());
+        let envelope = d.inner.envelope(&event, "did-3", "2026-07-17T12:34:56Z");
+        let parsed: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        assert_eq!(parsed["event"], "queue.started");
+        assert!(parsed.get("task").is_none());
+        assert_eq!(parsed["queue"]["name"], "Anime");
+        assert!(event_summary(&event).contains("Anime"));
+        assert_ne!(
+            event_summary(&event),
+            event_summary(&WebhookEvent::queue_drained(
+                "anime".to_string(),
+                "Anime".to_string()
+            ))
+        );
     }
 
     #[test]

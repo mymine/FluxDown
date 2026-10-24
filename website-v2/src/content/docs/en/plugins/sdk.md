@@ -252,9 +252,9 @@ networkHostsOf(manifest);  // sorted union of every view's desktop.networkHosts
 |---|---|
 | `validateManifest(manifest, files, options?)` | `manifest: unknown`, `files?: Set<string>` (package-relative paths with `/`; when omitted, file-existence checks are skipped), `options.strict?: boolean` (strict mode needs `files`; without it you get a single error asking for it, not a crash). Returns `{ ok: boolean; errors: string[] }` with **every** error found. Messages are in Chinese, mirroring the engine. |
 | `validateSniffPack(content)` | `content: string \| Uint8Array`; returns `{ ok, errors }`. |
-| `riskOf(manifest)` | `"full"` when `permissions` contains `desktop`; `"elevated"` for any of `ffmpeg`, `ytdlp`, `auth`, `tasks`, `browserRules`, `background`; otherwise `"standard"`. |
+| `riskOf(manifest)` | `"full"` when `permissions` contains `desktop` or `pageScripts`; `"elevated"` for any of `ffmpeg`, `ytdlp`, `auth`, `tasks`, `browserRules`, `background`; otherwise `"standard"`. |
 | `networkHostsOf(manifest)` | sorted, de-duplicated union of `contributes.views[].desktop.networkHosts`. |
-| `packageFilesOf(manifest)` | the files that must exist at install: `main.entry`, each `desktop.entry`, `sniffRules`. |
+| `packageFilesOf(manifest)` | the files that must exist at install: `main.entry`, each `desktop.entry`, `sniffRules`, every `pageScripts[].js` file. |
 | `isSafeRelativePath`, `isValidIdentity`, `isValidNetworkHost` | the predicates the validator uses. |
 | `VALID_PERMISSIONS`, `VALID_EVENTS`, `VIEW_LOCATIONS` | the closed value lists. |
 | `WINDOW_SIZE_MIN`/`MAX` (240 / 4096), `NETWORK_HOSTS_MAX` (64), `VIEWS_MAX` (16), `COMMANDS_MAX` (32), `TITLE_MAX_CHARS` (40), `SNIFF_PACK_MAX_BYTES` (256 KiB), `SNIFF_PACK_MAX_RULES` (500), `SNIFF_PACK_FORMAT` | limits used by the checks. |

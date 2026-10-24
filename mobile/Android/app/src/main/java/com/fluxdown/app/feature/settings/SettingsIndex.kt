@@ -186,7 +186,7 @@ internal object SettingsIndex {
         "general.sidebarStatus" to listOf(R.string.searchKeywordsSidebarVisibility),
         "general.sidebarQueues" to listOf(R.string.searchKeywordsSidebarVisibility),
         "general.sidebarCategory" to listOf(R.string.searchKeywordsSidebarVisibility),
-        "general.categories" to listOf(R.string.searchKeywordsCustomCategories),
+        "download.categories" to listOf(R.string.searchKeywordsCustomCategories),
         "appearance.language" to listOf(R.string.searchKeywordsLanguage),
         "appearance.mode" to listOf(R.string.searchKeywordsThemeMode),
         "appearance.color" to listOf(R.string.searchKeywordsThemeColor),

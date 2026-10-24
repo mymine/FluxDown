@@ -34,7 +34,7 @@ struct RssItemsScreen: View {
         ScrollViewReader { proxy in
             List(selection: $model.selection) {
                 ForEach(visible, id: \.guid) { item in
-                    itemRow(item, linked: linked[item.taskId], readOnly: readOnly)
+                    itemRow(item, linked: linked[item.taskId], readOnly: readOnly, tasksLoading: state.tasksLoading)
                 }
             }
             .listStyle(.plain)
@@ -99,12 +99,12 @@ struct RssItemsScreen: View {
     // MARK: 行
 
     @ViewBuilder
-    private func itemRow(_ item: RssItemDto, linked: RssLinkedTask?, readOnly: Bool) -> some View {
+    private func itemRow(_ item: RssItemDto, linked: RssLinkedTask?, readOnly: Bool, tasksLoading: Bool) -> some View {
         let busy = model.busy.contains(item.guid)
         let hasTask = item.state == .downloaded && linked != nil
         RssItemRow(
             item: item,
-            chip: RssFormat.chip(for: item, task: linked),
+            chip: RssFormat.chip(for: item, task: linked, tasksLoading: tasksLoading),
             busy: busy,
             expanded: model.expanded.contains(item.guid),
             selecting: model.isSelecting,

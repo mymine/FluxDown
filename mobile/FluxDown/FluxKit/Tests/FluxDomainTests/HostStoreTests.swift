@@ -71,6 +71,46 @@ struct HostStoreTests {
         #expect(st.runtime["a"]?.activeTransfers == 0)
     }
 
+    @Test func completedTasksLeaveNoRuntimeAndLateSamplesCannotReaddIt() {
+        let s = store()
+        s.apply(snapshot([]))
+        for index in 0..<600 {
+            let id = "t\(index)"
+            s.apply(.event(.taskChanged(task(id, .downloading))))
+            s.apply(.event(.taskRuntimeChanged(runtime(id, UInt64(index) + 1, [seg(0, true)]))))
+            s.flush()
+            #expect(Set(s.state.runtime.keys) == [id])
+            // 两条完成路径：taskChanged / taskProgress。
+            if index % 2 == 0 {
+                s.apply(.event(.taskChanged(task(id, .completed))))
+            } else {
+                s.apply(progress(id, .completed, speed: 0))
+            }
+            s.flush()
+            #expect(s.state.runtime.isEmpty)
+            // 迟到的采样（序号更高也一样）不得把条目加回来。
+            s.apply(.event(.taskRuntimeChanged(runtime(id, UInt64(index) + 10_000, [seg(0, true)]))))
+            s.flush()
+            #expect(s.state.runtime.isEmpty)
+        }
+        #expect(s.state.tasks.count == 600)
+    }
+
+    @Test func snapshotRuntimeOfCompletedTasksIsDroppedButPausedAndFailedKeepSegments() {
+        let s = store()
+        let ids = ["run", "paused", "failed", "done", "gone"]
+        s.apply(snapshot(
+            [task("run", .downloading), task("paused", .paused), task("failed", .failed), task("done", .completed)],
+            runtime: Dictionary(uniqueKeysWithValues: ids.map { ($0, runtime($0, 1, [seg(0, true)])) })
+        ))
+        #expect(Set(s.state.runtime.keys) == ["run", "paused", "failed"])
+        s.apply(progress("paused", .completed, speed: 0))
+        s.apply(progress("failed", .paused, speed: 0))
+        s.flush()
+        #expect(Set(s.state.runtime.keys) == ["run", "failed"])
+        #expect(s.state.runtime["failed"]?.segments.allSatisfy { $0.active == false } == true)
+    }
+
     @Test func staleSignalMakesStateReadOnlyAndDropsRuntimeAndSpeeds() {
         let s = store()
         s.apply(snapshot([task("a", .downloading)], runtime: ["a": runtime("a", 1, [seg(0, true)])]))
@@ -101,6 +141,124 @@ struct HostStoreTests {
         s.apply(snapshot([task("a", .downloading)]))
         #expect(s.state.tasks.map(\.taskId) == ["a"])
         #expect(s.state.speedHistory.latestDown == 512)
+    }
+
+    private func keys(_ pairs: [(String, Int64)]) -> [QueueOrderEntry] {
+        pairs.map { QueueOrderEntry(taskId: $0.0, order: $0.1) }
+    }
+
+    @Test func queueOrderDeltaKeepsRanksByKeyAndDoesNotRekeyOthers() {
+        let s = store()
+        s.apply(snapshot([task("a", .pending), task("b", .pending), task("c", .pending)]))
+        s.apply(.event(.queuePositionsChanged(keys([("a", 10), ("b", 20), ("c", 30)]))))
+        s.flush()
+        #expect(["a", "b", "c"].map { s.state.queueOrder.rank(of: $0) } == [1, 2, 3])
+
+        // 队首出队：其余任务的键不变，名次整体前移。
+        s.apply(.event(.queueOrderChanged(removed: ["a"], added: [])))
+        s.flush()
+        #expect(["a", "b", "c"].map { s.state.queueOrder.rank(of: $0) } == [0, 1, 2])
+        #expect(s.state.queueOrder.order(of: "b") == 20)
+
+        // 新增排在键的名次位置；同任务多次出现以最后一项为准；已有任务按新键移动。
+        s.apply(.event(.queueOrderChanged(removed: [], added: keys([("d", 5), ("d", 25), ("b", 40)]))))
+        s.flush()
+        #expect(s.state.queueOrder.entries.map(\.taskId) == ["d", "c", "b"])
+        #expect(["d", "c", "b"].map { s.state.queueOrder.rank(of: $0) } == [1, 2, 3])
+
+        // 全量消息整表替换。
+        s.apply(.event(.queuePositionsChanged(keys([("c", 1), ("b", 2)]))))
+        s.flush()
+        #expect(["d", "b", "c"].map { s.state.queueOrder.rank(of: $0) } == [0, 2, 1])
+    }
+
+    // MARK: 任务表分页载入（tasksLoading）
+
+    /// Rust 驱动在分页拉取期间先发的「加载态」快照：任务表为空占位，只带服务端任务总数。
+    private func loadingSnapshot(total: UInt64) -> HostSignal {
+        .snapshot(HostSnapshot(
+            info: HostInfo(serviceName: "t", serviceVersion: "1", protocolVersion: 17, capabilities: []),
+            tasksLoading: true,
+            taskTotal: total,
+            configRevision: 1
+        ))
+    }
+
+    @Test func defaultSnapshotIsACompleteTaskList() {
+        let s = store()
+        s.apply(snapshot([task("a", .paused)]))
+        #expect(!s.state.tasksLoading)
+        #expect(s.state.taskTotal == 0)
+    }
+
+    /// 加载态快照：空占位不是完整列表（`tasksLoading`），带总数供进度文案；连接仍视为在线。
+    @Test func loadingSnapshotMarksTheTaskListIncompleteAndCarriesTheTotal() {
+        let s = store()
+        s.apply(loadingSnapshot(total: 230_000))
+        let st = s.state
+        #expect(st.tasksLoading)
+        #expect(st.taskTotal == 230_000)
+        #expect(st.tasks.isEmpty)
+        #expect(st.connection == .live)
+    }
+
+    /// 载入完成的完整快照整表替换占位并清除加载态；分页期间到达、载入后回放的事件不丢、不重复。
+    @Test func completedSnapshotAfterLoadingKeepsReplayedChangesWithoutLossOrDuplication() {
+        let s = store()
+        s.apply(loadingSnapshot(total: 3))
+        // 完整快照 = 载入时刻的表（页取自 base 之后某时刻的状态）。
+        s.apply(snapshot([task("a", .downloading), task("b", .paused), task("c", .pending)]))
+        #expect(!s.state.tasksLoading)
+        #expect(s.state.taskTotal == 0)
+        #expect(s.state.tasks.map(\.taskId) == ["a", "b", "c"])
+
+        // 缓冲帧按游标回放：已翻页之后才发生的变更（更新 / 新增 / 删除）。
+        s.apply(.event(.taskChanged(task("b", .downloading))))
+        s.apply(.event(.taskChanged(task("d", .pending))))
+        s.apply(.event(.taskChanged(task("a", .completed))))
+        s.apply(.event(.taskDeleted(taskId: "c")))
+        // 同一帧被回放两次（整行写入幂等）：既不丢也不重复。
+        s.apply(.event(.taskChanged(task("d", .pending))))
+        s.flush()
+
+        let tasks = s.state.tasks
+        #expect(tasks.map(\.taskId) == ["a", "b", "d"])
+        #expect(Set(tasks.map(\.taskId)).count == tasks.count)
+        #expect(s.state.task("a")?.status == .completed)
+        #expect(s.state.task("b")?.status == .downloading)
+        #expect(s.state.task("c") == nil)
+        #expect(!s.state.tasksLoading)
+    }
+
+    /// 重同步 / 整表重载再次进入加载态：旧任务表被清空但这不是「任务都被删了」——
+    /// 速度曲线保留，完整快照到达后仍存在的任务继续接着画。
+    @Test func reloadingKeepsTaskSpeedHistoryUntilTheCompleteSnapshotArrives() {
+        let s = store()
+        s.apply(snapshot([task("a", .downloading), task("gone", .downloading)]))
+        s.apply(progress("a", .downloading, speed: 100))
+        s.apply(progress("gone", .downloading, speed: 50))
+        s.flush()
+        #expect(s.state.taskSpeedHistory["a"] != nil)
+
+        s.apply(loadingSnapshot(total: 2))
+        #expect(s.state.tasksLoading && s.state.tasks.isEmpty)
+        #expect(s.state.taskSpeedHistory["a"] != nil, "an empty placeholder is not a deletion")
+        #expect(s.state.taskSpeedHistory["gone"] != nil)
+
+        s.apply(snapshot([task("a", .downloading)]))
+        #expect(!s.state.tasksLoading)
+        #expect(s.state.taskSpeedHistory["a"] != nil)
+        #expect(s.state.taskSpeedHistory["gone"] == nil, "the complete list decides what was deleted")
+    }
+
+    /// 载入期间断线：仍是加载态（半份列表不会因此变成完整列表），只读。
+    @Test func staleWhileLoadingStaysIncomplete() {
+        let s = store()
+        s.apply(loadingSnapshot(total: 9))
+        s.apply(.stale)
+        #expect(s.state.isReadOnly)
+        #expect(s.state.tasksLoading)
+        #expect(s.state.taskTotal == 9)
     }
 
     // MARK: 通用分区 / 通知通道

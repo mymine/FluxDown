@@ -15,7 +15,7 @@ enum class UpdateManualReason {
     ManagedPackage, NotWritable, NoAsset, ElevationUnavailable, ReadOnlyLocation, UnofficialBuild, Unsupported, Unknown,
 }
 
-/** 失败分类（同 Rust `UpdateFailure`；Android 上 [ElevationCancelled] = 用户在系统安装确认中取消）。 */
+/** 失败分类（同 Rust `UpdateFailure`；Android 上 [ElevationCancelled] = 安装前用户放弃，如「安装会中断下载」确认里取消）。 */
 enum class UpdateFailure { Network, Verify, Storage, Install, ElevationCancelled, InstallIncomplete, Unknown }
 
 /** 一个版本的更新说明。 */

@@ -1,6 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
+#if FULL_FLAVOR
 
 /// S11.2 · 插件市场：`daemon.plugin.marketList` 拉取索引，本地关键字过滤 + 分页展开，`marketInstall` 安装
 /// （安装前确认权限，撤回版本不可安装）。
@@ -192,3 +193,4 @@ struct MarketDetailPage: View {
         }
     }
 }
+#endif

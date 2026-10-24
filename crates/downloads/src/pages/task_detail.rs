@@ -17,18 +17,19 @@ use std::{
 use chrono::{Local, TimeZone as _};
 use fluxdown_protocol::{
     AgentEvent, AgentSnapshot, DaemonEvent, ServiceEvent, TaskDto, TaskRuntimeDto,
-    TaskSpeedHistoryDto, TaskSpeedHistoryQuery,
+    TaskSpeedHistoryDto, TaskSpeedHistoryQuery, WsServerMsg,
 };
 use fluxdown_ui_components::{
-    ControlExt as _, FluxIcon, IconControlExt as _, form, form_field, form_row, segmented_tabs,
+    ControlExt as _, FluxIcon, IconControlExt as _, form, form_field, segmented_tabs,
     tabular_numbers,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    AnyElement, AnyView, App, AppContext as _, ClipboardItem, Context, Div, Entity, EventEmitter,
-    FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
+    Anchor, AnyElement, AnyView, App, AppContext as _, ClipboardItem, Context, Div, Entity,
+    EventEmitter, FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable as _, Icon, WindowExt as _,
@@ -36,6 +37,7 @@ use gpui_component::{
     chart::{AreaChart, PieChart},
     h_flex,
     input::{InputState, NumberInput},
+    menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
     v_flex,
 };
@@ -160,6 +162,8 @@ pub struct TaskDetailView {
     seed_time_limit: Entity<InputState>,
     seed_inactive_limit: Entity<InputState>,
     seed_upload_limit: Entity<InputState>,
+    /// 四个限制项（总分享率、做种后分享率、做种时长、不活跃时长）当前选中的模式。
+    seed_modes: [SeedMode; 4],
     /// 做种限制输入框上次预填所用的限制值；`None` = 尚未预填。保存时未改动的输入项按它还原。
     seed_baseline: Option<SeedLimits>,
     /// 错误信息复制按钮的反馈代次；非零 = 显示「已复制」勾选态，定时回落时比对代次防连点提前复位。
@@ -237,11 +241,15 @@ impl TaskDetailView {
             Some(controller) => Rc::clone(controller.store()),
             None => store.unwrap_or_default(),
         };
-        let seed_ratio = Self::seed_input(window, cx);
-        let seed_post_ratio = Self::seed_input(window, cx);
-        let seed_time_limit = Self::seed_input(window, cx);
-        let seed_inactive_limit = Self::seed_input(window, cx);
-        let seed_upload_limit = Self::seed_input(window, cx);
+        let seed_ratio = Self::seed_input(window, cx, |t| parse_seed_ratio(t).is_some(), "1.00");
+        let seed_post_ratio =
+            Self::seed_input(window, cx, |t| parse_seed_ratio(t).is_some(), "1.00");
+        let seed_time_limit =
+            Self::seed_input(window, cx, |t| parse_seed_minutes(t).is_some(), "1440");
+        let seed_inactive_limit =
+            Self::seed_input(window, cx, |t| parse_seed_minutes(t).is_some(), "1440");
+        let seed_upload_limit =
+            Self::seed_input(window, cx, |t| parse_seed_upload_limit(t).is_some(), "0");
 
         cx.observe(&translator, |this, translator, cx| {
             this.strings = DownloadStrings::from_translator(translator.read(cx));
@@ -281,6 +289,7 @@ impl TaskDetailView {
             seed_time_limit,
             seed_inactive_limit,
             seed_upload_limit,
+            seed_modes: [SeedMode::Global; 4],
             seed_baseline: None,
             error_copied: 0,
             log_copied: 0,
@@ -289,10 +298,17 @@ impl TaskDetailView {
         this
     }
 
-    fn seed_input(window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+    fn seed_input(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        valid: fn(&str) -> bool,
+        default_text: &str,
+    ) -> Entity<InputState> {
         cx.new(|cx| {
-            InputState::new(window, cx)
-                .validate(|text, _| text.trim().is_empty() || text.trim().parse::<i64>().is_ok())
+            let mut state = InputState::new(window, cx)
+                .validate(move |text, _| text.trim().is_empty() || valid(text.trim()));
+            state.set_value(default_text, window, cx);
+            state
         })
     }
 
@@ -412,6 +428,11 @@ impl TaskDetailView {
     }
 
     fn refresh_from_store(&mut self, cx: &mut Context<Self>) {
+        // 任务表分页载入期间行集合只是占位：行不在不代表任务已被删除。
+        if self.store.loading().is_some() {
+            cx.notify();
+            return;
+        }
         if self
             .store
             .get(&RowKey::Local(self.task_id.clone()))
@@ -430,7 +451,14 @@ impl TaskDetailView {
         let Some(row) = self.store.get(&RowKey::Local(self.task_id.clone())) else {
             return;
         };
-        let speed = row.speed_bytes_per_second.unwrap_or(0);
+        // 做种页曲线画上传速度：下载中取实时上传，本地做种中取做种上传，其余为 0。
+        let uploading = row.state == TaskState::Downloading
+            || (row.state == TaskState::Completed && row.seeding_status == 1);
+        let speed = if uploading {
+            row.upload_speed_bytes_per_second
+        } else {
+            0
+        };
         drop(row);
         push_bounded(
             &mut self.speed_history,
@@ -511,13 +539,33 @@ impl TaskDetailView {
                 _ => {}
             }
         }
+        let concerns_task = self.event_concerns_task(event);
         if let Some(controller) = &mut self.controller {
+            // 控制器照常应用；与本任务无关的单任务事件不再克隆 DTO / 重绘。
             let changed = controller.apply_event(event);
-            if changed {
+            if changed && concerns_task {
                 self.dto = controller.task_dto(&self.task_id).cloned();
                 self.refresh_from_store(cx);
             }
         }
+    }
+
+    /// 单任务的高频事件（任务变更 / 进度 / 运行态 / 元数据）只有涉及本任务才需要刷新；
+    /// 其余事件一律视为相关。
+    fn event_concerns_task(&self, event: &ServiceEvent) -> bool {
+        let ServiceEvent::Agent(AgentEvent::Daemon(event)) = event else {
+            return true;
+        };
+        let task_id = match event {
+            DaemonEvent::TaskChanged(task) => &task.task_id,
+            DaemonEvent::TaskRuntimeChanged(runtime) => &runtime.task_id,
+            DaemonEvent::Engine(
+                WsServerMsg::TaskProgress { task_id, .. }
+                | WsServerMsg::TaskMetaProbed { task_id, .. },
+            ) => task_id,
+            _ => return true,
+        };
+        *task_id == self.task_id
     }
 
     pub fn mark_stale(&mut self, cx: &mut Context<Self>) {
@@ -764,7 +812,7 @@ impl TaskDetailView {
         let Some(row) = self.store.get(&RowKey::Local(self.task_id.clone())) else {
             return;
         };
-        let message = row.error_message.clone();
+        let message = self.strings.task_error_text(&row.error_message).to_owned();
         drop(row);
         if message.is_empty() {
             return;
@@ -815,19 +863,44 @@ impl TaskDetailView {
         .detach();
     }
 
+    /// 切换某个限制项的模式：非自定义时数字框回到 qBittorrent 默认值，自定义保留当前文本。
+    fn set_seed_mode(
+        &mut self,
+        index: usize,
+        mode: SeedMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.seed_modes[index] = mode;
+        if mode != SeedMode::Custom {
+            let input = [
+                &self.seed_ratio,
+                &self.seed_post_ratio,
+                &self.seed_time_limit,
+                &self.seed_inactive_limit,
+            ][index];
+            input.update(cx, |input, cx| {
+                input.set_value(SEED_DEFAULT_TEXTS[index], window, cx);
+            });
+        }
+        cx.notify();
+    }
+
     fn save_seed_limits(&mut self, cx: &mut Context<Self>) {
         let baseline = self
             .seed_baseline
             .clone()
             .unwrap_or_else(SeedLimits::inherit_all);
+        let values = [
+            self.seed_ratio.read(cx).value(),
+            self.seed_post_ratio.read(cx).value(),
+            self.seed_time_limit.read(cx).value(),
+            self.seed_inactive_limit.read(cx).value(),
+            self.seed_upload_limit.read(cx).value(),
+        ];
         let limits = seed_limits_from_form(
-            [
-                &self.seed_ratio.read(cx).value(),
-                &self.seed_post_ratio.read(cx).value(),
-                &self.seed_time_limit.read(cx).value(),
-                &self.seed_inactive_limit.read(cx).value(),
-                &self.seed_upload_limit.read(cx).value(),
-            ],
+            self.seed_modes,
+            [&values[0], &values[1], &values[2], &values[3], &values[4]],
             &baseline,
         );
         self.run_command(
@@ -855,7 +928,9 @@ impl TaskDetailView {
             &self.seed_inactive_limit,
             &self.seed_upload_limit,
         ];
-        for (input, text) in inputs.into_iter().zip(seed_form_texts(&limits)) {
+        let (modes, texts) = seed_form_state(&limits);
+        self.seed_modes = modes;
+        for (input, text) in inputs.into_iter().zip(texts) {
             input.update(cx, |input, cx| input.set_value(text, window, cx));
         }
         self.seed_baseline = Some(limits);
@@ -1227,7 +1302,7 @@ impl TaskDetailView {
                         self.t(cx, "infoStatus"),
                         div()
                             .text_color(task_status_color(&row, cx))
-                            .child(self.strings.task_status_text(&row)),
+                            .child(self.strings.task_status_text(&row, &self.store)),
                         cx,
                     ))
                     .when(row.size_bytes > 0, |this| {
@@ -1324,7 +1399,9 @@ impl TaskDetailView {
                             .flex_1()
                             .min_w_0()
                             .text_color(tokens.colors.destructive)
-                            .child(SharedString::from(row.error_message.clone())),
+                            .child(SharedString::from(
+                                self.strings.task_error_text(&row.error_message).to_owned(),
+                            )),
                     )
                     .child(
                         Button::new("detail-copy-error")
@@ -1772,6 +1849,7 @@ impl TaskDetailView {
             "—".to_owned()
         };
         let duration = format_duration(self.translator.read(cx), seeding_time_secs);
+        // 做种页曲线画上传速度：上传一律用成功（绿）色，下载保持主色。
         let chart_points: Vec<(usize, f64)> = self
             .speed_history
             .iter()
@@ -1799,7 +1877,7 @@ impl TaskDetailView {
                         AreaChart::new(chart_points)
                             .x(|point: &(usize, f64)| SharedString::from(point.0.to_string()))
                             .y(|point: &(usize, f64)| point.1)
-                            .stroke(tokens.colors.primary)
+                            .stroke(extended.colors.success)
                             .tooltip_content(|point: &(usize, f64), _, _| {
                                 div().child(rate_text(point.1.max(0.) as u64))
                             })
@@ -1826,41 +1904,35 @@ impl TaskDetailView {
             )
             .child(
                 form(cx)
-                    .child(form_row(
-                        [
-                            self.render_seed_field(cx, "btSeedRatioLimit", &self.seed_ratio, None),
-                            self.render_seed_field(
-                                cx,
-                                "btSeedPostRatioLimit",
-                                &self.seed_post_ratio,
-                                None,
-                            ),
-                        ],
+                    .child(self.render_seed_limit_field(
                         cx,
+                        0,
+                        "btSeedRatioLimit",
+                        &self.seed_ratio,
+                        None,
                     ))
-                    .child(form_row(
-                        [
-                            self.render_seed_field(
-                                cx,
-                                "btSeedTimeLimit",
-                                &self.seed_time_limit,
-                                None,
-                            ),
-                            self.render_seed_field(
-                                cx,
-                                "btSeedInactiveTimeLimit",
-                                &self.seed_inactive_limit,
-                                None,
-                            ),
-                        ],
+                    .child(self.render_seed_limit_field(
                         cx,
+                        1,
+                        "btSeedPostRatioLimit",
+                        &self.seed_post_ratio,
+                        None,
                     ))
-                    .child(self.render_seed_field(
+                    .child(self.render_seed_limit_field(
                         cx,
-                        "btSeedUploadLimit",
-                        &self.seed_upload_limit,
-                        Some("btSeedUploadLimitHint"),
+                        2,
+                        "btSeedTimeLimit",
+                        &self.seed_time_limit,
+                        Some("timeUnitMinutes"),
                     ))
+                    .child(self.render_seed_limit_field(
+                        cx,
+                        3,
+                        "btSeedInactiveTimeLimit",
+                        &self.seed_inactive_limit,
+                        Some("timeUnitMinutes"),
+                    ))
+                    .child(self.render_seed_upload_field(cx))
                     .child(
                         h_flex().justify_end().child(
                             Button::new("detail-save-seed-limits")
@@ -1874,18 +1946,75 @@ impl TaskDetailView {
             .into_any_element()
     }
 
-    /// 做种限制字段：标签 → 数字输入（统一控件档 28 高）→ 可选说明。
-    fn render_seed_field(
+    /// 做种限制字段：标签 → 模式下拉 + 数字输入（仅自定义模式可编辑）→ 可选说明。
+    fn render_seed_limit_field(
         &self,
         cx: &mut Context<Self>,
+        index: usize,
         label_key: &str,
         state: &Entity<InputState>,
         hint_key: Option<&str>,
     ) -> AnyElement {
+        let mode = self.seed_modes[index];
+        let options: Vec<(SeedMode, SharedString)> = SeedMode::ALL
+            .into_iter()
+            .map(|option| (option, self.t(cx, option.label_key())))
+            .collect();
+        let label = self.t(cx, mode.label_key());
+        let this = cx.weak_entity();
+        let dropdown = Button::new(SharedString::from(format!("detail-seed-mode-{index}")))
+            .outline()
+            .control(cx)
+            .label(label)
+            .dropdown_caret(true)
+            .w_full()
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                options.iter().fold(menu, |menu, (option, label)| {
+                    let option = *option;
+                    let this = this.clone();
+                    menu.item(
+                        PopupMenuItem::new(label.clone())
+                            .checked(option == mode)
+                            .on_click(move |_, window, cx| {
+                                let Ok(()) = this.update(cx, |this, cx| {
+                                    this.set_seed_mode(index, option, window, cx);
+                                }) else {
+                                    // 视图已释放，结束这次回调而不再更新状态。
+                                    return;
+                                };
+                            }),
+                    )
+                })
+            });
         form_field(
             self.t(cx, label_key),
-            NumberInput::new(state).control(cx).w_full(),
+            // 详情面板很窄：每项独占一行，下拉与数字框各占一半，避免挤压重叠。
+            h_flex()
+                .w_full()
+                .gap(px(8.))
+                .child(div().flex_1().min_w_0().child(dropdown))
+                .child(
+                    div().flex_1().min_w_0().child(
+                        NumberInput::new(state)
+                            .control(cx)
+                            .w_full()
+                            .disabled(mode != SeedMode::Custom),
+                    ),
+                ),
             hint_key.map(|key| self.t(cx, key)),
+            cx,
+        )
+        .into_any_element()
+    }
+
+    /// 上传限速字段（KB/s）：始终可编辑的数字输入，0 = 不限速。
+    fn render_seed_upload_field(&self, cx: &mut Context<Self>) -> AnyElement {
+        form_field(
+            self.t(cx, "btSeedUploadLimit"),
+            NumberInput::new(&self.seed_upload_limit)
+                .control(cx)
+                .w_full(),
+            Some(self.t(cx, "btSeedUploadLimitHint")),
             cx,
         )
         .into_any_element()
@@ -2245,66 +2374,150 @@ fn activity_kind_key(kind: &str) -> &'static str {
     }
 }
 
-/// 输入框文本 → 限制值：空 / 非法 = 跟随全局。
-fn parse_seed_limit(text: &str) -> i64 {
-    text.trim()
-        .parse::<i64>()
-        .unwrap_or(SEED_LIMIT_FOLLOW_GLOBAL)
+/// 做种限制的三态：跟随全局 / 不限制 / 自定义（对应线上哨兵 -2 / -1 或 0 / 正值）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeedMode {
+    Global,
+    Unlimited,
+    Custom,
 }
 
-/// 上传限速输入（KB/s）→ 字节/秒：空 / 非法 = 0（跟随全局）。
-fn parse_seed_upload_limit(text: &str) -> i64 {
-    text.trim()
-        .parse::<i64>()
-        .map(|kbps| kbps.saturating_mul(1024))
-        .unwrap_or(0)
-}
+impl SeedMode {
+    const ALL: [Self; 3] = [Self::Global, Self::Unlimited, Self::Custom];
 
-/// 限制值 → 输入框预填文本：「跟随全局」显示为空；上传限速按 KB/s 向上取整显示。
-fn seed_form_texts(limits: &SeedLimits) -> [String; 5] {
-    let limit_text = |value: i64| {
+    /// 线上限制值 → 模式；引擎把 0 也视为不限制。
+    fn of(value: i64) -> Self {
         if value == SEED_LIMIT_FOLLOW_GLOBAL {
-            String::new()
+            Self::Global
+        } else if value > 0 {
+            Self::Custom
         } else {
-            value.to_string()
+            Self::Unlimited
+        }
+    }
+
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Global => "btSeedLimitsModeGlobal",
+            Self::Unlimited => "btSeedLimitsModeUnlimited",
+            Self::Custom => "btSeedLimitsModeCustom",
+        }
+    }
+}
+
+/// 非自定义模式下数字框展示的 qBittorrent 默认值：总分享率、做种后分享率、做种时长（分钟）、
+/// 不活跃时长（分钟）、上传限速（KB/s，0 = 不限）。
+const SEED_DEFAULT_TEXTS: [&str; 5] = ["1.00", "1.00", "1440", "1440", "0"];
+
+/// 千分比分享率 → 两位小数文本（1500 → "1.50"）。
+fn format_seed_ratio(milli: i64) -> String {
+    let hundredths = milli.saturating_add(5) / 10;
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
+/// 小数分享率文本 → 千分比；必须是有限正数且换算后至少 1。
+fn parse_seed_ratio(text: &str) -> Option<i64> {
+    let value: f64 = text.trim().parse().ok()?;
+    let milli = (value * 1000.0).round();
+    if !value.is_finite() || !(1.0..=1e12).contains(&milli) {
+        return None;
+    }
+    Some(milli as i64)
+}
+
+/// 时长文本（分钟）→ 正整数。
+fn parse_seed_minutes(text: &str) -> Option<i64> {
+    text.trim().parse::<i64>().ok().filter(|value| *value > 0)
+}
+
+/// 上传限速文本（KB/s）→ 字节/秒；非负整数，空 = 0（不限）。
+fn parse_seed_upload_limit(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(0);
+    }
+    text.parse::<i64>()
+        .ok()
+        .filter(|kbps| *kbps >= 0)
+        .map(|kbps| kbps.saturating_mul(1024))
+}
+
+/// 任务限制 → 表单状态：四个限制项的模式 + 五个数字框文本。自定义显示已存值，其余显示
+/// qBittorrent 默认值；上传限速按 KB/s 向上取整显示（0 = 不限）。
+fn seed_form_state(limits: &SeedLimits) -> ([SeedMode; 4], [String; 5]) {
+    let values = [
+        limits.ratio_limit_milli,
+        limits.post_ratio_limit_milli,
+        limits.seed_time_limit_minutes,
+        limits.inactive_time_limit_minutes,
+    ];
+    let modes = values.map(SeedMode::of);
+    let texts = std::array::from_fn(|index| {
+        if index == 4 {
+            return if limits.upload_limit_bps > 0 {
+                (limits.upload_limit_bps.saturating_add(1023) / 1024).to_string()
+            } else {
+                SEED_DEFAULT_TEXTS[4].to_owned()
+            };
+        }
+        match (modes[index], index) {
+            (SeedMode::Custom, 0 | 1) => format_seed_ratio(values[index]),
+            (SeedMode::Custom, _) => values[index].to_string(),
+            _ => SEED_DEFAULT_TEXTS[index].to_owned(),
+        }
+    });
+    (modes, texts)
+}
+
+/// 表单（四个模式 + 五个数字框文本）→ 保存的限制值。
+/// 全局 → -2，不限制 → -1，自定义 → 解析值。模式与文本都未改动的项保持 `baseline` 原值
+/// （含 0 视同不限制、上传限速不足 1 KB/s 的零头）；自定义文本非法的项同样保持原值。
+fn seed_limits_from_form(
+    modes: [SeedMode; 4],
+    texts: [&str; 5],
+    baseline: &SeedLimits,
+) -> SeedLimits {
+    let (base_modes, original) = seed_form_state(baseline);
+    let base_values = [
+        baseline.ratio_limit_milli,
+        baseline.post_ratio_limit_milli,
+        baseline.seed_time_limit_minutes,
+        baseline.inactive_time_limit_minutes,
+    ];
+    let limit = |index: usize| -> i64 {
+        let unchanged = base_values[index];
+        match modes[index] {
+            mode @ (SeedMode::Global | SeedMode::Unlimited) if mode == base_modes[index] => {
+                unchanged
+            }
+            SeedMode::Global => SEED_LIMIT_FOLLOW_GLOBAL,
+            SeedMode::Unlimited => -1,
+            SeedMode::Custom => {
+                let text = texts[index].trim();
+                if base_modes[index] == SeedMode::Custom && text == original[index] {
+                    unchanged
+                } else {
+                    let parsed = if index < 2 {
+                        parse_seed_ratio(text)
+                    } else {
+                        parse_seed_minutes(text)
+                    };
+                    parsed.unwrap_or(unchanged)
+                }
+            }
         }
     };
-    [
-        limit_text(limits.ratio_limit_milli),
-        limit_text(limits.post_ratio_limit_milli),
-        limit_text(limits.seed_time_limit_minutes),
-        limit_text(limits.inactive_time_limit_minutes),
-        if limits.upload_limit_bps > 0 {
-            (limits.upload_limit_bps.saturating_add(1023) / 1024).to_string()
-        } else {
-            String::new()
-        },
-    ]
-}
-
-/// 五个输入框（总分享率、做种后分享率、做种时长、不活跃时长、上传限速）→ 保存的限制值。
-/// 文本与预填文本一致的项视为未改动，保持 `baseline` 的原值（含上传限速不足 1 KB/s 的
-/// 零头），不会被重置为跟随全局；用户改过的项按输入解析。
-fn seed_limits_from_form(texts: [&str; 5], baseline: &SeedLimits) -> SeedLimits {
-    let original = seed_form_texts(baseline);
-    let resolve = |index: usize, parse: fn(&str) -> i64, unchanged: i64| {
-        let text = texts[index].trim();
-        if text == original[index] {
-            unchanged
-        } else {
-            parse(text)
-        }
+    let upload_limit_bps = if texts[4].trim() == original[4] {
+        baseline.upload_limit_bps
+    } else {
+        parse_seed_upload_limit(texts[4]).unwrap_or(baseline.upload_limit_bps)
     };
     SeedLimits {
-        ratio_limit_milli: resolve(0, parse_seed_limit, baseline.ratio_limit_milli),
-        post_ratio_limit_milli: resolve(1, parse_seed_limit, baseline.post_ratio_limit_milli),
-        seed_time_limit_minutes: resolve(2, parse_seed_limit, baseline.seed_time_limit_minutes),
-        inactive_time_limit_minutes: resolve(
-            3,
-            parse_seed_limit,
-            baseline.inactive_time_limit_minutes,
-        ),
-        upload_limit_bps: resolve(4, parse_seed_upload_limit, baseline.upload_limit_bps),
+        ratio_limit_milli: limit(0),
+        post_ratio_limit_milli: limit(1),
+        seed_time_limit_minutes: limit(2),
+        inactive_time_limit_minutes: limit(3),
+        upload_limit_bps,
     }
 }
 
@@ -2385,8 +2598,8 @@ mod tests {
     use chrono::{TimeZone as _, Utc};
 
     use super::{
-        DetailTab, SEED_LIMIT_FOLLOW_GLOBAL, SeedLimits, format_activity_timestamp,
-        seed_form_texts, seed_limits_from_form, visible_tabs,
+        DetailTab, SEED_LIMIT_FOLLOW_GLOBAL, SeedLimits, SeedMode, format_activity_timestamp,
+        format_seed_ratio, parse_seed_ratio, seed_form_state, seed_limits_from_form, visible_tabs,
     };
 
     #[test]
@@ -2472,32 +2685,75 @@ mod tests {
     }
 
     #[test]
-    fn untouched_seed_fields_keep_the_task_values() {
-        let baseline = SeedLimits {
-            ratio_limit_milli: 1500,
-            post_ratio_limit_milli: -1,
-            seed_time_limit_minutes: SEED_LIMIT_FOLLOW_GLOBAL,
-            inactive_time_limit_minutes: SEED_LIMIT_FOLLOW_GLOBAL,
-            upload_limit_bps: 1500,
-        };
-        let texts = seed_form_texts(&baseline);
-        assert_eq!(texts, ["1500", "-1", "", "", "2"].map(String::from));
-        // 用户只填了做种时长：其余项保持原值，上传限速零头不丢。
-        let saved = seed_limits_from_form(
-            [&texts[0], &texts[1], "90", &texts[3], &texts[4]],
-            &baseline,
-        );
-        assert_eq!(
-            saved,
-            SeedLimits {
-                seed_time_limit_minutes: 90,
-                ..baseline.clone()
-            }
-        );
+    fn ratio_text_is_decimal_with_two_places() {
+        assert_eq!(format_seed_ratio(1500), "1.50");
+        assert_eq!(format_seed_ratio(1000), "1.00");
+        assert_eq!(format_seed_ratio(2005), "2.01");
+        assert_eq!(format_seed_ratio(999), "1.00");
+        assert_eq!(parse_seed_ratio("1.50"), Some(1500));
+        assert_eq!(parse_seed_ratio(" 2 "), Some(2000));
+        assert_eq!(parse_seed_ratio("0.0004"), None);
+        assert_eq!(parse_seed_ratio("0"), None);
+        assert_eq!(parse_seed_ratio("-1"), None);
+        assert_eq!(parse_seed_ratio("abc"), None);
+        assert_eq!(parse_seed_ratio("inf"), None);
     }
 
     #[test]
-    fn edited_or_cleared_seed_fields_follow_the_input() {
+    fn form_shows_qbittorrent_defaults_unless_custom() {
+        let (modes, texts) = seed_form_state(&SeedLimits::inherit_all());
+        assert_eq!(modes, [SeedMode::Global; 4]);
+        assert_eq!(
+            texts,
+            ["1.00", "1.00", "1440", "1440", "0"].map(String::from)
+        );
+
+        let limits = SeedLimits {
+            ratio_limit_milli: 1500,
+            post_ratio_limit_milli: -1,
+            seed_time_limit_minutes: 0,
+            inactive_time_limit_minutes: 90,
+            upload_limit_bps: 1500,
+        };
+        let (modes, texts) = seed_form_state(&limits);
+        assert_eq!(
+            modes,
+            [
+                SeedMode::Custom,
+                SeedMode::Unlimited,
+                SeedMode::Unlimited,
+                SeedMode::Custom
+            ]
+        );
+        assert_eq!(texts, ["1.50", "1.00", "1440", "90", "2"].map(String::from));
+    }
+
+    #[test]
+    fn untouched_form_round_trips_the_baseline() {
+        for baseline in [
+            SeedLimits::inherit_all(),
+            SeedLimits {
+                ratio_limit_milli: 1005,
+                post_ratio_limit_milli: -1,
+                seed_time_limit_minutes: 0,
+                inactive_time_limit_minutes: 90,
+                upload_limit_bps: 1500,
+            },
+        ] {
+            let (modes, texts) = seed_form_state(&baseline);
+            let refs = [
+                texts[0].as_str(),
+                texts[1].as_str(),
+                texts[2].as_str(),
+                texts[3].as_str(),
+                texts[4].as_str(),
+            ];
+            assert_eq!(seed_limits_from_form(modes, refs, &baseline), baseline);
+        }
+    }
+
+    #[test]
+    fn modes_and_custom_values_map_to_limits() {
         let baseline = SeedLimits {
             ratio_limit_milli: 1500,
             post_ratio_limit_milli: 2000,
@@ -2505,26 +2761,46 @@ mod tests {
             inactive_time_limit_minutes: 30,
             upload_limit_bps: 512 * 1024,
         };
-        let saved = seed_limits_from_form(["", "2500", "60", "", "1024"], &baseline);
+        let saved = seed_limits_from_form(
+            [
+                SeedMode::Global,
+                SeedMode::Custom,
+                SeedMode::Unlimited,
+                SeedMode::Custom,
+            ],
+            ["1.50", "2.5", "1440", "30", "1024"],
+            &baseline,
+        );
         assert_eq!(
             saved,
             SeedLimits {
                 ratio_limit_milli: SEED_LIMIT_FOLLOW_GLOBAL,
                 post_ratio_limit_milli: 2500,
-                seed_time_limit_minutes: 60,
-                inactive_time_limit_minutes: SEED_LIMIT_FOLLOW_GLOBAL,
+                seed_time_limit_minutes: -1,
+                inactive_time_limit_minutes: 30,
                 upload_limit_bps: 1024 * 1024,
             }
         );
+        // 上传限速清空 / 填 0 = 不限速。
+        let (modes, _) = seed_form_state(&baseline);
         assert_eq!(
-            seed_limits_from_form(["", "", "", "", ""], &baseline).upload_limit_bps,
+            seed_limits_from_form(modes, ["", "", "", "", ""], &baseline).upload_limit_bps,
+            0
+        );
+        assert_eq!(
+            seed_limits_from_form(modes, ["1.5", "2", "60", "30", "0"], &baseline).upload_limit_bps,
             0
         );
     }
 
     #[test]
-    fn form_without_a_loaded_task_defaults_to_following_global() {
-        let saved = seed_limits_from_form(["", "", "", "", ""], &SeedLimits::inherit_all());
-        assert_eq!(saved, SeedLimits::inherit_all());
+    fn invalid_custom_input_keeps_the_baseline_value() {
+        let baseline = SeedLimits {
+            ratio_limit_milli: 1500,
+            ..SeedLimits::inherit_all()
+        };
+        let modes = [SeedMode::Custom; 4];
+        let saved = seed_limits_from_form(modes, ["0", "x", "-5", "", "-3"], &baseline);
+        assert_eq!(saved, baseline);
     }
 }

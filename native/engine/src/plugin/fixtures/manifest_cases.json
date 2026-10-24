@@ -2191,6 +2191,33 @@
  "ok": false
 },
 {
+ "name": "resolver memoryLimitMb raises the heap budget",
+ "manifest": {
+  "identity": "a@b",
+  "name": "N",
+  "version": "1.0.0",
+  "resolvers": [
+   { "match": { "urls": ["https://example.com/*"] }, "entry": "resolve.js", "memoryLimitMb": 384 }
+  ]
+ },
+ "files": ["resolve.js"],
+ "ok": true,
+ "risk": "standard"
+},
+{
+ "name": "resolver zero memoryLimitMb",
+ "manifest": {
+  "identity": "a@b",
+  "name": "N",
+  "version": "1.0.0",
+  "resolvers": [
+   { "match": { "urls": ["https://example.com/*"] }, "entry": "resolve.js", "memoryLimitMb": 0 }
+  ]
+ },
+ "files": ["resolve.js"],
+ "ok": false
+},
+{
  "name": "interceptors zero timeout",
  "manifest": {
   "identity": "a@b",
@@ -2223,5 +2250,1956 @@
  },
  "files": ["intercept.js"],
  "ok": false
-}
+},
+ {
+  "name": "pageScripts minimal ok is full risk",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true,
+  "risk": "full",
+  "networkHosts": []
+ },
+ {
+  "name": "pageScripts all fields ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js",
+       "page/b.js"
+      ],
+      "excludeMatches": [
+       "https://www.example.com/private/*"
+      ],
+      "runAt": "document_start",
+      "world": "main",
+      "allFrames": true
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true,
+  "risk": "full"
+ },
+ {
+  "name": "pageScripts empty list needs no permission",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "contributes": {
+    "pageScripts": []
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true,
+  "risk": "standard"
+ },
+ {
+  "name": "pageScripts missing permission",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts permission alone is full",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ]
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true,
+  "risk": "full"
+ },
+ {
+  "name": "pageScripts match any scheme wildcard ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "*://example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "pageScripts match ipv4 literal ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "http://127.0.0.1/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "pageScripts match exact host ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://www.example.com/watch?v=*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "pageScripts match all_urls",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "<all_urls>"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match host star",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match host without dot",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://localhost/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match wildcard tld",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match host with port",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://example.com:8080/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match path missing",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://example.com"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match path not slash",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://example.com*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match unsupported scheme",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "ftp://example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match file scheme",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "file:///etc/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match uppercase host",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://Example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match leading dot host",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match trailing dash host",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://example.com-/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match empty label host",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://a..example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match infix wildcard host",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://a.*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts match no scheme",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts excludeMatches invalid",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ],
+      "excludeMatches": [
+       "<all_urls>"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts empty matches",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts 32 matches ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://h0.example.com/*",
+       "https://h1.example.com/*",
+       "https://h2.example.com/*",
+       "https://h3.example.com/*",
+       "https://h4.example.com/*",
+       "https://h5.example.com/*",
+       "https://h6.example.com/*",
+       "https://h7.example.com/*",
+       "https://h8.example.com/*",
+       "https://h9.example.com/*",
+       "https://h10.example.com/*",
+       "https://h11.example.com/*",
+       "https://h12.example.com/*",
+       "https://h13.example.com/*",
+       "https://h14.example.com/*",
+       "https://h15.example.com/*",
+       "https://h16.example.com/*",
+       "https://h17.example.com/*",
+       "https://h18.example.com/*",
+       "https://h19.example.com/*",
+       "https://h20.example.com/*",
+       "https://h21.example.com/*",
+       "https://h22.example.com/*",
+       "https://h23.example.com/*",
+       "https://h24.example.com/*",
+       "https://h25.example.com/*",
+       "https://h26.example.com/*",
+       "https://h27.example.com/*",
+       "https://h28.example.com/*",
+       "https://h29.example.com/*",
+       "https://h30.example.com/*",
+       "https://h31.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "pageScripts 33 matches",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://h0.example.com/*",
+       "https://h1.example.com/*",
+       "https://h2.example.com/*",
+       "https://h3.example.com/*",
+       "https://h4.example.com/*",
+       "https://h5.example.com/*",
+       "https://h6.example.com/*",
+       "https://h7.example.com/*",
+       "https://h8.example.com/*",
+       "https://h9.example.com/*",
+       "https://h10.example.com/*",
+       "https://h11.example.com/*",
+       "https://h12.example.com/*",
+       "https://h13.example.com/*",
+       "https://h14.example.com/*",
+       "https://h15.example.com/*",
+       "https://h16.example.com/*",
+       "https://h17.example.com/*",
+       "https://h18.example.com/*",
+       "https://h19.example.com/*",
+       "https://h20.example.com/*",
+       "https://h21.example.com/*",
+       "https://h22.example.com/*",
+       "https://h23.example.com/*",
+       "https://h24.example.com/*",
+       "https://h25.example.com/*",
+       "https://h26.example.com/*",
+       "https://h27.example.com/*",
+       "https://h28.example.com/*",
+       "https://h29.example.com/*",
+       "https://h30.example.com/*",
+       "https://h31.example.com/*",
+       "https://h32.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts 33 excludeMatches",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ],
+      "excludeMatches": [
+       "https://h0.example.com/*",
+       "https://h1.example.com/*",
+       "https://h2.example.com/*",
+       "https://h3.example.com/*",
+       "https://h4.example.com/*",
+       "https://h5.example.com/*",
+       "https://h6.example.com/*",
+       "https://h7.example.com/*",
+       "https://h8.example.com/*",
+       "https://h9.example.com/*",
+       "https://h10.example.com/*",
+       "https://h11.example.com/*",
+       "https://h12.example.com/*",
+       "https://h13.example.com/*",
+       "https://h14.example.com/*",
+       "https://h15.example.com/*",
+       "https://h16.example.com/*",
+       "https://h17.example.com/*",
+       "https://h18.example.com/*",
+       "https://h19.example.com/*",
+       "https://h20.example.com/*",
+       "https://h21.example.com/*",
+       "https://h22.example.com/*",
+       "https://h23.example.com/*",
+       "https://h24.example.com/*",
+       "https://h25.example.com/*",
+       "https://h26.example.com/*",
+       "https://h27.example.com/*",
+       "https://h28.example.com/*",
+       "https://h29.example.com/*",
+       "https://h30.example.com/*",
+       "https://h31.example.com/*",
+       "https://h32.example.com/*"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts js not .js",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.txt"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts js mjs",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.mjs"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts js traversal",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "../a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts js absolute",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "/page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts js duplicate",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js",
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts js empty",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": []
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts js 9 entries",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/0.js",
+       "page/1.js",
+       "page/2.js",
+       "page/3.js",
+       "page/4.js",
+       "page/5.js",
+       "page/6.js",
+       "page/7.js",
+       "page/8.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts js file missing from package",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/missing.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts id uppercase",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "Demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts id leading dash",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "-demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts id digit start underscore ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "1_demo-x",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "pageScripts id 32 chars ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "pageScripts id 33 chars",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts duplicate id",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts 16 scripts ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "s0",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s1",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s2",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s3",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s4",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s5",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s6",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s7",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s8",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s9",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s10",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s11",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s12",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s13",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s14",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s15",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": true
+ },
+ {
+  "name": "pageScripts 17 scripts",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "s0",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s1",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s2",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s3",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s4",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s5",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s6",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s7",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s8",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s9",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s10",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s11",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s12",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s13",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s14",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s15",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     },
+     {
+      "id": "s16",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts empty title",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts title 41 chars",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ]
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts invalid world",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ],
+      "world": "page"
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts invalid runAt",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ],
+      "runAt": "document_ready"
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "pageScripts unknown field",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "permissions": [
+    "pageScripts"
+   ],
+   "contributes": {
+    "pageScripts": [
+     {
+      "id": "demo",
+      "title": "Demo",
+      "matches": [
+       "https://*.example.com/*"
+      ],
+      "js": [
+       "page/a.js"
+      ],
+      "extra": 1
+     }
+    ]
+   }
+  },
+  "files": [
+   "page/a.js",
+   "page/b.js"
+  ],
+  "ok": false
+ },
+ {
+  "name": "view icon svg ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [{ "id": "v", "title": "T", "location": "activity", "icon": "icons/v.SVG" }]
+   }
+  },
+  "files": ["main.js", "icons/v.SVG"],
+  "ok": true,
+  "risk": "standard"
+ },
+ {
+  "name": "view icon not svg",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [{ "id": "v", "title": "T", "location": "activity", "icon": "icons/v.png" }]
+   }
+  },
+  "files": ["main.js", "icons/v.png"],
+  "ok": false
+ },
+ {
+  "name": "view icon traversal",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [{ "id": "v", "title": "T", "location": "activity", "icon": "../v.svg" }]
+   }
+  },
+  "files": ["main.js"],
+  "ok": false
+ },
+ {
+  "name": "view icon file missing",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [{ "id": "v", "title": "T", "location": "activity", "icon": "icons/v.svg" }]
+   }
+  },
+  "files": ["main.js"],
+  "ok": false
+ },
+ {
+  "name": "view icon not string",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [{ "id": "v", "title": "T", "location": "activity", "icon": 1 }]
+   }
+  },
+  "files": ["main.js"],
+  "ok": false
+ }
 ]

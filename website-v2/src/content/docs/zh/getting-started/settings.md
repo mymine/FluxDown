@@ -3,7 +3,7 @@ title: 设置参考
 description: 按设置页侧边栏的分类逐项说明 FluxDown 的全部设置项及其默认值。
 section: getting-started
 order: 4
-sourceHash: "dd24c7a09286"
+sourceHash: "30ba5639d3c4"
 ---
 
 点击顶栏的齿轮图标打开**设置**。设置侧边栏共 9 个分类,顺序为:通用、外观、下载、BitTorrent、eD2K、代理、API 服务、扩展、关于。本页按分类逐项说明每个设置项及其默认值。「扩展」分类以两个 Tab 承载插件管理与可选外部组件(FFmpeg、yt-dlp),详见[插件文档](/docs/zh/plugins/overview/)。设置侧边栏顶部的搜索框可以按名称直接定位到任意设置项。
@@ -114,7 +114,7 @@ Windows 命令示例(请按实际安装路径调整;能定位到具体文件的�
 | 设置项 | 作用 | 默认值 |
 |---|---|---|
 | 启用 API 服务 | 本机 HTTP 服务总开关,下方三个功能开关都依赖它开启才能生效。 | 开 |
-| 监听端口 | 本机服务监听的端口(1024–65535)。 | 17800 |
+| 监听端口 | 本机服务监听的端口(1024–65535)。启动时若该端口已被占用或被系统保留(例如 Windows 上 Hyper-V / WSL / Docker 的保留端口段),FluxDown 会改用系统分配的空闲端口并在此显示;油猴脚本与 aria2 客户端请使用这里显示的端口。 | 17800 |
 | 访问令牌 | 用于校验 API 请求的令牌,字段旁提供生成/复制按钮。启用管理 API 后强制要求非空。 | 空 |
 | 浏览器脚本接管 | 供 FluxDown 油猴脚本在 `http://127.0.0.1:<端口>` 接管浏览器下载,附带复制脚本按钮。 | 开 |
 | aria2 RPC 兼容 | 在 `/jsonrpc` 实现 aria2 JSON-RPC 协议(`addUri`/`getVersion`/`getGlobalStat`/`multicall` 等),供"发送到 aria2"类脚本或 AriaNg 等客户端使用。 | 开 |

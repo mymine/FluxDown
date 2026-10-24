@@ -25,9 +25,11 @@ COPY assets/icon-packs/ /src/assets/icon-packs/
 COPY website-v2/src/lib/gpui-theme/ /src/website-v2/src/lib/gpui-theme/
 RUN bun run build
 
-# ── Stage 2: Rust 服务器（workspace 成员，编译 fluxdown_agent(web-ui) + fluxdown_daemon，按 TARGETARCH 交叉编译）──
+# ── Stage 2a: Rust 源码与工具链（server 构建与 server-check 共用，COPY 清单只此一份）──
 # Linux 侧全 rustls（无 openssl），SQLite 由 sqlx 捆绑编译（cc 交叉工具链），无额外系统依赖。
-FROM --platform=$BUILDPLATFORM rust:1-bookworm AS server
+# CI 构建 `--target server-check`（cargo check，无代码生成）在合入时暴露构建上下文缺失：
+# workspace 成员、[patch] 目录、include_bytes! 资源、build.rs 读取的文件。
+FROM --platform=$BUILDPLATFORM rust:1-bookworm AS server-src
 ARG TARGETARCH
 WORKDIR /src
 # aarch64 交叉链接器 / cc（libsqlite3-sys 等 build script 用）
@@ -68,10 +70,23 @@ ENV FLUXDOWN_APP_VERSION=$FLUXDOWN_APP_VERSION
 # FluxCloud base URL 编译期烘焙进 agent（option_env!；运行期 FLUXCLOUD_BASE_URL 可覆盖；缺省 127.0.0.1:8720）
 ARG FLUXCLOUD_BASE_URL
 ENV FLUXCLOUD_BASE_URL=$FLUXCLOUD_BASE_URL
-# cache mount：本地重复构建增量编译；registry 缓存避免重复下载。
+# cache mount（下方两个阶段）：本地重复构建增量编译；registry 缓存避免重复下载。
 # id 必须按 TARGETARCH 隔离：buildx 多平台构建里 amd64/arm64 两个 server 阶段并发跑，
 # 共享同一份 registry 缓存会让两个 cargo 同时解包同一个 crate（`.cargo-ok` File exists
 # → error: failed to unpack package）。sharing=locked 再兜住同架构重试的并发。
+# ARG 不跨阶段继承：子阶段须重新声明 TARGETARCH 才能用于 cache id。
+
+# ── Stage 2b: 构建上下文检查（CI 门禁用；与 server 阶段同两条 cargo 命令，只做 check）──
+FROM server-src AS server-check
+ARG TARGETARCH
+RUN --mount=type=cache,id=fluxdown-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=fluxdown-cargo-check-$TARGETARCH,target=/src/target,sharing=locked \
+    RUSTFLAGS="$(cat /rust-flags)" cargo check --locked -p fluxdown_agent --features web-ui --target "$(cat /rust-target)" \
+    && RUSTFLAGS="$(cat /rust-flags)" cargo check --locked -p fluxdown_daemon --target "$(cat /rust-target)"
+
+# ── Stage 2c: Rust 服务器（编译 fluxdown_agent(web-ui) + fluxdown_daemon，按 TARGETARCH 交叉编译）──
+FROM server-src AS server
+ARG TARGETARCH
 RUN --mount=type=cache,id=fluxdown-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=fluxdown-cargo-target-$TARGETARCH,target=/src/target,sharing=locked \
     RUSTFLAGS="$(cat /rust-flags)" cargo build --release --locked -p fluxdown_agent --features web-ui --target "$(cat /rust-target)" \

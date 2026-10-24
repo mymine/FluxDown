@@ -27,7 +27,9 @@ struct SupervisorState {
 /// 只在连接拒绝路径调用的 daemon 单飞启动器。
 pub struct DaemonSupervisor {
     state: Arc<Mutex<SupervisorState>>,
-    bind_addr: SocketAddr,
+    /// 显式 daemon 地址（`FLUXDOWN_DAEMON_URL`）：经 `FLUXDOWN_DAEMON_BIND` 交给 daemon，严格绑定。
+    /// 为 `None` 时不干预该变量：daemon 使用默认端口，不可用时回退系统分配端口并发布端点文件。
+    bind_addr: Option<SocketAddr>,
     /// 完全退出流程中置位：此后连接拒绝不再拉起 daemon。
     stopped: AtomicBool,
     /// 追加给 daemon 子进程的环境变量（如 server 模式生效的演示 URL）。
@@ -42,7 +44,7 @@ pub struct DaemonSupervisor {
 
 impl DaemonSupervisor {
     #[must_use]
-    pub fn new(bind_addr: SocketAddr) -> Self {
+    pub fn new(bind_addr: Option<SocketAddr>) -> Self {
         Self {
             state: Arc::new(Mutex::new(SupervisorState::default())),
             bind_addr,
@@ -88,8 +90,10 @@ impl DaemonSupervisor {
         }
         let executable = daemon_executable()?;
         let mut command = std::process::Command::new(&executable);
+        if let Some(bind_addr) = self.bind_addr {
+            command.env("FLUXDOWN_DAEMON_BIND", bind_addr.to_string());
+        }
         command
-            .env("FLUXDOWN_DAEMON_BIND", self.bind_addr.to_string())
             .envs(self.extra_env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -136,6 +140,11 @@ impl DaemonSupervisor {
             }
         }));
         Ok(Some(generation))
+    }
+
+    /// 本进程拉起的 daemon 子进程是否仍在运行（尚未被回收）。
+    pub async fn child_alive(&self) -> bool {
+        self.state.lock().await.running
     }
 
     /// 子进程是否处于「启动即崩溃」循环（连续快速异常退出）；调用方据此拉长重拉间隔。
@@ -238,13 +247,13 @@ fn detach_background_process(_command: &mut std::process::Command) {}
 /// 新 agent 遇到旧版 daemon 占着端口（既不能与它握手，也绝不能向它发送 token）时的善后：
 /// 结束当前用户名下的旧 `fluxdownd`，随后由 [`DaemonSupervisor::ensure_running`] 拉起同版本 daemon。
 impl DaemonSupervisor {
-    /// 结束占着 daemon 端口的旧版 `fluxdownd`；返回被发出终止信号的进程数。
+    /// 结束占着 `port` 的旧版 `fluxdownd`；返回被发出终止信号的进程数。
     /// 已停止监管或认不出目标进程时为 0。
-    pub async fn terminate_stale_daemon(&self) -> usize {
+    pub async fn terminate_stale_daemon(&self, port: u16) -> usize {
         if self.stopped.load(Ordering::Acquire) {
             return 0;
         }
-        terminate_stale_listener(self.bind_addr.port()).await
+        terminate_stale_listener(port).await
     }
 }
 

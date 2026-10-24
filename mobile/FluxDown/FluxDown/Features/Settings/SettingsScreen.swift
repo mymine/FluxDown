@@ -36,12 +36,14 @@ private struct SettingsStack: View {
                     case .appearance: AppearancePage()
                     case .notify: NotifyPage()
                     case .download: DownloadPage()
-                    #if FULL_P2P
+                    #if FULL_FLAVOR
                     case .bt: BtPage()
                     case .ed2k: Ed2kPage()
                     #endif
                     case .network: NetworkPage()
+                    #if FULL_FLAVOR
                     case .extensions: ExtensionsPage()
+                    #endif
                     case .webhook: WebhookPage()
                     case .api: ApiServicePage()
                     case .diagnostics: DiagnosticsPage()
@@ -122,14 +124,14 @@ private struct SettingsHomeList: View {
         }
 
         Section(L("settingsGroupPersonal")) {
-            tile(.general, L("settingsCatGeneral"), GeneralPage.readout(ctx) ?? L("settingsCatGeneralDesc"), "gearshape.fill", .gray)
+            tile(.general, L("settingsCatGeneral"), L("settingsCatGeneralDesc"), "gearshape.fill", .gray)
             tile(.appearance, L("settingsCatAppearance"), appearanceReadout(), "paintpalette.fill", .pink)
             tile(.notify, L("settingsCatNotify"), NotifyPage.readout(ctx) ?? L("settingsCatNotifyDesc"), "bell.badge.fill", .red)
         }
 
         Section {
             tile(.download, L("settingsCatDownload"), downloadReadout(state.config), "arrow.down.circle.fill", .accentColor)
-            #if FULL_P2P
+            #if FULL_FLAVOR
             tile(
                 .bt, L("settingsCatBt"), BtPage.readout(ctx) ?? L("settingsCatBtDesc"),
                 "point.3.connected.trianglepath.dotted", .green
@@ -137,7 +139,9 @@ private struct SettingsHomeList: View {
             tile(.ed2k, L("ed2kSettings"), Ed2kPage.readout(ctx) ?? L("ed2kSettingsDesc"), "server.rack", .orange)
             #endif
             tile(.network, L("settingsCatProxy"), NetworkPage.readout(ctx) ?? L("settingsCatProxyDesc"), "globe", .blue)
+            #if FULL_FLAVOR
             tile(.extensions, L("settingsCatExtensions"), L("settingsCatExtensionsDesc"), "puzzlepiece.extension.fill", .purple)
+            #endif
             // 功能开关关闭时无入口；开启后 `ui.show_activity_webhooks` = false 仍可隐藏首页行（搜索仍可进入）。
             if FeatureFlags.webhooks, state.preferences.bool("ui.show_activity_webhooks", default: true) {
                 tile(.webhook, L("webhookNavTitle"), nil, "bolt.horizontal.fill", .indigo)

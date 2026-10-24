@@ -356,7 +356,7 @@ struct MobileChecksTests {
         #expect(MobileChecks.storage(writable: true, freeBytes: 5 << 30).level == .ok)
     }
 
-    #if FULL_P2P
+    #if FULL_FLAVOR
     @Test func linkLevelsFollowInfoPlistDeclarations() {
         let all: Set<String> = ["magnet", "ed2k", "fluxdown"]
         #expect(MobileChecks.links(declaredSchemes: all, torrentDeclared: true, handlers: [:]).level == .ok)

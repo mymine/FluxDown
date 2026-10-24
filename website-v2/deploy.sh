@@ -67,6 +67,27 @@ fi
 echo "[2/4] 重建 Docker 镜像..."
 ${DOCKER} compose build website
 
+# ── IP 归属地库（/api/download 判定中国大陆访客，见 src/lib/geoip.ts）──
+# 只读挂载进容器（docker-compose.yml），不进镜像与仓库；缺失或超过 30 天时重新下载，
+# 下载失败时沿用旧文件，连旧文件都没有才中止。
+GEO_XDB="${SCRIPT_DIR}/geo/ip2region_v4.xdb"
+if [ ! -s "${GEO_XDB}" ] || [ -n "$(find "${GEO_XDB}" -mtime +30 2>/dev/null)" ]; then
+  echo "[+] 更新 IP 归属地库..."
+  mkdir -p "$(dirname "${GEO_XDB}")"
+  if curl -fsSL --retry 3 -m 120 -o "${GEO_XDB}.tmp" \
+      https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb \
+      && [ "$(stat -c %s "${GEO_XDB}.tmp")" -gt 1000000 ]; then
+    mv "${GEO_XDB}.tmp" "${GEO_XDB}"
+  else
+    rm -f "${GEO_XDB}.tmp"
+    if [ ! -s "${GEO_XDB}" ]; then
+      echo "      IP 归属地库下载失败且本地没有旧文件" >&2
+      exit 1
+    fi
+    echo "      下载失败，沿用现有文件"
+  fi
+fi
+
 # ── 3. 重启容器 ──────────────────────────────
 echo "[3/4] 启动/重启容器..."
 ${DOCKER} compose down --remove-orphans >/dev/null 2>&1 || true

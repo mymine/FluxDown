@@ -16,6 +16,7 @@ pub(super) fn show(
     title: &str,
     body: &str,
     actions: Option<&super::CompletionActions>,
+    silent: bool,
 ) -> Result<(), String> {
     // Use a short-lived dedicated thread that has never initialized COM: windows-core then
     // joins the process MTA through `CoIncrementMTAUsage`, which it never releases. That keeps
@@ -30,13 +31,13 @@ pub(super) fn show(
     let actions = actions.cloned();
     std::thread::Builder::new()
         .name("fluxdown-toast".into())
-        .spawn(move || runtime::show(&data_dir, &title, &body, actions.as_ref()))
+        .spawn(move || runtime::show(&data_dir, &title, &body, actions.as_ref(), silent))
         .map_err(|error| format!("could not start toast sender: {error}"))?
         .join()
         .map_err(|_| "toast sender panicked".to_owned())?
 }
 
-fn toast_xml(title: &str, body: &str, actions: Option<(&str, &str, &str)>) -> String {
+fn toast_xml(title: &str, body: &str, actions: Option<(&str, &str, &str)>, silent: bool) -> String {
     let launch = actions.map_or_else(String::new, |(token, _, _)| {
         format!(
             " activationType=\"protocol\" launch=\"{}\"",
@@ -54,6 +55,10 @@ fn toast_xml(title: &str, body: &str, actions: Option<(&str, &str, &str)>) -> St
             escape_xml(file), activation::uri(token, "open-file"),
             escape_xml(folder), activation::uri(token, "open-folder"),
         ));
+    }
+    if silent {
+        // 提示音由 agent 自己播放（`desktop.sound.task_completed`），避免系统通知音叠加。
+        xml.push_str("<audio silent=\"true\"/>");
     }
     xml.push_str("</toast>");
     xml
@@ -98,6 +103,7 @@ mod runtime {
         title: &str,
         body: &str,
         actions: Option<&CompletionActions>,
+        silent: bool,
     ) -> Result<(), String> {
         // Hold the emission lease through Show: concurrent emitters cannot reuse a slot
         // between token creation and delivery. File close releases the cross-process lock.
@@ -117,6 +123,7 @@ mod runtime {
                     actions.open_folder_label.as_str(),
                 )
             }),
+            silent,
         );
         let result = deliver(&xml, stored.as_ref());
         if let Err(delivery_error) = &result
@@ -178,7 +185,7 @@ mod tests {
             "&lt;&amp;&gt;&quot;&apos;&#9;&#10;&#13;���中📁"
         );
         let hostile = "\"/><action arguments=\"file:///C:/evil\"/><text>";
-        let xml = toast_xml(hostile, hostile, Some((TOKEN, hostile, hostile)));
+        let xml = toast_xml(hostile, hostile, Some((TOKEN, hostile, hostile)), false);
         assert_eq!(xml.matches("<action ").count(), 2);
         assert_eq!(xml.matches("<text>").count(), 2);
         assert!(!xml.contains("arguments=\"file:"));
@@ -190,6 +197,7 @@ mod tests {
             "Done",
             "name.zip",
             Some((TOKEN, "Open File", "Open Folder")),
+            false,
         );
         assert!(xml.contains(&format!(
             "launch=\"fluxdown-notification://{TOKEN}/open-folder\""
@@ -203,9 +211,16 @@ mod tests {
 
     #[test]
     fn informational_toast_has_no_protocol_activation() {
-        let xml = toast_xml("Test", "Hello", None);
+        let xml = toast_xml("Test", "Hello", None, false);
+        assert!(!xml.contains("<audio"));
         assert!(!xml.contains("protocol"));
         assert!(!xml.contains("<actions>"));
         assert!(!xml.contains("launch="));
+    }
+
+    #[test]
+    fn silent_toast_suppresses_the_system_sound() {
+        let xml = toast_xml("Done", "name.zip", None, true);
+        assert!(xml.ends_with("<audio silent=\"true\"/></toast>"));
     }
 }

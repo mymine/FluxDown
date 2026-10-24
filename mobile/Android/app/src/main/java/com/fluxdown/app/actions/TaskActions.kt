@@ -243,7 +243,15 @@ class TaskActions(
             overlays.toast(s(R.string.mobileFileNotFound), FluxToastKind.Warn, FluxIcons.FileWarning)
             return
         }
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+        val uri = try {
+            FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+        } catch (e: IllegalArgumentException) {
+            // 文件不在 FileProvider 任何已声明根目录内（异常存储布局）：提示而不是崩溃
+            android.util.Log.w("FluxDown", "open: ${file.path} is outside the FileProvider roots: ${e.message}")
+            haptics.reject()
+            overlays.toast(s(R.string.mobileOpenFileFailed), FluxToastKind.Error, FluxIcons.FileWarning)
+            return
+        }
         val mime = mimeForFile(file.name)
         fun view(type: String) = Intent(Intent.ACTION_VIEW).setDataAndType(uri, type)
             .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -277,9 +285,10 @@ class TaskActions(
         val st = task.status
         if (st == TaskStatus.Completed && !task.fileMissing) add(FluxMenuItem.Action(s(R.string.openFile), { open(task) }, FluxIcons.ExternalLink))
         if (canRedownload(task)) add(FluxMenuItem.Action(s(R.string.redownloadTask), { confirmRedownload(task) }, FluxIcons.RotateCw))
-        if (st == TaskStatus.Paused || st == TaskStatus.Failed) add(FluxMenuItem.Action(s(R.string.resume), { resume(listOf(task.taskId)) }, FluxIcons.Play))
-        if (st.isActive || st == TaskStatus.Pending) add(FluxMenuItem.Action(s(R.string.pause), { pause(listOf(task.taskId)) }, FluxIcons.Pause))
-        if (st != TaskStatus.Completed) {
+        if (task.canResume) add(FluxMenuItem.Action(s(R.string.resume), { resume(listOf(task.taskId)) }, FluxIcons.Play))
+        if (task.canPause) add(FluxMenuItem.Action(s(R.string.pause), { pause(listOf(task.taskId)) }, FluxIcons.Pause))
+        // 只有未结束的任务能优先下载（主机对已完成 / 失败任务拒绝 Boost）。
+        if (st != TaskStatus.Completed && st != TaskStatus.Failed) {
             add(FluxMenuItem.Action(s(if (boosted) R.string.cancelBoost else R.string.boostDownload), { boost(task, boosted) }, FluxIcons.Zap, checked = boosted))
         }
         add(FluxMenuItem.Divider)

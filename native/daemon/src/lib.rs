@@ -8,6 +8,7 @@ pub mod blob_store;
 pub mod config;
 mod doctor_probe;
 pub mod event_hub;
+mod event_pump;
 pub mod http;
 pub mod log_redact;
 #[cfg(feature = "plugins")]

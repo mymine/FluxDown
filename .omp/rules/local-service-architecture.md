@@ -26,7 +26,7 @@ fluxdown-agent  ---- HTTPS/SSE ----> FluxCloud
 - `native/daemon`（`fluxdown_daemon`，目标二进制 `fluxdownd`）：aria2c 式纯下载核心；拥有下载任务、下载设置、RSS、插件、Webhook、下载 DB 与下载事件。
 - `native/agent`（`fluxdown_agent`，目标二进制 `fluxdown-agent`）：官方客户端常驻后端；拥有 FluxCloud Token、设备身份、配置同步、Entitlements、远程任务、UI Gateway，以及系统外壳（托盘、关闭 UI 后的驻留策略、剪贴板监听、完成后关机、开机自启入口）。
 - `native/protocol`（`fluxdown_protocol`）：传输无关 wire；只放 DTO、版本、方法名、事件和稳定错误码，不放网络运行时、业务实现、数据库或 UI。
-- `native/server`：已冻结的旧 headless 宿主，不构建、不发布、不接收任何改动（待新链路发版验证后删除）；headless/NAS 由 `fluxdown-agent --server` + `fluxdownd` 承担，Web SPA 走 agent `/rpc`。
+- headless/NAS 由 `fluxdown-agent --server` + `fluxdownd` 承担，Web SPA 走 agent `/rpc`；旧 headless 宿主 `native/server`（Flutter 时代产物）已移除，不得恢复。
 
 ## 状态单一所有者
 
@@ -72,4 +72,4 @@ protocol <- daemon / agent / clients
 2. 功能是否需要知道 FluxCloud 账户？需要则归 agent，不归 daemon。
 3. 功能是否直接改变下载事实？需要则由 daemon 统一入口调用 engine。
 4. 这是 wire 语义还是传输实现？前者归 protocol，后者留在服务端/客户端适配器。
-5. 是否依赖了 `native/server` 或建立第二套 DTO/状态机？若是，停止并收敛到新边界（Web SPA 同样只消费 `native/protocol` 的 wire 形状，TS 镜像在 `web/src/lib/rpc/protocol/`）。
+5. 是否恢复了旧 headless 宿主或建立第二套 DTO/状态机？若是，停止并收敛到新边界（Web SPA 同样只消费 `native/protocol` 的 wire 形状，TS 镜像在 `web/src/lib/rpc/protocol/`）。

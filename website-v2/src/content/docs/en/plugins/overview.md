@@ -30,6 +30,7 @@ Every row links to the tutorial for that capability and to the reference that li
 | **Portable UI** — pages, settings tab, task-detail tabs, commands, timers; the same code renders on desktop and Web | `main`, `contributes.views`, `contributes.commands`, `settings` | `tasks` to manage tasks, `background` to stay resident | [UI guide](/docs/en/plugins/ui-guide/) | [Views](/docs/en/plugins/views/) |
 | **Native desktop UI** — GPUI scripts with full desktop access | `contributes.views[].desktop` | `desktop` | [Desktop UI guide](/docs/en/plugins/desktop-ui-guide/) | [Views](/docs/en/plugins/views/) |
 | **Browser sniffing rules** | `contributes.sniffRules` | `browserRules` | [Manifest reference](/docs/en/plugins/manifest/) | [Manifest reference](/docs/en/plugins/manifest/) |
+| **Browser page scripts** — run your JavaScript on listed websites through the browser extension, with a bridge back to the plugin | `contributes.pageScripts` | `pageScripts` | [Page scripts](/docs/en/plugins/page-scripts-guide/) | [Manifest reference](/docs/en/plugins/manifest/#pagescripts) |
 | **Plugin settings form** | `settings` | none | [Your first plugin](/docs/en/plugins/your-first-plugin/#6-add-a-setting-optional) | [Manifest reference](/docs/en/plugins/manifest/) |
 
 The base sandbox **cannot** create tasks or read arbitrary files. It talks to the outside world through the `flux.*` API (HTTP fetch, key-value storage, scratch files, logging, retry requests). Anything beyond that is a permission the plugin declares, the user approves, and FluxDown records in an audit log; see [Permissions](/docs/en/plugins/permissions/).
@@ -146,6 +147,6 @@ A view that has both a `desktop` entry and `"portable": true` uses the native on
 
 1. [Your first plugin](/docs/en/plugins/your-first-plugin/) — a working resolver in plain JavaScript.
 2. [TypeScript project](/docs/en/plugins/typescript-project/) — resolver, hook, view and settings with the SDK, up to a packed `.fxplug`.
-3. Guides: [Hooks](/docs/en/plugins/hooks-guide/), [Interceptors](/docs/en/plugins/interceptors-guide/), [Auth](/docs/en/plugins/auth-guide/), [Subscriptions](/docs/en/plugins/subscription-guide/), [Portable UI](/docs/en/plugins/ui-guide/), [Desktop UI](/docs/en/plugins/desktop-ui-guide/).
+3. Guides: [Hooks](/docs/en/plugins/hooks-guide/), [Interceptors](/docs/en/plugins/interceptors-guide/), [Page scripts](/docs/en/plugins/page-scripts-guide/), [Auth](/docs/en/plugins/auth-guide/), [Subscriptions](/docs/en/plugins/subscription-guide/), [Portable UI](/docs/en/plugins/ui-guide/), [Desktop UI](/docs/en/plugins/desktop-ui-guide/).
 4. [Debugging](/docs/en/plugins/debugging/) — logs, reload semantics, error messages and fixes.
 5. Reference: [Manifest](/docs/en/plugins/manifest/), [API](/docs/en/plugins/api-reference/), [Views](/docs/en/plugins/views/), [SDK & CLI](/docs/en/plugins/sdk/), [Permissions](/docs/en/plugins/permissions/), [Packaging & market](/docs/en/plugins/packaging/).

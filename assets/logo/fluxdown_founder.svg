@@ -1,0 +1,83 @@
+<svg width="512" height="512" viewBox="56 56 400 400" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>FluxDown Founding Member</title>
+  <desc>Deep black rounded square with a polished metallic gold download arrow and fine gold frame</desc>
+
+  <defs>
+    <!-- 底：近黑暖调，顶部微亮，营造灯下的漆面质感 -->
+    <radialGradient id="bg" cx="256" cy="150" r="360" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2B2620"/>
+      <stop offset="0.55" stop-color="#16130F"/>
+      <stop offset="1" stop-color="#0A0908"/>
+    </radialGradient>
+
+    <!-- 金属金：高光 / 中间调 / 暗部交替出现，模拟抛光金属的环境反射 -->
+    <linearGradient id="gold" x1="140" y1="119" x2="372" y2="390" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF2C6"/>
+      <stop offset="0.18" stop-color="#E6C075"/>
+      <stop offset="0.38" stop-color="#B8862F"/>
+      <stop offset="0.52" stop-color="#F7E2A6"/>
+      <stop offset="0.66" stop-color="#D4A651"/>
+      <stop offset="0.84" stop-color="#8E5E1C"/>
+      <stop offset="1" stop-color="#C99A47"/>
+    </linearGradient>
+
+    <!-- 倒角边：更深的古铜色，给箭头厚度 -->
+    <linearGradient id="bevel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#C9963F"/>
+      <stop offset="1" stop-color="#5E3A0E"/>
+    </linearGradient>
+
+    <!-- 顶面高光：自上而下淡出 -->
+    <linearGradient id="shine" x1="0" y1="119" x2="0" y2="390" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.85"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- 边框金线 -->
+    <linearGradient id="frame" x1="56" y1="56" x2="456" y2="456" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F3D98E"/>
+      <stop offset="0.35" stop-color="#A9772A"/>
+      <stop offset="0.6" stop-color="#EBCB7C"/>
+      <stop offset="1" stop-color="#7C5218"/>
+    </linearGradient>
+
+    <filter id="drop" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+
+    <path id="arrow" d="
+      M 226 131
+      Q 226 119 238 119
+      L 274 119
+      Q 286 119 286 131
+      L 286 296
+      L 331 251
+      Q 340 242 349 251
+      L 363 265
+      Q 372 274 363 283
+      L 265 381
+      Q 256 390 247 381
+      L 149 283
+      Q 140 274 149 265
+      L 163 251
+      Q 172 242 181 251
+      L 226 296
+      Z"/>
+  </defs>
+
+  <rect x="56" y="56" width="400" height="400" rx="88" fill="url(#bg)"/>
+
+  <!-- 双线金框：外细内更细，奢侈品包装常用手法 -->
+  <rect x="70" y="70" width="372" height="372" rx="76" fill="none" stroke="url(#frame)" stroke-width="3"/>
+  <rect x="79" y="79" width="354" height="354" rx="68" fill="none" stroke="url(#frame)" stroke-width="1" stroke-opacity="0.6"/>
+
+  <!-- 投影 -->
+  <use href="#arrow" transform="translate(0 8)" fill="#000000" fill-opacity="0.65" filter="url(#drop)"/>
+  <!-- 倒角 / 厚度 -->
+  <use href="#arrow" transform="translate(0 4)" fill="url(#bevel)" stroke="url(#bevel)" stroke-width="4" stroke-linejoin="round"/>
+  <!-- 金属顶面 -->
+  <use href="#arrow" fill="url(#gold)"/>
+  <!-- 边缘高光 -->
+  <use href="#arrow" fill="none" stroke="url(#shine)" stroke-width="2.5" stroke-linejoin="round"/>
+</svg>

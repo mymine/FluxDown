@@ -30,8 +30,10 @@ struct DownloadsListScreen: View {
     @State private var pendingGroupDelete: GroupDeleteRequest?
     /// 多选底栏「删除」待确认的任务（确认 alert 由该按钮挂载）。
     @State private var pendingSelectionDelete: TaskDeleteRequest?
+    #if FULL_FLAVOR
     /// 待确认「忽略插件重试」的任务（`daemon.plugin.ignoreRetry`）。
     @State private var ignoreRetryTaskId: String?
+    #endif
 
     private var prefs: ViewPrefsStore { container.viewPrefs }
 
@@ -56,6 +58,7 @@ struct DownloadsListScreen: View {
             .safeAreaBar(edge: .top, spacing: 0) {
                 DownloadsFilterBar(model: model)
             }
+            #if FULL_FLAVOR
             .alert(L("taskIgnorePluginRetryTitle"), isPresented: Binding(
                 get: { ignoreRetryTaskId != nil },
                 set: { if !$0 { ignoreRetryTaskId = nil } }
@@ -67,6 +70,7 @@ struct DownloadsListScreen: View {
             } message: {
                 Text(L("taskIgnorePluginRetryMsg"))
             }
+            #endif
             .alert(L("mobileClearFinishedTitle"), isPresented: $confirmingClear) {
                 Button(L("cancel"), role: .cancel) {}
                 Button(L("mobileClearFinishedAction", ["n": clearIds.count]), role: .destructive) { clearFinished(clearIds) }
@@ -98,6 +102,9 @@ struct DownloadsListScreen: View {
             if loading {
                 Section {
                     ForEach(0 ..< 6, id: \.self) { _ in DownloadRowPlaceholder() }
+                } header: {
+                    // 首个快照到达前（连接中）没有进度可报；快照头已到、任务表分页载入中才显示。
+                    if !list.loaded, model.chrome.link != .connecting { loadingHeader(total: list.loadingTotal) }
                 }
             } else if !list.isEmpty {
                 ForEach(list.sections) { section in
@@ -140,6 +147,17 @@ struct DownloadsListScreen: View {
         .onScrollPhaseChange { _, _ in model.touch() }
     }
 
+    /// 任务表分页载入中的进度文案（含服务端任务总数）；占位行之上。
+    private func loadingHeader(total: UInt64) -> some View {
+        HStack(spacing: 8) {
+            ProgressView()
+            Text(total > 0 ? L("mobileTasksLoadingProgress", ["n": total]) : L("mobileTasksLoading"))
+        }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
+        .accessibilityElement(children: .combine)
+    }
+
     private var footerText: String {
         var text = L("nTasks", ["n": model.facets.matching])
         if let free = model.chrome.diskFree {
@@ -150,10 +168,12 @@ struct DownloadsListScreen: View {
 
     private func row(_ item: TaskItem, style: RowStyle, editing: Bool) -> some View {
         let readOnly = model.chrome.isReadOnly
+        let queuePosition = item.visual == .queued ? model.queueOrder.rank(of: item.id) : 0
         return DownloadRowView(
             item: item,
             style: style,
             isLocalHost: container.isLocalHost,
+            queuePosition: queuePosition,
             showsRing: !editing,
             zoom: zoom,
             onOpen: editing ? nil : { onOpen(item.id) }
@@ -164,6 +184,7 @@ struct DownloadsListScreen: View {
         .contextMenu {
             if !editing {
                 TaskMenuItems(task: item.task, boosted: item.boosted, onSelect: { model.beginSelecting(with: item.id) })
+                #if FULL_FLAVOR
                 if PluginFailure.isIgnorable(status: item.task.status, errorMessage: item.task.errorMessage) {
                     Section {
                         Button(L("taskIgnorePluginRetry"), systemImage: "puzzlepiece.extension") {
@@ -171,9 +192,12 @@ struct DownloadsListScreen: View {
                         }
                     }
                 }
+                #endif
             }
         } preview: {
-            DownloadRowView(item: item, style: style, isLocalHost: container.isLocalHost, showsRing: false)
+            DownloadRowView(
+                item: item, style: style, isLocalHost: container.isLocalHost, queuePosition: queuePosition, showsRing: false
+            )
                 .padding(.horizontal)
                 .frame(minWidth: 320)
                 .environment(actions)
@@ -444,6 +468,7 @@ struct DownloadsListScreen: View {
 
     // MARK: 动作
 
+    #if FULL_FLAVOR
     /// `daemon.plugin.ignoreRetry`：跳过插件，用原始链接重试（仅插件失败任务，已由菜单条件保证）。
     private func ignorePluginRetry(_ taskId: String) {
         actions.run(onSuccess: { [toasts] in
@@ -452,6 +477,7 @@ struct DownloadsListScreen: View {
             try await session.callVoid(HostMethod.daemonPluginIgnoreRetry, params: TaskIdParams(taskId: taskId))
         }
     }
+    #endif
 
     private func refresh() async {
         guard actions.guardWritable() else { return }
@@ -471,6 +497,11 @@ struct DownloadsListScreen: View {
     /// 清除已完成任务：确认 → `deleteMany(deleteFiles: false)`（只移除记录，保留文件）。
     private func confirmClearFinished() {
         guard actions.guardWritable() else { return }
+        // 任务表还在分页载入：列表只是半份，不能据此判定「没有已完成任务」或批量清除。
+        guard !container.store.state.tasksLoading else {
+            toasts.show(text: L("mobileTasksLoading"), tone: .info, systemImage: "hourglass")
+            return
+        }
         let ids = container.store.state.tasks.filter { $0.status == .completed }.map(\.taskId)
         guard !ids.isEmpty else {
             toasts.show(text: L("mobileClearFinishedNone"), tone: .info, systemImage: "checkmark.circle")

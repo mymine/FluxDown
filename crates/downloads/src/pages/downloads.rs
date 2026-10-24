@@ -21,7 +21,7 @@ use crate::{
             DownloadTableDelegate, SelectionSummary, TableFilter, ToolbarCommand,
             spawn_midnight_refresh,
         },
-        title_bar::DownloadTitleBar,
+        title_bar::{DownloadSearchBox, DownloadTitleBar, DownloadViewMenu},
     },
     controller::{DownloadsCommand, DownloadsController, DownloadsPort, ResumeTargets},
     deletion::{
@@ -31,8 +31,9 @@ use crate::{
         DownloadFilter, DownloadStatusFilter, RowKey, SidebarSection, SidebarSelection,
         StatusFolderMotion, TaskState,
         file_rescan::{RescanDecision, RescanThrottle},
+        group_tree::{GroupMeta, member_dir},
         refresh_gate::{RefreshGate, RefreshPlan, RefreshTrigger},
-        view_prefs::{DetailPlacement, VIEW_PREFS_KEY, ViewGroupBy, ViewPrefs},
+        view_prefs::{DetailPlacement, VIEW_PREFS_KEY, ViewPrefs},
     },
     pages::new_download::{NewDownloadContext, build_new_download_context},
     pages::task_detail::TaskDetailView,
@@ -60,6 +61,9 @@ use gpui_component::{
     table::{TableEvent, TableState},
     v_flex, v_resizable,
 };
+
+#[path = "downloads_group_panel.rs"]
+mod group_panel;
 
 pub(crate) const SIDEBAR_MOTION_DURATION: Duration = Duration::from_millis(200);
 const PREFS_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -112,6 +116,8 @@ pub struct PluginTaskCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginTaskTab {
     pub title: SharedString,
+    /// 内容修订号：变化即旧视图作废、须按工厂重建（插件包代码被替换时由 app 递增）。
+    pub revision: u64,
 }
 
 /// app 注入的跨窗口 / 跨能力入口；未注入的入口对应按钮无动作。
@@ -123,6 +129,10 @@ pub struct DownloadHostActions {
     pub open_queue_manager: Option<PlainOpener>,
     /// 侧栏「设备」区标题上的「添加设备」入口；`None` 时不显示按钮。
     pub open_add_device: Option<PlainOpener>,
+    /// 侧栏独立直连设备右键「重命名」：参数为设备指纹。
+    pub rename_linked_device: Option<IdOpener>,
+    /// 侧栏独立直连设备右键「解除配对」（含确认）：参数为设备指纹。
+    pub unpair_linked_device: Option<IdOpener>,
     /// 任务表「待确认」角标点击：打开 / 置前聚合的「文件已存在」窗口。
     pub open_file_conflicts: Option<PlainOpener>,
     /// `Some(id)` 编辑现有分类，`None` 新建。
@@ -193,19 +203,23 @@ pub struct DownloadView {
     /// 根元素 focus handle：右键菜单 action_context 分派目标，`escape`
     /// 清空搜索框后也交回给它。
     pub(crate) focus_handle: FocusHandle,
-    /// 顶栏搜索框状态（输入框渲染在 [`DownloadTitleBar`] 插槽里）。
+    /// 顶栏搜索框状态（输入框渲染在 [`DownloadSearchBox`] 里）。
     pub(crate) search_input: Entity<InputState>,
+    /// 搜索框被布局隐藏时，经快捷键临时展开（`Esc` 收起）。
+    search_revealed: bool,
     /// 已下发给搜索框的 placeholder（语言切换后需重下发）。
     search_placeholder: SharedString,
     /// 搜索防抖代数。
     search_generation: Rc<Cell<u64>>,
     prefs_generation: Rc<Cell<u64>>,
-    /// 已从偏好加载过视图设置（缺省分组维度只在首次决定）。
+    /// 已从偏好加载过视图设置。
     prefs_loaded: bool,
     /// 最近一次应用 / 写出的视图偏好持久化值：未变化的偏好回流不重载。
     applied_view_prefs: Option<serde_json::Value>,
     /// 停靠详情面板（`None` = 尚未选中过任何任务）。
     pub(crate) detail: Option<Entity<TaskDetailView>>,
+    /// 停靠面板正在显示概览的任务组（经组行聚焦；优先于 `detail`）。
+    pub(crate) detail_group: Option<String>,
     /// 详情面板 / 主内容拆分的独立 resizable 状态。
     pub(crate) detail_resizable_state: Entity<ResizableState>,
     /// 上次渲染时的选中投影；表格选中变化时与之比较，变了才重绘本页（浮动选择条）。
@@ -273,23 +287,28 @@ impl DownloadView {
         cx.subscribe_in(&table_state, window, Self::handle_table_event)
             .detach();
         // 选中变化只通知表格实体；浮动选择条依赖它，按投影差异重绘本页，
-        // 避免表格滚动 / 悬停等高频 notify 带着整页重绘。停靠详情面板打开时跟随单选任务。
+        // 避免表格滚动 / 悬停等高频 notify 带着整页重绘。停靠详情面板打开时跟随聚焦的
+        // 任务组（组概览）或单选任务。
         cx.observe_in(&table_state, window, |this, table_state, window, cx| {
-            let (selection, follow) = {
+            let (selection, follow_group, follow) = {
                 let delegate = table_state.read(cx).delegate();
-                let follow = delegate
-                    .prefs()
-                    .detail_open
+                let detail_open = delegate.prefs().detail_open;
+                let follow_group = detail_open
+                    .then(|| delegate.focused_group().map(str::to_owned))
+                    .flatten();
+                let follow = (detail_open && follow_group.is_none())
                     .then(|| delegate.single_selected_key().filter(|key| key.is_local()))
                     .flatten()
                     .cloned();
-                (delegate.selection_summary(), follow)
+                (delegate.selection_summary(), follow_group, follow)
             };
             if this.selection_summary.get() != selection {
                 this.selection_summary.set(selection);
                 cx.notify();
             }
-            if let Some(key) = follow {
+            if let Some(group_id) = follow_group {
+                this.bind_group_detail(group_id, cx);
+            } else if let Some(key) = follow {
                 this.bind_detail(key, window, cx);
             }
         })
@@ -337,12 +356,14 @@ impl DownloadView {
             last_error: None,
             focus_handle,
             search_input,
+            search_revealed: false,
             search_placeholder: strings_placeholder,
             search_generation: Rc::new(Cell::new(0)),
             prefs_generation: Rc::new(Cell::new(0)),
             prefs_loaded: false,
             applied_view_prefs: None,
             detail: None,
+            detail_group: None,
             detail_resizable_state: cx.new(|_| ResizableState::default()),
             selection_summary: Cell::new(SelectionSummary::default()),
             file_rescan: RescanThrottle::default(),
@@ -437,6 +458,10 @@ impl DownloadView {
     /// 状态栏「全部暂停」不可用的原因（`None` = 可点）：没有等待 / 下载中的本地任务，
     /// 且本页没有进行中的导入（全部暂停同时挂起导入闸门）。
     pub(crate) fn pause_all_blocker(&self) -> Option<SharedString> {
+        // 任务表分页载入期间「有没有可暂停任务」无从判断：显示加载态而不是「没有任务」。
+        if self.controller.tables_loading() {
+            return Some(self.strings.tasks_loading_title.clone());
+        }
         let available = self.controller.has_pausable_tasks() || !self.imports.is_empty();
         (!available).then(|| self.strings.pause_all_unavailable.clone())
     }
@@ -447,6 +472,9 @@ impl DownloadView {
         if self.import_suspended {
             return None;
         }
+        if self.controller.tables_loading() {
+            return Some(self.strings.tasks_loading_title.clone());
+        }
         match self.controller.resume_targets() {
             ResumeTargets::Some => None,
             ResumeTargets::OnlyInStoppedQueues => {
@@ -456,13 +484,26 @@ impl DownloadView {
         }
     }
 
-    /// 创建挂到 shell 统一顶栏的下载页插槽（搜索、视图选项、新建）。
+    /// 创建挂到 shell 统一顶栏的下载页插槽（「新建」按钮）。
     pub fn new_title_bar(&self, cx: &mut Context<Self>) -> Entity<DownloadTitleBar> {
+        let view = cx.weak_entity();
+        let translator = self.translator.clone();
+        cx.new(|_| DownloadTitleBar::new(view, translator))
+    }
+
+    /// 创建顶栏搜索框（chrome 布局条目，由宿主注册为 shell 控件）。
+    pub fn new_search_box(&self, cx: &mut Context<Self>) -> Entity<DownloadSearchBox> {
+        let view = cx.weak_entity();
+        let search_input = self.search_input.clone();
+        cx.new(|cx| DownloadSearchBox::new(view, search_input, cx))
+    }
+
+    /// 创建「视图」选项菜单（chrome 布局条目，由宿主注册为 shell 控件）。
+    pub fn new_view_menu(&self, cx: &mut Context<Self>) -> Entity<DownloadViewMenu> {
         let view = cx.entity();
         let translator = self.translator.clone();
-        let search_input = self.search_input.clone();
         let table_state = self.table_state.clone();
-        cx.new(|cx| DownloadTitleBar::new(&view, translator, search_input, table_state, cx))
+        cx.new(|cx| DownloadViewMenu::new(&view, translator, table_state, cx))
     }
 
     /// 「新建下载」表单的环境快照：保存目录 / 默认队列 / 线程数初值与队列候选；
@@ -501,6 +542,21 @@ impl DownloadView {
 
     pub(crate) fn open_new_download(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_new_download_with(Vec::new(), window, cx);
+    }
+
+    /// 侧栏独立直连设备：打开「新建下载」并把「下载到」预选为该设备。
+    pub(crate) fn open_new_download_to(
+        &self,
+        target: crate::model::devices::DispatchTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(opener) = self.host.open_new_download.clone() else {
+            return;
+        };
+        let mut context = self.new_download_context();
+        context.target = target;
+        opener(context, window, cx);
     }
 
     /// 按表单提交创建任务 / 确认外部捕获 / 下发到其他设备；对话框确认后由宿主调用。
@@ -934,9 +990,9 @@ impl DownloadView {
                     && id != SidebarSelection::ALL_DEVICES
                     && !self
                         .controller
-                        .sidebar_devices()
+                        .other_devices()
                         .iter()
-                        .any(|device| device.id == *id) =>
+                        .any(|device| !device.is_standalone_link() && device.id == *id) =>
             {
                 self.selected_item = SidebarSelection::Download(DownloadFilter::ALL);
             }
@@ -953,7 +1009,7 @@ impl DownloadView {
         cx.notify();
     }
 
-    /// 偏好 → 表格视图设置；无偏好时首次按「存在组任务」决定默认分组维度。
+    /// 偏好 → 表格视图设置；无偏好时用默认视图。
     ///
     /// 任何偏好键变化都会触发这里（`PreferencesChanged` 不区分键），只有视图偏好本身的持久化值
     /// 变了才重载：否则别的键（如命令面板使用记录）回流时，会用旧持久化值覆盖 300ms 防抖
@@ -966,19 +1022,7 @@ impl DownloadView {
                 ViewPrefs::from_value(value)
             }
             None if self.prefs_loaded => return,
-            None => {
-                let mut prefs = ViewPrefs::default();
-                let has_groups = self
-                    .controller
-                    .store()
-                    .local()
-                    .iter()
-                    .any(|task| !task.group_id.is_empty());
-                if has_groups {
-                    prefs.group_by = ViewGroupBy::Group;
-                }
-                prefs
-            }
+            None => ViewPrefs::default(),
         };
         self.prefs_loaded = true;
         self.table_state.update(cx, |table, cx| {
@@ -987,7 +1031,7 @@ impl DownloadView {
         });
     }
 
-    /// 队列名 / 组名 / 分类 / 设备名同步进表格代理（只在变化时触发重算）。
+    /// 队列名 / 任务组 / 分类 / 设备名同步进表格代理（只在变化时触发重算）。
     fn sync_delegate_context(&mut self, cx: &mut Context<Self>) {
         let queues: Vec<(String, String)> = self
             .controller
@@ -995,11 +1039,11 @@ impl DownloadView {
             .iter()
             .map(|queue| (queue.queue_id.clone(), queue.name.clone()))
             .collect();
-        let groups: HashMap<String, String> = self
+        let groups: HashMap<String, GroupMeta> = self
             .controller
             .groups()
             .iter()
-            .map(|group| (group.group_id.clone(), group.name.clone()))
+            .map(|group| (group.group_id.clone(), GroupMeta::from_dto(group)))
             .collect();
         let devices: HashMap<String, String> = self
             .controller
@@ -1014,7 +1058,7 @@ impl DownloadView {
         self.table_state.update(cx, |table, _| {
             let delegate = table.delegate_mut();
             delegate.set_queue_names(queues);
-            delegate.set_group_names(groups);
+            delegate.set_groups(groups);
             delegate.set_device_names(devices);
             delegate.set_categories(categories);
         });
@@ -1264,6 +1308,9 @@ impl DownloadView {
         if !key.is_local() {
             return;
         }
+        if self.detail_group.take().is_some() {
+            cx.notify();
+        }
         let task_id = key.task_id().to_owned();
         match self.detail.clone() {
             Some(detail) if detail.read(cx).task_id() == task_id => return,
@@ -1292,6 +1339,33 @@ impl DownloadView {
         cx.notify();
     }
 
+    /// 让停靠面板显示该任务组的概览；已是该组时不做事。
+    fn bind_group_detail(&mut self, group_id: String, cx: &mut Context<Self>) {
+        if self.detail_group.as_deref() != Some(group_id.as_str()) {
+            self.detail_group = Some(group_id);
+            cx.notify();
+        }
+    }
+
+    /// 组行「详情」按钮：选中并聚焦该组，打开停靠面板显示组概览。
+    pub(crate) fn show_group_detail(
+        &mut self,
+        group_id: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.table_state.update(cx, |table, cx| {
+            table
+                .delegate_mut()
+                .select_group(&group_id, gpui::Modifiers::default());
+            cx.notify();
+        });
+        self.bind_group_detail(group_id, cx);
+        if !self.table_state.read(cx).delegate().prefs().detail_open {
+            self.mutate_prefs(|prefs| prefs.detail_open = true, cx);
+        }
+    }
+
     /// 右键「详情」：在停靠面板中查看选区锚点（或第一个本地选中）任务。
     fn on_show_selected_detail(
         &mut self,
@@ -1318,6 +1392,7 @@ impl DownloadView {
 
     fn on_close_detail_panel(&mut self, cx: &mut Context<Self>) {
         self.detail = None;
+        self.detail_group = None;
         self.mutate_prefs(|prefs| prefs.detail_open = false, cx);
     }
 
@@ -1328,8 +1403,13 @@ impl DownloadView {
         );
     }
 
-    /// 面板「弹出为窗口」：交给宿主开独立任务窗口后关闭面板。
+    /// 面板「弹出为窗口」：交给宿主开独立任务 / 任务组窗口后关闭面板。
     fn on_pop_out_detail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(group_id) = self.detail_group.clone() {
+            self.open_group_in_window(group_id, window, cx);
+            self.on_close_detail_panel(cx);
+            return;
+        }
         let Some(detail) = self.detail.clone() else {
             return;
         };
@@ -1465,7 +1545,15 @@ impl DownloadView {
                 cx.notify();
             }
         });
+        self.search_revealed = false;
         self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// 搜索框被布局隐藏时是否仍临时显示：快捷键唤出后、或仍有查询词时（避免筛选条件不可见）。
+    #[must_use]
+    pub fn search_revealed(&self, cx: &App) -> bool {
+        self.search_revealed || !self.search_input.read(cx).value().is_empty()
     }
 
     /// 内联重命名对话框（单选本地任务）；确认后写 `DownloadsCommand::Rename`。
@@ -1623,18 +1711,28 @@ impl DownloadView {
         self.execute_commands(commands, cx);
     }
 
-    /// 打开组内首个成员所在目录。
+    /// 打开组文件夹：定位一个位于组根目录的成员（文件管理器即打开组根目录），没有则
+    /// 取第一个成员。
     pub(crate) fn group_open_folder(&mut self, group_id: String, cx: &mut Context<Self>) {
-        let Some(task_id) = self
+        let root = self
             .controller
-            .store()
-            .local()
+            .group_summaries()
             .iter()
-            .find(|task| task.group_id == group_id)
-            .map(|task| task.key.task_id().to_owned())
-        else {
+            .find(|group| group.id == group_id)
+            .map(|group| group.meta.save_dir.clone())
+            .unwrap_or_default();
+        let store = Rc::clone(self.controller.store());
+        let local = store.local();
+        let mut members = local.iter().filter(|task| task.group_id == group_id);
+        let Some(first) = members.next() else {
             return;
         };
+        let target = std::iter::once(first)
+            .chain(members)
+            .find(|task| member_dir(&root, &task.save_dir).is_empty())
+            .unwrap_or(first);
+        let task_id = target.key.task_id().to_owned();
+        drop(local);
         self.execute_commands(vec![DownloadsCommand::RevealTask { task_id }], cx);
     }
 
@@ -1649,7 +1747,7 @@ impl DownloadView {
             .group_summaries()
             .iter()
             .find(|group| group.id == group_id)
-            .map(|group| group.origin_url.clone())
+            .map(|group| group.meta.source_url.clone())
             .filter(|url| !url.is_empty())
         else {
             return;
@@ -1680,7 +1778,7 @@ impl DownloadView {
             .group_summaries()
             .iter()
             .find(|group| group.id == group_id)
-            .map_or_else(|| group_id.clone(), |group| group.name.clone());
+            .map_or_else(|| group_id.clone(), |group| group.meta.name.clone());
         let title = self.strings.group_delete_with_files.clone();
         let description = self.strings.group_delete_with_files_description(&name);
         let ok_label = self.strings.delete.clone();
@@ -1819,9 +1917,9 @@ impl DownloadView {
         let selected = self.table_state.read(cx).delegate().selected_keys();
         let store = self.controller.store();
         let any_active = selected.iter().any(|key| {
-            store
-                .get(key)
-                .is_some_and(|row| matches!(row.state, TaskState::Downloading | TaskState::Pending))
+            store.get(key).is_some_and(|row| {
+                row.is_seeding() || matches!(row.state, TaskState::Downloading | TaskState::Pending)
+            })
         });
         let action = if any_active {
             ToolbarCommand::Pause
@@ -2015,13 +2113,23 @@ impl DownloadView {
     fn on_toggle_boost_selected(
         &mut self,
         _: &ToggleBoostSelected,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let selected = self.table_state.read(cx).delegate().selected_keys();
         let Some(key) = selected.iter().find(|key| key.is_local()) else {
             return;
         };
+        // 只有未结束的任务能优先下载：已完成 / 失败直接提示，不下发命令。
+        let ended_notice = match self.controller.store().get(key).map(|row| row.state) {
+            Some(TaskState::Completed) => Some(self.strings.boost_task_completed.clone()),
+            Some(TaskState::Failed) => Some(self.strings.boost_task_ended.clone()),
+            _ => None,
+        };
+        if let Some(notice) = ended_notice {
+            window.push_notification(Notification::warning(notice), cx);
+            return;
+        }
         self.execute_commands(
             vec![DownloadsCommand::ToggleBoost {
                 task_id: key.task_id().to_owned(),
@@ -2123,6 +2231,10 @@ impl DownloadView {
             PageCommand::PauseAll => self.execute_toolbar(ToolbarCommand::PauseAll, cx),
             PageCommand::ResumeAll => self.execute_toolbar(ToolbarCommand::ResumeAll, cx),
             PageCommand::ClearFinished => {
+                // 任务表分页载入期间「已完成」范围不完整，不能据占位表清理。
+                if self.controller.tables_loading() {
+                    return;
+                }
                 let commands: Vec<DownloadsCommand> = self
                     .controller
                     .store()
@@ -2140,9 +2252,12 @@ impl DownloadView {
                 table.delegate_mut().select_all_tasks();
                 cx.notify();
             }),
-            PageCommand::FocusSearch => self
-                .search_input
-                .update(cx, |input, cx| input.focus(window, cx)),
+            PageCommand::FocusSearch => {
+                self.search_revealed = true;
+                self.search_input
+                    .update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+            }
             PageCommand::CycleDensity => self.mutate_prefs(ViewPrefs::cycle_density, cx),
             PageCommand::CycleGroupBy => self.mutate_prefs(ViewPrefs::cycle_group_by, cx),
             PageCommand::CycleSort => self.mutate_prefs(ViewPrefs::cycle_sort, cx),
@@ -2262,6 +2377,11 @@ impl DownloadView {
     }
 
     fn render_detail_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let group_overview = self
+            .detail_group
+            .as_deref()
+            .and_then(|group_id| self.render_group_overview(group_id, cx));
+        let showing_group = group_overview.is_some();
         let theme = fluxdown_ui_theme::active_theme(cx);
         let tokens = theme.tokens().clone();
         let icon_size = theme.extended().icon.md;
@@ -2353,8 +2473,11 @@ impl DownloadView {
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .when_some(self.detail.clone(), |this, detail| this.child(detail))
-                    .when(self.detail.is_none(), |this| {
+                    .when_some(group_overview, |this, overview| this.child(overview))
+                    .when(!showing_group, |this| {
+                        this.when_some(self.detail.clone(), |this, detail| this.child(detail))
+                    })
+                    .when(!showing_group && self.detail.is_none(), |this| {
                         this.child(
                             v_flex()
                                 .size_full()

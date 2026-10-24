@@ -3,7 +3,7 @@ title: 插件 API 参考
 description: 全部入口函数、flux.* 接口、JavaScript 运行环境、运行时限制，以及插件会遇到的错误信息。
 section: plugins
 order: 11
-sourceHash: "485aa6e33714"
+sourceHash: "d901816ec8e5"
 ---
 
 本页列出插件脚本能看到的一切：FluxDown 会调用的入口函数、注入的 `flux` 对象、JavaScript 运行环境、运行时限制，以及开发中会遇到的错误信息。这是一份参考手册；分步教程请看[你的第一个插件](/docs/zh/plugins/your-first-plugin/)、[TypeScript 项目](/docs/zh/plugins/typescript-project/)、[事件钩子指南](/docs/zh/plugins/hooks-guide/)、[账号登录指南](/docs/zh/plugins/auth-guide/)、[订阅源指南](/docs/zh/plugins/subscription-guide/)、[可移植界面指南](/docs/zh/plugins/ui-guide/)和[桌面原生界面指南](/docs/zh/plugins/desktop-ui-guide/)。
@@ -70,7 +70,7 @@ sourceHash: "485aa6e33714"
 | `fileName` | string | 覆盖保存的文件名；为空时忽略。 |
 | `totalBytes` | integer | 文件大小（字节）。**仅当 `ephemeral` 为 `true` 时**才被采用，作为跳过探测后的大小提示（未知或 `0` 视为「未知」）。其他情况下被忽略：FluxDown 会自己探测真实大小。被选中变体的 `totalBytes` 会先覆盖这个字段。 |
 | `extraHeaders` | object | 下载解析后链接时要发送的请求头，会替换任务原本捕获的请求头。 |
-| `request` | object | 应用于任务本次运行的 [`RequestPatch`](/docs/zh/plugins/interceptors-guide/#requestpatch)，规则与 `prepare` 阶段相同（同主机 `url`、请求头、Cookie、User-Agent、`segments` 等）。非法补丁会让任务失败，错误为 `[插件] <identity>: <消息>`。每次运行都会应用，不会存库。同时返回 `extraHeaders` 与 `request` 时，先由 `extraHeaders` 替换请求头表，再叠加 `request`。 |
+| `request` | object | 应用于任务本次运行的 [`RequestPatch`](/docs/zh/plugins/interceptors-guide/#requestpatch)，规则与 `prepare` 阶段相同（同主机 `url`、请求头、Cookie、User-Agent、`segments`，以及用于拒绝大 `Range` 区间的直链的 `maxRangeBytes` 等）。非法补丁会让任务失败，错误为 `[插件] <identity>: <消息>`。每次运行都会应用，不会存库。同时返回 `extraHeaders` 与 `request` 时，先由 `extraHeaders` 替换请求头表，再叠加 `request`。 |
 | `ephemeral` | boolean | `true` 表示链接是一次性 / 防盗链的：跳过元数据探测（代价是续传完整性校验变弱）。默认 `false`：正常探测并保留基于 ETag 的续传校验。 |
 | `rangeSupported` | boolean | `true` 表示你保证解析后的主机支持 HTTP Range 请求（例如 googlevideo）。与 `ephemeral` 同时使用时，FluxDown 仍然跳过探测，但会立即规划完整的多段下载，而不是保守的单流起步。默认 `false`：没有探测时，Range 能力由首个响应判断。 |
 | `variants` | array | 多个画质 / 格式选项，见[变体](#变体variants)。 |
@@ -317,6 +317,7 @@ HTTP 客户端。`opts`：
 |---|---|
 | 协议 | 仅 `http` / `https` |
 | 目标地址 | 仅限公网可路由地址。环回、局域网、链路本地、CGNAT、文档 / 基准测试地址段和云元数据 IP 都被拦截——对字面量 URL、DNS 解析结果（因此能防 DNS rebinding）以及每一跳重定向都会检查。用户在应用里配置了代理时，DNS 由代理解析，只有字面量 IP 与重定向检查生效。 |
+| 开发模式例外 | 通过「从目录安装（开发模式）」加载的插件不受上述公网限制，可访问 `localhost`、局域网等地址（直连，不走全局代理），便于连接本机服务联调；正式安装的插件行为不变。 |
 | 响应体上限 | 8 MB，超出截断 |
 | 单请求超时 | 10 秒 |
 | 并发请求 | 8，所有插件共享 |
@@ -555,10 +556,10 @@ globalThis.resolve = async (ctx) => {
 | `flux.ui.h(kind, props, ...children)` / `flux.ui.Fragment` | 构建 `{k, p, c}` 节点（子节点会被展平，`null` / `false` / `true` 被丢弃）。通过 [SDK](/docs/zh/plugins/sdk/#jsx) 使用 JSX 会产生同样的形状。 |
 | `flux.ui.toast(level, text)` | `info`、`success`、`warning` 或 `error`（其他值按 `info` 显示）。 |
 | `flux.commands.register(id, handler)` | 处理器收到 `{ taskIds }`。 |
-| `flux.rpc.handle(name, handler)` | 你自己的桌面视图可通过 `fluxdown.invoke(name, args)` 调用。 |
+| `flux.rpc.handle(name, handler, opts?)` | `handler(args, ctx)`。你自己的桌面视图可通过 `fluxdown.invoke(name, args)` 调用，此时 `ctx` 为 `{ caller: "desktop" }`。把 `{ page: true }` 作为 `opts` 传入，还会向你的[页面脚本](/docs/zh/plugins/page-scripts-guide/)暴露该处理函数：页面脚本用 `fluxdown.invoke(name, args)` 调用，`ctx` 为 `{ caller: "page", pageUrl }`。没有带 `page: true` 注册的处理函数会在页面调用时被拒绝，错误为 `rpc not exposed to page: <name>`。`pageUrl` 与 `args` 都来自网页，请当作不可信输入。只接收 `args` 的旧处理函数照常工作。 |
 | `flux.events.on(name, handler)` | `name` 是钩子名（`onStart`、`onDone`、`onError`、`onMetaProbed`、`onCancel`），必须列在 `main.events` 中。这类投递**不受** `hooks.match.urls` 过滤。处理器抛异常会被记录并跳过。之后已打开的视图会重新渲染。 |
 | `flux.timers.setTimeout(fn, ms)` / `setInterval(fn, ms)` / `clear(id)` | 最多 64 个存活的定时器（`too many timers (max 64)`）。有视图会话打开时，间隔被限制为 ≥ 1 秒，否则 ≥ 60 秒。它们**不是**全局的 `setTimeout` / `setInterval`。 |
-| `flux.tasks.list()` / `get(id)` / `create(params)` / `pause(id)` / `resume(id)` / `remove(id, deleteFiles?)` | 需要权限 `tasks`。它们调用 daemon 的 `daemon.task.list` / `get` / `create` / `pause` / `resume` / `delete`，参数和结果与 [RPC API](/docs/zh/api/overview/) 相同（`create` 接受 `{ request: { url, … } }`；`get` / `pause` / `resume` / `remove` 接受任务 id 字符串）。只能调用这六个方法。`create` 限制为**每个插件每 60 秒 20 次**（`tasks.create rate limited`）。每次调用都会写入审计日志。 |
+| `flux.tasks.list()` / `get(id)` / `create(params)` / `pause(id)` / `resume(id)` / `remove(id, deleteFiles?)` | 需要权限 `tasks`。它们调用 daemon 的 `daemon.task.list` / `get` / `create` / `pause` / `resume` / `delete`，参数和结果与 [RPC API](/docs/zh/api/overview/) 相同（`create` 接受 `{ request: { url, … } }`；`get` / `pause` / `resume` / `remove` 接受任务 id 字符串）。`list()` 无参返回全部任务，任务数超过 5000 时会被拒绝；此时传 `list({ cursor, limit })` 按 `taskId` 升序分页（`cursor` = 上一页最后一个 `taskId`，`limit` ≤ 5000，返回数不足 `limit` 即末页）。只能调用这六个方法。`create` 限制为**每个插件每 60 秒 20 次**（`tasks.create rate limited`）。每次调用都会写入审计日志。 |
 | `flux.settings.update({ key: "value" })` | 写入你自己插件的设置。**值必须是字符串**；会按 `manifest.settings` 校验，键或值不合法则 reject。 |
 | `flux.ffmpeg`、`flux.ffprobe`、`flux.ytdlp`、`flux.auth` | 见[矩阵](#各入口里有哪些-flux-接口)。`flux.ffmpeg.run` 在 `main` 里总是 reject（没有产物文件）。 |
 
@@ -585,7 +586,7 @@ globalThis.resolve = async (ctx) => {
 
 | 入口 | 墙钟 | CPU 预算 | 内存 |
 |---|---|---|---|
-| `resolve` | 默认 10 秒；`resolvers[0].timeoutMs` 会替换它，**硬上限 30 秒** | 同一数值，≤ 30 秒 | 64 MB |
+| `resolve` | 默认 10 秒；`resolvers[0].timeoutMs` 会替换它，**硬上限 30 秒** | 同一数值，≤ 30 秒 | 默认 64 MB；`resolvers[0].memoryLimitMb` 会替换它，上限 512 MB |
 | `subscribe` | 默认 10 秒；`subscriptions[0].timeoutMs` 会替换它，上限 30 秒 | 相同 | 64 MB |
 | `authenticate` | 默认 30 秒；`auth.timeoutMs` 会替换它，上限 30 秒 | 相同 | 64 MB |
 | 钩子 | 5 秒 | 5 秒 | 32 MB |

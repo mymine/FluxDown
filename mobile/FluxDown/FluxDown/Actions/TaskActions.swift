@@ -146,9 +146,15 @@ final class TaskActions {
         }
     }
 
-    /// 可重新下载：已完成 / 失败，且 url 不是 `torrent-file://` 哨兵（GPUI `redownload_commands` 同规则）。
+    /// 可重新下载：已完成 / 失败，且 url 不是 `torrent-file://` 哨兵（GPUI `redownload_commands` 同规则）；
+    /// store 构建不含 P2P，magnet / ed2k 任务也不可重新下载。
     func canRedownload(_ task: DownloadTask) -> Bool {
-        (task.status == .completed || task.status == .failed) && !task.url.hasPrefix("torrent-file://")
+        guard task.status == .completed || task.status == .failed, !task.url.hasPrefix("torrent-file://") else { return false }
+        #if FULL_FLAVOR
+        return true
+        #else
+        return !P2PLink.isP2P(task.url)
+        #endif
     }
 
     func confirmRedownload(_ task: DownloadTask) {

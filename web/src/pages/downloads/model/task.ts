@@ -49,6 +49,8 @@ export interface DownloadTaskView {
   downloadedBytes: number
   /** 字节/秒；未收到实时采样为 null。 */
   speed: number | null
+  /** 做种 / 下载中任务的上传速率（字节/秒）；未收到实时采样（或远程任务）为 null。 */
+  uploadSpeed: number | null
   runtime: TaskRuntimeDto | undefined
   /** daemon 连接就绪（快照未过期）。 */
   runtimeConnected: boolean
@@ -77,10 +79,12 @@ export interface DownloadTaskView {
   preparing: boolean
   /** 队列内插入序（每队列 MAX+1，用来打破同一秒批量添加的平局）；远程任务为 0。 */
   queueOrder: number
-  /** 引擎队列位置（1-based；0 = 未知 / 不在队列）。 */
-  queuePosition: number
+  /** 引擎队列排序键（升序即启动顺序，任务在队列期间不变）；null = 不在队列。排序用它，序号按键的名次求得。 */
+  queueKey: number | null
   /** 大小写折叠后的名称，自然序比较用（建行时预计算，比较器内不分配）。 */
   nameFold: string
+  /** 搜索用的小写「名称 / url / 站点」拼接；'' = 尚未计算（首次搜索时惰性填入，之后每次搜索只做一次 `includes`）。 */
+  searchFold: string
   /** 远程任务目标设备 id（本地任务为空）。 */
   toDevice: string
   /** 远程任务的云端状态（云端命令是否可用的门控依据）；本地任务为 null。 */
@@ -138,6 +142,35 @@ export function stateOfStatus(status: number): TaskState {
   }
 }
 
+/** 做种相关判定所需的视图字段。 */
+type SeedingFacts = Pick<DownloadTaskView, 'source' | 'state' | 'seedingStatus' | 'fileMissing'>
+
+/** 本地已完成任务正在做种或排队等做种槽（seeding_status 1 / 8）；归入「做种中」文件夹，可暂停。 */
+export function isSeeding(view: Pick<SeedingFacts, 'source' | 'state' | 'seedingStatus'>): boolean {
+  return view.source === 'local' && view.state === 'completed' && (view.seedingStatus === 1 || view.seedingStatus === 8)
+}
+
+/** 「暂停」适用：下载中 / 排队 / 做种中，以及本地失败任务（撤销等待中的自动重试，#947）。 */
+export function canPause(view: Pick<SeedingFacts, 'source' | 'state' | 'seedingStatus'>): boolean {
+  return (
+    view.state === 'downloading' ||
+    view.state === 'pending' ||
+    isSeeding(view) ||
+    (view.source === 'local' && view.state === 'failed')
+  )
+}
+
+/** 本地已完成任务因停止原因（seeding_status 2..=7）未在做种且文件仍在：可恢复做种。其余完成态任务不可继续（#935）。 */
+export function canResumeSeeding(view: SeedingFacts): boolean {
+  return (
+    view.source === 'local' &&
+    view.state === 'completed' &&
+    view.seedingStatus >= 2 &&
+    view.seedingStatus <= 7 &&
+    !view.fileMissing
+  )
+}
+
 const REMOTE_STATUS: Record<RemoteTaskDto['status'], number> = {
   pending: 0,
   accepted: 0,
@@ -174,9 +207,10 @@ export function buildLocalView(
   task: TaskDto,
   speed: number | null,
   boosted: boolean,
-  queuePosition: number,
+  queueKey: number | null,
   runtime: TaskRuntimeDto | undefined,
   runtimeConnected: boolean,
+  uploadSpeed: number | null = null,
 ): DownloadTaskView {
   const live = speed === null ? null : Math.max(0, speed)
   const base = compute(task.fileName, task.totalBytes, task.downloadedBytes, live)
@@ -189,6 +223,7 @@ export function buildLocalView(
     sizeBytes: base.sizeBytes,
     downloadedBytes: base.downloaded,
     speed: live,
+    uploadSpeed: uploadSpeed === null ? null : Math.max(0, uploadSpeed),
     runtime,
     runtimeConnected,
     etaSeconds: base.etaSeconds,
@@ -212,8 +247,9 @@ export function buildLocalView(
     boosted,
     preparing: task.status === 5,
     queueOrder: task.queueOrder,
-    queuePosition,
+    queueKey,
     nameFold: task.fileName.toLowerCase(),
+    searchFold: '',
     toDevice: '',
     remoteStatus: null,
     dto: task,
@@ -232,6 +268,7 @@ export function buildRemoteView(task: RemoteTaskDto): DownloadTaskView {
     sizeBytes: base.sizeBytes,
     downloadedBytes: base.downloaded,
     speed,
+    uploadSpeed: null,
     runtime: undefined,
     runtimeConnected: false,
     etaSeconds: base.etaSeconds,
@@ -255,8 +292,9 @@ export function buildRemoteView(task: RemoteTaskDto): DownloadTaskView {
     boosted: false,
     preparing: false,
     queueOrder: 0,
-    queuePosition: 0,
+    queueKey: null,
     nameFold: task.fileName.toLowerCase(),
+    searchFold: '',
     toDevice: task.toDevice,
     remoteStatus: task.status,
     dto: undefined,

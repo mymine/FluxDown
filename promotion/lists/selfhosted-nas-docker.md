@@ -158,7 +158,7 @@ source_code_url: https://github.com/zerx-lab/FluxDown
 
 `stargazers_count` / `updated_at` / `archived` / `current_release` / `commit_history` 由 `make update_metadata` 自动写入，**投稿时一律不要写**。同时删除所有注释与未使用的可选字段（PR 模板第 6 条）。
 
-`demo_url` 为可选字段。当前 headless 的演示模式由 agent 的 `FLUXDOWN_DEMO` / `FLUXDOWN_DEMO_URL` 配置（见 `.omp/knowledge/hosts-and-api.md`），不再以冻结的 `native/server` 为部署入口。若上线 demo，提交前按当前实例核实可交互性及所需凭据；**不上 demo 不影响准入。**
+`demo_url` 为可选字段。当前 headless 的演示模式由 agent 的 `FLUXDOWN_DEMO` / `FLUXDOWN_DEMO_URL` 配置（见 `.omp/knowledge/hosts-and-api.md`）。若上线 demo，提交前按当前实例核实可交互性及所需凭据；**不上 demo 不影响准入。**
 
 ### CONTRIBUTING 的硬性要求（逐条核对）
 

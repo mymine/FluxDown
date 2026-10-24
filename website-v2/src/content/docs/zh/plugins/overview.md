@@ -3,7 +3,7 @@ title: 插件系统概览
 description: FluxDown 插件能做什么、如何选择开发路线（纯 JavaScript 或 TypeScript SDK）、怎么运行、怎么安装，以及各客户端的支持情况。
 section: plugins
 order: 1
-sourceHash: "469c2260b730"
+sourceHash: "e0f5863c44ef"
 ---
 
 FluxDown 插件是一个文件夹（或这个文件夹打成的 `.fxplug` zip 包），里面有一份 `manifest.json` 和若干 JavaScript 文件。manifest 声明插件贡献了什么，脚本则由 FluxDown 在后台服务的沙箱里，于合适的时机调用。
@@ -31,6 +31,7 @@ FluxDown 插件是一个文件夹（或这个文件夹打成的 `.fxplug` zip �
 | **可移植界面**——页面、设置页签、任务详情页签、命令、定时器；同一份代码在桌面端和 Web 端都能渲染 | `main`、`contributes.views`、`contributes.commands`、`settings` | 管理任务用 `tasks`，常驻用 `background` | [可移植界面指南](/docs/zh/plugins/ui-guide/) | [视图](/docs/zh/plugins/views/) |
 | **桌面原生界面**——拥有完整桌面权限的 GPUI 脚本 | `contributes.views[].desktop` | `desktop` | [桌面原生界面指南](/docs/zh/plugins/desktop-ui-guide/) | [视图](/docs/zh/plugins/views/) |
 | **浏览器嗅探规则** | `contributes.sniffRules` | `browserRules` | [Manifest 参考](/docs/zh/plugins/manifest/) | [Manifest 参考](/docs/zh/plugins/manifest/) |
+| **浏览器页面脚本**——通过浏览器扩展在列出的网站中运行你的 JavaScript，并与插件互通 | `contributes.pageScripts` | `pageScripts` | [页面脚本](/docs/zh/plugins/page-scripts-guide/) | [Manifest 参考](/docs/zh/plugins/manifest/#pagescripts) |
 | **插件设置表单** | `settings` | 无 | [写第一个插件](/docs/zh/plugins/your-first-plugin/#6-添加设置项可选) | [Manifest 参考](/docs/zh/plugins/manifest/) |
 
 基础沙箱**不能**创建任务、不能读取任意文件，只能通过 `flux.*` 接口与外界交互（HTTP 请求、键值存储、临时文件、日志、请求重试）。超出这些的能力都是权限：由插件声明、用户批准，并记入审计日志，见[权限](/docs/zh/plugins/permissions/)。
@@ -147,6 +148,6 @@ hooks 是发出即不管的通知：
 
 1. [写第一个插件](/docs/zh/plugins/your-first-plugin/)——用纯 JavaScript 写出能跑的 resolver。
 2. [TypeScript 项目](/docs/zh/plugins/typescript-project/)——用 SDK 写 resolver、hook、视图和设置，直到打出 `.fxplug`。
-3. 指南：[事件钩子](/docs/zh/plugins/hooks-guide/)、[拦截器](/docs/zh/plugins/interceptors-guide/)、[账号登录与认证](/docs/zh/plugins/auth-guide/)、[订阅源](/docs/zh/plugins/subscription-guide/)、[可移植界面](/docs/zh/plugins/ui-guide/)、[桌面原生界面](/docs/zh/plugins/desktop-ui-guide/)。
+3. 指南：[事件钩子](/docs/zh/plugins/hooks-guide/)、[拦截器](/docs/zh/plugins/interceptors-guide/)、[页面脚本](/docs/zh/plugins/page-scripts-guide/)、[账号登录与认证](/docs/zh/plugins/auth-guide/)、[订阅源](/docs/zh/plugins/subscription-guide/)、[可移植界面](/docs/zh/plugins/ui-guide/)、[桌面原生界面](/docs/zh/plugins/desktop-ui-guide/)。
 4. [调试与排错](/docs/zh/plugins/debugging/)——日志、重新加载语义、报错信息与解决办法。
 5. 参考：[Manifest](/docs/zh/plugins/manifest/)、[API](/docs/zh/plugins/api-reference/)、[视图](/docs/zh/plugins/views/)、[SDK 与 CLI](/docs/zh/plugins/sdk/)、[权限](/docs/zh/plugins/permissions/)、[打包与市场](/docs/zh/plugins/packaging/)。

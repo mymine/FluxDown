@@ -1,19 +1,23 @@
 // 侧栏选中项与状态筛选（移植 crates/downloads/src/model/mod.rs）。
 
 import type { CategoryIndex } from './categories'
+import { isSeeding } from './task'
 import type { DownloadTaskView, TaskState } from './task'
 
-export type DownloadStatusFilter = 'all' | 'completed' | 'incomplete' | 'failed' | 'paused'
+export type DownloadStatusFilter = 'all' | 'completed' | 'seeding' | 'incomplete' | 'failed' | 'paused'
 
-/** 侧栏状态文件夹顺序。 */
-export const STATUS_FILTERS: readonly DownloadStatusFilter[] = ['all', 'incomplete', 'completed', 'failed', 'paused']
+/** 侧栏状态文件夹顺序（「做种中」紧随「已完成」）。 */
+export const STATUS_FILTERS: readonly DownloadStatusFilter[] = ['all', 'incomplete', 'completed', 'seeding', 'failed', 'paused']
 
-export function statusMatches(filter: DownloadStatusFilter, state: TaskState): boolean {
+/** `seeding` = 任务是否处于做种中（{@link isSeeding}）；做种任务同时属于「已完成」。 */
+export function statusMatches(filter: DownloadStatusFilter, state: TaskState, seeding: boolean): boolean {
   switch (filter) {
     case 'all':
       return true
     case 'completed':
       return state === 'completed'
+    case 'seeding':
+      return seeding
     // 下载中筛选包含下载中与等待中的任务。
     case 'incomplete':
       return state === 'downloading' || state === 'pending'
@@ -34,7 +38,8 @@ export const FILTER_ALL: DownloadFilter = { status: 'all', category: null }
 
 export function filterMatches(filter: DownloadFilter, view: DownloadTaskView, categories: CategoryIndex): boolean {
   return (
-    statusMatches(filter.status, view.state) && (filter.category === null || categories.matches(filter.category, view))
+    statusMatches(filter.status, view.state, isSeeding(view)) &&
+    (filter.category === null || categories.matches(filter.category, view))
   )
 }
 
@@ -48,6 +53,24 @@ export type SidebarSelection =
   | { kind: 'device'; deviceId: string }
 
 export const SELECTION_ALL: SidebarSelection = { kind: 'download', filter: FILTER_ALL }
+
+/** 视图是否属于侧栏当前选中项（筛选 + 分类 / 队列 / 设备）。 */
+export function selectionMatches(selection: SidebarSelection, view: DownloadTaskView, categories: CategoryIndex): boolean {
+  switch (selection.kind) {
+    case 'download':
+      return filterMatches(selection.filter, view, categories)
+    case 'queue':
+      return view.source === 'local' && view.queueId === selection.queueId
+    case 'device':
+      if (selection.deviceId === LOCAL_DEVICE) return view.source === 'local'
+      return view.source === 'remote' && view.toDevice === selection.deviceId
+  }
+}
+
+/** 选中项不筛掉任何任务（「全部」且不限分类）。 */
+export function selectsEverything(selection: SidebarSelection): boolean {
+  return selection.kind === 'download' && selection.filter.status === 'all' && selection.filter.category === null
+}
 
 export function sameSelection(a: SidebarSelection, b: SidebarSelection): boolean {
   if (a.kind !== b.kind) return false

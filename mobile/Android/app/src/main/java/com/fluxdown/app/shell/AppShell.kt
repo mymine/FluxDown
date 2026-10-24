@@ -405,7 +405,7 @@ private fun Sheets() {
     MoveToQueueSheet(route = sheet as? SheetRoute.MoveToQueue, onDismiss = nav::closeSheet)
     ViewOptionsSheet(visible = sheet == SheetRoute.ViewOptions, onDismiss = nav::closeSheet)
     HostSwitchSheet(visible = sheet == SheetRoute.HostSwitch, onDismiss = nav::closeSheet)
-    AddHostSheet(visible = sheet == SheetRoute.AddHost, onDismiss = nav::closeSheet)
+    AddHostSheet(route = sheet as? SheetRoute.AddHost, onDismiss = nav::closeSheet)
     AddDeviceSheet(visible = sheet == SheetRoute.AddDevice, onDismiss = nav::closeSheet)
     ActivitySheet(visible = sheet == SheetRoute.Activity, onDismiss = nav::closeSheet)
     val rss = sheet as? SheetRoute.RssEditor
@@ -476,12 +476,9 @@ private fun BoxScope.BottomChrome(failed: Boolean, orb: FluxOrbState) {
             items = dockItems(failed, tabs),
             selected = tabs.indexOf(nav.tab),
             onSelect = { nav.selectTab(tabs[it]) },
-            mini = nav.dockMini && !nav.selecting && nav.sheet == null,
-            onExpand = { nav.dockMini = false },
             hidden = hidden,
             selectionMode = nav.selecting,
             contentDescription = str(R.string.mobileMainNav),
-            expandDescription = str(R.string.mobileExpandNav),
         )
         DownloadsSelectionDock(Modifier.fillMaxWidth())
         if (!hidden) {
@@ -508,7 +505,6 @@ private fun BoxScope.BottomChrome(failed: Boolean, orb: FluxOrbState) {
                 },
                 modifier = Modifier.align(Alignment.CenterEnd),
                 selectionMode = nav.selecting,
-                mini = nav.dockMini && !nav.selecting,
                 contentDescription = str(if (rssTab) R.string.rssAddSource else R.string.newDownload),
                 exitDescription = str(R.string.mobileExitSelection),
             )

@@ -199,6 +199,37 @@ pub struct PluginInvokeParams {
     pub args: Value,
 }
 
+/// `daemon.plugin.pageInvoke` 参数：浏览器页面脚本经扩展 / agent 调用本插件处理器。
+/// 处理器须以 `flux.rpc.handle(name, fn, { page: true })` 注册，收到的第二个参数为
+/// `{ caller: "page", pageUrl }`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PluginPageInvokeParams {
+    pub identity: String,
+    pub name: String,
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub args: Value,
+    /// 发起调用的页面地址（扩展取自消息发送方，不信任脚本自报）。
+    pub page_url: String,
+}
+
+/// `daemon.plugin.pageInvoke` 结果：处理器返回值，以及本次调用期间插件经 `flux.tasks.create` /
+/// `flux.tasks.resume` 开始的任务。agent 据后两者把用户在浏览器里的操作登记为「用户开始」
+/// （与免打扰捕获同一套进度 / 完成窗口规则），扩展只收到 `value`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PluginPageInvokeResultDto {
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub value: Value,
+    #[serde(default)]
+    pub created_task_ids: Vec<String>,
+    #[serde(default)]
+    pub resumed_task_ids: Vec<String>,
+}
+
 /// 视图协议错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewError {

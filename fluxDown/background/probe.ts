@@ -1,7 +1,7 @@
 /**
  * 页面探测的存活检测与恢复。
  *
- * sensor 是声明式内容脚本：Chrome 在扩展安装 / 更新 / 重载后不会给已打开的页面补注入，旧实例的
+ * sensor 是声明式内容脚本：浏览器在扩展安装 / 更新 / 重载后不会给已打开的页面补注入，旧实例的
  * 扩展上下文失效后整页只剩 webRequest 嗅探，所有候选都失去元素证据（「未关联」、标题错位）。
  *
  * 检测：sensor 每次拉配置都登记会话 sid（tab-state）。顶层帧没有会话的 http(s) 页面加载完成后，
@@ -79,24 +79,15 @@ async function ping(tabId: number): Promise<ProbeReply | null> {
 }
 
 /**
- * 补注入：Chrome 先注入 MAIN 钩子（已有任何版本的钩子时它自己放弃安装），再注入 sensor；
- * Firefox（MV2，无 world: MAIN）只注入 sensor，由它照常注入页面钩子。页内面板（悬浮球）只在
- * 顶层帧，它失败不影响探测恢复。
+ * 补注入：先注入 MAIN 钩子（已有任何版本的钩子时它自己放弃安装），再注入 sensor，最后注入页内面板
+ * （悬浮球，只在顶层帧；它失败不影响探测恢复）。Chrome 与 Firefox（MV3）同用 scripting.executeScript。
  */
 async function inject(tabId: number): Promise<void> {
-  const scripting = browser.scripting;
-  if (scripting?.executeScript) {
-    const target = { tabId, allFrames: true };
-    await scripting.executeScript({ target, files: [HOOKS_FILE], world: "MAIN", injectImmediately: true });
-    await scripting.executeScript({ target, files: [SENSOR_FILE], injectImmediately: true });
-    await scripting
-      .executeScript({ target: { tabId, frameIds: [0] }, files: [PANEL_FILE] })
-      .catch((e) => console.warn("[FluxDown] panel reinjection failed:", e));
-    return;
-  }
-  await browser.tabs.executeScript(tabId, { file: SENSOR_FILE, allFrames: true, matchAboutBlank: true });
-  await browser.tabs
-    .executeScript(tabId, { file: PANEL_FILE })
+  const target = { tabId, allFrames: true };
+  await browser.scripting.executeScript({ target, files: [HOOKS_FILE], world: "MAIN", injectImmediately: true });
+  await browser.scripting.executeScript({ target, files: [SENSOR_FILE], injectImmediately: true });
+  await browser.scripting
+    .executeScript({ target: { tabId, frameIds: [0] }, files: [PANEL_FILE] })
     .catch((e) => console.warn("[FluxDown] panel reinjection failed:", e));
 }
 
@@ -156,17 +147,26 @@ export async function probeTab(tabId: number): Promise<void> {
   }
 }
 
+/** 恢复各窗口的当前页；其余页面在被激活、产生媒体请求或打开面板时按需恢复。 */
+function recoverActiveTabs(): void {
+  browser.tabs
+    .query({ active: true })
+    .then((tabs) => {
+      for (const tab of tabs) if (tab.id !== undefined) scheduleProbeCheck(tab.id, 0);
+    })
+    .catch((e) => console.warn("[FluxDown] probe tabs query failed:", e));
+}
+
 /** 同步注册触发点；由 startBackground 调用一次。 */
 export function installProbe(): void {
-  // 扩展安装 / 更新 / 重载：已打开的页面里没有本版本的 sensor。先恢复各窗口的当前页，
-  // 其余页面在被激活、产生媒体请求或打开面板时按需恢复。
-  browser.runtime.onInstalled.addListener(() => {
-    browser.tabs
-      .query({ active: true })
-      .then((tabs) => {
-        for (const tab of tabs) if (tab.id !== undefined) scheduleProbeCheck(tab.id, 0);
-      })
-      .catch((e) => console.warn("[FluxDown] probe tabs query failed:", e));
+  // 扩展安装 / 更新 / 重载：已打开的页面里没有本版本的 sensor。
+  browser.runtime.onInstalled.addListener(recoverActiveTabs);
+  // Firefox MV3 的全站访问权限可被用户撤销后再授予：授予前补注入被拒、记为 unavailable 的页面
+  // 需要重新检查（声明式内容脚本只对之后加载的文档生效）。
+  browser.permissions?.onAdded?.addListener((permissions) => {
+    if (!permissions.origins?.includes("<all_urls>")) return;
+    for (const [tabId, outcome] of outcomes) if (outcome === "unavailable") outcomes.delete(tabId);
+    recoverActiveTabs();
   });
   browser.tabs.onActivated.addListener(({ tabId }) => scheduleProbeCheck(tabId));
   browser.tabs.onUpdated.addListener((tabId, changeInfo) => {

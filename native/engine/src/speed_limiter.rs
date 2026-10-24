@@ -28,6 +28,8 @@ struct Inner {
     limit_bps: AtomicU64,
     /// Available tokens (bytes that may be consumed immediately).
     tokens: AtomicU64,
+    /// `consume` 进入令牌等待的累计次数（见 [`SpeedLimiter::throttle_waits`]）。
+    throttle_waits: AtomicU64,
     /// Notify waiters when tokens are replenished.
     notify: Notify,
     /// Notify the refill task to wake from its idle sleep when the limit
@@ -54,6 +56,7 @@ impl SpeedLimiter {
                 limit_bps: AtomicU64::new(limit_bps),
                 tokens: AtomicU64::new(0),
                 notify: Notify::new(),
+                throttle_waits: AtomicU64::new(0),
                 refill_wake: Arc::new(Notify::new()),
             }),
         }
@@ -70,9 +73,16 @@ impl SpeedLimiter {
     }
 
     /// Current configured limit (bytes/sec).  0 = unlimited.
-    #[allow(dead_code)]
     pub fn limit(&self) -> u64 {
         self.inner.limit_bps.load(Ordering::Relaxed)
+    }
+
+    /// 自创建以来 `consume` 因令牌耗尽而进入等待的累计次数（单调递增，
+    /// 零分配）。调用方取两次读数的差值即可得知窗口内限速器是否真正在节流：
+    /// 限速值高于链路速率时令牌恒有余量，计数不增长。限速器为全局共享桶，
+    /// 计数含其它任务的等待（共享同一瓶颈，对本任务同样是节流）。
+    pub fn throttle_waits(&self) -> u64 {
+        self.inner.throttle_waits.load(Ordering::Relaxed)
     }
 
     /// Consume up to `requested` bytes worth of tokens.
@@ -112,7 +122,9 @@ impl SpeedLimiter {
                 }
             }
 
-            // No tokens available — wait for the refill task to notify us.
+            // No tokens available — 记一次节流等待（coordinator 按窗口读取增量，
+            // 判定该窗口是否被限速器节流），随后等待 refill task 通知。
+            self.inner.throttle_waits.fetch_add(1, Ordering::Relaxed);
             // Bounded wait guards against the rare TOCTOU race where
             // notify_waiters() fires between our tokens.load() returning 0
             // and the notified().await registration: since notify_waiters()
@@ -292,6 +304,27 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await; // wait for refill tick
         let got = limiter.consume(500_000).await;
         assert_eq!(got, 500_000, "should be unlimited again");
+    }
+
+    /// 令牌有余量时不计节流等待；只有桶被抽干、连接真的要等令牌才递增——
+    /// coordinator 据此区分「限速值高于链路速率」与「限速器饱和」。
+    #[tokio::test]
+    async fn throttle_waits_only_count_real_token_waits() {
+        let limiter = SpeedLimiter::new(1_000_000);
+        limiter.spawn_refill_task();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let got = limiter.consume(1_000).await;
+        assert_eq!(got, 1_000);
+        assert_eq!(limiter.throttle_waits(), 0, "令牌有余量不应计等待");
+
+        for _ in 0..20 {
+            limiter.consume(10_000_000).await;
+            if limiter.throttle_waits() > 0 {
+                break;
+            }
+        }
+        assert!(limiter.throttle_waits() > 0, "抽干令牌桶后必须计入等待");
     }
 
     #[tokio::test]

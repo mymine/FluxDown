@@ -4,10 +4,10 @@ import type { JsonValue, ServiceRole } from './common';
 import type { RpcErrorObject } from './error';
 
 export const JSONRPC_VERSION = '2.0';
-/** 当前协议版本；v4 增加 ShellChanged / PowerChanged，v5 增加 CaptureTasksStarted，v6 增加错误 reason 扩展、远程任务/局域网互联新参数与事件，v7 增加 CloudConnectionChanged，v8 增加应用内更新（UpdateStatusDto / UpdateChanged / agent.update.*），v9 增加「文件已存在」交互选择（SelectionKind::FileExists / SelectionOutcome::FileExists）与 `file_exists_behavior = ask`，v10 增加云端推送（TaskNotice / CloudNotifyChanged / AgentSnapshot.cloudNotify / agent.cloudNotify.*），v11 增加批量建任务（`daemon.task.createMany`）与批量任务事实事件（`tasksChanged`），v12 增加批量删除事实事件（`tasksDeleted`），v13 增加插件可移植视图事件（`pluginViewFrame` / `pluginViewClosed` / `pluginToast`），v14 增加「多插件择一」交互选择（SelectionKind::Plugin / SelectionOutcome::Plugin）与站点默认插件 RPC（`daemon.plugin.siteDefaults` / `daemon.plugin.setSiteDefault`）。 */
-export const PROTOCOL_VERSION = 14;
-/** 服务端拒绝低于此版本的客户端，握手时不兼容即断开；v14 起选择请求含 `plugin` 种类，旧客户端无法回答（任务会卡在择一等待）。 */
-export const MIN_PROTOCOL_VERSION = 14;
+/** 当前协议版本；v4 增加 ShellChanged / PowerChanged，v5 增加 CaptureTasksStarted，v6 增加错误 reason 扩展、远程任务/局域网互联新参数与事件，v7 增加 CloudConnectionChanged，v8 增加应用内更新（UpdateStatusDto / UpdateChanged / agent.update.*），v9 增加「文件已存在」交互选择（SelectionKind::FileExists / SelectionOutcome::FileExists）与 `file_exists_behavior = ask`，v10 增加云端推送（TaskNotice / CloudNotifyChanged / AgentSnapshot.cloudNotify / agent.cloudNotify.*），v11 增加批量建任务（`daemon.task.createMany`）与批量任务事实事件（`tasksChanged`），v12 增加批量删除事实事件（`tasksDeleted`），v13 增加插件可移植视图事件（`pluginViewFrame` / `pluginViewClosed` / `pluginToast`），v14 增加「多插件择一」交互选择（SelectionKind::Plugin / SelectionOutcome::Plugin）与站点默认插件 RPC（`daemon.plugin.siteDefaults` / `daemon.plugin.setSiteDefault`），v15 增加队列顺序增量（`queueOrderChanged`、`QueuePositionDto.order`）与落后订阅者的帧合并（`EventFrame.previous`，按 cursor.ts 的 judgeFrame 判定），v16 增加外部恢复任务通知（`captureTasksResumed`），v17 取消全量任务单帧（`DaemonSnapshot.taskTotal` / `queueTotal`、`tablesReloading`、`system.taskPage` 分页载入）。 */
+export const PROTOCOL_VERSION = 17;
+/** 服务端拒绝低于此版本的客户端，握手时不兼容即断开；v17 快照不再内嵌任务表，旧客户端会把空表当成完整列表。 */
+export const MIN_PROTOCOL_VERSION = 17;
 /** 服务因 `system.shutdown` 退出时的 WebSocket 关闭原因：客户端据此停止重连与重拉。 */
 export const CLOSE_REASON_SERVICE_QUIT = 'service-quit';
 /** server 模式更新重启时的关闭原因：客户端保持重连，serviceVersion 变化后刷新页面。 */

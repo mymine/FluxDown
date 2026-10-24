@@ -69,7 +69,7 @@ Return `null` or `undefined` to pass through: FluxDown downloads `ctx.url` uncha
 | `fileName` | string | Override the saved file name. Ignored when empty. |
 | `totalBytes` | integer | File size in bytes. Used **only when `ephemeral` is `true`**, as the size hint for the skipped probe (an unknown or `0` size becomes "unknown"). Otherwise ignored: FluxDown probes the real size itself. A selected variant's `totalBytes` overrides this field first. |
 | `extraHeaders` | object | Headers to send when downloading the resolved link. They replace the headers captured with the task. |
-| `request` | object | A [`RequestPatch`](/docs/en/plugins/interceptors-guide/#requestpatch) applied to this run of the task — same rules as the `prepare` stage (same-host `url`, headers, cookies, User-Agent, `segments`, …). An invalid patch fails the task with `[插件] <identity>: <message>`. Applied on every run, never stored. If both `extraHeaders` and `request` are returned, `extraHeaders` replaces the header table first and `request` is applied on top. |
+| `request` | object | A [`RequestPatch`](/docs/en/plugins/interceptors-guide/#requestpatch) applied to this run of the task — same rules as the `prepare` stage (same-host `url`, headers, cookies, User-Agent, `segments`, `maxRangeBytes` for links that reject large `Range` spans, …). An invalid patch fails the task with `[插件] <identity>: <message>`. Applied on every run, never stored. If both `extraHeaders` and `request` are returned, `extraHeaders` replaces the header table first and `request` is applied on top. |
 | `ephemeral` | boolean | `true` = the link is one-shot / anti-hotlinked: skip the metadata probe (at the cost of weaker resume-integrity checks). Default `false`: probe normally and keep ETag-based resume validation. |
 | `rangeSupported` | boolean | `true` = you guarantee the resolved host honours HTTP Range requests (e.g. googlevideo). Combined with `ephemeral`, FluxDown still skips the probe but plans a full multi-segment download right away instead of the conservative single-stream start. Default `false`: without a probe, Range capability is learned from the first response. |
 | `variants` | array | Multiple quality/format choices — see [Variants](#variants). |
@@ -316,6 +316,7 @@ Guard rails, all enforced host-side:
 |---|---|
 | Schemes | `http` / `https` only |
 | Destinations | Publicly routable addresses only. Loopback, LAN, link-local, CGNAT, documentation/benchmark ranges and cloud-metadata IPs are blocked — checked against the literal URL, at DNS resolution (so DNS rebinding is covered), and again on every redirect hop. When the user has configured a proxy in the app, DNS is resolved by the proxy and only the literal-IP and redirect checks apply. |
+| Dev-mode exception | Plugins loaded through "Install from directory (developer mode)" are not subject to the public-address restriction: they can reach `localhost`, LAN hosts, etc. (direct connection, bypassing the global proxy) so they can talk to local services during development. Normally installed plugins are unchanged. |
 | Response body cap | 8 MB, then truncated |
 | Per-request timeout | 10 s |
 | Concurrent requests | 8, shared across all plugins |
@@ -554,10 +555,10 @@ These exist only in the resident `main` script. Behavior in detail is in [Views]
 | `flux.ui.h(kind, props, ...children)` / `flux.ui.Fragment` | Build `{k, p, c}` nodes (children flattened, `null` / `false` / `true` dropped). JSX via the [SDK](/docs/en/plugins/sdk/#jsx) produces the same shape. |
 | `flux.ui.toast(level, text)` | `info`, `success`, `warning` or `error` (anything else is shown as `info`). |
 | `flux.commands.register(id, handler)` | Handler receives `{ taskIds }`. |
-| `flux.rpc.handle(name, handler)` | Callable from your own desktop views with `fluxdown.invoke(name, args)`. |
+| `flux.rpc.handle(name, handler, opts?)` | `handler(args, ctx)`. Callable from your own desktop views with `fluxdown.invoke(name, args)`; then `ctx` is `{ caller: "desktop" }`. Pass `{ page: true }` as `opts` to also expose the handler to your [page scripts](/docs/en/plugins/page-scripts-guide/): they call it with `fluxdown.invoke(name, args)` and `ctx` is `{ caller: "page", pageUrl }`. A handler registered without `page: true` is rejected for page calls with `rpc not exposed to page: <name>`. `pageUrl` and `args` come from a web page, so treat them as untrusted. Older handlers that take only `args` keep working. |
 | `flux.events.on(name, handler)` | `name` is a hook name (`onStart`, `onDone`, `onError`, `onMetaProbed`, `onCancel`) listed in `main.events`. These deliveries are **not** filtered by `hooks.match.urls`. A throwing handler is logged and skipped. Open views re-render afterwards. |
 | `flux.timers.setTimeout(fn, ms)` / `setInterval(fn, ms)` / `clear(id)` | At most 64 live timers (`too many timers (max 64)`). While a view session is open an interval is clamped to ≥ 1 s, otherwise ≥ 60 s. These are *not* global `setTimeout`/`setInterval`. |
-| `flux.tasks.list()` / `get(id)` / `create(params)` / `pause(id)` / `resume(id)` / `remove(id, deleteFiles?)` | Needs permission `tasks`. They call the daemon's `daemon.task.list` / `get` / `create` / `pause` / `resume` / `delete` with the same parameters and results as the [RPC API](/docs/en/api/overview/) (`create` takes `{ request: { url, … } }`; `get`/`pause`/`resume`/`remove` take a task id string). Only these six methods are reachable. `create` is limited to **20 calls per plugin per 60 s** (`tasks.create rate limited`). Every call is written to the audit log. |
+| `flux.tasks.list()` / `get(id)` / `create(params)` / `pause(id)` / `resume(id)` / `remove(id, deleteFiles?)` | Needs permission `tasks`. They call the daemon's `daemon.task.list` / `get` / `create` / `pause` / `resume` / `delete` with the same parameters and results as the [RPC API](/docs/en/api/overview/) (`create` takes `{ request: { url, … } }`; `get`/`pause`/`resume`/`remove` take a task id string). `list()` without arguments returns every task but is rejected when there are more than 5000; pass `list({ cursor, limit })` to page in ascending `taskId` order (`cursor` = the last `taskId` of the previous page, `limit` ≤ 5000, a page shorter than `limit` is the last). Only these six methods are reachable. `create` is limited to **20 calls per plugin per 60 s** (`tasks.create rate limited`). Every call is written to the audit log. |
 | `flux.settings.update({ key: "value" })` | Writes your plugin's own settings. **Values must be strings**; they are validated against `manifest.settings` and a bad key or value rejects. |
 | `flux.ffmpeg`, `flux.ffprobe`, `flux.ytdlp`, `flux.auth` | As in the [matrix](#which-flux-apis-exist-where). `flux.ffmpeg.run` always rejects in `main` (no produced file). |
 
@@ -584,7 +585,7 @@ Budgets are per call. "CPU budget" is the time your JavaScript may execute; time
 
 | Entry | Wall clock | CPU budget | Memory |
 |---|---|---|---|
-| `resolve` | 10 s default; `resolvers[0].timeoutMs` replaces it, **30 s hard ceiling** | same value, ≤ 30 s | 64 MB |
+| `resolve` | 10 s default; `resolvers[0].timeoutMs` replaces it, **30 s hard ceiling** | same value, ≤ 30 s | 64 MB default; `resolvers[0].memoryLimitMb` replaces it, 512 MB ceiling |
 | `subscribe` | 10 s default; `subscriptions[0].timeoutMs` replaces it, 30 s ceiling | same | 64 MB |
 | `authenticate` | 30 s default; `auth.timeoutMs` replaces it, 30 s ceiling | same | 64 MB |
 | Hooks | 5 s | 5 s | 32 MB |

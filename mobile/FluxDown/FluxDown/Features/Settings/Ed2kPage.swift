@@ -1,7 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
-#if FULL_P2P
+#if FULL_FLAVOR
 
 /// S7 · eD2K 设置（常规 · 服务器）。行与 GPUI `sections/ed2k.rs` 同序同键同范围。
 /// `ed2k_server_list` 存逗号分隔的 `host:port`，编辑区每行一条，写回时按条目去空白并忽略大小写去重。

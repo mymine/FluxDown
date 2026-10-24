@@ -1,17 +1,19 @@
 // 插件市场：`daemon.plugin.marketList` 拉取索引，前端关键字过滤 + 分页展开，`marketInstall` 安装。
 
-import { CircleAlert, Info, Package, Search, X } from 'lucide-react'
+import { CircleAlert, Info, Package, Search, Star, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useT } from '../../../../i18n'
-import { RpcError, rpc } from '../../../../lib/rpc'
+import { cn } from '../../../../lib/cn'
+import { RpcError, rpc, useAgent } from '../../../../lib/rpc'
 import type { InstalledPlugin, MarketEntryDto, PluginDto } from '../../../../lib/rpc'
-import { Badge, Button, EmptyState, Icon, Input, Spinner } from '../../../../ui'
+import { Badge, Button, EmptyState, Icon, Input, Select, Spinner, Tooltip } from '../../../../ui'
 import { BlockTitle, ExtLink, IconButton, ListCard, ListRow } from './common'
 import { detailFromMarket } from './detail'
 import type { PluginDetail } from './detail'
 import { extensionErrorText } from './errors'
 import {
   MARKET_PAGE_SIZE,
+  arrangeMarket,
   filterMarket,
   hostsToConfirm,
   installedVersionYanked,
@@ -21,7 +23,7 @@ import {
   riskOf,
   yankedLabelKey,
 } from './logic'
-import type { ConsentSet } from './logic'
+import type { ConsentSet, MarketSort } from './logic'
 import { PluginConsentDialog, RiskBadge } from './PluginConsentDialog'
 import type { ConsentView } from './PluginConsentDialog'
 
@@ -51,10 +53,31 @@ export function MarketSection({
   const [pending, setPending] = useState<ReadonlySet<string>>(new Set())
   const [confirm, setConfirm] = useState<{ view: ConsentView; resolve: (ok: boolean) => void } | null>(null)
   const requested = useRef(false)
+  const signedIn = useAgent((snapshot) => snapshot.session !== null && snapshot.session !== undefined, false)
+  const [sort, setSort] = useState<MarketSort>('default')
+  const [favoritesOnlyRaw, setFavoritesOnly] = useState(false)
+  const [counts, setCounts] = useState<Record<string, number>>({})
+  const [mine, setMine] = useState<string[]>([])
+  const [favorites, setFavorites] = useState({ failed: false })
+  const [favPending, setFavPending] = useState<ReadonlySet<string>>(new Set())
+  const loadFavorites = async () => {
+    try {
+      const result = await rpc.agent.pluginFavorite.list()
+      setCounts(result.counts)
+      setMine(result.mine)
+      setFavorites({ failed: false })
+    } catch {
+      // 收藏失败不影响市场列表：计数清空、星标禁用并给出内联提示。
+      setCounts({})
+      setMine([])
+      setFavorites({ failed: true })
+    }
+  }
 
   const load = async () => {
     requested.current = true
     setMarket((current) => ({ ...current, loading: true, error: null }))
+    void loadFavorites()
     try {
       const entries = await rpc.daemon.plugin.marketList()
       setMarket({ loading: false, error: null, entries })
@@ -65,6 +88,16 @@ export function MarketSection({
   }
   const loadRef = useRef(load)
   loadRef.current = load
+  const loadFavoritesRef = useRef(loadFavorites)
+  loadFavoritesRef.current = loadFavorites
+
+  // 登录态变化（登录 / 登出）且市场已请求过时重新拉收藏。
+  const lastSignedIn = useRef(signedIn)
+  useEffect(() => {
+    if (lastSignedIn.current === signedIn) return
+    lastSignedIn.current = signedIn
+    if (requested.current) void loadFavoritesRef.current()
+  }, [signedIn])
 
   // 首次进入插件页且连接就绪时自动拉取一次（与 GPUI `ensure_market_loaded` 一致）。
   useEffect(() => {
@@ -112,8 +145,38 @@ export function MarketSection({
   }
 
   const installedById = useMemo(() => new Map(plugins.map((plugin) => [plugin.identity, plugin])), [plugins])
+  const mineSet = useMemo(() => new Set(mine), [mine])
+  const favoriteDisabled = !signedIn || favorites.failed
+  const favoriteTitle = (pluginId: string) =>
+    t(!signedIn ? 'marketFavoriteLoginRequired' : mineSet.has(pluginId) ? 'marketFavoriteRemove' : 'marketFavoriteAdd')
 
-  const filtered = useMemo(() => filterMarket(latestPerPlugin(market.entries), query), [market.entries, query])
+  const toggleFavorite = async (pluginId: string) => {
+    if (favPending.has(pluginId)) return
+    const target = !mineSet.has(pluginId)
+    setFavPending((current) => new Set(current).add(pluginId))
+    try {
+      const result = await rpc.agent.pluginFavorite.set({ pluginId, favorited: target })
+      setMine((current) => {
+        const rest = current.filter((id) => id !== pluginId)
+        return result.favorited ? [pluginId, ...rest] : rest
+      })
+      setCounts((current) => ({ ...current, [pluginId]: result.count }))
+    } catch (error) {
+      onInstallFailed(error)
+    } finally {
+      setFavPending((current) => {
+        const next = new Set(current)
+        next.delete(pluginId)
+        return next
+      })
+    }
+  }
+
+  const favoritesOnly = favoritesOnlyRaw && signedIn
+  const filtered = useMemo(
+    () => arrangeMarket(filterMarket(latestPerPlugin(market.entries), query), sort, counts, mineSet, favoritesOnly),
+    [market.entries, query, sort, counts, mineSet, favoritesOnly],
+  )
   const remaining = Math.max(0, filtered.length - limit)
 
   let body
@@ -158,8 +221,39 @@ export function MarketSection({
             )
           }
         />
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="w-44">
+            <Select<MarketSort>
+              value={sort}
+              aria-label={t('marketSortLabel')}
+              options={[
+                { value: 'default', label: t('marketSortDefault') },
+                { value: 'newest', label: t('marketSortNewest') },
+                { value: 'favorites', label: t('marketSortFavorites') },
+              ]}
+              onValueChange={(next) => {
+                setSort(next)
+                setLimit(MARKET_PAGE_SIZE)
+              }}
+            />
+          </div>
+          <Button
+            variant={favoritesOnly ? 'primary' : 'outline'}
+            icon={Star}
+            aria-pressed={favoritesOnly}
+            disabled={!signedIn}
+            title={signedIn ? undefined : t('marketFavoriteLoginRequired')}
+            onClick={() => {
+              setFavoritesOnly((current) => !current)
+              setLimit(MARKET_PAGE_SIZE)
+            }}
+          >
+            {t('marketFavoritesOnly')}
+          </Button>
+          {favorites.failed ? <span className="text-xs text-muted-foreground">{t('marketFavoritesLoadFailed')}</span> : null}
+        </div>
         {filtered.length === 0 ? (
-          <EmptyState icon={Search} title={t('marketSearchNoResult')} />
+          <EmptyState icon={favoritesOnly && query.trim() === '' ? Star : Search} title={t(favoritesOnly && query.trim() === '' ? 'marketFavoritesEmpty' : 'marketSearchNoResult')} />
         ) : (
           <ListCard>
             {filtered.slice(0, limit).map((entry) => {
@@ -188,6 +282,20 @@ export function MarketSection({
                   }
                   actions={
                     <>
+                      <Tooltip content={favoriteTitle(entry.pluginId)}>
+                        <Button
+                          variant="ghost"
+                          aria-label={favoriteTitle(entry.pluginId)}
+                          aria-pressed={mineSet.has(entry.pluginId)}
+                          disabled={favoriteDisabled || favPending.has(entry.pluginId)}
+                          loading={favPending.has(entry.pluginId)}
+                          onClick={() => void toggleFavorite(entry.pluginId)}
+                          className={cn('gap-1 px-2 tabular', mineSet.has(entry.pluginId) ? 'text-accent-text' : 'text-muted-foreground hover:text-foreground')}
+                        >
+                          {favPending.has(entry.pluginId) ? null : <Icon icon={Star} size="md" className={mineSet.has(entry.pluginId) ? 'fill-current' : undefined} />}
+                          {(counts[entry.pluginId] ?? 0) > 0 ? <span className="text-xs">{counts[entry.pluginId]}</span> : null}
+                        </Button>
+                      </Tooltip>
                       <IconButton icon={Info} label={t('pluginDetailDescription')} onClick={() => onShowDetail(detailFromMarket(entry))} />
                       <Button
                         variant="outline"

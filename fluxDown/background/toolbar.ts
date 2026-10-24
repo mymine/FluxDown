@@ -1,18 +1,9 @@
-/** 工具栏图标与角标。 */
+/** 工具栏图标与角标（Chrome / Firefox 均为 MV3 action）。 */
 import { browser } from "wxt/browser";
-
-/** MV3 为 action，Firefox MV2 构建只有 browserAction。 */
-export function getActionApi(): typeof browser.action | undefined {
-  // wxt 的 browser 类型只声明 MV3 的 action；browserAction 仅在 Firefox MV2 运行时存在。
-  const mv2Browser = browser as unknown as {
-    browserAction?: typeof browser.action;
-  };
-  return browser.action ?? mv2Browser.browserAction;
-}
 
 export async function updateBadgeForTab(tabId: number, count: number): Promise<void> {
   const text = count > 0 ? String(count) : "";
-  const action = getActionApi();
+  const action = browser.action;
   try {
     await action?.setBadgeText({ text, tabId });
     if (count > 0) {
@@ -31,7 +22,7 @@ export function updateIcon(enabled: boolean) {
     48: `/icon/48${suffix}.png`,
     128: `/icon/128${suffix}.png`,
   };
-  getActionApi()
+  browser.action
     ?.setIcon({ path: iconPath })
     ?.catch(() => {
       /* 权限不足时静默忽略 */

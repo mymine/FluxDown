@@ -1,4 +1,4 @@
-//! 通知设置：系统通知与下载进度 / 完成窗口；Webhook 使用活动栏独立页面。
+//! 通知设置：系统通知、提示音与下载进度 / 完成窗口；Webhook 使用活动栏独立页面。
 
 use fluxdown_ui_components::FluxIcon;
 use gpui::App;
@@ -26,6 +26,7 @@ pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingsPage {
                 Some("notifyOnCompleteDesc"),
                 ctx.pref_switch("download.notify_on_complete", true),
             )),
+        super::sound::section(ctx),
         SettingsSection::new()
             .title(ctx.t("progressWindowGroup"))
             .row(ctx.item(

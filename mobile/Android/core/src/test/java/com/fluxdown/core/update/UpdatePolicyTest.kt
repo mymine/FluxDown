@@ -2,7 +2,6 @@ package com.fluxdown.core.update
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -42,16 +41,6 @@ class UpdatePolicyTest {
         assertFalse(UpdatePolicy.shouldNotify(available.copy(hasUpdate = false), "", ""))
         assertFalse(UpdatePolicy.shouldNotify(available.copy(phase = UpdatePhase.UpToDate), "", ""))
         assertTrue(UpdatePolicy.shouldNotify(available.copy(phase = UpdatePhase.Ready), "", ""))
-    }
-
-    @Test fun installerStatusCodesMapToFailures() {
-        assertNull(UpdatePolicy.installFailureFor(0)) // SUCCESS
-        assertNull(UpdatePolicy.installFailureFor(-1)) // PENDING_USER_ACTION
-        assertEquals(UpdateFailure.ElevationCancelled, UpdatePolicy.installFailureFor(3)) // ABORTED
-        assertEquals(UpdateFailure.Storage, UpdatePolicy.installFailureFor(6)) // STORAGE
-        for (code in listOf(1, 2, 4, 5, 7, 99)) {
-            assertEquals("$code", UpdateFailure.Install, UpdatePolicy.installFailureFor(code))
-        }
     }
 
     @Test fun previewBuildsDefaultToFrontier() {

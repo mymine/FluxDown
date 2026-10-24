@@ -11,6 +11,8 @@ struct QueuePendingOrderSection: View {
     /// 本地提交后到主机回流前的顺序。
     let override: [String]?
     let readOnly: Bool
+    /// 任务表分页载入中：`serverTasks` 是半份列表，不能显示成「没有待处理任务」。
+    var loading = false
     @Binding var editMode: EditMode
     let onReorder: ([String]) -> Void
 
@@ -28,7 +30,14 @@ struct QueuePendingOrderSection: View {
         let tasks = tasks
         let ids = tasks.map(\.taskId)
         Section {
-            if tasks.isEmpty {
+            if loading {
+                HStack(spacing: 8) {
+                    ProgressView()
+                    Text(L("mobileTasksLoading"))
+                }
+                .foregroundStyle(.secondary)
+                .accessibilityElement(children: .combine)
+            } else if tasks.isEmpty {
                 Text(L("queueNoPendingTasks"))
                     .foregroundStyle(.secondary)
             } else {

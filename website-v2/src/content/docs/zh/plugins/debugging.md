@@ -3,7 +3,7 @@ title: 调试与排错
 description: 插件日志在哪、怎么搜；每种改动之后该做什么；以及你会遇到的报错信息、原因与解决办法对照表。
 section: plugins
 order: 9
-sourceHash: "09147b657889"
+sourceHash: "fc58e8245fc0"
 ---
 
 这一页写给「出问题了」的时刻：去哪里看、插件的各种状态是什么意思、某个改动需要什么操作，以及最有用的——**报错信息**与它们的原因。
@@ -136,10 +136,12 @@ resolver、拦截器、订阅 provider 或 `main` 调用中，**连续** 3 次�
 | `resolver timeoutMs 不可为 0` | `timeoutMs` 为 `0`（`auth` 与 `subscription` 同样会检查）。 | 用正整数，实际生效最多 30000。 |
 | `hooks.events 不可为空` | `hooks` 没有事件。 | 至少列出一个事件。 |
 | `未知事件 '…'，合法：[…]` | 不是 `onStart`、`onError`、`onDone`、`onMetaProbed`、`onCancel` 之一。 | 改正名称（`main.events` 同样适用，其信息为 `main.events 未知事件 '…'，合法：[…]`）。 |
-| `未知权限 '…'，合法：[…]` | 权限名不存在。 | 使用 `ffmpeg`、`ytdlp`、`auth`、`tasks`、`browserRules`、`desktop`、`background`、`intercept` 之一。 |
+| `未知权限 '…'，合法：[…]` | 权限名不存在。 | 使用 `ffmpeg`、`ytdlp`、`auth`、`tasks`、`browserRules`、`desktop`、`background`、`intercept`、`pageScripts` 之一。 |
 | `声明 auth.entry 时 permissions 必须包含 auth` | 声明了 `auth` 却没有 `auth` 权限。 | 把 `"auth"` 加进 `permissions`。 |
 | `声明 sniffRules 时 permissions 必须包含 browserRules` | 有嗅探规则却没有对应权限。 | 加上 `"browserRules"`。 |
 | `main.background 为 true 时 permissions 必须包含 background` | `main.background` 为 `true` 却没有 `background` 权限。 | 加上 `"background"`。 |
+| `声明 pageScripts 时 permissions 必须包含 pageScripts` | 有 `contributes.pageScripts` 却没有对应权限。 | 把 `"pageScripts"` 加进 `permissions`。 |
+| `pageScript '<id>' …`（id、title、matches、js 相关错误） | 某条页面脚本违反了 [Manifest 参考](/docs/zh/plugins/manifest/#pagescripts)中的规则。 | 修正消息里指出的字段。 |
 | `view '<id>' 有可移植实现，必须声明 main` | 没有 `desktop`（或带 `portable: true`）的视图需要 `main` 脚本。 | 声明 `main`。 |
 | `声明 commands 时必须声明 main` | 命令需要 `main`。 | 声明 `main`。 |
 | `view id '…' 非法：…` / `command id '…' 非法：须匹配 ^[a-z][a-z0-9-]{0,31}$` | id 不是以小写字母开头、由 `a-z0-9-` 组成、至多 32 个字符。 | 改名。 |
@@ -154,6 +156,9 @@ resolver、拦截器、订阅 provider 或 `main` 调用中，**连续** 3 次�
 | `读取入口文件 '…' 失败: …` | 入口文件存在但读不出来（没有权限、路径是个目录，或文件不是合法的 UTF-8）；冒号之后是系统错误。出现的场合同上。 | 修好权限或文件（UTF-8 文本），然后**重新加载**。 |
 | `main entry '…' 扩展名须为 .js` | `main` 不是 `.js` 文件。 | 改名。 |
 | `sniffRules '…' 扩展名须为 .json` / `sniffRules format 须为 fluxdown-sniff-pack` / `sniffRules 至多 500 条规则` / `sniffRules 文件超过 262144 字节` | 嗅探规则包有问题。 | 见 [Manifest 参考](/docs/zh/plugins/manifest/)。 |
+| `view '<id>' icon 路径 '…' 非法` / `view '<id>' icon '…' 扩展名须为 .svg` | 视图 `icon` 不是安全的包内相对路径，或不是 `.svg` 文件。 | 使用包内的相对 `.svg` 路径。 |
+| `view '<id>' icon 超过 16384 字节` / `view '<id>' icon 不是合法 UTF-8` | 图标文件超过 16 KiB，或不是 UTF-8 文本。 | 精简 SVG；以 UTF-8 保存。 |
+| `view '<id>' icon 不是 SVG 文档` | 去掉可选的 BOM 与空白后，文件不以 `<svg` 或 `<?xml` 开头，或不含 `<svg`。 | 提供真正的 SVG 文件。 |
 | `需要 App ≥ X，当前 Y` | `minAppVersion` 比你的应用新。 | 升级 FluxDown，或降低 `minAppVersion`。 |
 | `脚本编译失败: …` | resolver、hooks、interceptors、auth 或订阅脚本有语法错误——**或者在顶层就抛了异常**。检查时会在一个没有 `flux` 和 `console` 的空白上下文里把脚本求值一次。 | 修正语法；把所有 `flux.*` / `console.*` 调用挪进入口函数。TypeScript 项目请运行 `npm run typecheck`，并确认产物已重新构建。 |
 | `安装后未能加载插件（校验失败或版本门槛不满足）` | 上面这些检查在安装过程中失败了；如果有旧版本，已经被恢复。 | 看日志里更早的几行，找到真正的原因。 |
@@ -194,7 +199,7 @@ resolver 失败时，任务会进入**下载失败**，信息以 `[插件] <iden
 | `插件运行时错误: 入口 resolve 未定义` | 脚本跑了，但没有在 `globalThis.resolve` 上放函数——漏了 `defineResolver(...)`、函数名写错，或者用了 ES 的 `export` 而不是全局函数。 | 定义 `resolve`。hook 的名字是 `onStart`/`onError`/`onDone`/`onMetaProbed`/`onCancel`；auth 是 `authenticate`；订阅是 `subscribe`。 |
 | `脚本编译失败: …` | 脚本有语法错误。 | 修正。 |
 | `脚本执行超时` | 调用没有在预算内完成（默认 10 秒，最多 30 秒）。计入熔断。 | 提速或减少请求数；确实有慢站点时把 `timeoutMs` 调到最多 30000。 |
-| `脚本超出内存上限` | 使用超过 64 MB。计入熔断。 | 不要持有大响应；谨慎对待被 `truncated` 截断的响应体。 |
+| `脚本超出内存上限` | 使用超过内存预算（默认 64 MB）。计入熔断。 | 不要持有大响应；谨慎对待被 `truncated` 截断的响应体。确实需要更多内存的 resolver 可声明 `memoryLimitMb`（最多 512）。 |
 | `插件运行时过载（并发已满）` | 同时的解析太多；等待空闲名额超过 3 秒。 | 重试任务。 |
 | `插件输出非法: resolve 返回值非法: …` | 返回的对象字段类型不对，比如 `totalBytes` 不是数字。 | 按 [API 参考](/docs/zh/plugins/api-reference/)返回正确的结构。 |
 | `插件输出非法: url scheme 不允许: …`、`url 超过 8KB`、`file_name 非法: …`、`variants 过多: N > 50`、`manifest 与 url/variants/audioUrl 互斥` | 返回结果违反了某条规则：不支持的 URL 协议、URL 过长、不安全的文件名、变体太多，或同时返回 `manifest` 和 `url`。 | 修正返回字段。 |
@@ -224,6 +229,8 @@ resolver 失败时，任务会进入**下载失败**，信息以 `[插件] <iden
 | `blocked: non-routable redirect target` | 服务器重定向到了这类地址。 |
 | `fetch 失败: …` 加详情 | 连接错误、TLS 错误、超时（每个请求 10 秒），或域名只解析到非公网地址。 |
 | `插件未声明 auth 权限，不能使用认证凭据` | 没有 `auth` 权限却传了 `authRef`。 |
+
+**例外：开发模式插件。**通过「设置 → 扩展 → 插件 → 从目录安装（开发模式）」加载的插件，`flux.fetch` 不受公网地址限制，可直接访问 `localhost` 或局域网服务（直连，不经全局代理），便于连接本机服务联调；正式安装的插件行为不变。下面的替代做法适用于非开发模式安装。
 
 开发时**怎样对着自己的服务器测试**：`flux.fetch` 访问不了 `localhost` 或你的局域网。可选做法：把测试环境放在公网主机上（HTTPS，端口不限）、使用公共的 mock 服务，或者在一个设置项后面放一份写死的数据，让插件跳过请求直接返回。对于只改写 URL 的 resolver，根本不需要服务器——resolver 可以直接返回固定的 `url`（见 [TypeScript 项目](/docs/zh/plugins/typescript-project/#4-添加-resolver)里 `.invalid` 主机的做法）。响应体只支持文本（超过 8 MB 时 `truncated: true`）。
 

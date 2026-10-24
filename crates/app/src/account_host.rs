@@ -5,7 +5,10 @@
 use std::sync::Arc;
 
 use fluxdown_protocol::ErrorReason;
-use fluxdown_ui_account::{AccountHost, AccountHostEvent, open_add_device, open_pairing_prompt};
+use fluxdown_ui_account::{
+    AccountHost, AccountHostEvent, confirm_unpair_by_fingerprint, open_add_device,
+    open_link_rename_by_fingerprint, open_pairing_prompt,
+};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_settings::SettingsStore;
 use gpui::{App, AppContext as _, Entity, Window};
@@ -163,4 +166,16 @@ fn notify_session_revoked(host: &Entity<AccountHost>, reason: ErrorReason, cx: &
 pub(crate) fn open_add_device_dialog(window: &mut Window, cx: &mut App) {
     let host = Desktop::global(cx).account_host.clone();
     open_add_device(&host, window, cx);
+}
+
+/// 侧栏直连设备「重命名」入口。
+pub(crate) fn open_link_rename_dialog(fingerprint: String, window: &mut Window, cx: &mut App) {
+    let host = Desktop::global(cx).account_host.clone();
+    open_link_rename_by_fingerprint(&host, &fingerprint, window, cx);
+}
+
+/// 侧栏直连设备「解除配对」入口。
+pub(crate) fn confirm_link_unpair(fingerprint: String, window: &mut Window, cx: &mut App) {
+    let host = Desktop::global(cx).account_host.clone();
+    confirm_unpair_by_fingerprint(&host, &fingerprint, window, cx);
 }

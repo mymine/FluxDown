@@ -31,7 +31,7 @@ export const changelog = defineMessages({
     copied: "Copied",
     permalink: (version: string) => `Link to ${version}`,
     downloads: (n: number) => `Downloads · ${n} file${n === 1 ? "" : "s"}`,
-    assetsNote: "Downloads use Cloudflare cache first, fetch from OSS on a cache miss, and automatically fall back to GitHub if OSS fails. You can also use the GitHub backup link for the same file.",
+    assetsNote: "Visitors in mainland China download through our download mirror; everyone else downloads from GitHub. If the mirror doesn't have the file yet, it falls back to GitHub automatically. You can also use the GitHub backup link for the same file.",
     textHeader: (tag: string) => `FluxDown ${tag} release notes`,
     asset: {
       installer: "installer",
@@ -43,6 +43,8 @@ export const changelog = defineMessages({
       other: "Other",
       rpm: "RPM package",
       unsigned: "unsigned",
+      storeSigned: "store-signed · auto-updates",
+      unpacked: "unpacked · developer mode",
     },
   },
   zh: {
@@ -72,7 +74,7 @@ export const changelog = defineMessages({
     copied: "已复制",
     permalink: (version: string) => `${version} 的链接`,
     downloads: (n: number) => `下载 · ${n} 个文件`,
-    assetsNote: "默认优先通过 Cloudflare 缓存下载，未命中时从 OSS 回源，OSS 失败后自动回退 GitHub。也可使用同一文件的 GitHub 备用链接。",
+    assetsNote: "中国大陆访客通过下载镜像下载，其他地区直接从 GitHub 下载；镜像暂缺该文件时自动回退 GitHub。也可使用同一文件的 GitHub 备用链接。",
     textHeader: (tag: string) => `FluxDown ${tag} 更新日志`,
     asset: {
       installer: "安装包",
@@ -84,6 +86,8 @@ export const changelog = defineMessages({
       other: "其他",
       rpm: "RPM 包",
       unsigned: "未签名",
+      storeSigned: "商店签名 · 自动更新",
+      unpacked: "解压包 · 开发者模式",
     },
   },
 });

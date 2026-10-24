@@ -69,7 +69,10 @@ pub(crate) fn install(cx: &mut App) {
                 reconcile(cx);
             }
         }
-        SessionSignal::Stale | SessionSignal::Fatal(_) | SessionSignal::ServiceStopped => {}
+        SessionSignal::Stale
+        | SessionSignal::Fatal(_)
+        | SessionSignal::ServiceStopped
+        | SessionSignal::ServiceFailed(_) => {}
     })
     .detach();
 }

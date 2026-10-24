@@ -85,7 +85,7 @@ Grab the latest build from [**GitHub Releases**](https://github.com/zerx-lab/Flu
 | **macOS** (Intel / Apple Silicon) | `.dmg` · portable `.tar.gz` |
 | **Linux** (x64) | `.AppImage` · `.deb` · Arch `.pkg.tar.zst` · portable `.tar.gz` |
 | **Android** (arm64-v8a / armeabi-v7a / x86_64) | per-ABI `.apk` · universal `.apk` |
-| **NAS / Server** (headless, x64 / ARM64) | [Docker](https://ghcr.io/zerx-lab/fluxdown-server) · Synology DSM 6/7 `.spk` · QNAP `.qpkg` · OpenWrt `.ipk` · Unraid CA template · CasaOS / ZimaOS app store |
+| **NAS / Server** (headless, x64 / ARM64) | [Docker](https://ghcr.io/zerx-lab/fluxdown-server) · Synology DSM 6/7 `.spk` · QNAP `.qpkg` · OpenWrt `.apk` (25.12+) / `.ipk` · Unraid CA template · CasaOS / ZimaOS app store |
 
 ### Browser Extension
 
@@ -113,7 +113,7 @@ Open `http://<server>:17800/` and set an access key in the first-run wizard. The
 - For unattended setup, supply `FLUXDOWN_TOKEN` through your deployment environment or secret manager, not a committed file. It initializes the key only if one has not already been set.
 - Persist `/data` for the database, logs and access key, and `/root/Downloads` for downloads. The supplied Compose file uses a named data volume and `docker/downloads/` on the host.
 - Prefer SSD/cache storage for `/data` if download disks need to sleep.
-- Native deployments must keep `fluxdown-agent` and `fluxdownd` in the same directory. The old `native/server` crate is frozen and is not the deployment entry point.
+- Native deployments must keep `fluxdown-agent` and `fluxdownd` in the same directory.
 
 ## CLI & HTTP APIs
 
@@ -298,7 +298,7 @@ Pull requests are welcome! Branch off `main` and target `main` — it is the dev
 
 ```shell
 cargo fmt --check
-cargo clippy --workspace --exclude fluxdown_server --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.

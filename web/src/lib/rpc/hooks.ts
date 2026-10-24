@@ -3,6 +3,7 @@
 
 import { useEffect, useMemo, useSyncExternalStore } from 'react'
 import { subscribeServiceEvents } from './client'
+import { tablesLoading } from './apply'
 import type { ConnectionState, RpcState } from './store'
 import { rpcStore } from './store'
 import type { AgentSnapshot, DaemonSnapshot, EventFrame, TaskDto, TaskRuntimeDto } from './protocol'
@@ -93,6 +94,34 @@ export function useTask(taskId: string | null): TaskDto | undefined {
     (daemon) => (taskId === null ? undefined : daemon.tasks.find((task) => task.taskId === taskId)),
     undefined,
   )
+}
+
+/** 任务表载入状态：`loading` 期间 `tasks` 不是完整列表，UI 只能显示加载态。 */
+export interface TaskTableStatus {
+  /** `daemon.taskTotal` 或 `queueTotal` 存在（任一表尚在分页载入）。 */
+  loading: boolean
+  /** 服务端任务总数：载入期间取快照头里的 `taskTotal`，载入完毕取实际行数。 */
+  total: number
+  /** 已载入的任务行数；载入完毕等于 `total`。 */
+  loaded: number
+}
+
+const TABLE_IDLE: TaskTableStatus = { loading: false, total: 0, loaded: 0 }
+
+function selectTaskTableStatus(state: RpcState): TaskTableStatus {
+  const daemon = state.snapshot?.daemon
+  if (daemon === undefined) return TABLE_IDLE
+  if (!tablesLoading(daemon)) return { loading: false, total: daemon.tasks.length, loaded: daemon.tasks.length }
+  return { loading: true, total: daemon.taskTotal ?? daemon.tasks.length, loaded: state.tableLoad?.loadedTasks ?? 0 }
+}
+
+export function useTaskTableStatus(): TaskTableStatus {
+  return useRpcSelector(selectTaskTableStatus, shallowEqual)
+}
+
+/** 任务表是否仍在载入（半份列表不得当作完整列表：计数、空态、批量范围、「任务已消失」推断都要跳过）。 */
+export function useTasksLoading(): boolean {
+  return useDaemon(tablesLoading, false)
 }
 
 /** 单个任务的运行时（速度/分段）。 */

@@ -172,6 +172,8 @@ export function permissionKeys(permission: string): { name: string; desc: string
       return { name: 'pluginPermBackgroundName', desc: 'pluginPermBackgroundDesc' }
     case 'intercept':
       return { name: 'pluginPermInterceptName', desc: 'pluginPermInterceptDesc' }
+    case 'pageScripts':
+      return { name: 'pluginPermPageScriptsName', desc: 'pluginPermPageScriptsDesc' }
     default:
       return null
   }
@@ -189,9 +191,9 @@ const ELEVATED_PERMISSIONS: readonly string[] = [
   'intercept',
 ]
 
-/** 风险等级：含 `desktop` → full；含任一提权权限 → elevated；否则 standard。 */
+/** 风险等级：含 `desktop` / `pageScripts` → full；含任一提权权限 → elevated；否则 standard。 */
 export function riskOf(permissions: readonly string[]): PluginRisk {
-  if (permissions.includes('desktop')) return 'full'
+  if (permissions.includes('desktop') || permissions.includes('pageScripts')) return 'full'
   if (permissions.some((permission) => ELEVATED_PERMISSIONS.includes(permission))) return 'elevated'
   return 'standard'
 }
@@ -342,4 +344,40 @@ export function formatBytes(bytes: number): string {
     unit += 1
   }
   return unit === 0 ? `${Math.trunc(clamped)} B` : `${value.toFixed(1)} ${units[unit]}`
+}
+
+export type MarketSort = 'default' | 'newest' | 'favorites'
+
+/** 发布时间降序比较（ISO-8601 字符串比较），空串排最后。 */
+function comparePublishDesc(a: string, b: string): number {
+  if (a === b) return 0
+  if (a === '') return 1
+  if (b === '') return -1
+  return a < b ? 1 : -1
+}
+
+/**
+ * 市场排序 / 收藏筛选（镜像 crates/extensions/src/market.rs `arrange_market`）：
+ * 先按 `favoritesOnly` 过滤；default 保持输入顺序，newest 按发布时间降序，
+ * favorites 按收藏数降序（缺省 0）、同数按发布时间降序；均稳定。
+ */
+export function arrangeMarket(
+  entries: readonly MarketEntryDto[],
+  sort: MarketSort,
+  counts: Readonly<Record<string, number>>,
+  mine: ReadonlySet<string>,
+  favoritesOnly: boolean,
+): MarketEntryDto[] {
+  const kept = favoritesOnly ? entries.filter((entry) => mine.has(entry.pluginId)) : [...entries]
+  if (sort === 'default') return kept
+  const count = (entry: MarketEntryDto) => counts[entry.pluginId] ?? 0
+  const indexed = kept.map((entry, index) => ({ entry, index }))
+  indexed.sort((x, y) => {
+    if (sort === 'favorites') {
+      const diff = count(y.entry) - count(x.entry)
+      if (diff !== 0) return diff
+    }
+    return comparePublishDesc(x.entry.publishTime, y.entry.publishTime) || x.index - y.index
+  })
+  return indexed.map((item) => item.entry)
 }

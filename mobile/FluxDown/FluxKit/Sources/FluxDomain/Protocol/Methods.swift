@@ -9,6 +9,9 @@ public enum HostMethod {
     public static let systemHello = "system.hello"
     public static let systemPing = "system.ping"
     public static let systemSnapshot = "system.snapshot"
+    /// 任务表 / 队列位置表分页（载入 `taskTotal` / `queueTotal` 加载态的快照头）：由 Rust 驱动（FluxBridge 之下）
+    /// 消费，Swift 侧不直接调用；列出仅为与 Rust 常量表一一对应。
+    public static let systemTaskPage = "system.taskPage"
     /// 让服务优雅退出：daemon 关停引擎后退出；agent 先关停 daemon 再退出（完全退出）。
     ///
     /// 允许作为连接首帧（握手前）调用：协议版本不兼容的新旧进程替换只能靠它完成。
@@ -83,6 +86,8 @@ public enum HostMethod {
     public static let daemonLinkProbe = "daemon.link.probe"
     public static let daemonPluginList = "daemon.plugin.list"
     public static let daemonPluginSniffRules = "daemon.plugin.sniffRules"
+    public static let daemonPluginPageScripts = "daemon.plugin.pageScripts"
+    public static let daemonPluginPageScriptSource = "daemon.plugin.pageScriptSource"
     public static let daemonPluginAuth = "daemon.plugin.auth"
     public static let daemonPluginSetEnabled = "daemon.plugin.setEnabled"
     public static let daemonPluginUpdateSettings = "daemon.plugin.updateSettings"
@@ -109,6 +114,7 @@ public enum HostMethod {
     public static let daemonPluginViewKeepalive = "daemon.plugin.view.keepalive"
     public static let daemonPluginCommand = "daemon.plugin.command"
     public static let daemonPluginInvoke = "daemon.plugin.invoke"
+    public static let daemonPluginPageInvoke = "daemon.plugin.pageInvoke"
     public static let daemonComponentGet = "daemon.component.get"
     public static let daemonComponentListVersions = "daemon.component.listVersions"
     public static let daemonComponentInstall = "daemon.component.install"
@@ -157,6 +163,8 @@ public enum HostMethod {
     public static let agentProfileChangeNickname = "agent.profile.changeNickname"
     public static let agentProfileSendPasswordCode = "agent.profile.sendPasswordCode"
     public static let agentProfileChangePassword = "agent.profile.changePassword"
+    public static let agentProfileSendDeleteCode = "agent.profile.sendDeleteCode"
+    public static let agentProfileDeleteAccount = "agent.profile.deleteAccount"
     public static let agentGatewayGet = "agent.gateway.get"
     public static let agentGatewayPatch = "agent.gateway.patch"
     /// 仅供本机官方 UI 展示/复制用户 token；结果 `{ "userToken": "..." }`（未配置为空串）。
@@ -203,6 +211,8 @@ public enum HostMethod {
     public static let agentLinkRefresh = "agent.link.refresh"
     /// `LinkDispatchParams` → `LinkDispatchResult`：下发下载到已配对设备。
     public static let agentLinkDispatch = "agent.link.dispatch"
+    /// `LinkDeviceParams` → `LinkControlCredentialDto`：向本机 agent 申请对某已配对主机的设备控制凭据（仅 `controllable && !revoked`）。
+    public static let agentLinkControlCredential = "agent.link.controlCredential"
     public static let agentPlanList = "agent.plan.list"
     public static let agentOrderCreate = "agent.order.create"
     public static let agentOrderGet = "agent.order.get"
@@ -222,6 +232,8 @@ public enum HostMethod {
     public static let agentPlatformSetUrlProtocol = "agent.platform.setUrlProtocol"
     /// 系统文件管理器为文件显示的图标（PNG）；参数见 `PlatformFileIconParams`。
     public static let agentPlatformFileIcon = "agent.platform.fileIcon"
+    /// 由 agent 在本机播放一次提示音偏好值；仅桌面，移动端不使用。
+    public static let agentSoundPreview = "agent.sound.preview"
     public static let agentCaptureSubmit = "agent.capture.submit"
     /// 从本机 `.torrent` 文件建任务：agent 读文件、上传 daemon blob 后调用 `daemon.task.create`。
     public static let agentCaptureSubmitTorrentFile = "agent.capture.submitTorrentFile"

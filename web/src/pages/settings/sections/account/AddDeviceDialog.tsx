@@ -9,7 +9,7 @@ import { rpc, useAgent } from '../../../../lib/rpc'
 import type { LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairingCodeDto } from '../../../../lib/rpc'
 import { Button, ConfirmFooter, Dialog, FieldError, FieldHint, Form, FormField, Icon, Input, SegmentedTabs, Spinner, Tooltip, toast } from '../../../../ui'
 import { accountErrorKey } from './errorText'
-import { isManualAddressValid, isPairingCodeComplete, normalizePairingCode, peerAddress, unpairedPeers } from './pairing'
+import { isManualAddressValid, isPairingCodeComplete, localDeadlineMs, normalizePairingCode, peerAddress, renewDelayMs, secondsUntil, unpairedPeers } from './pairing'
 import { useCountdown } from './useCountdown'
 
 const NO_PEERS: readonly LinkDiscoveredPeer[] = []
@@ -52,6 +52,7 @@ function OwnCodePanel() {
   const [busy, setBusy] = useState(false)
   const [errorKey, setErrorKey] = useState<string | null>(null)
   const active = useRef(false)
+  const codeRef = useRef<string | undefined>(undefined)
   const alive = useRef(true)
   const expiry = useCountdown()
 
@@ -61,12 +62,15 @@ function OwnCodePanel() {
     try {
       const result = await rpc.agent.link.pairingCode()
       if (!alive.current) {
-        void rpc.agent.link.stopPairing().catch(() => undefined)
+        void rpc.agent.link.stopPairing({ code: result.code }).catch(() => undefined)
         return
       }
       active.current = true
+      codeRef.current = result.code
       setOwn(result)
-      expiry.start(Math.max(0, Math.round((result.expiresAtUnixMs - Date.now()) / 1000)))
+      const next = localDeadlineMs(result, Date.now())
+      setDeadline(next)
+      expiry.start(secondsUntil(next, Date.now()))
     } catch (error) {
       if (alive.current) setErrorKey(accountErrorKey(error))
     } finally {
@@ -78,21 +82,21 @@ function OwnCodePanel() {
     alive.current = true
     return () => {
       alive.current = false
-      if (active.current) void rpc.agent.link.stopPairing().catch(() => undefined)
+      if (active.current) void rpc.agent.link.stopPairing({ code: codeRef.current }).catch(() => undefined)
     }
   }, [])
 
   // lanActive 才生成码；之后到期自动续码。
-  const expiresAt = own?.expiresAtUnixMs ?? 0
+  const [deadline, setDeadline] = useState(0)
   useEffect(() => {
     if (!lanActive) return
     if (own === null) {
       void renew()
       return
     }
-    const timer = window.setTimeout(() => void renew(), Math.max(0, expiresAt - Date.now()))
+    const timer = window.setTimeout(() => void renew(), renewDelayMs(deadline, Date.now()))
     return () => window.clearTimeout(timer)
-  }, [lanActive, own === null, expiresAt, renew])
+  }, [lanActive, own === null, deadline, renew])
 
   // 本机码被对端使用（出现新的入站请求）后换新码。
   const seen = useRef<Set<string> | null>(null)
@@ -140,6 +144,7 @@ function OwnCodePanel() {
                   </Button>
                 </Tooltip>
               </div>
+              <FieldHint>{t('linkControlPairCodeHint')}</FieldHint>
               {own.addresses.length > 0 ? (
                 <div className="flex flex-col gap-0.5 text-xs text-muted-foreground">
                   <span>{t('localPairingMyAddresses')}</span>
@@ -253,7 +258,10 @@ function LocalTab({ onDone }: { onDone: () => void }) {
 
   // 放弃 SAS 确认（关闭对话框 / 切走）时通知对端，避免悬挂会话。
   const pendingRef = useRef<LinkPairBeginResponse | null>(null)
-  pendingRef.current = pending
+  const setPendingBoth = (value: LinkPairBeginResponse | null) => {
+    pendingRef.current = value
+    setPending(value)
+  }
   useEffect(() => {
     alive.current = true
     return () => {
@@ -278,9 +286,9 @@ function LocalTab({ onDone }: { onDone: () => void }) {
         void rpc.agent.link.pairFinish({ token: response.token, accept: false }).catch(() => undefined)
         return
       }
-      setPending(response)
+      setPendingBoth(response)
     } catch (error) {
-      if (alive.current && flow.current === mine) setErrorKey(accountErrorKey(error))
+      if (alive.current && flow.current === mine) setErrorKey(accountErrorKey(error, 'pairing'))
     } finally {
       if (alive.current && flow.current === mine) setBusy(false)
     }
@@ -294,20 +302,21 @@ function LocalTab({ onDone }: { onDone: () => void }) {
     setFinishing(accept)
     setErrorKey(null)
     try {
-      pendingRef.current = null
+      if (!accept) pendingRef.current = null
       const result = await rpc.agent.link.pairFinish({ token: current.token, accept })
       if (!alive.current || flow.current !== mine) return
+      pendingRef.current = null
       if (accept && result.paired) {
         toast.key('localPairingPaired', 'success', { device: result.device?.name ?? current.peerName })
         onDone()
         return
       }
-      setPending(null)
+      setPendingBoth(null)
       if (accept) setErrorKey('localPairingFailed')
     } catch (error) {
       if (!alive.current || flow.current !== mine) return
-      setPending(null)
-      setErrorKey(accountErrorKey(error))
+      setPendingBoth(null)
+      setErrorKey(accountErrorKey(error, 'pairing'))
     } finally {
       if (alive.current && flow.current === mine) {
         setBusy(false)
@@ -321,44 +330,42 @@ function LocalTab({ onDone }: { onDone: () => void }) {
     const token = pending?.token
     flow.current += 1
     pendingRef.current = null
-    setPending(null)
+    setPendingBoth(null)
     setBusy(false)
     setFinishing(false)
     if (token) void rpc.agent.link.pairFinish({ token, accept: false }).catch(() => undefined)
   }
 
-  if (pending) {
-    return (
-      <div className="flex flex-col gap-3">
-        <div className="text-sm font-medium text-foreground">{t('localPairingSasTitle')}</div>
-        <FieldHint>{t('localPairingSasHint')}</FieldHint>
-        <div className="flex flex-col items-center gap-1 rounded-md bg-muted py-4">
-          <span className="tabular font-mono text-display font-semibold tracking-widest text-foreground">{pending.sas}</span>
-          <span className="text-xs text-muted-foreground">{pending.peerName}</span>
-        </div>
-        {finishing ? <FieldHint>{t('localPairingWaitingPeer')}</FieldHint> : null}
-        {errorKey ? <FieldError>{t(errorKey)}</FieldError> : null}
-        <div className="flex justify-end gap-2">
-          {finishing ? (
-            <Button variant="outline" onClick={cancelFinishing}>
-              {t('cancel')}
-            </Button>
-          ) : (
-            <>
-              <Button variant="outline" disabled={busy} onClick={() => void finish(false)}>
-                {t('localPairingReject')}
-              </Button>
-              <Button variant="primary" loading={busy} onClick={() => void finish(true)}>
-                {t('localPairingConfirm')}
-              </Button>
-            </>
-          )}
-        </div>
+  const sasView = pending ? (
+    <div className="flex flex-col gap-3">
+      <div className="text-sm font-medium text-foreground">{t('localPairingSasTitle')}</div>
+      <FieldHint>{t('localPairingSasHint')}</FieldHint>
+      <div className="flex flex-col items-center gap-1 rounded-md bg-muted py-4">
+        <span className="tabular font-mono text-display font-semibold tracking-widest text-foreground">{pending.sas}</span>
+        <span className="text-xs text-muted-foreground">{pending.peerName}</span>
       </div>
-    )
-  }
+      {finishing ? <FieldHint>{t('localPairingWaitingPeer')}</FieldHint> : null}
+      {errorKey ? <FieldError>{t(errorKey)}</FieldError> : null}
+      <div className="flex justify-end gap-2">
+        {finishing ? (
+          <Button variant="outline" onClick={cancelFinishing}>
+            {t('cancel')}
+          </Button>
+        ) : (
+          <>
+            <Button variant="outline" disabled={busy} onClick={() => void finish(false)}>
+              {t('localPairingReject')}
+            </Button>
+            <Button variant="primary" loading={busy} onClick={() => void finish(true)}>
+              {t('localPairingConfirm')}
+            </Button>
+          </>
+        )}
+      </div>
+    </div>
+  ) : null
 
-  return (
+  const formView = pending ? null : (
     <Form onSubmit={() => void begin()}>
       {!lanActive ? <FieldHint>{t('localPairingOneWayHint')}</FieldHint> : null}
       <FieldHint>{t('localPairingHint')}</FieldHint>
@@ -405,9 +412,17 @@ function LocalTab({ onDone }: { onDone: () => void }) {
           {t('localPairingConnect')}
         </Button>
       </div>
-      <OwnCodePanel />
       <button type="submit" className="hidden" />
     </Form>
+  )
+
+  // 本机配对码面板始终挂载在固定位置：核对 SAS 期间不卸载（卸载会 stopPairing 作废本机码）。
+  return (
+    <div className="flex flex-col gap-3">
+      {sasView}
+      {formView}
+      <OwnCodePanel />
+    </div>
   )
 }
 

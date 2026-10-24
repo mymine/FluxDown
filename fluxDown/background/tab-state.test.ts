@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import { compileBundled } from "@/rules/engine";
+import { checkElement } from "@/page/dom-scan";
 import type { ElementState } from "./protocol";
 
 // storage.session 缺省：不持久化；tab-state 只在 installTabState 里注册浏览器监听（本测试不调用）。
@@ -7,7 +8,7 @@ mock.module("wxt/browser", () => ({ browser: { storage: {}, tabs: {} } }));
 const engine = compileBundled();
 mock.module("./rules-store", () => ({ getEngine: () => engine }));
 // 必须先 mock 再加载被测模块（与 settings.test.ts 同一约定），故此处动态导入。
-const { getElements, getRetiredElements, registerSession, setSessionHooks, unseenEvidence, updateElements } =
+const { getElements, getResources, getRetiredElements, ingestResources, registerSession, setSessionHooks, unseenEvidence, updateElements } =
   await import("./tab-state");
 
 let nextTab = 1;
@@ -124,5 +125,45 @@ describe("按元素证据补报资源", () => {
     const missing = unseenEvidence(tab, elements);
     expect(missing.map((m) => [m.url, m.mimeType, m.detectedBy])).toEqual([["https://cdn/x/a.mp4", "audio/mp4", "fetch-intercept"]]);
     expect(unseenEvidence(tab, elements)).toEqual([]);
+  });
+});
+
+describe("嵌入 PDF 入库", () => {
+  const scanCtx = { classify: (url: string) => engine.classify(url), sniffImages: false, keyOf: () => undefined };
+
+  test("<embed type=application/pdf> 指向无扩展名地址：按作者声明的 MIME 归为文档，默认视图可见", () => {
+    const tab = nextTab++;
+    const embed = { tagName: "EMBED", src: "https://x.com/preview/42", type: "Application/PDF" } as unknown as Element;
+    ingestResources(tab, "https://x.com/doc", checkElement(embed, "dom-scan", scanCtx));
+    expect(getResources(tab).map((r) => [r.url, r.type, r.mimeType, r.confidence])).toEqual([
+      ["https://x.com/preview/42", "document", "application/pdf", "medium"],
+    ]);
+  });
+
+  test("<object> 未声明 type 时只靠地址分类，不臆造 MIME", () => {
+    const tab = nextTab++;
+    const object = { tagName: "OBJECT", data: "https://x.com/preview/43", type: "" } as unknown as Element;
+    expect(checkElement(object, "dom-scan", scanCtx)).toEqual([
+      { url: "https://x.com/preview/43", type: "other", detectedBy: "dom-scan" },
+    ]);
+    ingestResources(tab, "https://x.com/doc", checkElement(object, "dom-scan", scanCtx));
+    expect(getResources(tab).map((r) => [r.type, r.confidence])).toEqual([["other", "low"]]);
+  });
+
+  test("接口路径下的 PDF 响应入库复核时不被路径噪音规则丢弃；同路径无 MIME 的请求仍被丢弃", () => {
+    const tab = nextTab++;
+    ingestResources(tab, "https://x.com/doc", [
+      {
+        url: "https://x.com/api/v1/files/42/content",
+        type: "document",
+        mimeType: "application/pdf",
+        size: 5 * 1024 * 1024,
+        detectedBy: "webRequest",
+      },
+      { url: "https://x.com/api/v1/files/42/meta", type: "other", detectedBy: "dom-scan" },
+    ]);
+    expect(getResources(tab).map((r) => [r.url, r.type, r.confidence])).toEqual([
+      ["https://x.com/api/v1/files/42/content", "document", "high"],
+    ]);
   });
 });

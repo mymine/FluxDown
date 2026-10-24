@@ -94,7 +94,7 @@ internal fun Context.appVersionName(): String {
 /**
  * S14 · 关于：品牌头、版本信息（应用 / 协议 / 远端服务版本）、软件更新、日志工具、支持 / 网站 / 更新日志 / 隐私 / 开源许可。
  * 同 iOS `AboutPage`；Android 没有 App Store 审核限制，保留捐赠入口。
- * 软件更新（[UpdateSection]）是应用内自更新：Rust 更新器检查 / 下载 / 校验，经系统 `PackageInstaller` 安装（必须用户点按确认）；
+ * 软件更新（[UpdateSection]）是应用内自更新：Rust 更新器检查 / 下载 / 校验，交给用户默认的安装程序安装（必须用户点按确认）；
  * 商店安装 / 非官方构建只给手动说明与官网入口。更新的是本机 App，与当前主机（含远端）无关。
  */
 @Composable

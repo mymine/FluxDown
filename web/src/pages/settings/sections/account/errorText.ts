@@ -5,7 +5,7 @@
 import { RpcError } from '../../../../lib/rpc'
 import type { ErrorReason } from '../../../../lib/rpc'
 
-export type AccountErrorContext = 'generic' | 'login' | 'register' | 'code'
+export type AccountErrorContext = 'generic' | 'login' | 'register' | 'code' | 'pairing'
 
 /** reason → 文案键；未列出的 reason（含 `unknown` 与插件市场类）回退按码。 */
 export const REASON_KEYS: Partial<Record<ErrorReason, string>> = {
@@ -32,6 +32,8 @@ export const REASON_KEYS: Partial<Record<ErrorReason, string>> = {
   saveDirUnavailable: 'errReasonSaveDirUnavailable',
   pairingCodeInvalid: 'errReasonPairingCodeInvalid',
   pairingSessionExpired: 'errReasonPairingSessionExpired',
+  pairingTimeout: 'errReasonPairingTimeout',
+  peerClockSkew: 'errReasonPeerClockSkew',
   pairingPeerUnreachable: 'errReasonPairingPeerUnreachable',
   pairingNotFluxDown: 'errReasonPairingNotFluxDown',
   pairingThrottled: 'errReasonPairingThrottled',
@@ -83,6 +85,7 @@ export function accountErrorKey(error: unknown, context: AccountErrorContext = '
   if (byReason) return byReason
   const code = error.appCode
   if (context === 'code' && (code === 'invalidArgument' || code === 'notFound')) return 'accountErrorInvalidCode'
+  if (context === 'pairing' && code === 'invalidArgument') return 'localPairingAddressInvalid'
   if ((context === 'login' || context === 'register') && code === 'invalidArgument') return 'accountErrorValidation'
   return codeKey(error)
 }

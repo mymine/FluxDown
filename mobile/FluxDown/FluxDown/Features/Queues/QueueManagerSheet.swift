@@ -41,7 +41,8 @@ struct QueueManagerSheet: View {
                 if !queues.isEmpty {
                     Section {
                         ForEach(queues) { queue in
-                            row(queue, taskCount: counts[normalizedQueueId(queue.queueId)] ?? 0, readOnly: state.isReadOnly)
+                            // 任务表分页载入中数量未知（nil），不能显示成 0。
+                            row(queue, taskCount: state.tasksLoading ? nil : counts[normalizedQueueId(queue.queueId)] ?? 0, readOnly: state.isReadOnly)
                         }
                     } footer: {
                         Text(L("queueTasksOrderHint"))
@@ -89,7 +90,7 @@ struct QueueManagerSheet: View {
 
     // MARK: 行
 
-    private func row(_ queue: TaskQueue, taskCount: Int, readOnly: Bool) -> some View {
+    private func row(_ queue: TaskQueue, taskCount: Int?, readOnly: Bool) -> some View {
         let builtin = QueueIds.isBuiltin(queue.queueId)
         let busy = model.busy.contains(queue.queueId)
         let layout = typeSize.isAccessibilitySize
@@ -157,7 +158,7 @@ struct QueueManagerSheet: View {
         }
     }
 
-    private func info(_ queue: TaskQueue, taskCount: Int) -> some View {
+    private func info(_ queue: TaskQueue, taskCount: Int?) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(queue.displayName)

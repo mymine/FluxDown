@@ -1,7 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
-#if FULL_P2P
+#if FULL_FLAVOR
 
 /// S6 · BitTorrent 设置（常规 · Tracker · 做种）。
 /// 行与 GPUI `sections/bt.rs` 同序同键同范围；全部写入走 `ConfigEditor`（云同步键 ☁︎ 由目录决定）。

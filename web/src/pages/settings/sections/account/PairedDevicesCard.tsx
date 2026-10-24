@@ -3,6 +3,7 @@
 import { Pencil, Plus, RefreshCw, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useT } from '../../../../i18n'
+import type { TFunction } from '../../../../i18n'
 import { rpc, useAgent } from '../../../../lib/rpc'
 import type { CloudDevice, LinkDeviceInfo } from '../../../../lib/rpc'
 import { Badge, Button, Card, ConfirmFooter, Dialog, FieldError, FieldHint, Form, FormField, Icon, Input, confirmDialog, toast } from '../../../../ui'
@@ -12,7 +13,7 @@ import { accountErrorKey } from './errorText'
 const NO_CLOUD: readonly CloudDevice[] = []
 
 /** 备注名重命名：留空 = 清除备注名（恢复对方设备名）；非空 1–64 字符。 */
-function RenameLinkDialog({ device, onClose }: { device: LinkDeviceInfo; onClose: () => void }) {
+export function RenameLinkDialog({ device, onClose }: { device: LinkDeviceInfo; onClose: () => void }) {
   const t = useT()
   const [name, setName] = useState(device.customName ?? '')
   const [busy, setBusy] = useState(false)
@@ -53,26 +54,27 @@ function RenameLinkDialog({ device, onClose }: { device: LinkDeviceInfo; onClose
   )
 }
 
+/** 解除配对：确认后调用 `agent.link.remove`；失败 toast。设置页与下载页侧栏共用。 */
+export async function confirmRemoveLinkDevice(t: TFunction, device: LinkDeviceInfo): Promise<void> {
+  const ok = await confirmDialog({
+    title: t('linkedDeviceRemoveTitle'),
+    description: t('linkedDeviceRemoveDesc', { name: device.name }),
+    intent: 'destructive',
+    okLabel: t('linkedDeviceRemove'),
+  })
+  if (!ok) return
+  try {
+    await rpc.agent.link.remove({ fingerprint: device.fingerprint })
+  } catch (error) {
+    toast.key(accountErrorKey(error), 'error')
+  }
+}
+
 function PairedRow({ device, disabled, sameAccount }: { device: LinkDeviceInfo; disabled: boolean; sameAccount: boolean }) {
   const t = useT()
   const [renaming, setRenaming] = useState(false)
   const seen = device.lastSeenAt > 0 ? new Date(device.lastSeenAt * (device.lastSeenAt < 1e12 ? 1000 : 1)).toLocaleString() : ''
   const meta = [device.platform, device.defaultSaveDir, seen].filter((part): part is string => Boolean(part)).join(' · ')
-
-  const remove = async () => {
-    const ok = await confirmDialog({
-      title: t('linkedDeviceRemoveTitle'),
-      description: t('linkedDeviceRemoveDesc', { name: device.name }),
-      intent: 'destructive',
-      okLabel: t('linkedDeviceRemove'),
-    })
-    if (!ok) return
-    try {
-      await rpc.agent.link.remove({ fingerprint: device.fingerprint })
-    } catch (error) {
-      toast.key(accountErrorKey(error), 'error')
-    }
-  }
 
   return (
     <div className="flex items-center gap-2 px-3 py-2 coarse:min-h-touch">
@@ -83,6 +85,7 @@ function PairedRow({ device, disabled, sameAccount }: { device: LinkDeviceInfo; 
           <Badge>{t('deviceLocalTag')}</Badge>
           {device.revoked ? <Badge>{t('linkedDeviceRevokedTag')}</Badge> : null}
           {sameAccount && !device.revoked ? <Badge>{t('linkedDeviceSameAccountTag')}</Badge> : null}
+          {device.grantsControl && !device.revoked ? <Badge>{t('linkControlGrantedTag')}</Badge> : null}
           {device.revoked ? null : (
             <span className="text-xs text-muted-foreground">{t(disabled ? 'devicePresenceUnknown' : device.online ? 'deviceOnline' : 'deviceOffline')}</span>
           )}
@@ -95,7 +98,7 @@ function PairedRow({ device, disabled, sameAccount }: { device: LinkDeviceInfo; 
           <Icon icon={Pencil} size="md" />
         </Button>
       )}
-      <Button variant="ghost" iconOnly aria-label={t('linkedDeviceRemove')} title={t('linkedDeviceRemove')} className="text-muted-foreground hover:text-destructive" disabled={disabled} onClick={() => void remove()}>
+      <Button variant="ghost" iconOnly aria-label={t('linkedDeviceRemove')} title={t('linkedDeviceRemove')} className="text-muted-foreground hover:text-destructive" disabled={disabled} onClick={() => void confirmRemoveLinkDevice(t, device)}>
         <Icon icon={Trash2} size="md" />
       </Button>
       {renaming ? <RenameLinkDialog device={device} onClose={() => setRenaming(false)} /> : null}

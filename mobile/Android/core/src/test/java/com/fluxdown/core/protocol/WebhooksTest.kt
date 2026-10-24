@@ -20,7 +20,15 @@ class WebhooksTest {
     @Test
     fun eventWireNamesMatchEngineKindsInCanonicalOrder() {
         assertEquals(
-            listOf("task.created", "task.started", "task.completed", "task.failed", "task.paused", "queue.drained"),
+            listOf(
+                "task.created",
+                "task.started",
+                "task.completed",
+                "task.failed",
+                "task.paused",
+                "queue.started",
+                "queue.drained",
+            ),
             WebhookEvent.entries.map { it.wire },
         )
         assertEquals(listOf("task.completed", "task.failed"), WebhookEvent.defaultWires)

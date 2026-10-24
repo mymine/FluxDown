@@ -112,11 +112,6 @@ export function mergeDevices(
   return entries
 }
 
-/** 侧栏设备区 / 设备筛选只列云条目（含挂接）；独立直连一次性投递，没有任务视图。 */
-export function sidebarDevices(entries: readonly DeviceEntry[]): DeviceEntry[] {
-  return entries.filter((entry) => entry.kind === 'cloud')
-}
-
 /** 目标为本机的远程任务在本地已有真实任务，不再作为镜像行显示。 */
 export function visibleRemoteTasks(tasks: readonly RemoteTaskDto[], currentId: string | null): RemoteTaskDto[] {
   return currentId === null ? tasks.slice() : tasks.filter((task) => task.toDevice !== currentId)

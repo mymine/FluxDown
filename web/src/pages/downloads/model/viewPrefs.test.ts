@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import { parseTimestampSecs } from './task'
 import type { DownloadTaskView, TaskState } from './task'
-import { columnShown, compareNatural, compareViews, defaultViewPrefs, nextHeaderSort, parseViewPrefs, smartTier } from './viewPrefs'
+import { compareNatural, compareViews, defaultViewPrefs, nextHeaderSort, parseViewPrefs, smartTier } from './viewPrefs'
 import type { ViewPrefs, ViewSortKey } from './viewPrefs'
 
 interface Spec {
@@ -9,7 +9,7 @@ interface Spec {
   state?: TaskState
   createdAtSecs?: number
   queueOrder?: number
-  queuePosition?: number
+  queueKey?: number | null
   boosted?: boolean
   preparing?: boolean
   name?: string
@@ -24,7 +24,7 @@ const view = (spec: Spec): DownloadTaskView => {
     state: 'completed',
     createdAtSecs: 0,
     queueOrder: 0,
-    queuePosition: 0,
+    queueKey: null,
     boosted: false,
     preparing: false,
     sizeBytes: 0,
@@ -95,14 +95,16 @@ describe('智能排序档位', () => {
     expect(smart(history)).toEqual(['c', 'b', 'a'])
   })
 
-  test('排队档按引擎队列位置，未知位置(0)在所有已知之后再按添加顺序', () => {
+  test('排队档按引擎排序键升序（键可为 0 / 负数），不在队列(null)的在所有已知之后再按添加顺序', () => {
     const specs: Spec[] = [
-      { key: 'unknownNew', state: 'pending', queuePosition: 0, createdAtSecs: 9 },
-      { key: 'pos3', state: 'pending', queuePosition: 3, createdAtSecs: 1 },
-      { key: 'unknownOld', state: 'pending', queuePosition: 0, createdAtSecs: 2 },
-      { key: 'pos1', state: 'pending', queuePosition: 1, createdAtSecs: 8 },
+      { key: 'unknownNew', state: 'pending', queueKey: null, createdAtSecs: 9 },
+      { key: 'key300', state: 'pending', queueKey: 300, createdAtSecs: 1 },
+      { key: 'unknownOld', state: 'pending', queueKey: null, createdAtSecs: 2 },
+      { key: 'key100', state: 'pending', queueKey: 100, createdAtSecs: 8 },
+      { key: 'key0', state: 'pending', queueKey: 0, createdAtSecs: 7 },
+      { key: 'keyNegative', state: 'pending', queueKey: -5, createdAtSecs: 6 },
     ]
-    expect(smart(specs)).toEqual(['pos1', 'pos3', 'unknownOld', 'unknownNew'])
+    expect(smart(specs)).toEqual(['keyNegative', 'key0', 'key100', 'key300', 'unknownOld', 'unknownNew'])
   })
 
   test('历史档（失败/暂停/已完成）最新在前', () => {
@@ -230,15 +232,8 @@ describe('偏好解析', () => {
     expect(future.group_by).toBe('status')
   })
 
-  test('宽松密度主列恒显示，指标列并入主列，其余列照偏好（与 GPUI 一致）', () => {
-    expect(columnShown('file_name', false, 'relaxed')).toBe(true)
-    for (const kind of ['size', 'progress', 'speed', 'eta'] as const) {
-      expect(columnShown(kind, true, 'relaxed')).toBe(false)
-      expect(columnShown(kind, true, 'comfortable')).toBe(true)
-    }
-    expect(columnShown('status', true, 'relaxed')).toBe(true)
-    expect(columnShown('source', false, 'relaxed')).toBe(false)
-    expect(columnShown('file_name', false, 'compact')).toBe(false)
+  test('已移除的「按任务组分组」读成默认「无」', () => {
+    expect(parseViewPrefs({ group_by: 'group' }).group_by).toBe('none')
   })
 
   test('status 是合法排序键，非法值回落默认', () => {

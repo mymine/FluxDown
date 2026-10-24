@@ -23,11 +23,12 @@ use crate::events::EngineEvent;
 use crate::logger::log_info;
 use crate::plugin::audit::{AuditLog, PluginAuditRow};
 use crate::plugin::manifest::{
-    PERMISSION_AUTH, PERMISSION_FFMPEG, PERMISSION_TASKS, PERMISSION_YTDLP, PluginManifest,
+    PERMISSION_AUTH, PERMISSION_FFMPEG, PERMISSION_PAGE_SCRIPTS, PERMISSION_TASKS,
+    PERMISSION_YTDLP, PluginManifest,
 };
 use crate::plugin::runtime::{
     HostCall, HostContext, HostEvents, HostFuture, HostReply, PluginEntryKind, PluginError,
-    PluginEvent, PluginHost, PluginScript, PluginTaskPort,
+    PluginEvent, PluginHost, PluginScript, PluginTaskPort, StartedTasks,
 };
 
 /// 非 background 宿主在「无会话、无定时器、无进行中调用」持续这么久后回收。
@@ -357,25 +358,84 @@ impl PluginManager {
         .map(|_| ())
     }
 
-    /// 调用插件 `flux.rpc.handle` 注册的处理器。
+    /// 调用插件 `flux.rpc.handle` 注册的处理器（桌面视图调用，ctx 为 `{ caller: "desktop" }`）。
     pub async fn invoke(
         self: &Arc<Self>,
         identity: &str,
         name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, PluginError> {
+        self.invoke_value(identity, name, args, None)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    /// 浏览器页面脚本调用插件处理器。插件须启用、已加载、声明 `pageScripts` 权限且无待授权项；
+    /// 处理器须以 `{ page: true }` 注册，否则报 `rpc not exposed to page: <name>`。
+    /// 返回处理器结果与本次调用期间插件经 `flux.tasks` 开始的任务。
+    pub async fn invoke_from_page(
+        self: &Arc<Self>,
+        identity: &str,
+        name: &str,
+        args: serde_json::Value,
+        page_url: &str,
+    ) -> Result<(serde_json::Value, StartedTasks), PluginError> {
+        let manifest = {
+            let snapshot = self.plugins.read().await.clone();
+            let plugin = snapshot
+                .iter()
+                .find(|p| p.manifest.identity == identity)
+                .ok_or_else(|| PluginError::Runtime(format!("plugin not found: {identity}")))?;
+            if !plugin.enabled {
+                return Err(PluginError::Runtime(format!("plugin disabled: {identity}")));
+            }
+            plugin.manifest.clone()
+        };
+        if manifest.main.is_none() {
+            return Err(PluginError::Runtime(format!(
+                "plugin has no main: {identity}"
+            )));
+        }
+        if !manifest.has_permission(PERMISSION_PAGE_SCRIPTS)
+            || manifest
+                .contributes
+                .as_ref()
+                .is_none_or(|c| c.page_scripts.is_empty())
+        {
+            return Err(PluginError::Runtime(format!(
+                "plugin has no pageScripts permission: {identity}"
+            )));
+        }
+        let (pending, pending_hosts) = self.pending_for(&manifest).await;
+        if !pending.is_empty() || !pending_hosts.is_empty() {
+            return Err(PluginError::Runtime(format!(
+                "plugin consent pending: {identity}"
+            )));
+        }
+        self.invoke_value(identity, name, args, Some(page_url.to_string()))
+            .await
+    }
+
+    async fn invoke_value(
+        self: &Arc<Self>,
+        identity: &str,
+        name: &str,
+        args: serde_json::Value,
+        page_url: Option<String>,
+    ) -> Result<(serde_json::Value, StartedTasks), PluginError> {
         match self
             .host_call(
                 identity,
                 HostCall::Invoke {
                     name: name.to_string(),
                     args,
+                    page_url,
                 },
             )
             .await?
         {
-            HostReply::Value(value) => Ok(value),
-            _ => Ok(serde_json::Value::Null),
+            HostReply::Value { value, started } => Ok((value, started)),
+            _ => Ok((serde_json::Value::Null, StartedTasks::default())),
         }
     }
 
@@ -566,6 +626,7 @@ impl PluginManager {
             ffmpeg_root: None,
             ytdlp_permitted: plugin.manifest.has_permission(PERMISSION_YTDLP),
             auth_permitted: plugin.manifest.has_permission(PERMISSION_AUTH),
+            private_network_allowed: plugin.dev,
         };
         let task_port: Option<Arc<dyn PluginTaskPort>> =
             if plugin.manifest.has_permission(PERMISSION_TASKS) {

@@ -126,8 +126,11 @@ export default defineConfig({
   },
 
   // 日文站点已下线(v2 仅 en + zh);旧链接永久跳转到英文首页。
+  // macOS 构建已签名 + 公证,「已损坏」指南下线;旧链接跳下载页。
   redirects: {
     "/ja": { status: 301, destination: `${BASE}/` },
+    "/macos-gatekeeper": { status: 301, destination: `${BASE}/download/` },
+    "/zh/macos-gatekeeper": { status: 301, destination: `${BASE}/zh/download/` },
   },
 
   prefetch: { prefetchAll: false, defaultStrategy: "hover" },
@@ -193,11 +196,10 @@ export default defineConfig({
         optional: true,
       }),
 
-      // ── 可选：阿里云 OSS 发布资产源（/api/download 优先 302 到此处，缺失回退 GitHub）──
+      // ── 可选：阿里云 OSS 发布资产 + dl-cn 下载镜像（/api/download，见 src/lib/oss.ts）──
       // 对象布局 `<OSS_RELEASE_PREFIX>/<tag>/<file>`，与 .github/actions/oss-upload 一致。
-      // bucket 私有：官网用 AK/SK 做存在性探测；未配 AK/SK 时整条 OSS 路径关闭。
-      // 302 目标：中国大陆访客（CF-IPCountry=CN）走 CN_CDN_BASE（阿里云 CDN，URL 鉴权 A），其余走
-      // OSS_CDN_BASE（Cloudflare Worker dl.fluxdown.com，见 cdn/oss-proxy.js）；两者都不可用时签发 1h 预签名直链。
+      // bucket 私有：官网用 AK/SK 只做 HEAD 存在性探测；中国大陆访客（src/lib/geoip.ts）与 source=oss
+      // 302 到 CN_CDN_BASE（URL 鉴权 A），其余访客走 GitHub。AK/SK 或 CN_CDN_AUTH_KEY 缺失时全部走 GitHub。
       OSS_ACCESS_KEY_ID: envField.string({
         context: "server",
         access: "secret",
@@ -223,19 +225,8 @@ export default defineConfig({
         access: "secret",
         default: "FluxDownRelease",
       }),
-      OSS_CDN_BASE: envField.string({
-        context: "server",
-        access: "secret",
-        default: "https://dl.fluxdown.com",
-      }),
-      // Worker 下载链接签名密钥（与 Worker secret DOWNLOAD_SIGNING_SECRET 相同）；不配置则签发无签名链接。
-      OSS_CDN_SIGNING_SECRET: envField.string({
-        context: "server",
-        access: "secret",
-        optional: true,
-      }),
-      // 阿里云 CDN（加速区域：全球不含中国内地，OSS 私有 Bucket 回源）；CN_CDN_AUTH_KEY 为
-      // 「URL 鉴权 → A 方式」主 KEY，缺省则大陆访客也走 Cloudflare。
+      // dl-cn 下载镜像：现为 Cloudflare Worker（website-v2/cdn/oss-proxy.js，私有 OSS 回源），ICP 备案后
+      // 改回阿里云 CDN；两者都按「URL 鉴权 A 方式」校验 CN_CDN_AUTH_KEY，缺省则镜像关闭。
       CN_CDN_BASE: envField.string({
         context: "server",
         access: "secret",

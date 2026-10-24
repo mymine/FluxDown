@@ -196,9 +196,34 @@ export interface FluxCommands {
   register(id: string, handler: (ctx: { taskIds: string[] }) => Awaitable<void>): void;
 }
 
+/** Context passed as the handler's second argument. */
+export type FluxRpcContext =
+  | { readonly caller: "desktop" }
+  | {
+      readonly caller: "page";
+      /** URL of the page whose script made the call; comes from the web page, treat as untrusted. */
+      readonly pageUrl: string;
+    };
+
+export interface FluxRpcHandleOptions {
+  /**
+   * Also expose the handler to browser page scripts (`fluxdown.invoke(name, args)` in
+   * `contributes.pageScripts`). Requires the `pageScripts` permission; default `false`
+   * (desktop views only). Page-callable handlers must treat `args` and `ctx.pageUrl` as untrusted.
+   */
+  page?: boolean;
+}
+
 export interface FluxRpc {
-  /** Exposes `name` to the plugin's own desktop views via `fluxdown.invoke(name, args)`. */
-  handle(name: string, handler: (args: unknown) => Awaitable<unknown>): void;
+  /**
+   * Exposes `name` to the plugin's own desktop views via `fluxdown.invoke(name, args)`; with
+   * `{ page: true }` also to the plugin's page scripts. Old one-argument handlers keep working.
+   */
+  handle(
+    name: string,
+    handler: (args: unknown, ctx: FluxRpcContext) => Awaitable<unknown>,
+    options?: FluxRpcHandleOptions,
+  ): void;
 }
 
 export interface FluxEvents {
@@ -221,7 +246,12 @@ export type TaskDto = Record<string, unknown>;
 
 /** `flux.tasks` — only present when `permissions` contains `tasks` (`main` script only). */
 export interface FluxTasks {
-  list(): Promise<TaskDto[]>;
+  /**
+   * Without arguments resolves to every task, but rejects when the library holds more than 5000
+   * tasks. Pass `{ cursor, limit }` to page in ascending `taskId` order (`cursor` = the last
+   * `taskId` of the previous page; a page shorter than `limit` is the last one; `limit` ≤ 5000).
+   */
+  list(params?: { cursor?: string; limit?: number }): Promise<TaskDto[]>;
   get(id: string): Promise<TaskDto>;
   /** Rate-limited to 20 per minute. Resolves to the new (or, with URL dedup, existing) task id. */
   create(params: CreateTaskParams): Promise<{ taskId: string }>;
@@ -615,6 +645,16 @@ export interface RequestPatch {
   originHeaders?: OriginHeaders[];
   segments?: number;
   maxConnections?: number;
+  /**
+   * HTTP only; must be >= 65536 (64 KiB). Bytes. Caps the `Range` span of every data request
+   * of this task: each segment worker requests its range in windows of at most this size, and
+   * single-stream / fallback downloads send only bounded `Range` requests of at most this
+   * size (never a plain GET or an open-ended `bytes=N-`). Use it for direct links that reject
+   * large ranges, e.g. a cloud-drive CDN that answers 403 above ~5 MiB per request. Needs a
+   * known `totalBytes` and a server that honours `Range`; the metadata probe requests are
+   * unaffected. Not allowed in `refresh` results.
+   */
+  maxRangeBytes?: number;
   /**
    * HTTP only, same meaning as in a resolver result: skip the metadata probe for this run
    * (use for one-time credentials a probe would burn).

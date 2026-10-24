@@ -1,0 +1,71 @@
+{
+  "description": "插件市场排序 / 收藏筛选跨实现用例：Rust crates/extensions/src/market.rs::arrange_market 与 web/src/pages/settings/sections/extensions/logic.ts::arrangeMarket 共用。entries 已是每插件最新版本、保持索引顺序；改规则先改用例。",
+  "cases": [
+    {
+      "name": "default keeps index order",
+      "entries": [
+        { "pluginId": "a@a", "publishTime": "2026-01-01T00:00:00.000Z" },
+        { "pluginId": "b@b", "publishTime": "2026-03-01T00:00:00.000Z" },
+        { "pluginId": "c@c", "publishTime": "2026-02-01T00:00:00.000Z" }
+      ],
+      "counts": { "a@a": 1, "b@b": 9 },
+      "mine": [],
+      "sort": "default",
+      "favoritesOnly": false,
+      "expected": ["a@a", "b@b", "c@c"]
+    },
+    {
+      "name": "newest sorts by publishTime descending, empty time last, ties keep index order",
+      "entries": [
+        { "pluginId": "a@a", "publishTime": "" },
+        { "pluginId": "b@b", "publishTime": "2026-02-01T00:00:00.000Z" },
+        { "pluginId": "c@c", "publishTime": "2026-03-01T00:00:00.000Z" },
+        { "pluginId": "d@d", "publishTime": "2026-02-01T00:00:00.000Z" }
+      ],
+      "counts": {},
+      "mine": [],
+      "sort": "newest",
+      "favoritesOnly": false,
+      "expected": ["c@c", "b@b", "d@d", "a@a"]
+    },
+    {
+      "name": "favorites sorts by count descending, missing count is zero, ties fall back to newest then index order",
+      "entries": [
+        { "pluginId": "a@a", "publishTime": "2026-01-01T00:00:00.000Z" },
+        { "pluginId": "b@b", "publishTime": "2026-01-01T00:00:00.000Z" },
+        { "pluginId": "c@c", "publishTime": "2026-05-01T00:00:00.000Z" },
+        { "pluginId": "d@d", "publishTime": "2026-04-01T00:00:00.000Z" },
+        { "pluginId": "e@e", "publishTime": "2026-09-01T00:00:00.000Z" }
+      ],
+      "counts": { "a@a": 3, "b@b": 3, "c@c": 3, "d@d": 7 },
+      "mine": [],
+      "sort": "favorites",
+      "favoritesOnly": false,
+      "expected": ["d@d", "c@c", "a@a", "b@b", "e@e"]
+    },
+    {
+      "name": "favorites only keeps my favorites before sorting",
+      "entries": [
+        { "pluginId": "a@a", "publishTime": "2026-01-01T00:00:00.000Z" },
+        { "pluginId": "b@b", "publishTime": "2026-03-01T00:00:00.000Z" },
+        { "pluginId": "c@c", "publishTime": "2026-02-01T00:00:00.000Z" }
+      ],
+      "counts": { "a@a": 2, "b@b": 1, "c@c": 5 },
+      "mine": ["a@a", "c@c", "gone@gone"],
+      "sort": "newest",
+      "favoritesOnly": true,
+      "expected": ["c@c", "a@a"]
+    },
+    {
+      "name": "favorites only with no favorites is empty",
+      "entries": [
+        { "pluginId": "a@a", "publishTime": "2026-01-01T00:00:00.000Z" }
+      ],
+      "counts": { "a@a": 2 },
+      "mine": [],
+      "sort": "default",
+      "favoritesOnly": true,
+      "expected": []
+    }
+  ]
+}

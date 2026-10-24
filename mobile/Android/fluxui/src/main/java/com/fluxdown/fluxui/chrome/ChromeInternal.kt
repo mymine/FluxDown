@@ -18,6 +18,8 @@ import androidx.compose.ui.unit.dp
 import com.fluxdown.fluxui.theme.FluxSpring
 import com.fluxdown.fluxui.theme.FluxTheme
 import androidx.compose.ui.graphics.Shape
+import com.fluxdown.fluxui.material.fluxGlow
+import com.fluxdown.fluxui.material.softShadow
 
 /**
  * 出入场进度：`progress` 0..1（弹簧驱动），`composed` 表示内容是否仍需留在组合中
@@ -61,13 +63,19 @@ internal fun Modifier.chromeFade(
 }
 
 /**
- * 浮动 chrome（导航坞 / 选择坞 / 顶部读数条）的共同表面：不透明实色与细边界。
- * 与页面画布的明度差、内缩选中态共同建立层次，不透出正文，不使用模糊、投影或辉光。
+ * 浮动 chrome（导航坞 / 选择坞 / 顶部读数条）的共同表面：最不透明的实色面 + 向下软投影 + 细边界。
+ * 浅色几乎纯白、深色明显抬亮，投影把它从页面画布上托起；不透出正文，不使用模糊材质或辉光。
  */
 @Composable
 internal fun Modifier.floatingChromeSurface(shape: Shape): Modifier {
     val c = FluxTheme.colors
     return this
-        .background(c.glassSolid3, shape)
-        .border(0.5.dp, c.hairlineStrong, shape)
+        .floatingChromeShadow(shape)
+        .background(c.glassSolid4, shape)
+        .border(0.5.dp, if (c.dark) c.hairlineStrong else c.hairline, shape)
 }
+
+/** 浮动 chrome 与新建球共用的向下软投影（token 派生色，与 Toast 同一做法；Android 12 以下不画）。 */
+@Composable
+internal fun Modifier.floatingChromeShadow(shape: Shape): Modifier =
+    fluxGlow(FluxTheme.colors.softShadow(0.42f), 14.dp, shape, spread = (-6).dp, dy = 8.dp)

@@ -16,7 +16,7 @@
 - 同步阻塞调用未包 `spawn_blocking`
 - 翻译只改单语（en/zh 基线必须成对补齐；ja 等社区语言不检查，也不该由 AI 补）；UI 里硬编码中文文案未走 i18n 查表；新增依赖未见用户确认
 - 绕过已有 trait/error/日志宏平行造轮子
-- workspace clippy 未排除冻结的 `fluxdown_server` 或遗漏测试目标；正确门禁为 `cargo clippy --workspace --exclude fluxdown_server --all-targets -- -D warnings`（见 `.github/workflows/ci.yml`；`clippy.toml` 仅允许测试 unwrap/expect，其余 lint 一视同仁）
+- workspace clippy 遗漏测试目标；正确门禁为 `cargo clippy --workspace --all-targets -- -D warnings`（见 `.github/workflows/ci.yml`；`clippy.toml` 仅允许测试 unwrap/expect，其余 lint 一视同仁）
 
 ## Nit（旁注）
 - 导入顺序、日志 `_tag` 缺失、公开 API 缺 doc comment、超长文件/函数未说明

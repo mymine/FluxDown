@@ -41,9 +41,7 @@ pub type BtHandle = Arc<ManagedTorrent>;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-// 配置类型的权威定义在始终编译的 `bt_config`。此处保留重导出仅为冻结的
-// `native/server`（按指令不改动，仍从本模块引用）；该 crate 删除后随之移除。
-pub use crate::bt_config::{BtConfig, BtMseMode};
+use crate::bt_config::{BtConfig, BtMseMode};
 use crate::bt_seeding::{SeedingManager, SeedingRegistration, UnregisteredSeed};
 use crate::db::Db;
 use crate::downloader::{DownloadError, ProgressUpdate, SegmentProgressInfo};
@@ -242,6 +240,9 @@ fn hex_val(b: u8) -> Option<u8> {
 /// long-running `spawn_blocking` work (completion moves, full re-verification).
 const BT_MAX_BLOCKING_THREADS: usize = 64;
 
+/// 关停会话后等待监听端口真正释放的上限（见 `SharedBtSession::shutdown`）。
+const LISTENER_RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// DHT 路由表（`dht.json`）的落盘间隔。
 ///
 /// librqbit 默认每 60s 重写一次 `dht.json`（临时文件 + rename）。路由表只是
@@ -306,6 +307,46 @@ const PUBLIC_TRACKERS: &[&str] = &[
     "https://1337.abcvg.info:443/announce",
     "http://tracker.bt4g.com:2095/announce",
 ];
+
+/// 新增种子时追加的 tracker：设置里的自定义列表（为空时用内置
+/// [`PUBLIC_TRACKERS`]）+ 订阅列表，按规范化形式去重，只保留能解析的 URL。
+pub fn extra_trackers_for(bt_config: &BtConfig) -> Vec<String> {
+    let base: Vec<&str> = if bt_config.custom_trackers.trim().is_empty() {
+        PUBLIC_TRACKERS.to_vec()
+    } else {
+        bt_config.custom_trackers.lines().collect()
+    };
+    crate::tracker_subscription::merge_dedup(
+        base.into_iter()
+            .chain(bt_config.subscription_trackers.lines()),
+    )
+    .into_iter()
+    .filter(|tracker| url::Url::parse(tracker).is_ok())
+    .collect()
+}
+
+/// 把追加 tracker 以 `tr=` 参数并入磁力链接（librqbit 对磁力 add 只认链接里
+/// 的 tracker，`AddTorrentOptions::trackers` 仅作用于种子文件）。已在链接里的
+/// tracker 不重复追加。
+pub fn magnet_with_trackers(magnet: &str, trackers: &[String]) -> String {
+    let existing: HashSet<String> = url::Url::parse(magnet)
+        .map(|url| {
+            url.query_pairs()
+                .filter(|(key, _)| key == "tr")
+                .map(|(_, value)| value.into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut out = magnet.to_owned();
+    for tracker in trackers {
+        if existing.contains(tracker) {
+            continue;
+        }
+        out.push_str(if out.contains('?') { "&tr=" } else { "?tr=" });
+        out.extend(url::form_urlencoded::byte_serialize(tracker.as_bytes()));
+    }
+    out
+}
 
 impl From<BtMseMode> for librqbit::MseMode {
     fn from(value: BtMseMode) -> Self {
@@ -415,7 +456,22 @@ fn clear_stale_session_state(persistence_folder: &Path) {
 /// (piece bitfield) and avoids expensive re-verification of already
 /// downloaded pieces.
 pub struct SharedBtSession {
-    runtime: tokio::runtime::Runtime,
+    /// 专用 runtime。`Option` 只为 [`Drop`] 能取走它：最后一个 `Arc` 可能在
+    /// 本 runtime 的 worker 上释放（如在途的重新挂载任务），直接 drop 会因
+    /// 「在异步上下文里阻塞关停」panic，见 `impl Drop`。
+    runtime: Option<tokio::runtime::Runtime>,
+    /// `runtime` 的 handle，与 runtime 同生命周期，供 spawn / block_on。
+    runtime_handle: tokio::runtime::Handle,
+    /// 新增种子时追加的 tracker（设置里的自定义列表 / 内置列表 + 订阅列表，
+    /// 已去重）。对齐 qBittorrent「自动添加到新下载」：列表改动热生效于此后
+    /// 加入会话的种子，不重建会话、不打断已有任务，见 [`Self::set_extra_trackers`]。
+    extra_trackers: std::sync::Mutex<Vec<String>>,
+    /// 会话进入关停（配置重建 / 禁用 / 退出）。在途的重新挂载据此放弃向本会话
+    /// 登记，由调用方在新会话上统一重新挂载。
+    closing: CancellationToken,
+    /// 正在从磁盘重新挂载做种（本地数据校验中）的任务。登记早于挂载、退出
+    /// 晚于做种登记，会话重建据此与做种表合并，不漏掉校验中的任务。
+    reseeding: Arc<std::sync::Mutex<HashSet<String>>>,
     session: Arc<Session>,
     /// Maps our `task_id` → librqbit `BtHandle`.
     /// Protected by an async Mutex because it's accessed from both the
@@ -518,22 +574,10 @@ impl SharedBtSession {
             .build()
             .map_err(|e| DownloadError::Other(format!("failed to build BT runtime: {e}")))?;
 
-        // Base list: the user's tracker list from Settings, falling back to
-        // the built-in PUBLIC_TRACKERS when empty.  Subscription trackers
-        // (fetched from community-maintained lists) are appended, and the
-        // whole set is deduped by normalized URL form.
-        let base: Vec<&str> = if bt_config.custom_trackers.trim().is_empty() {
-            PUBLIC_TRACKERS.to_vec()
-        } else {
-            bt_config.custom_trackers.lines().collect()
-        };
-        let merged = crate::tracker_subscription::merge_dedup(
-            base.into_iter()
-                .chain(bt_config.subscription_trackers.lines()),
-        );
-        let trackers: HashSet<url::Url> = merged.iter().filter_map(|s| s.parse().ok()).collect();
-
-        let total_tracker_count = trackers.len();
+        // 追加 tracker 不进会话级 `SessionOptions::trackers`（构造后不可改）：
+        // 改为每次 add 注入（见 `add_input`），列表变化无需重建会话。
+        let extra_trackers = extra_trackers_for(bt_config);
+        let total_tracker_count = extra_trackers.len();
 
         let download_bps = NonZeroU32::new(speed_limit_bps.min(u32::MAX as u64) as u32);
         let upload_bps = NonZeroU32::new(upload_limit_bps.min(u32::MAX as u64) as u32);
@@ -629,7 +673,6 @@ impl SharedBtSession {
                     ..Default::default()
                 }),
             }),
-            trackers: trackers.clone(),
             ratelimits: librqbit::limits::LimitsConfig {
                 download_bps,
                 upload_bps,
@@ -815,8 +858,13 @@ impl SharedBtSession {
             worker_threads
         );
 
+        let runtime_handle = rt.handle().clone();
         Ok(Self {
-            runtime: rt,
+            runtime: Some(rt),
+            runtime_handle,
+            extra_trackers: std::sync::Mutex::new(extra_trackers),
+            closing: CancellationToken::new(),
+            reseeding: Arc::new(std::sync::Mutex::new(HashSet::new())),
             session,
             handles: Mutex::new(HashMap::new()),
             pending_deletes: Mutex::new(HashMap::new()),
@@ -912,7 +960,82 @@ impl SharedBtSession {
 
     /// Get a handle to the BT runtime for spawning tasks.
     pub fn runtime_handle(&self) -> tokio::runtime::Handle {
-        self.runtime.handle().clone()
+        self.runtime_handle.clone()
+    }
+
+    /// 替换新增种子时追加的 tracker 列表（[`extra_trackers_for`]）。只影响此后
+    /// 加入会话的种子；已在会话里的种子保持原列表（与 qBittorrent 一致）。
+    pub fn set_extra_trackers(&self, bt_config: &BtConfig) {
+        let trackers = extra_trackers_for(bt_config);
+        let count = trackers.len();
+        let mut slot = self
+            .extra_trackers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *slot != trackers {
+            *slot = trackers;
+            log_info!(
+                "[BT] extra trackers for new torrents updated: {} trackers",
+                count
+            );
+        }
+    }
+
+    /// 构造 add 输入并注入追加 tracker：种子文件走 `opts.trackers`，磁力链接
+    /// 并入 `tr=` 参数。所有向本会话 add 种子的路径都必须经此。
+    pub fn add_input(
+        &self,
+        source: &TorrentSource,
+        opts: &mut AddTorrentOptions,
+    ) -> AddTorrent<'static> {
+        let trackers = self
+            .extra_trackers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match source {
+            TorrentSource::Magnet(url) => {
+                AddTorrent::from_url(magnet_with_trackers(url, &trackers))
+            }
+            TorrentSource::TorrentFileBytes(bytes) => {
+                opts.trackers = Some(trackers);
+                AddTorrent::from_bytes(Bytes::from(bytes.clone()))
+            }
+        }
+    }
+
+    /// 会话是否已进入关停。
+    pub fn is_closing(&self) -> bool {
+        self.closing.is_cancelled()
+    }
+
+    /// 关停信号：在途的重新挂载据此中止，不再向本会话登记。
+    pub fn closing_token(&self) -> CancellationToken {
+        self.closing.clone()
+    }
+
+    /// 登记一个从磁盘重新挂载做种的在途任务；守卫释放即注销。必须在挂载
+    /// 开始前登记、在做种登记之后释放（见 [`Self::reseeding_task_ids`]）。
+    pub fn begin_reseed(&self, task_id: &str) -> ReseedGuard {
+        self.reseeding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id.to_owned());
+        ReseedGuard {
+            reseeding: Arc::clone(&self.reseeding),
+            task_id: task_id.to_owned(),
+        }
+    }
+
+    /// 正在重新挂载做种的任务。会话重建时先读它、再读做种表：任务先完成做种
+    /// 登记才释放守卫，按此顺序读取不会漏掉任何任务。
+    pub fn reseeding_task_ids(&self) -> Vec<String> {
+        self.reseeding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Store a torrent handle for a task so it can be paused/resumed later.
@@ -1027,7 +1150,7 @@ impl SharedBtSession {
     fn spawn_deferred_pause(&self, task_id: String, handle: BtHandle, epoch: u64) {
         let epochs = Arc::clone(&self.pause_epochs);
         let session = self.session.clone();
-        self.runtime.handle().spawn(async move {
+        self.runtime_handle.spawn(async move {
             if let Err(error) = handle.wait_until_initialized().await {
                 // Initial checking failed; resume uses the Error → recheck path.
                 log_info!(
@@ -1190,13 +1313,7 @@ impl SharedBtSession {
         upload_limit_bps: u64,
         parts_factory: Option<crate::bt_partfile::PartsSeedStorageFactory>,
     ) -> Result<BtHandle, String> {
-        let add_input = match source {
-            TorrentSource::Magnet(ref url) => AddTorrent::from_url(url),
-            TorrentSource::TorrentFileBytes(ref bytes) => {
-                AddTorrent::from_bytes(Bytes::from(bytes.clone()))
-            }
-        };
-        let opts = AddTorrentOptions {
+        let mut opts = AddTorrentOptions {
             overwrite: true,
             output_folder: Some(output_folder),
             only_files,
@@ -1205,6 +1322,7 @@ impl SharedBtSession {
             storage_factory: parts_factory.map(|f| f.into_boxed()),
             ..Default::default()
         };
+        let add_input = self.add_input(&source, &mut opts);
         let response = self
             .session
             .add_torrent(add_input, Some(opts))
@@ -1257,16 +1375,17 @@ impl SharedBtSession {
         Ok(handle)
     }
 
-    /// Gracefully shut down the BT session and runtime.
+    /// Gracefully shut down the BT session.
     ///
-    /// Pauses all active torrents, then shuts down the runtime with a timeout.
-    /// Called when the application exits to ensure clean resource release.
+    /// Signals [`Self::is_closing`], pauses all tracked torrents so they flush
+    /// state to disk, then cancels the librqbit session (listeners, DHT,
+    /// trackers) so the listening port is released even while stray `Arc`s
+    /// (in-flight tasks) keep this object alive. The runtime itself is shut
+    /// down when the last `Arc` drops (see `impl Drop`).
     pub fn shutdown(&self) {
         log_info!("[BT] shutting down shared session...");
-        // Use the runtime to gracefully close the session.  The session's
-        // drop will attempt to persist DHT state and piece bitfields.
-        // We give it a generous timeout to allow disk writes to complete.
-        self.runtime.block_on(async {
+        self.closing.cancel();
+        self.runtime_handle.block_on(async {
             // Pause all tracked torrents so they flush state to disk.
             let handles: Vec<(String, BtHandle)> = {
                 let map = self.handles.lock().await;
@@ -1284,8 +1403,17 @@ impl SharedBtSession {
                 }
             }
         });
-        // The Runtime::drop will be called after this, which blocks until
-        // all spawned tasks finish (or the runtime forces them to stop).
+        // 停掉监听 / DHT / tracker：即便在途任务仍持有本对象的 `Arc`，端口也
+        // 立即释放，重建的新会话能绑回同一端口，旧会话不会以僵尸形态继续上传。
+        self.session.cancellation_token().cancel();
+        // 监听任务在取消后异步退出；限时等端口真正空出，重建的会话才能绑回原
+        // 端口（端口映射 / 对端缓存的地址继续有效）。本函数只在同步线程调用。
+        if let Some(port) = self.session.listen_addr().map(|addr| addr.port()) {
+            let deadline = Instant::now() + LISTENER_RELEASE_TIMEOUT;
+            while probe_listener_port(port).is_err() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         log_info!("[BT] shared session shutdown complete");
     }
 
@@ -1410,6 +1538,43 @@ pub struct InflightGuard(Arc<SharedBtSession>);
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.0.decrement_inflight_add();
+    }
+}
+
+impl Drop for SharedBtSession {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        // 最后一个 `Arc` 可能在任意线程释放：本 runtime 的 worker（在途重新
+        // 挂载 / 下载任务收尾）、actor 的 async 上下文或同步线程。在 tokio
+        // 上下文里阻塞关停 runtime 会 panic（"Cannot drop a runtime in a context
+        // where blocking is not allowed"），此时改为不等待的后台关停——需要落盘
+        // 的状态已由 `shutdown` 暂停 torrent 时写出。纯同步线程（退出 / 重建
+        // 路径）就地限时关停，给在途任务收尾时间。
+        if tokio::runtime::Handle::try_current().is_ok() {
+            runtime.shutdown_background();
+        } else {
+            runtime.shutdown_timeout(BT_RUNTIME_SHUTDOWN_TIMEOUT);
+        }
+    }
+}
+
+/// 关停 BT runtime 时等待在途任务收尾（bitv 落盘等）的上限。
+const BT_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 在途重新挂载的登记守卫（[`SharedBtSession::begin_reseed`]），释放即注销。
+pub struct ReseedGuard {
+    reseeding: Arc<std::sync::Mutex<HashSet<String>>>,
+    task_id: String,
+}
+
+impl Drop for ReseedGuard {
+    fn drop(&mut self) {
+        self.reseeding
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.task_id);
     }
 }
 
@@ -2094,12 +2259,11 @@ pub fn rescue_stranded_staging_files(
 /// runtime thread after downloading is complete).
 ///
 /// 冲突判定同时覆盖三类占用:
-/// - **磁盘同名条目(大小写折叠)**:Windows/APFS 文件系统大小写不敏感,
-///   精确字节比较会漏判 `MOVIE (1)` vs 已存在的 `Movie (1)`,选中后
-///   move 落盘走 REPLACE 语义静默覆盖真实文件。折叠用 `to_lowercase`,
-///   非 UTF-8 名经 lossy 转换——只可能把不冲突误判为冲突(多让一个编号),
-///   决不会漏判。Linux 上折叠偏保守(ext4 大小写敏感,`movie` 与 `Movie`
-///   本可共存),代价仅是多让出一个名字,换取全平台一致的安全行为。
+/// - **磁盘同名条目**:不再整目录 `read_dir`,逐候选 `symlink_metadata`
+///   探测(见 `downloader::dedup_name_by_probe`),由文件系统自己裁决大小写:
+///   APFS/NTFS 等大小写不敏感文件系统上 `MOVIE (1)` 与已存在的 `Movie (1)` 是
+///   同一条目,探测天然命中,move 落盘不会 REPLACE 真实文件;大小写敏感文件系统
+///   上二者本就是不同文件。重度冲突(同名成百上千)时退化为一次折叠扫描。
 /// - **同名 HTTP/HLS 临时文件 `<name>.fdownloading`**:下载中的 HTTP 任务
 ///   已预订最终名(manager 启动期 dedup 认 temp),BT 完成若占用该名,
 ///   HTTP finalize rename 会覆盖 BT 产物(跨协议撞名)。
@@ -2116,52 +2280,16 @@ fn dedup_name_in_dir(
     avoid: &HashSet<String>,
     allow_overwrite: bool,
 ) -> std::io::Result<String> {
-    let temp_ext = crate::downloader::TEMP_EXT;
-    let candidate = dir.join(name);
-    let temp_candidate = dir.join(format!("{name}{temp_ext}"));
-    let final_conflict = if allow_overwrite {
-        candidate.is_dir()
-    } else {
-        candidate.exists()
-    };
-    if !final_conflict && !temp_candidate.exists() && !avoid.contains(&name.to_lowercase()) {
-        return Ok(name.to_string());
-    }
-
-    // Scan directory once (case-folded) to avoid per-candidate FS round-trips.
-    let mut existing = HashSet::new();
-    for entry in std::fs::read_dir(dir)? {
-        existing.insert(entry?.file_name().to_string_lossy().to_lowercase());
-    }
-
-    let stem = Path::new(name)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(name);
-    let ext = Path::new(name).extension().and_then(|s| s.to_str());
-
-    for i in 1..=9999u32 {
-        let new_name = match ext {
-            Some(e) => format!("{} ({}).{}", stem, i, e),
-            None => format!("{} ({})", stem, i),
-        };
-        let folded = new_name.to_lowercase();
-        let folded_temp = format!("{folded}{temp_ext}");
-        if !existing.contains(&folded)
-            && !existing.contains(&folded_temp)
-            && !avoid.contains(&folded)
-        {
-            return Ok(new_name);
-        }
-    }
-    // 极端兜底:1..=9999 个编号变体全被占用时,此前返回**原名不变**,调用点
-    // (容器 / 单文件分支)会直接拿它当 dst,move_path 静默覆盖已存在文件丢数据。
-    // 改用 UUID 后缀保证唯一,杜绝覆盖。(BUG-BT-DEDUP-FALLBACK-OVERWRITE)
-    let uniq = uuid::Uuid::new_v4();
-    Ok(match ext {
-        Some(e) => format!("{} ({}).{}", stem, uniq, e),
-        None => format!("{} ({})", stem, uniq),
-    })
+    crate::downloader::dedup_name_by_probe(
+        dir,
+        name,
+        &crate::downloader::DedupRules {
+            reserved: None,
+            avoid: Some(avoid),
+            allow_overwrite,
+            companion_mp4: false,
+        },
+    )
 }
 
 struct CompletionLayoutInput<'a> {
@@ -3795,8 +3923,9 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 subset.len()
             );
         }
-        let add_opts =
+        let mut add_opts =
             build_add_torrent_options(&selection_strategy, stage_dir_str, upload_limit_bps);
+        let add_input = shared_bt.add_input(&torrent_source, &mut add_opts);
 
         log_info!(
             "[BT] task={} adding torrent to shared session (metadata resolution may take a while)...",
@@ -3804,7 +3933,6 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         );
 
         let session_for_add = session.clone();
-        let source_for_add = torrent_source.clone();
         let shared_bt_for_add = shared_bt.clone();
         let task_id_for_add = task_id.clone();
         // Create the RAII guard before spawning so `maybe_release_bt_session`
@@ -3819,12 +3947,6 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
             // Move the guard into the task so it is dropped (and thus
             // decrements) when the task finishes normally *or* panics.
             let _inflight = inflight;
-            let add_input = match source_for_add {
-                TorrentSource::Magnet(ref url) => AddTorrent::from_url(url),
-                TorrentSource::TorrentFileBytes(ref bytes) => {
-                    AddTorrent::from_bytes(Bytes::from(bytes.clone()))
-                }
-            };
             let result = tokio::select! {
                 r = session_for_add.add_torrent(add_input, Some(add_opts)) => r,
                 _ = add_abort_for_task.notified() => {
@@ -5780,6 +5902,28 @@ mod tests {
             })
             .collect()
     }
+
+    /// 追加 tracker 并入磁力链接后，librqbit 解析出的 tracker = 原有 + 追加
+    /// （含需转义的查询串），已有的不重复。
+    #[test]
+    fn magnet_with_trackers_round_trips_through_librqbit_parser() {
+        let magnet = "magnet:?xt=urn:btih:def7006974f228ca39c44c806a0fb839a0469c97\
+                      &dn=ubuntu&tr=udp%3A%2F%2Fa.example%3A80%2Fannounce";
+        let extra = vec![
+            "udp://a.example:80/announce".to_string(),
+            "https://b.example/announce?passkey=x&y=1".to_string(),
+        ];
+        let merged = super::magnet_with_trackers(magnet, &extra);
+        let parsed = librqbit::Magnet::parse(&merged).expect("valid magnet");
+        assert_eq!(
+            parsed.trackers,
+            [
+                "udp://a.example:80/announce",
+                "https://b.example/announce?passkey=x&y=1"
+            ]
+        );
+        assert_eq!(parsed.name.as_deref(), Some("ubuntu"));
+    }
     #[test]
     fn bt_mse_mode_parses_supported_values_without_allocating() {
         assert_eq!(
@@ -5939,7 +6083,7 @@ mod tests {
         };
         let session = super::SharedBtSession::new(&work_string, &work_string, 0, 0, &config)
             .expect("BT session");
-        session.runtime.block_on(async {
+        session.runtime_handle.block_on(async {
             assert!(session.pause_task("t1").await.is_ok());
             assert!(session.pending_pauses.lock().await.contains_key("t1"));
             // 暂停 → 恢复：意图必须作废，否则新一轮 add 会被误暂停。
@@ -6087,8 +6231,13 @@ mod tests {
                     },
                 ))
                 .expect("local BT session");
+            let runtime_handle = runtime.handle().clone();
             Arc::new(SharedBtSession {
-                runtime,
+                runtime: Some(runtime),
+                runtime_handle,
+                extra_trackers: std::sync::Mutex::new(Vec::new()),
+                closing: tokio_util::sync::CancellationToken::new(),
+                reseeding: Arc::new(std::sync::Mutex::new(HashSet::new())),
                 session,
                 handles: Mutex::new(HashMap::new()),
                 pending_deletes: Mutex::new(HashMap::new()),
@@ -6170,7 +6319,7 @@ mod tests {
             let save_dir = root.join("save");
             std::fs::create_dir_all(&save_dir).expect("fixture save directory");
             let shared_bt = local_session(&root);
-            shared_bt.runtime.block_on(async {
+            shared_bt.runtime_handle.block_on(async {
                 let db = Db::open(&root).await.expect("fixture DB");
                 db.insert_task(
                     "selection-task",
@@ -7972,21 +8121,80 @@ mod tests {
         let dir = unique_test_dir("dedup_case_fold");
         std::fs::create_dir_all(&dir)
             .unwrap_or_else(|error| panic!("test filesystem operation failed: {error}"));
-        // Exact-case entry forces the early-return probe to see a conflict
-        // on every platform (Linux's Path::exists() is case-sensitive).
+        // 大小写由文件系统自己裁决:大小写不敏感文件系统(APFS/NTFS)上
+        // `Movie (1).mkv` 与 `MOVIE (1).mkv` 是同一条目,必须视为占用;大小写敏感
+        // 文件系统上二者是不同文件,rename 不会互相覆盖。
+        std::fs::write(dir.join("CaseProbe"), b"x")
+            .unwrap_or_else(|error| panic!("test filesystem operation failed: {error}"));
+        let case_insensitive = dir.join("caseprobe").exists();
         std::fs::write(dir.join("MOVIE.mkv"), b"x")
             .unwrap_or_else(|error| panic!("test filesystem operation failed: {error}"));
-        // Differently-cased numbered variant already occupies " (1)".
+        // Differently-cased numbered variant.
         std::fs::write(dir.join("Movie (1).mkv"), b"x")
             .unwrap_or_else(|error| panic!("test filesystem operation failed: {error}"));
 
         let name = super::dedup_name_in_dir(&dir, "MOVIE.mkv", &HashSet::new(), false)
             .expect("read dedup destination");
-        assert_ne!(
-            name, "MOVIE (1).mkv",
-            "case-different existing 'Movie (1).mkv' must be treated as occupied"
+        let expected = if case_insensitive {
+            "MOVIE (2).mkv"
+        } else {
+            "MOVIE (1).mkv"
+        };
+        assert_eq!(name, expected);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[BT tests] fixture cleanup failed: {}", error);
+        }
+    }
+
+    /// 目录里有大量同名编号条目时,探测式去重与「整目录扫描」参照算法逐例一致:
+    /// 编号取最小可用、不覆盖任何既有条目(含 `.fdownloading` 与 `avoid` 声明)。
+    #[test]
+    fn dedup_name_in_dir_matches_directory_scan_with_many_entries() {
+        let dir = unique_test_dir("dedup_many_entries");
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|error| panic!("test filesystem operation failed: {error}"));
+        std::fs::write(dir.join("pack.mkv"), b"x")
+            .unwrap_or_else(|error| panic!("test filesystem operation failed: {error}"));
+        for index in 1..=800u32 {
+            if index == 650 {
+                continue;
+            }
+            std::fs::write(dir.join(format!("pack ({index}).mkv")), b"x")
+                .unwrap_or_else(|error| panic!("test filesystem operation failed: {error}"));
+        }
+        // 缺口 650 只被 `.fdownloading` 临时文件占用(同样算占用),所以最小可用编号是 801。
+        std::fs::write(dir.join("pack (650).mkv.fdownloading"), b"x")
+            .unwrap_or_else(|error| panic!("test filesystem operation failed: {error}"));
+        let avoid = HashSet::new();
+        let expected = crate::downloader::dedup_reference_scan(
+            &dir,
+            "pack.mkv",
+            &HashSet::new(),
+            &avoid,
+            false,
         );
-        assert_eq!(name, "MOVIE (2).mkv");
+        let name = super::dedup_name_in_dir(&dir, "pack.mkv", &avoid, false)
+            .expect("read dedup destination");
+        assert_eq!(name, expected);
+        assert_eq!(name, "pack (801).mkv");
+
+        // claim 声明占住 801 → 802。
+        let claimed = HashSet::from(["pack (801).mkv".to_string()]);
+        let name = super::dedup_name_in_dir(&dir, "pack.mkv", &claimed, false)
+            .expect("read dedup destination");
+        assert_eq!(
+            name,
+            crate::downloader::dedup_reference_scan(
+                &dir,
+                "pack.mkv",
+                &HashSet::new(),
+                &claimed,
+                false
+            )
+        );
+        assert_eq!(name, "pack (802).mkv");
         if let Err(error) = std::fs::remove_dir_all(&dir)
             && error.kind() != std::io::ErrorKind::NotFound
         {

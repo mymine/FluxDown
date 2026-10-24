@@ -17,6 +17,9 @@ struct DownloadRowView: View, Equatable {
     let item: TaskItem
     let style: RowStyle
     let isLocalHost: Bool
+    /// 排队名次（1 起；非排队行 0）。由父视图按可见行从 `QueueOrder` 取：队首出队只让名次变化的可见行重绘，
+    /// 任务行模型（`item`）不因名次变化而重建。
+    var queuePosition = 0
     /// 多选模式下圆环让位给系统勾选。
     var showsRing = true
     var zoom: Namespace.ID?
@@ -29,6 +32,7 @@ struct DownloadRowView: View, Equatable {
 
     static func == (lhs: DownloadRowView, rhs: DownloadRowView) -> Bool {
         lhs.item == rhs.item && lhs.style == rhs.style && lhs.isLocalHost == rhs.isLocalHost
+            && lhs.queuePosition == rhs.queuePosition
             && lhs.showsRing == rhs.showsRing && lhs.zoom == rhs.zoom && (lhs.onOpen == nil) == (rhs.onOpen == nil)
     }
 
@@ -37,10 +41,10 @@ struct DownloadRowView: View, Equatable {
     var body: some View {
         let text = RowText.live
         let nowSec = Int64(Date().timeIntervalSince1970)
-        let status = text.status(item, fields: style.fields)
+        let status = text.status(item, fields: style.fields, queuePosition: queuePosition)
         let percent = text.percent(item)
         let meta = compact ? nil : text.meta(item, fields: style.fields, nowSec: nowSec)
-        let summary = text.summary(item, fields: style.fields, nowSec: nowSec)
+        let summary = text.summary(item, fields: style.fields, nowSec: nowSec, queuePosition: queuePosition)
 
         HStack(alignment: typeSize >= .accessibility1 ? .top : .center, spacing: compact ? 10 : 12) {
             tappable(

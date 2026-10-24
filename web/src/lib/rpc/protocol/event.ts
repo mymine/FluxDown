@@ -32,9 +32,17 @@ import type { WsServerMsg } from './ws';
 export interface DaemonSnapshot {
   /** 任务最新传输采样，按 taskId 索引。 */
   taskRuntime: Record<string, TaskRuntimeDto>;
+  /**
+   * 任务全表。线上快照 / 替换事件不内嵌：`taskTotal` 存在时本字段为空，须经 `system.taskPage`
+   * 分页载入（见 `../tableSync.ts`）。
+   */
   tasks: TaskDto[];
+  /** 存在 = 任务表尚未载入完整（服务端共这么多行）：UI 只能显示加载态，不得把 `tasks` 当完整列表。 */
+  taskTotal?: number;
   queues: QueueDto[];
   queuePositions: QueuePositionDto[];
+  /** 存在 = 队列位置表尚未载入完整，语义同 `taskTotal`，对应 `queuePositions`。 */
+  queueTotal?: number;
   groups: GroupDto[];
   config: DaemonConfigSnapshot;
   rssSources: RssSourceDto[];
@@ -88,7 +96,10 @@ export interface Snapshot {
 export type DaemonEvent =
   | { type: 'taskRuntimeChanged'; data: TaskRuntimeDto }
   | { type: 'taskActivityAdded'; data: TaskActivityDto }
+  /** 载荷永远是头（无任务表、带 `taskTotal` / `queueTotal`）：整体替换投影，随后分页载入。 */
   | { type: 'snapshotReplaced'; data: DaemonSnapshot }
+  /** 整表替换行数过多：清空对应表并置待载入标记，客户端分页重载。 */
+  | { type: 'tablesReloading'; data: { tasks?: number; queue?: number } }
   | { type: 'engine'; data: WsServerMsg }
   | { type: 'taskChanged'; data: TaskDto }
   /** 一批任务事实：等价于按序逐条 `taskChanged`（`daemon.task.createMany` 一块一条）。 */
@@ -122,6 +133,7 @@ export type DaemonEvent =
 export type AgentEvent =
   /** 转发的 daemon 事件：注意嵌套两层 `{type:'daemon', data:{type, data}}`。 */
   | { type: 'daemon'; data: DaemonEvent }
+  /** 载荷永远是头（语义同 `snapshotReplaced`）。 */
   | { type: 'daemonSnapshotReplaced'; data: DaemonSnapshot }
   | { type: 'daemonConnectionChanged'; data: boolean }
   /** 会话被撤销（一次性通知，不进快照；随后是 `sessionChanged(null)`；主动登出 / 删本设备不发）。 */
@@ -140,8 +152,10 @@ export type AgentEvent =
   | { type: 'pendingCapturesChanged'; data: PendingCaptureDto[] }
   | { type: 'shellChanged'; data: ShellStatusDto }
   | { type: 'powerChanged'; data: PowerStatusDto }
-  /** 外部捕获未经确认直接建成的任务 ID（一次性通知，不进快照）。 */
+  /** 外部来源未经确认直接建成的任务 ID（含插件页面脚本新建；一次性通知，不进快照）。 */
   | { type: 'captureTasksStarted'; data: string[] }
+  /** 外部来源恢复的已有任务 ID（插件页面脚本恢复；一次性通知，不进快照）。 */
+  | { type: 'captureTasksResumed'; data: string[] }
   /** 云端推送状态整体替换。 */
   | { type: 'cloudNotifyChanged'; data: CloudNotifyStateDto };
 
@@ -150,9 +164,15 @@ export type ServiceEvent =
   | { service: 'daemon'; event: DaemonEvent }
   | { service: 'agent'; event: AgentEvent };
 
-/** 单个严格递增的事件帧（`service.event` 通知的 params）。 */
+/**
+ * 单个严格递增的事件帧（`service.event` 通知的 params）。
+ *
+ * 帧覆盖序号区间 `(previous, sequence]`：转发者为落后的订阅者合并过可取代的帧时，用 `previous`
+ * 声明被合并掉的序号；缺省即 `sequence - 1`（逐帧连续）。消费方统一用 `judgeFrame` 判定。
+ */
 export interface EventFrame {
   epoch: string;
   sequence: number;
+  previous?: number;
   event: ServiceEvent;
 }

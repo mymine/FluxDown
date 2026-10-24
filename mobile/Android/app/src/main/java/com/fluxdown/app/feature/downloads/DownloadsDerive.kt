@@ -25,6 +25,7 @@ import com.fluxdown.core.protocol.RemoteTaskDto
 import com.fluxdown.core.protocol.RemoteTaskRules
 import com.fluxdown.core.protocol.has
 import com.fluxdown.core.store.HostState
+import com.fluxdown.core.store.TaskTable
 import com.fluxdown.fluxui.data.FlowSegmentUi
 import com.fluxdown.fluxui.data.FlowStripState
 import java.time.Instant
@@ -102,6 +103,11 @@ internal fun derive(input: DeriveInput, cache: DeriveCache, nowMs: Long, interac
     val s = input.state
     val f = input.filter
     val p = input.prefs
+
+    // 任务表分页载入中：`state.tasks` 不完整（可能为空），不派生行 / 计数 / 空态，也不动行模型缓存（载入后复用）。
+    (s.taskTable as? TaskTable.Loading)?.let { loading ->
+        return DeriveResult(DownloadsList(emptyList(), emptyList(), 0, loaded = false, loading = loading), Facets.Initial, 0L)
+    }
 
     if (cache.categoriesRef !== s.categories) {
         cache.categoriesRef = s.categories
@@ -217,7 +223,7 @@ internal fun derive(input: DeriveInput, cache: DeriveCache, nowMs: Long, interac
 }
 
 private fun StatusFolder.accepts(it: DownloadItem): Boolean = when (it) {
-    is TaskItem -> accepts(it.task.status)
+    is TaskItem -> accepts(it.task)
     is RemoteItem -> accepts(it.task.status)
 }
 
@@ -237,7 +243,7 @@ private fun itemFor(t: Task, s: HostState, cache: DeriveCache, queuesById: Map<S
     val sd = speed?.down ?: 0L
     val su = speed?.up ?: 0L
     val rt = s.runtime[t.taskId]
-    val qp = s.queuePositions[t.taskId] ?: 0
+    val qo = s.queueOrder.orderOf(t.taskId)
     val boosted = s.priorityTaskId == t.taskId
     val cat = cache.categoryByName.getOrPut(t.fileName) { cache.index.categoryOf(t.fileName) }
     val queue = queuesById[normQueue(t.queueId)]
@@ -246,17 +252,17 @@ private fun itemFor(t: Task, s: HostState, cache: DeriveCache, queuesById: Map<S
     if (prev != null) {
         val it = prev.item
         if (it.task === t && prev.runtime === rt && it.speedDown == sd && it.speedUp == su &&
-            it.queuePosition == qp && it.boosted == boosted && it.category === cat && it.queue === queue
+            it.queueOrder == qo && it.boosted == boosted && it.category === cat && it.queue === queue
         ) return it
     }
 
-    val visual = t.visualState(qp)
+    val visual = t.visualState(qo != null)
     val (flow, flowState) = flowFor(t, visual, rt)
     val item = TaskItem(
         task = t,
         speedDown = sd,
         speedUp = su,
-        queuePosition = qp,
+        queueOrder = qo,
         boosted = boosted,
         category = cat,
         queue = queue,
@@ -368,7 +374,7 @@ private fun sectioned(rows: List<DownloadItem>, folder: StatusFolder, out: Mutab
         inflight.forEachIndexed { i, it -> out += rowEntry(it, RowZone.Flow, first = false, last = i == inflight.lastIndex, visible) }
     }
     if (history.isNotEmpty()) {
-        val named = folder.takeIf { it == StatusFolder.Completed || it == StatusFolder.Failed || it == StatusFolder.Paused }
+        val named = folder.takeIf { it == StatusFolder.Completed || it == StatusFolder.Seeding || it == StatusFolder.Failed || it == StatusFolder.Paused }
         out += HistoryHeaderEntry(history.size, named)
         history.forEachIndexed { i, it -> out += rowEntry(it, RowZone.History, first = i == 0, last = i == history.lastIndex, visible) }
     }

@@ -2,6 +2,7 @@ package com.fluxdown.app.feature.devices
 
 import com.fluxdown.core.host.HostSession
 import com.fluxdown.core.protocol.HostMethod
+import com.fluxdown.core.protocol.LinkControlCredential
 import com.fluxdown.core.protocol.LinkApproveParams
 import com.fluxdown.core.protocol.LinkDeviceParams
 import com.fluxdown.core.protocol.LinkDiscoveryParams
@@ -13,6 +14,7 @@ import com.fluxdown.core.protocol.LinkPairingCode
 import com.fluxdown.core.protocol.LinkRenameParams
 import com.fluxdown.core.protocol.callJson
 import com.fluxdown.core.protocol.callUnit
+import com.fluxdown.core.protocol.jsonObject
 
 /**
  * 局域网直连（`agent.link.*`）的类型化调用：对 `HostSession` 通用通道的薄封装（同 iOS `AgentAPI` 的 link 部分）。
@@ -23,7 +25,9 @@ internal class LinkApi(private val session: HostSession) {
     suspend fun pairingCode(): LinkPairingCode =
         LinkPairingCode.fromJson(session.callJson(HostMethod.agentLinkPairingCode))
 
-    suspend fun stopPairing() = session.callUnit(HostMethod.agentLinkStopPairing)
+    /** [code] = 只作废自己拿到的那个配对码（仍是当前码才生效，多客户端互不干扰）；null = 作废当前码。 */
+    suspend fun stopPairing(code: String? = null) =
+        session.callUnit(HostMethod.agentLinkStopPairing, code?.let { jsonObject("code" to it) })
 
     suspend fun discoverySet(enabled: Boolean) =
         session.callUnit(HostMethod.agentLinkDiscoverySet, LinkDiscoveryParams(enabled).toJson())
@@ -46,4 +50,8 @@ internal class LinkApi(private val session: HostSession) {
 
     /** 探测全部已配对设备在线状态（结果经 `LinkedDevicesChanged` 推送）。 */
     suspend fun refresh() = session.callUnit(HostMethod.agentLinkRefresh)
+
+    /** 本机对已配对且 `controllable` 的主机的设备控制凭据（`fdl1.…`）；否则主机 `PeerNotPaired`。 */
+    suspend fun controlCredential(fingerprint: String): String =
+        LinkControlCredential.fromJson(session.callJson(HostMethod.agentLinkControlCredential, LinkDeviceParams(fingerprint).toJson())).token
 }

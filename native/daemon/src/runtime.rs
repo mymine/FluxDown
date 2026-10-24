@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +33,106 @@ use crate::service::DaemonService;
 pub struct DaemonReady {
     pub addr: SocketAddr,
     pub token: String,
+}
+
+/// 控制面端点文件路径：与 daemon token 同目录。
+fn endpoint_file_path(config: &DaemonConfig, data_dir: &Path) -> PathBuf {
+    let dir = match config.token_file_override.as_deref() {
+        Some(token) => match token.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => data_dir,
+        },
+        None => data_dir,
+    };
+    dir.join(fluxdown_protocol::local_service::DAEMON_ENDPOINT_FILE)
+}
+
+/// 删除端点文件；`NotFound` 忽略，其它错误只记录（后续原子写入会覆盖）。
+fn remove_endpoint_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to remove daemon endpoint file");
+        }
+    }
+}
+
+/// 退出时删除端点文件。
+struct EndpointGuard(PathBuf);
+
+impl Drop for EndpointGuard {
+    fn drop(&mut self) {
+        remove_endpoint_file(&self.0);
+    }
+}
+
+/// 原子发布控制面真实地址（临时文件 + rename，权限同 daemon.token）。
+async fn publish_endpoint_file(path: &Path, bound: SocketAddr) -> std::io::Result<()> {
+    let endpoint = fluxdown_protocol::local_service::LocalEndpoint {
+        rpc_url: format!("ws://{bound}/rpc"),
+    };
+    let mut bytes = serde_json::to_vec(&endpoint).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    let temp = crate::http::temporary_path(path);
+    if let Err(error) = write_private_file(&temp, &bytes).await {
+        if let Err(cleanup) = tokio::fs::remove_file(&temp).await
+            && cleanup.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %temp.display(), error = %cleanup, "failed to remove temporary endpoint file");
+        }
+        return Err(error);
+    }
+    if let Err(error) = tokio::fs::rename(&temp, path).await {
+        if let Err(cleanup) = tokio::fs::remove_file(&temp).await
+            && cleanup.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %temp.display(), error = %cleanup, "failed to remove temporary endpoint file");
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    let mut file = options.open(path).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    drop(file);
+    crate::http::set_private_file_permissions(path).await
+}
+
+/// 绑定控制面。`fallback` 为真且地址被占用 / 被系统保留（Windows WSAEACCES）时，
+/// 回退到同一 IP 的系统分配端口。
+async fn bind_control_plane(addr: SocketAddr, fallback: bool) -> std::io::Result<TcpListener> {
+    let error = match TcpListener::bind(addr).await {
+        Ok(listener) => return Ok(listener),
+        Err(error) => error,
+    };
+    let fallback_addr = SocketAddr::new(addr.ip(), 0);
+    if !(fallback
+        && matches!(
+            error.kind(),
+            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+        ))
+    {
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!("could not bind daemon control plane {addr}: {error}"),
+        ));
+    }
+    tracing::warn!(%addr, %error, "default daemon control port unavailable; falling back to a system-assigned loopback port");
+    TcpListener::bind(fallback_addr).await.map_err(|second| {
+        std::io::Error::new(
+            second.kind(),
+            format!(
+                "could not bind daemon control plane {addr} ({error}) or {fallback_addr}: {second}"
+            ),
+        )
+    })
 }
 
 /// 运行 daemon 直到收到取消信号。
@@ -78,6 +178,14 @@ pub async fn run_with(
             return Ok(());
         }
     };
+    let endpoint_path = process_config
+        .publish_endpoint
+        .then(|| endpoint_file_path(&process_config, &data_dir));
+    if let Some(path) = &endpoint_path {
+        remove_endpoint_file(path);
+    }
+    // 声明在租约之后：先于租约释放，覆盖所有返回路径。
+    let _endpoint_guard = endpoint_path.clone().map(EndpointGuard);
     if let Err(error) = crate::private_fs::secure_data_dir(&data_dir).await {
         tracing::warn!(error = %error, "failed to restrict data directory permissions");
     }
@@ -219,8 +327,12 @@ pub async fn run_with(
             plugin_manager.start_background_hosts().await;
         });
     }
-    let listener = TcpListener::bind(process_config.bind_addr).await?;
+    let listener =
+        bind_control_plane(process_config.bind_addr, process_config.bind_fallback).await?;
     let bound_addr = listener.local_addr()?;
+    if let Some(path) = &endpoint_path {
+        publish_endpoint_file(path, bound_addr).await?;
+    }
     tracing::info!(address = %bound_addr, "fluxdownd control plane listening");
     if let Some(ready) = ready
         && ready
@@ -680,6 +792,10 @@ fn apply_manager_settings(engine: &mut Engine, config: &HashMap<String, String>)
     engine
         .manager
         .set_idle_file_scan(bool_config(config, "idle_file_scan", false));
+    engine.manager.set_completed_record_retention_days(
+        u32::try_from(i32_config(config, "completed_record_retention_days", 0).clamp(0, 3650))
+            .unwrap_or(0),
+    );
 }
 
 fn configured_save_dir(config: &HashMap<String, String>, fallback: String) -> String {
@@ -846,7 +962,75 @@ mod tests {
     use fluxdown_engine::db::DbError;
     use tokio_util::sync::CancellationToken;
 
-    use super::{bootstrap_database, monitor_writer_lease};
+    use super::{
+        EndpointGuard, bind_control_plane, bootstrap_database, endpoint_file_path,
+        monitor_writer_lease, publish_endpoint_file,
+    };
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fluxdown-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn bind_falls_back_only_when_allowed() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("occupy port");
+        let addr = occupied.local_addr().expect("occupied addr");
+
+        let fallback = bind_control_plane(addr, true)
+            .await
+            .expect("fallback bind succeeds");
+        let bound = fallback.local_addr().expect("fallback addr");
+        assert_ne!(bound.port(), addr.port());
+        assert!(bound.ip().is_loopback());
+
+        let error = bind_control_plane(addr, false)
+            .await
+            .expect_err("strict bind must fail");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(error.to_string().contains(&addr.to_string()), "{error}");
+    }
+
+    #[tokio::test]
+    async fn endpoint_file_replaces_stale_content_and_guard_removes_it() {
+        let dir = temp_dir("endpoint");
+        let path = dir.join("daemon-endpoint.json");
+        std::fs::write(&path, "stale").expect("write stale file");
+        let bound: std::net::SocketAddr = "127.0.0.1:4321".parse().expect("addr");
+
+        publish_endpoint_file(&path, bound).await.expect("publish");
+        let endpoint: fluxdown_protocol::local_service::LocalEndpoint =
+            serde_json::from_slice(&std::fs::read(&path).expect("read endpoint"))
+                .expect("parse endpoint");
+        assert_eq!(endpoint.rpc_url, "ws://127.0.0.1:4321/rpc");
+
+        drop(EndpointGuard(path.clone()));
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn endpoint_file_sits_next_to_the_token() {
+        let data = std::path::Path::new("data");
+        let mut config = crate::config::DaemonConfig::embedded(data.to_path_buf(), None);
+        assert_eq!(
+            endpoint_file_path(&config, data),
+            data.join("daemon-endpoint.json")
+        );
+        config.token_file_override = Some(std::path::PathBuf::from("tokens/daemon.token"));
+        assert_eq!(
+            endpoint_file_path(&config, data),
+            std::path::Path::new("tokens").join("daemon-endpoint.json")
+        );
+        config.token_file_override = Some(std::path::PathBuf::from("daemon.token"));
+        assert_eq!(
+            endpoint_file_path(&config, data),
+            data.join("daemon-endpoint.json")
+        );
+    }
 
     #[tokio::test]
     async fn fresh_database_snapshot_contains_builtin_queues() {

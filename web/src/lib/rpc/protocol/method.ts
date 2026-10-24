@@ -5,6 +5,8 @@ export const METHOD = {
   SYSTEM_HELLO: 'system.hello',
   SYSTEM_PING: 'system.ping',
   SYSTEM_SNAPSHOT: 'system.snapshot',
+  /** 任务表 / 队列位置表分页（快照头带 `taskTotal` / `queueTotal` 时用它载入）。 */
+  SYSTEM_TASK_PAGE: 'system.taskPage',
   /** 允许作为连接首帧（握手前）调用。 */
   SYSTEM_SHUTDOWN: 'system.shutdown',
 
@@ -78,6 +80,8 @@ export const METHOD = {
 
   DAEMON_PLUGIN_LIST: 'daemon.plugin.list',
   DAEMON_PLUGIN_SNIFF_RULES: 'daemon.plugin.sniffRules',
+  DAEMON_PLUGIN_PAGE_SCRIPTS: 'daemon.plugin.pageScripts',
+  DAEMON_PLUGIN_PAGE_SCRIPT_SOURCE: 'daemon.plugin.pageScriptSource',
   DAEMON_PLUGIN_AUTH: 'daemon.plugin.auth',
   DAEMON_PLUGIN_SET_ENABLED: 'daemon.plugin.setEnabled',
   DAEMON_PLUGIN_UPDATE_SETTINGS: 'daemon.plugin.updateSettings',
@@ -101,6 +105,7 @@ export const METHOD = {
   DAEMON_PLUGIN_VIEW_KEEPALIVE: 'daemon.plugin.view.keepalive',
   DAEMON_PLUGIN_COMMAND: 'daemon.plugin.command',
   DAEMON_PLUGIN_INVOKE: 'daemon.plugin.invoke',
+  DAEMON_PLUGIN_PAGE_INVOKE: 'daemon.plugin.pageInvoke',
   DAEMON_COMPONENT_GET: 'daemon.component.get',
   DAEMON_COMPONENT_LIST_VERSIONS: 'daemon.component.listVersions',
   DAEMON_COMPONENT_INSTALL: 'daemon.component.install',
@@ -153,6 +158,8 @@ export const METHOD = {
   AGENT_PROFILE_CHANGE_NICKNAME: 'agent.profile.changeNickname',
   AGENT_PROFILE_SEND_PASSWORD_CODE: 'agent.profile.sendPasswordCode',
   AGENT_PROFILE_CHANGE_PASSWORD: 'agent.profile.changePassword',
+  AGENT_PROFILE_SEND_DELETE_CODE: 'agent.profile.sendDeleteCode',
+  AGENT_PROFILE_DELETE_ACCOUNT: 'agent.profile.deleteAccount',
 
   AGENT_GATEWAY_GET: 'agent.gateway.get',
   AGENT_GATEWAY_PATCH: 'agent.gateway.patch',
@@ -178,6 +185,7 @@ export const METHOD = {
   AGENT_LINK_REMOVE: 'agent.link.remove',
   AGENT_LINK_RENAME: 'agent.link.rename',
   AGENT_LINK_REFRESH: 'agent.link.refresh',
+  AGENT_LINK_CONTROL_CREDENTIAL: 'agent.link.controlCredential',
   AGENT_LINK_DISPATCH: 'agent.link.dispatch',
   AGENT_CLOUD_ENDPOINT_GET: 'agent.cloud.endpointGet',
   AGENT_CLOUD_ENDPOINT_SET: 'agent.cloud.endpointSet',
@@ -195,6 +203,8 @@ export const METHOD = {
   AGENT_REFERRAL_DELETE_CODE: 'agent.referral.deleteCode',
   AGENT_REFERRAL_LIST_RECORDS: 'agent.referral.listRecords',
   AGENT_REFERRAL_VALIDATE: 'agent.referral.validate',
+  AGENT_PLUGIN_FAVORITE_LIST: 'agent.pluginFavorite.list',
+  AGENT_PLUGIN_FAVORITE_SET: 'agent.pluginFavorite.set',
 
   // 以下方法读写宿主机路径 / 桌面集成，Web 不使用。
   AGENT_PLATFORM_OPEN_TASK: 'agent.platform.openTask',
@@ -205,6 +215,7 @@ export const METHOD = {
   AGENT_PLATFORM_SET_FILE_ASSOCIATION: 'agent.platform.setFileAssociation',
   AGENT_PLATFORM_SET_URL_PROTOCOL: 'agent.platform.setUrlProtocol',
   AGENT_PLATFORM_FILE_ICON: 'agent.platform.fileIcon',
+  AGENT_SOUND_PREVIEW: 'agent.sound.preview',
   AGENT_CAPTURE_SUBMIT: 'agent.capture.submit',
   AGENT_CAPTURE_SUBMIT_TORRENT_FILE: 'agent.capture.submitTorrentFile',
   AGENT_CAPTURE_LIST: 'agent.capture.list',

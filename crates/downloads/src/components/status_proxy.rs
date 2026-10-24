@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use fluxdown_ui_components::FluxIcon;
+use fluxdown_ui_components::{FluxIcon, tooltip_view};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     AnyElement, App, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
@@ -9,7 +9,6 @@ use gpui::{
 use gpui_component::{
     Disableable as _, Icon, h_flex,
     menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
-    tooltip::Tooltip,
 };
 
 use super::status_bar::{WidgetPlacement, compact_tooltip, status_button, status_button_content};
@@ -96,7 +95,7 @@ fn proxy_menu(menu: PopupMenu, entity: &Entity<DownloadView>, cx: &App) -> Popup
                             .line_height(caption.line_height)
                             .text_color(theme.tokens().colors.muted_foreground)
                             .tooltip(move |window, cx| {
-                                Tooltip::new(tooltip_endpoint.clone()).build(window, cx)
+                                tooltip_view(tooltip_endpoint.clone(), window, cx)
                             })
                             .child(endpoint.clone()),
                     )

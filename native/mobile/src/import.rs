@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use fluxdown_protocol::{
-    ApplicationErrorCode, CreateTaskItem, CreateTaskOutcome, CreateTaskRequest,
+    ApplicationErrorCode, CategoryRouteDto, CreateTaskItem, CreateTaskOutcome, CreateTaskRequest,
     DaemonCreateTasksParams, DaemonCreateTasksResult, RpcErrorData,
 };
 use tokio::sync::{Mutex, watch};
@@ -186,11 +186,19 @@ pub(crate) trait ChunkSender: Send + Sync {
 pub(crate) struct ImportBatch {
     common: CreateTaskRequest,
     items: Vec<CreateTaskItem>,
+    category_route: Option<CategoryRouteDto>,
 }
 
 impl From<ImportBatchDto> for ImportBatch {
     fn from(batch: ImportBatchDto) -> Self {
-        let mut common = CreateTaskRequest::from(batch.common);
+        Self::routed(batch, None)
+    }
+}
+
+impl ImportBatch {
+    /// 转成线协议的一组并按 `route` 决定保存目录与分类路由。
+    fn routed(batch: ImportBatchDto, route: Option<&CategoryRouteDto>) -> Self {
+        let (mut common, category_route) = crate::session::routed_request(batch.common, route);
         common.url.clear();
         common.file_name.clear();
         common.checksum.clear();
@@ -205,11 +213,10 @@ impl From<ImportBatchDto> for ImportBatch {
                     checksum: item.checksum,
                 })
                 .collect(),
+            category_route,
         }
     }
-}
 
-impl ImportBatch {
     pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
@@ -388,7 +395,11 @@ pub(crate) async fn run_import<S: ChunkSender + ?Sized>(
     let mut run = Run::default();
     let mut remaining = total;
     'batches: for batch in batches {
-        let ImportBatch { common, items } = batch;
+        let ImportBatch {
+            common,
+            items,
+            category_route,
+        } = batch;
         for chunk in items.chunks(CREATE_CHUNK_SIZE) {
             if cancel.is_cancelled() {
                 run.cancelled = true;
@@ -402,6 +413,7 @@ pub(crate) async fn run_import<S: ChunkSender + ?Sized>(
                 batch_id: new_batch_id(),
                 common: common.clone(),
                 items: chunk.to_vec(),
+                category_route: category_route.clone(),
             };
             let base = ImportProgressDto {
                 total: count(total),
@@ -451,15 +463,17 @@ pub(crate) async fn run_import<S: ChunkSender + ?Sized>(
     run.summary(total)
 }
 
-/// 启动导入：在 `runtime` 上运行，返回句柄。
+/// 启动导入：在 `runtime` 上运行，返回句柄。`route` 为已连接主机当前的分类路由，仅对
+/// `common.offered_save_dir` 为 `Some` 的组生效（见 [`crate::session::routed_request`]）。
 pub(crate) fn start(
     runtime: &tokio::runtime::Handle,
     sender: Arc<dyn ChunkSender>,
     batches: Vec<ImportBatchDto>,
+    route: Option<&CategoryRouteDto>,
 ) -> Arc<ImportHandle> {
     let batches: Vec<ImportBatch> = batches
         .into_iter()
-        .map(ImportBatch::from)
+        .map(|batch| ImportBatch::routed(batch, route))
         .filter(|batch| !batch.items.is_empty())
         .collect();
     let total: usize = batches.iter().map(ImportBatch::len).sum();
@@ -588,6 +602,8 @@ mod tests {
             http_user: String::new(),
             http_password: String::new(),
             save_site_auth: false,
+            unattended: false,
+            offered_save_dir: None,
         }
     }
 
@@ -962,6 +978,7 @@ mod tests {
                     })
                     .collect(),
             }],
+            None,
         );
         let mut last_done = 0;
         let summary = loop {
@@ -994,6 +1011,7 @@ mod tests {
                     })
                     .collect(),
             }],
+            None,
         );
         handle.cancel();
         handle.cancel();
@@ -1021,6 +1039,7 @@ mod tests {
                 common: request("/d"),
                 items: Vec::new(),
             }],
+            None,
         );
         // 首个更新可能是占位进度，随后必为 Finished（全 0）。
         let summary = loop {
@@ -1032,5 +1051,32 @@ mod tests {
         };
         assert_eq!(summary.total, 0);
         assert!(!summary.cancelled);
+    }
+
+    #[test]
+    fn offered_save_dir_routes_the_batch_with_the_host_category_route() {
+        let route = CategoryRouteDto {
+            rules: Vec::new(),
+            other_dir: "/other".to_owned(),
+        };
+        let dto = |offered: Option<&str>, save_dir: &str| {
+            let mut common = request(save_dir);
+            common.offered_save_dir = offered.map(str::to_owned);
+            ImportBatchDto {
+                common,
+                items: vec![ImportItemDto::default()],
+            }
+        };
+        let routed = ImportBatch::routed(dto(Some("/default"), "/other"), Some(&route));
+        assert_eq!(routed.common.save_dir, "/default");
+        assert_eq!(routed.category_route.as_ref(), Some(&route));
+
+        let chosen = ImportBatch::routed(dto(Some("/default"), "/chosen"), Some(&route));
+        assert_eq!(chosen.common.save_dir, "/chosen");
+        assert_eq!(chosen.category_route, None);
+
+        let unrouted = ImportBatch::routed(dto(None, "/other"), Some(&route));
+        assert_eq!(unrouted.common.save_dir, "/other");
+        assert_eq!(unrouted.category_route, None);
     }
 }

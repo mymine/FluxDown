@@ -243,16 +243,16 @@ struct SearchSettingsTests {
         let entries = SettingsIndex.entries(state: loadedState(capabilities: [HostCapability.agentAuth]), isLocalHost: true)
         let categories = Set(entries.filter { $0.id.hasPrefix("category.") }.map(\.route))
         var expected: Set<SettingsRoute> = [
-            .account, .general, .appearance, .notify, .download, .network, .extensions, .diagnostics, .about,
+            .account, .general, .appearance, .notify, .download, .network, .diagnostics, .about,
         ]
-        #if FULL_P2P
-        expected.formUnion([.bt, .ed2k])
+        #if FULL_FLAVOR
+        expected.formUnion([.extensions, .bt, .ed2k])
         #endif
         #expect(categories == expected) // 本机：没有 API 服务页；Webhook 受 `FeatureFlags.webhooks` 隐藏
         #expect(!entries.contains { $0.route == .webhook || $0.id.contains("webhook") })
         let withRows = Set(entries.filter { !$0.id.hasPrefix("category.") }.map(\.route))
         var routesWithRows: [SettingsRoute] = [.general, .appearance, .notify, .download, .network, .diagnostics, .about]
-        #if FULL_P2P
+        #if FULL_FLAVOR
         routesWithRows += [.bt, .ed2k]
         #endif
         for route in routesWithRows {
@@ -290,7 +290,7 @@ struct SearchSettingsTests {
         let speedWords = SettingsIndex.words("searchKeywordsSpeedLimit")
         #expect(!speedWords.isEmpty)
         #expect(entries.first { $0.id == "download.speedLimit" }?.keywords == speedWords)
-        #if FULL_P2P
+        #if FULL_FLAVOR
         let btWords = SettingsIndex.words("searchKeywordsBtSettings")
         #expect(!btWords.isEmpty)
         #expect(entries.first { $0.id == "category.bt" }?.keywords == btWords)

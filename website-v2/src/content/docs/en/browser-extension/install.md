@@ -23,23 +23,32 @@ Chrome (Manifest V3) and Firefox are supported directly. The desktop app also re
 2. Click **Add to Firefox**, then **Add** in the permissions prompt.
 3. Firefox 140 or later is required. If the install button is greyed out, update Firefox first.
 
-## Manual install from a GitHub Release
+## Offline install: store-signed package (auto-updates)
 
-Use this if you want a build newer than what's currently live on a store, or your organization only allows manually reviewed extensions.
+For when you can't open the store page itself. Every stable release gets a `FluxDown-<version>-chrome.crx` once the Chrome Web Store has approved that version, so the newest package can lag the newest release by a few days. It is the exact `.crx` the Chrome Web Store serves: same extension, same signature.
 
-**Chrome (and other Chromium browsers):**
+**Chrome (and Brave, Vivaldi, …):**
 
-1. Download `FluxDown-<version>-chrome.zip` from the [latest GitHub Release](https://github.com/zerx-lab/fluxdown/releases/latest) and unzip it somewhere permanent — Chrome loads the extension from that folder directly, not from the zip.
+1. Download `FluxDown-<version>-chrome.crx` from the [download page](/download/#extension-signed) or a [GitHub Release](https://github.com/zerx-lab/fluxdown/releases). If Chrome says it can't add extensions from this site, right-click the download link and choose **Save link as** instead.
 2. Open `chrome://extensions` and turn on **Developer mode** (top-right toggle).
-3. Click **Load unpacked** and select the unzipped folder.
-4. The unpacked build keeps the same extension identity as the Chrome Web Store build, so it connects to the desktop app exactly the same way — no extra setup needed.
+3. Drag the `.crx` onto the page and confirm **Add extension**.
+4. You can turn Developer mode off again. Chrome treats the extension as a store install and **updates it automatically**, provided the browser can reach Google's update service.
 
 **Firefox:**
 
-Release builds ship as a signed `FluxDown-<version>-firefox.xpi`, which a regular (non-Developer-Edition) Firefox installs without extra flags:
+Release builds also ship a Mozilla-signed `FluxDown-<version>-firefox.xpi`, which a regular (non-Developer-Edition) Firefox installs without extra flags:
 
 1. Download `FluxDown-<version>-firefox.xpi` from the same Release.
 2. Open `about:addons`, click the gear icon → **Install Add-on From File…**, and select the downloaded `.xpi`.
+
+## Last resort: unpacked build (never auto-updates)
+
+> **The browser never updates an unpacked extension.** Each new version means downloading it again, replacing the folder and clicking **Reload** on `chrome://extensions`. Use it only when neither the store nor the signed package works for you.
+
+1. Download `FluxDown-<version>-chrome.zip` from the [latest GitHub Release](https://github.com/zerx-lab/fluxdown/releases/latest) and unzip it somewhere permanent. Chrome loads the extension from that folder directly, not from the zip.
+2. Open `chrome://extensions` and turn on **Developer mode** (top-right toggle). Leave it on.
+3. Click **Load unpacked** and select the unzipped folder.
+4. The unpacked build keeps the same extension identity as the Chrome Web Store build, so it connects to the desktop app exactly the same way. No extra setup is needed.
 
 <!-- TODO(screenshot): chrome://extensions with Developer mode enabled and the Load unpacked button visible -->
 

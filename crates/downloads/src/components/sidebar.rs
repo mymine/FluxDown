@@ -3,6 +3,7 @@ use std::time::Instant;
 use fluxdown_protocol::{CustomCategoryDto, QueueDto};
 use fluxdown_ui_components::{
     Button, FluxIcon, category_icon, nav_icon_color, sidebar_navigation_button, tabular_numbers,
+    tooltip_view,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -16,7 +17,6 @@ use gpui_component::{
     h_flex,
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
     scroll::ScrollableElement as _,
-    tooltip::Tooltip,
     v_flex,
 };
 
@@ -24,7 +24,7 @@ use crate::{
     controller::DownloadsCommand,
     model::{
         DownloadFilter, DownloadStatusFilter, SidebarSection, SidebarSelection, StatusFolderMotion,
-        devices::devices_section_visible,
+        devices::{DeviceEntry, devices_section_visible},
     },
     pages::downloads::DownloadView,
 };
@@ -42,6 +42,7 @@ fn folder_id(status: DownloadStatusFilter) -> &'static str {
         DownloadStatusFilter::All => "download-folder-all",
         DownloadStatusFilter::Incomplete => "download-folder-incomplete",
         DownloadStatusFilter::Completed => "download-folder-completed",
+        DownloadStatusFilter::Seeding => "download-folder-seeding",
         DownloadStatusFilter::Failed => "download-folder-failed",
         DownloadStatusFilter::Paused => "download-folder-paused",
     }
@@ -53,6 +54,7 @@ fn status_icon(status: DownloadStatusFilter) -> FluxIcon {
         DownloadStatusFilter::All => FluxIcon::Layers,
         DownloadStatusFilter::Incomplete => FluxIcon::CircleArrowDown,
         DownloadStatusFilter::Completed => FluxIcon::CircleCheck,
+        DownloadStatusFilter::Seeding => FluxIcon::ArrowUp,
         DownloadStatusFilter::Failed => FluxIcon::CircleAlert,
         DownloadStatusFilter::Paused => FluxIcon::CirclePause,
     }
@@ -517,6 +519,7 @@ impl DownloadView {
             DownloadStatusFilter::All => self.strings.status_all.clone(),
             DownloadStatusFilter::Incomplete => self.strings.status_incomplete.clone(),
             DownloadStatusFilter::Completed => self.strings.status_completed.clone(),
+            DownloadStatusFilter::Seeding => self.strings.status_seeding.clone(),
             DownloadStatusFilter::Failed => self.strings.tab_failed.clone(),
             DownloadStatusFilter::Paused => self.strings.status_paused.clone(),
         }
@@ -818,7 +821,7 @@ impl DownloadView {
                 .cursor_pointer()
                 .text_color(tokens.colors.muted_foreground)
                 .hover(move |style| style.bg(nav_hover).text_color(hover_foreground))
-                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
@@ -829,8 +832,9 @@ impl DownloadView {
         )
     }
 
-    /// 设备区：（有其他设备时）全部设备 + 本机 + 账号其他设备 + 已配对设备。云设备排除本机
-    /// （名册包含请求设备自身）；在线状态用圆点；同名设备已追加短码；远程任务按目标设备计数。
+    /// 设备区：（有云端其他设备时）全部设备 + 本机 + 账号其他设备（含挂接直连）+ 独立直连设备。
+    /// 云条目可选中作为任务筛选，远程任务按目标设备计数；独立直连设备没有任务视图，点击打开
+    /// 「新建下载」并预选该设备，右键可下发 / 重命名 / 解除配对。在线状态用圆点；同名已消歧。
     fn render_devices_section(
         &self,
         first: bool,
@@ -842,9 +846,29 @@ impl DownloadView {
         let icon_size = theme.extended().icon.lg;
         let online_color = theme.extended().colors.success;
         let offline_color = theme.extended().colors.text_tertiary;
-        let others = self.controller.sidebar_devices();
+        let (standalone, cloud): (Vec<_>, Vec<_>) = self
+            .controller
+            .other_devices()
+            .into_iter()
+            .partition(DeviceEntry::is_standalone_link);
+        let presence = |device: &DeviceEntry| {
+            let dot = match device.online {
+                Some(true) => Some(online_color),
+                Some(false) => Some(offline_color),
+                None => None,
+            };
+            let label = if device.online.is_none() {
+                SharedString::from(format!(
+                    "{} · {}",
+                    device.label, self.strings.device_presence_unknown
+                ))
+            } else {
+                SharedString::from(device.label.clone())
+            };
+            (label, dot)
+        };
         let mut rows: Vec<(String, SharedString, FluxIcon, Option<Hsla>)> = Vec::new();
-        if !others.is_empty() {
+        if !cloud.is_empty() {
             rows.push((
                 SidebarSelection::ALL_DEVICES.to_owned(),
                 self.strings.all_devices.clone(),
@@ -858,35 +882,29 @@ impl DownloadView {
             FluxIcon::Cpu,
             None,
         ));
-        rows.extend(others.into_iter().map(|device| {
-            let icon = FluxIcon::Globe;
-            let dot = match device.online {
-                Some(true) => Some(online_color),
-                Some(false) => Some(offline_color),
-                None => None,
-            };
-            let label = if device.online.is_none() {
-                SharedString::from(format!(
-                    "{} · {}",
-                    device.label, self.strings.device_presence_unknown
-                ))
-            } else {
-                SharedString::from(device.label)
-            };
-            (device.id, label, icon, dot)
+        rows.extend(cloud.iter().map(|device| {
+            let (label, dot) = presence(device);
+            (device.id.clone(), label, FluxIcon::Globe, dot)
         }));
-        let count = rows.len() as f32;
-        let mut items = Vec::with_capacity(rows.len());
+        let count = (rows.len() + standalone.len()) as f32;
+        let mut items: Vec<AnyElement> = Vec::with_capacity(rows.len() + standalone.len());
         for (id, label, icon, dot) in rows {
             let task_count = self.device_count(&id, cx);
-            items.push(self.nav_item(
-                format!("download-nav-device-{id}"),
-                SidebarSelection::Device(id),
-                label,
-                Icon::new(icon).size(icon_size),
-                (task_count, dot),
-                cx,
-            ));
+            items.push(
+                self.nav_item(
+                    format!("download-nav-device-{id}"),
+                    SidebarSelection::Device(id),
+                    label,
+                    Icon::new(icon).size(icon_size),
+                    (task_count, dot),
+                    cx,
+                )
+                .into_any_element(),
+            );
+        }
+        for device in &standalone {
+            let (label, dot) = presence(device);
+            items.push(self.linked_device_item(device, label, dot, cx));
         }
         Self::section_container(first, cx)
             .child(self.section_header(
@@ -905,6 +923,73 @@ impl DownloadView {
             )
     }
 
+    /// 独立直连设备行：不参与选中；点击打开「新建下载」并预选该设备，右键下发 / 重命名 / 解除配对。
+    fn linked_device_item(
+        &self,
+        device: &DeviceEntry,
+        label: SharedString,
+        dot: Option<Hsla>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let icon_size = active_theme(cx).extended().icon.lg;
+        let icon_color = nav_icon_color(false, cx);
+        let target = device.target();
+        let click_target = target.clone();
+        let this = cx.weak_entity();
+        let fingerprint = device.id.clone();
+        let download_label = self.strings.device_download_to_this.clone();
+        let rename_label = self.strings.linked_device_rename.clone();
+        let unpair_label = self.strings.linked_device_unpair.clone();
+        let rename = self.host.rename_linked_device.clone();
+        let unpair = self.host.unpair_linked_device.clone();
+        sidebar_navigation_button(
+            format!("download-nav-link-{}", device.id),
+            label,
+            Icon::new(FluxIcon::Network)
+                .size(icon_size)
+                .text_color(icon_color),
+            Self::nav_trailing(0, false, dot, cx),
+            false,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.open_new_download_to(click_target.clone(), window, cx);
+        }))
+        .context_menu(move |menu, _window, _cx| {
+            let menu = menu.item({
+                let this = this.clone();
+                let target = target.clone();
+                PopupMenuItem::new(download_label.clone()).on_click(move |_, window, cx| {
+                    let target = target.clone();
+                    let Ok(()) = this.update(cx, |this, cx| {
+                        this.open_new_download_to(target, window, cx);
+                    }) else {
+                        // 视图已释放，结束这次回调而不再更新状态。
+                        return;
+                    };
+                })
+            });
+            let menu = menu.when_some(rename.clone(), |menu, rename| {
+                let fingerprint = fingerprint.clone();
+                menu.item(PopupMenuItem::new(rename_label.clone()).on_click(
+                    move |_, window, cx| {
+                        rename(fingerprint.clone(), window, cx);
+                    },
+                ))
+            });
+            menu.when_some(unpair.clone(), |menu, unpair| {
+                let fingerprint = fingerprint.clone();
+                menu.separator()
+                    .item(PopupMenuItem::new(unpair_label.clone()).on_click(
+                        move |_, window, cx| {
+                            unpair(fingerprint.clone(), window, cx);
+                        },
+                    ))
+            })
+        })
+        .into_any_element()
+    }
+
     /// 分区可见性：设备区三态（偏好显式设置则按值，未设置时按「是否存在其他设备」判定——
     /// 账号里只有本机一台不算）；其余分区二态，默认显示。
     fn section_visible(&self, section: SidebarSection) -> bool {
@@ -913,7 +998,7 @@ impl DownloadView {
                 self.controller
                     .preference(section.visibility_pref())
                     .and_then(serde_json::Value::as_bool),
-                self.controller.sidebar_devices().len(),
+                self.controller.other_devices().len(),
             ),
             _ => self
                 .controller

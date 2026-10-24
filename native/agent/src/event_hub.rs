@@ -41,20 +41,63 @@ impl AgentEventHub {
         }
     }
 
+    /// 进程内的**完整**快照（含任务表，O(任务数) 克隆）。线上一律走 [`Self::wire_snapshot`]；
+    /// 只需个别字段时用 [`Self::inspect`]。
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         let state = lock_or_recover(&self.state);
+        let mut snapshot = state.snapshot.clone();
+        // 入站配对请求的相对剩余时间按取快照时刻重算（晚连接的客户端不能拿到建请求时的旧值）。
+        crate::link::refresh_request_ttls(&mut snapshot.link_pairing_requests);
         Snapshot {
             epoch: state.epoch.clone(),
             sequence: state.sequence,
-            body: SnapshotBody::Agent(Box::new(state.snapshot.clone())),
+            body: SnapshotBody::Agent(Box::new(snapshot)),
         }
+    }
+
+    /// `system.snapshot` 的线上快照：嵌套 daemon 快照只带头（`taskTotal` / `queueTotal`），
+    /// 不克隆任务表；表经 [`Self::task_page`] 分页取。
+    #[must_use]
+    pub fn wire_snapshot(&self) -> Snapshot {
+        let state = lock_or_recover(&self.state);
+        let mut header = state.snapshot.paged_header();
+        crate::link::refresh_request_ttls(&mut header.link_pairing_requests);
+        Snapshot {
+            epoch: state.epoch.clone(),
+            sequence: state.sequence,
+            body: SnapshotBody::Agent(Box::new(header)),
+        }
+    }
+
+    /// `system.taskPage`：在同一临界区内读出事件位置与一页行。
+    ///
+    /// # Errors
+    ///
+    /// 游标无法解析。
+    pub fn task_page(
+        &self,
+        params: &fluxdown_protocol::TablePageParams,
+    ) -> Result<fluxdown_protocol::TablePage, fluxdown_protocol::InvalidPageCursor> {
+        let state = lock_or_recover(&self.state);
+        fluxdown_protocol::TablePage::build(
+            &state.snapshot.daemon,
+            &state.epoch,
+            state.sequence,
+            params,
+        )
     }
 
     #[must_use]
     pub fn subscribe_and_snapshot(&self) -> (broadcast::Receiver<EventFrame>, Snapshot) {
         let receiver = self.events.subscribe();
         (receiver, self.snapshot())
+    }
+
+    /// 只订阅增量广播（不克隆快照）；订阅早于调用方随后拉取的快照即可。
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<EventFrame> {
+        self.events.subscribe()
     }
 
     /// 在临界区内只读访问当前投影。高频事件路径用它按需提取少量字段，
@@ -74,6 +117,9 @@ impl AgentEventHub {
         self.publish(AgentEvent::DaemonSnapshotReplaced(snapshot))
     }
 
+    /// 先更新完整投影，再递增 sequence 并广播。广播 / 线上形态里的整表替换换成头或重载宣告
+    /// （[`AgentEvent::into_wire`]），任何一帧都不随任务数增长；订阅者经 `system.taskPage`
+    /// 分页取表，进程内消费者读 [`Self::inspect`] 的完整投影。
     pub fn publish(&self, event: AgentEvent) -> EventFrame {
         let mut state = lock_or_recover(&self.state);
         apply_agent_event(&mut state.snapshot, &event);
@@ -81,7 +127,8 @@ impl AgentEventHub {
         let frame = EventFrame {
             epoch: state.epoch.clone(),
             sequence: state.sequence,
-            event: ServiceEvent::Agent(event),
+            previous: None,
+            event: ServiceEvent::Agent(event.into_wire()),
         };
         // 无订阅者时快照仍需更新，但无需克隆整帧，也不逐事件刷生命周期日志。
         if self.events.receiver_count() > 0 && self.events.send(frame.clone()).is_err() {

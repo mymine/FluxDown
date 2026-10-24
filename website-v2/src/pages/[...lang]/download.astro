@@ -9,7 +9,7 @@ import DesktopMatrix from "@/components/download/DesktopMatrix.astro";
 import ServerSection from "@/components/download/ServerSection.astro";
 import ToolsSection from "@/components/download/ToolsSection.astro";
 import ExtensionSection from "@/components/download/ExtensionSection.astro";
-import SubscribeSection from "@/components/download/SubscribeSection.astro";
+import HelpSection from "@/components/download/HelpSection.astro";
 import { download } from "@/i18n/messages/download";
 import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
 import { GITHUB_URL } from "@/lib/site-nav";
@@ -37,7 +37,7 @@ const jsonLdNodes = [
     <ServerSection lang={lang} />
     <ToolsSection lang={lang} />
     <ExtensionSection lang={lang} />
-    <SubscribeSection lang={lang} />
+    <HelpSection lang={lang} />
   </div>
 </Layout>
 

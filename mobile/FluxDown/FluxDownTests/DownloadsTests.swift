@@ -57,7 +57,9 @@ import Testing
     for (id, bps) in upSpeeds where state.speeds[id] == nil { state.speeds[id] = LiveSpeed(down: 0, up: bps) }
     state.queues = queues
     state.groups = groups
-    state.queuePositions = positions
+    state.queueOrder = QueueOrder(sorted: positions.sorted { $0.value < $1.value }.map {
+        QueueOrderEntry(taskId: $0.key, order: Int64($0.value))
+    })
     state.priorityTaskId = boosted
     state.runtime = runtime
     return state
@@ -128,6 +130,26 @@ struct DownloadsFilterTests {
         #expect(facets.count(.paused) == 1)
     }
 
+    #if FULL_FLAVOR
+    @Test func seedingFolderHoldsSeedingAndQueuedAndStaysInsideCompleted() {
+        let state = makeState([
+            makeTask("s", .completed, seeding: .seeding),
+            makeTask("q", .completed, seeding: .queuedForSlot),
+            makeTask("u", .completed, seeding: .userStopped),
+            makeTask("c", .completed),
+            makeTask("d", .downloading, seeding: .seeding),
+        ])
+        let facets = derive(state).facets
+        #expect(facets.count(.seeding) == 2)
+        #expect(facets.count(.completed) == 4)
+        var filter = DownloadsFilter()
+        filter.folder = .seeding
+        #expect(Set(ids(derive(state, filter: filter))) == ["s", "q"])
+        #expect(StatusFolder.allCases.firstIndex(of: .seeding) == StatusFolder.allCases.firstIndex(of: .completed).map { $0 + 1 })
+        #expect(!StatusFolder.seeding.accepts(.pending as RemoteTaskStatus))
+    }
+    #endif
+
     @Test func categoryPillsCountOnlyCurrentFolder() {
         let state = makeState(tasks)
         var filter = DownloadsFilter()
@@ -146,6 +168,23 @@ struct DownloadsFilterTests {
         #expect(ids(result) == ["a"])
         #expect(result.facets.matching == 1)
         #expect(result.list.taskTotal == 7)
+    }
+
+    /// 任务表分页载入中：派生结果必须声明「未载入」并带上服务端总数，空列表不是完整列表。
+    @Test func tasksLoadingStateIsNotACompleteList() {
+        var state = makeState([])
+        state.tasksLoading = true
+        state.taskTotal = 230_000
+        let loading = derive(state).list
+        #expect(!loading.loaded)
+        #expect(loading.loadingTotal == 230_000)
+        #expect(loading.visibleIds.isEmpty)
+
+        // 载入完成：同一状态不再是加载态，总数清零。
+        let done = derive(makeState(tasks)).list
+        #expect(done.loaded)
+        #expect(done.loadingTotal == 0)
+        #expect(done.taskTotal == 7)
     }
 
     @Test func unknownCategoryFallsBackToAll() {
@@ -452,7 +491,11 @@ struct DownloadsRemoteRowsTests {
         ]
         let state = makeState([makeTask("l", .paused, url: "https://e.com/f", created: at("2026-10-08T03:00:00Z"))])
         let result = run(order: order(.smart, ascending: false, group: .site), state: state, remote: remote)
+        #if FULL_FLAVOR
         #expect(result.list.sections.map(\.id) == ["site:e.com", "site:"])
+        #else
+        #expect(result.list.sections.map(\.id) == ["site:e.com", "site:-"])
+        #endif
         #expect(result.list.sections[0].rows.map(\.id) == ["l", "remote:w"])
         #expect(result.list.sections[1].rows.map(\.id) == ["remote:m"])
     }
@@ -746,9 +789,16 @@ struct DownloadsGroupingTests {
             makeTask("ed", .paused, url: "ed2k://|file|x|1|h|/"),
         ])
         let sections = derive(state, order: ViewOrder(groupBy: .site, sortKey: .smart, ascending: false)).list.sections
+        #if FULL_FLAVOR
         #expect(sections.map(\.id) == ["site:A.example.com", "site:b.example.com", "site:", "site:-"])
         #expect(sections[2].title == .key("viewSiteBt"))
         #expect(sections[3].title == .text(Format.dash))
+        #else
+        // store 不含 P2P：无 host 的磁力 / eD2K 行一律归「—」。
+        #expect(sections.map(\.id) == ["site:A.example.com", "site:b.example.com", "site:-"])
+        #expect(sections[2].title == .text(Format.dash))
+        #expect(sections[2].rows.map(\.id).sorted() == ["bt", "ed"])
+        #endif
     }
 
     @Test func groupByTaskGroupShowsDoneOfTotalAndUngroupedLast() {
@@ -864,6 +914,31 @@ struct DownloadsRowModelTests {
         #expect(try bar(makeTask("d", .downloading))?.progress == nil)
     }
 
+    /// 队首出队只删一个键：其余排队行的稳定键不变 → 行模型逐个相等（不重建）；名次在渲染时按键二分得到。
+    @Test func dequeuingTheHeadKeepsOtherQueuedRowsEqualAndRanksShift() throws {
+        let tasks = ["a", "b", "c"].map { makeTask($0, .pending) }
+        var deriver = DownloadsDeriver()
+        func items(_ state: HostState) -> [String: TaskItem] {
+            let result = deriver.derive(
+                DeriveInput(state: state, order: smart, filter: DownloadsFilter(), collapsed: []),
+                nowMs: 1_000_000,
+                interactionMs: 0
+            )
+            return Dictionary(uniqueKeysWithValues: result.list.sections.flatMap { $0.rows.compactMap(\.item) }.map { ($0.id, $0) })
+        }
+        var state = makeState(tasks)
+        state.queueOrder = QueueOrder(sorted: [("a", 10), ("b", 20), ("c", 30)].map { QueueOrderEntry(taskId: $0.0, order: $0.1) })
+        let before = items(state)
+        #expect(state.queueOrder.rank(of: "b") == 2)
+
+        state.queueOrder = QueueOrder(sorted: state.queueOrder.entries.filter { $0.taskId != "a" })
+        let after = items(state)
+        #expect(after["b"] == before["b"] && after["c"] == before["c"])
+        #expect(after["b"]?.visual == .queued)
+        #expect(state.queueOrder.rank(of: "b") == 1 && state.queueOrder.rank(of: "c") == 2)
+        #expect(state.queueOrder.rank(of: "a") == 0)
+    }
+
     @Test func visualStateAndRingMapping() throws {
         func item(_ task: DownloadTask, queued: Bool = false) throws -> TaskItem {
             try firstItem(derive(makeState([task], positions: queued ? [task.taskId: 3] : [:])))
@@ -874,7 +949,12 @@ struct DownloadsRowModelTests {
         #expect(try item(makeTask("a", .preparing)).visual == .preparing)
         #expect(try item(makeTask("a", .preparing, total: 10)).visual == .verifying)
         #expect(try item(makeTask("a", .completed, missing: true)).visual == .missing)
+        #if FULL_FLAVOR
         #expect(try item(makeTask("a", .completed, seeding: .seeding)).visual == .seeding)
+        #else
+        // store 不含做种：做种任务按已完成呈现。
+        #expect(try item(makeTask("a", .completed, seeding: .seeding)).visual == .completed)
+        #endif
 
         #expect(try item(makeTask("a", .downloading)).ring == .pause)
         #expect(try item(makeTask("a", .preparing)).ring == .preparing)
@@ -969,8 +1049,13 @@ struct DownloadsRowTextTests {
     }
 
     @Test func stateStatusLines() throws {
-        func line(_ task: DownloadTask, queued: Int32 = 0) throws -> StatusLine {
-            echo.status(try item(task) { if queued > 0 { $0.queuePositions[task.taskId] = queued } }, fields: allFields)
+        func line(_ task: DownloadTask, queued: Int = 0) throws -> StatusLine {
+            let built = try item(task) {
+                guard queued > 0 else { return }
+                let fillers = (1..<queued).map { QueueOrderEntry(taskId: "f\($0)", order: Int64($0)) }
+                $0.queueOrder = QueueOrder(sorted: fillers + [QueueOrderEntry(taskId: task.taskId, order: Int64(queued))])
+            }
+            return echo.status(built, fields: allFields, queuePosition: queued)
         }
         #expect(try line(makeTask("a", .pending), queued: 3) == StatusLine(text: "subtitleQueued|pos=3", tone: .secondary))
         #expect(try line(makeTask("a", .pending)) == StatusLine(text: "statusPending", tone: .secondary))
@@ -983,12 +1068,40 @@ struct DownloadsRowTextTests {
         #expect(try line(makeTask("a", .failed)) == StatusLine(text: "statusError", tone: .failure))
     }
 
+    #if FULL_FLAVOR
     @Test func seedingShowsUploadSpeed() throws {
         let seeding = try item(makeTask("a", .completed, seeding: .seeding)) { $0.speeds["a"] = LiveSpeed(down: 0, up: 640 * 1024) }
         let line = echo.status(seeding, fields: allFields)
         #expect(line.tone == .success)
         #expect(line.text == "statusSeeding · ↑ \(try #require(Format.speed(640 * 1024)).description)")
     }
+
+    @Test func queuedSeedingShowsQueuedLabelAndStoppedSeedKeepsCompleted() throws {
+        let queued = try item(makeTask("q", .completed, seeding: .queuedForSlot))
+        #expect(queued.visual == .seeding)
+        #expect(echo.status(queued, fields: allFields) == StatusLine(text: "seedingStatusQueued", tone: .success))
+        let stopped = try item(makeTask("s", .completed, seeding: .userStopped))
+        #expect(stopped.visual == .completed)
+        #expect(echo.status(stopped, fields: allFields) == StatusLine(text: "statusCompleted", tone: .secondary))
+    }
+    #else
+    @Test func seedingTasksReadAsCompletedInStoreBuilds() throws {
+        let seeding = try item(makeTask("a", .completed, seeding: .seeding)) { $0.speeds["a"] = LiveSpeed(down: 0, up: 640 * 1024) }
+        #expect(seeding.visual == .completed)
+        #expect(echo.status(seeding, fields: allFields) == StatusLine(text: "statusCompleted", tone: .secondary))
+    }
+
+    @Test func storeBuildsSkipBtAndPluginSelections() {
+        func request(_ id: String, _ kind: SelectionKind) -> SelectionRequest {
+            SelectionRequest(requestId: id, taskId: "t", kind: kind, defaultChoice: .cancelled, deadlineUnixMs: 0)
+        }
+        let hidden = [request("b", .bt([])), request("p", .plugin(site: "s", url: "u", candidates: [])), request("v", .variant([]))]
+        #expect(hidden.presentable.isEmpty)
+        #expect(PendingSelection.make(hidden) { _ in nil } == nil)
+        // 队首被剔除时横幅落到下一条可处理的请求（HLS 照常）。
+        #expect(PendingSelection.make(hidden + [request("h", .hls([]))]) { _ in nil }?.route == .selection(requestId: "h"))
+    }
+    #endif
 
     @Test func pendingFileConflictMarksOnlyItsTaskAndOverridesTheStatusLine() throws {
         let conflict = SelectionRequest(
@@ -1023,7 +1136,11 @@ struct DownloadsRowTextTests {
         #expect(many?.deadlineUnixMs == 5 && many?.countdownKey == "fileConflictAutoRenameIn")
 
         let bt = SelectionRequest(requestId: "bt", taskId: "t", kind: .bt([]), defaultChoice: .cancelled, deadlineUnixMs: 1)
+        #if FULL_FLAVOR
         #expect(PendingSelection.make([bt]) { _ in "x" }?.route == .selection(requestId: "bt"))
+        #else
+        #expect(PendingSelection.make([bt]) { _ in "x" } == nil)
+        #endif
     }
 
     @Test func metaLineByStateAndFields() throws {

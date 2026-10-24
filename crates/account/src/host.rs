@@ -246,6 +246,12 @@ impl AccountHost {
             .cloned()
     }
 
+    /// 入站配对请求的本机截止时刻（Unix 毫秒）：收到时刻 + `ttlMs`，免疫远端主机的时钟偏差。
+    #[must_use]
+    pub fn pairing_deadline_ms(&self, session_id: &str) -> Option<i64> {
+        self.controller.pairing_deadline_ms(session_id)
+    }
+
     /// 当前全部待确认的入站请求 ID（app 在窗口就绪后补弹启动前已存在的请求）。
     #[must_use]
     pub fn pending_pairing_requests(&self) -> Vec<String> {

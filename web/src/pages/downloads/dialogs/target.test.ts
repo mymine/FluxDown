@@ -9,7 +9,7 @@ import {
   resolveTargetValue,
   summarizeDispatch,
 } from './target'
-import { mergeDevices, sidebarDevices } from '../model/devices'
+import { mergeDevices } from '../model/devices'
 
 function link(over: Partial<LinkDeviceInfo>): LinkDeviceInfo {
   return { fingerprint: 'fp', name: 'Phone', online: true, pairedAt: 0, lastSeenAt: 0, revoked: false, ...over }
@@ -148,9 +148,16 @@ describe('目标列表', () => {
     expect(resolveTargetValue('link:nope', targets)).toBeNull()
   })
 
-  test('侧栏只列云条目（含挂接），独立直连不列', () => {
+  test('其他设备 = 云条目（含挂接）在前 + 独立直连在后；独立直连保留 kind=link 与指纹 id', () => {
     const entries = mergeDevices([cloud({ deviceId: 'pc', name: 'PC' })], [link({ cloudDeviceId: 'pc' }), link({ fingerprint: 'solo', name: 'Solo' })], presence)
-    expect(sidebarDevices(entries).map((entry) => entry.id)).toEqual(['pc'])
+    expect(entries.map((entry) => [entry.id, entry.kind])).toEqual([['pc', 'cloud'], ['solo', 'link']])
+    expect(entries[1]).toMatchObject({ linkFingerprint: 'solo', linkOnline: true })
+  })
+
+  test('仅有独立直连、无云设备时也计入其他设备总数；revoked 不计', () => {
+    expect(mergeDevices([], [link({ fingerprint: 'solo' })], presence)).toHaveLength(1)
+    expect(mergeDevices([], [link({ revoked: true })], presence)).toHaveLength(0)
+    expect(mergeDevices([cloud({ deviceId: 'me', isCurrent: true })], [], presence)).toHaveLength(0)
   })
 
   test('汇总成功 / 失败条数', () => {

@@ -22,6 +22,7 @@ This page covers the user-facing model and the rules a plugin author needs to kn
 | `background` | Keep the `main` script running with the daemon. |
 | `intercept` | Interceptors: read and change the URL, request headers, cookies and body of matching tasks, control their connection count, skip the probe, swap credentials mid-download, rewrite or filter streaming segments, choose the quality or DASH Period, process the file before completion, and ask for a retry after a task fails. See the [Interceptors guide](/docs/en/plugins/interceptors-guide/). |
 | `desktop` | Run native desktop scripts with **full trust** (see below). |
+| `pageScripts` | Run the plugin's scripts on the websites it lists in `contributes.pageScripts`, through the FluxDown browser extension, with **Full** risk (see [Page scripts](#page-scripts-in-the-browser)). |
 
 Subscription providers, hooks, resolvers and portable views need no permission of their own.
 
@@ -33,7 +34,7 @@ The risk level is computed from the permissions — it is not self-declared.
 |---|---|---|
 | **Standard** | No permissions. | — |
 | **Elevated** | Any of `ffmpeg`, `ytdlp`, `auth`, `tasks`, `browserRules`, `background`, `intercept`. | Warning badge |
-| **Full** | `desktop`. | Destructive badge |
+| **Full** | `desktop` or `pageScripts`. | Destructive badge |
 
 The badge appears on installed plugins and on market listings.
 
@@ -88,6 +89,17 @@ Install a plugin with `desktop` only if you trust its author the way you would t
 **Native file, process and network operations performed by desktop scripts are not logged one by one.** The audit log records that a desktop script was loaded, unloaded, and every `fluxdown.call` / `fluxdown.invoke` it made — the coarse boundary where it touched FluxDown — but nothing about what it did on its own with the operating system.
 
 Desktop scripts do not run in the daemon, on Web or on mobile.
+
+## Page scripts in the browser
+
+A plugin with `pageScripts` makes the FluxDown browser extension run the plugin's JavaScript on the websites its manifest lists. Such a script can read and change everything the page shows and everything the signed-in user can do on that site, so the permission is **Full** risk and the consent dialog (desktop and Web) lists each script's title and the sites it matches.
+
+Two confirmations are needed, once per plugin:
+
+1. **In FluxDown**: approve the permission in the consent dialog described above (a Full plugin needs *I understand* ticked).
+2. **In the browser extension**: the first time you enable a plugin's page scripts in the extension's options page, a dialog states the risk and asks you to confirm.
+
+After that, new scripts, new code and a changed match list from the same plugin take effect without further prompts. Disabling or uninstalling the plugin, or leaving a newly requested permission unapproved, removes its scripts from the browser. The script code is always fetched from the FluxDown desktop app; the extension keeps no copy of its own. See [Page scripts](/docs/en/plugins/page-scripts-guide/) for the bridge, the limits and the safety notes.
 
 ## Failure circuit breaker
 

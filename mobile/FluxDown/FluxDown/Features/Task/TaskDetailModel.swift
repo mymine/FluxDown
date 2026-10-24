@@ -18,7 +18,7 @@ nonisolated enum TaskDetailVisual: Sendable, Hashable {
         case .completed:
             if task.fileMissing {
                 self = .missing
-            } else if task.seedingStatus == .seeding {
+            } else if task.presentsSeeding {
                 self = .seeding
             } else {
                 self = .completed
@@ -83,7 +83,7 @@ nonisolated struct TaskDetailModel: Equatable {
 
     init?(state: HostState, taskId: String) {
         guard let task = state.task(taskId) else { return nil }
-        let position = Int(state.queuePositions[taskId] ?? 0)
+        let position = state.queueOrder.rank(of: taskId)
         let speed = state.speed(taskId)
         self.task = task
         visual = TaskDetailVisual(task: task, queuePosition: position)
@@ -242,7 +242,11 @@ enum TaskDetailFormat {
            let host = URLComponents(string: raw)?.host, !host.isEmpty {
             return host.hasPrefix("www.") && host.count > 4 ? String(host.dropFirst(4)) : host
         }
+        #if FULL_FLAVOR
         return task.protocol == .bt ? "BitTorrent" : protocolTag(task.protocol)
+        #else
+        return protocolTag(task.protocol)
+        #endif
     }
 
     /// 首个非空行（错误信息常带多行堆栈）。

@@ -160,7 +160,7 @@ class ExternalDownloadActivity : ComponentActivity() {
         val plan = SilentCapture.plan(request, state)
         if (plan != null && silentDirUsable(container, plan)) {
             try {
-                container.session.callUnit(HostMethod.daemonTaskCreate, plan.params())
+                container.session.createTask(plan.request)
                 keepLocalDownloadsAlive(container)
                 if (navigator.sheet == null) finishAndRemoveTask()
                 return

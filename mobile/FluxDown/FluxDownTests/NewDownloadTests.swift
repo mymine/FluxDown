@@ -135,6 +135,7 @@ struct LinkParserTests {
     }
 }
 
+#if FULL_FLAVOR
 @Suite("BtFileTree")
 struct BtFileTreeTests {
     private let files = [
@@ -185,3 +186,4 @@ struct BtFileTreeTests {
         #expect(initialBtSelection(files: files, defaultIndices: [99]) == [0, 1, 2, 3])
     }
 }
+#endif

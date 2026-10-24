@@ -2,6 +2,7 @@
 // 连到 agent 的 /rpc 时，agent 会把 `daemon.*` 原样转发给 daemon。
 
 import { call } from '../client';
+import { normalizeTask } from '../normalize';
 import { METHOD } from '../protocol';
 import type {
   ComponentInstallParams,
@@ -93,7 +94,7 @@ import type {
   TaskDeleteParams,
   TaskChangeUrlParams,
   TaskSetSegmentsParams,
-  TaskDto,
+  TaskDtoWire,
   TaskIdParams,
   TaskIdsParams,
   TaskRenameParams,
@@ -110,9 +111,11 @@ const SLOW_MIRROR_TIMEOUT_MS = 120_000;
 /** BT 完整性校验需读盘比对全部分块，耗时随数据量增长。 */
 const VERIFY_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 
+// `daemon.task.list` 在任务数超过 5000 时服务端报错（需分页），Web 不再封装：任务表一律来自
+// store 的快照 + `system.taskPage` 载入。
 const task = {
-  list: () => call<TaskDto[]>(METHOD.DAEMON_TASK_LIST),
-  get: (params: TaskIdParams) => call<TaskDto>(METHOD.DAEMON_TASK_GET, params),
+  get: async (params: TaskIdParams) =>
+    normalizeTask(await call<TaskDtoWire>(METHOD.DAEMON_TASK_GET, params)),
   activity: (params: TaskActivityQuery) =>
     call<TaskActivityPage>(METHOD.DAEMON_TASK_ACTIVITY, params),
   speedHistory: (params: TaskSpeedHistoryQuery) =>

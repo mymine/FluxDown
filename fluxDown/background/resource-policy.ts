@@ -49,7 +49,8 @@ export function computeConfidence(
 
   const threshold = SIZE_THRESHOLDS[type];
   if (type !== "other" && type !== "image") {
-    if (size > 0 && threshold > 0 && size >= threshold) return "high";
+    // 阈值 -1（文档 / 压缩包）= 不设下限：大小已知即为 high，而不是落进「低于阈值」。
+    if (size > 0 && (threshold <= 0 || size >= threshold)) return "high";
     if (size <= 0) return "medium"; // 大小未知，但类型明确
     return "low";
   }

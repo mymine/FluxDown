@@ -38,7 +38,12 @@ struct TaskDetailTests {
         var done = task(status: .completed)
         #expect(TaskDetailVisual(task: done, queuePosition: 0) == .completed)
         done.seedingStatus = .seeding
+        // store 不含做种：做种任务按已完成呈现。
+        #if FULL_FLAVOR
         #expect(TaskDetailVisual(task: done, queuePosition: 0) == .seeding)
+        #else
+        #expect(TaskDetailVisual(task: done, queuePosition: 0) == .completed)
+        #endif
         done.fileMissing = true
         #expect(TaskDetailVisual(task: done, queuePosition: 0) == .missing)
         #expect(TaskDetailVisual.missing.isFinished)
@@ -123,8 +128,13 @@ struct TaskDetailTests {
 
     @Test func siteLabel() {
         #expect(TaskDetailFormat.siteLabel(task(url: "https://www.example.com/x")) == "example.com")
+        #if FULL_FLAVOR
         #expect(TaskDetailFormat.siteLabel(task(url: "torrent-file://local")) == "BitTorrent")
         #expect(TaskDetailFormat.siteLabel(task(url: "magnet:?xt=urn:btih:abc")) == "BitTorrent")
+        #else
+        #expect(TaskDetailFormat.siteLabel(task(url: "torrent-file://local")) == "BT")
+        #expect(TaskDetailFormat.siteLabel(task(url: "magnet:?xt=urn:btih:abc")) == "BT")
+        #endif
         #expect(TaskDetailFormat.siteLabel(task(url: "torrent-file://local", origin: "https://t.example.org/a.torrent")) == "t.example.org")
         #expect(TaskDetailFormat.siteLabel(task(url: "ed2k://|file|x|1|h|/")) == "ED2K")
     }

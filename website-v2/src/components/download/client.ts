@@ -1,7 +1,7 @@
 /**
  * 下载页客户端逻辑(由 download.astro 的 <script> 引入,仅在存在 [data-dl-root] 时运行)。
  *
- * - 拉取 /api/release(?channel=frontier),默认使用 CF 缓存 → OSS 回源 → GitHub 兜底,提供 GitHub 备用直链;
+ * - 拉取 /api/release(?channel=frontier),主链接走 /api/download(大陆访客 dl-cn 镜像,其余 GitHub),提供 GitHub 备用直链;
  *   失败时保留服务端渲染的 GitHub Releases 回退链接并显示错误条。
  * - 识别访客 OS / CPU 架构,决定首屏主按钮;`D` 键在本页直接触发主按钮。
  * - 复制按钮、邮件订阅表单。
@@ -11,6 +11,7 @@ import type { Lang } from "@/i18n/config";
 import { formatSize, pickPath, versionAnchor, type ReleaseAsset, type ReleaseInfo } from "@/lib/release-format";
 import { withBase } from "@/lib/base";
 import { assetDownloadUrl } from "@/lib/download-source";
+import { TESTFLIGHT_URL } from "@/lib/site-nav";
 
 type Channel = "stable" | "frontier";
 type Os = "windows" | "macos" | "linux" | "android" | "ios";
@@ -263,13 +264,20 @@ function init(root: HTMLElement) {
       primaryBackup.href = assetDownloadUrl(pick.asset, "github");
       primary.title = pick.asset.name;
       primaryLabel.textContent = pick.label;
+    } else if (os === "ios") {
+      primary.href = TESTFLIGHT_URL;
+      primary.target = "_blank";
+      primary.rel = "noopener";
+      primaryBackup.removeAttribute("href");
+      primary.removeAttribute("title");
+      primaryLabel.textContent = t.ios.join;
     } else {
       primary.href = os === "android" ? "#android" : "#desktop";
       primary.removeAttribute("target");
       primaryBackup.removeAttribute("href");
       primary.removeAttribute("title");
       primaryLabel.textContent =
-        osName && root.dataset.state !== "loading" && (os === "ios" || release) ? t.hero.noBuild(osName) : t.hero.allPlatforms;
+        osName && root.dataset.state !== "loading" && release ? t.hero.noBuild(osName) : t.hero.allPlatforms;
     }
     const altBackup = $<HTMLAnchorElement>("[data-alt-backup]")!;
     altLink.hidden = !pick.alt;
@@ -343,67 +351,11 @@ function init(root: HTMLElement) {
     });
   }
 
-  /* ── Subscribe ── */
-  const form = $<HTMLFormElement>("[data-subscribe]");
-  if (form) initSubscribe(form);
-
-  function initSubscribe(form: HTMLFormElement) {
-    const fields = form.querySelector<HTMLFieldSetElement>("[data-subscribe-fields]")!;
-    const select = form.querySelector<HTMLSelectElement>("[data-subscribe-platform]")!;
-    const email = form.querySelector<HTMLInputElement>("input[name=email]")!;
-    const label = form.querySelector("[data-subscribe-label]")!;
-    const out = form.querySelector<HTMLElement>("[data-subscribe-status]")!;
-    fields.disabled = false;
-
-    const say = (text: string, tone?: "ok" | "error") => {
-      out.textContent = text;
-      if (tone) out.dataset.tone = tone;
-      else delete out.dataset.tone;
-    };
-
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      if (!email.value.trim() || !email.checkValidity()) {
-        email.reportValidity();
-        return;
-      }
-      fields.disabled = true;
-      label.textContent = t.subscribe.loading;
-      say("");
-      try {
-        const res = await fetch(withBase("/api/subscribe"), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: email.value.trim(), platform: select.value }),
-        });
-        if (res.status === 429) say(t.subscribe.rateLimited, "error");
-        else if (!res.ok) say(t.subscribe.error, "error");
-        else {
-          const data = (await res.json()) as { message?: string };
-          if (data.message === "already_subscribed") say(t.subscribe.duplicate, "ok");
-          else {
-            say(t.subscribe.success, "ok");
-            email.value = "";
-          }
-        }
-      } catch {
-        say(t.subscribe.error, "error");
-      } finally {
-        fields.disabled = false;
-        label.textContent = t.subscribe.submit;
-      }
-    });
-  }
-
   /* ── Boot ── */
   void load();
   void detectPlatform().then((result) => {
     platform = result;
     detected = true;
-    const preset: Partial<Record<Os, string>> = { macos: "macos", linux: "linux", android: "mobile" };
-    const select = $<HTMLSelectElement>("[data-subscribe-platform]");
-    const value = result.os ? preset[result.os] : undefined;
-    if (select && value) select.value = value;
     renderHero();
   });
 }

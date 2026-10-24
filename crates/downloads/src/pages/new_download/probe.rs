@@ -317,6 +317,8 @@ impl NewDownloadView {
                 self.probe.filled = None;
             }
         }
+        // 预填 / 清空探测名会改变自动分类的预测输入。
+        self.sync_category(window, cx);
     }
 
     /// 链接输入区下方的一行状态：探测中 / 已识别（文件名 + 大小，0 = 未知）/ 无法获取。

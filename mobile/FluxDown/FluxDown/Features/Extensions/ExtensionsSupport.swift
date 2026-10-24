@@ -7,6 +7,7 @@ import SwiftUI
 import UIKit
 
 // 扩展 / Webhook / API 服务三页共用的小构件：分区解码缓存、错误文案、换行布局、剪贴板、二维码。
+// 插件 / 组件专属的构件（错误文案、外链、二维码、组件标题）只在 full flavor 编译（`FULL_FLAVOR`）。
 
 // MARK: - 分区解码缓存
 
@@ -36,6 +37,7 @@ final class SectionMemo<Value: Decodable & Sendable> {
     }
 }
 
+#if FULL_FLAVOR
 // MARK: - 错误文案
 
 enum ExtensionErrorText {
@@ -63,6 +65,7 @@ enum ExtensionErrorText {
         "marketVersionChanged": "pluginErrorMarketVersionChanged",
     ]
 }
+#endif
 
 // MARK: - 换行布局
 
@@ -117,6 +120,7 @@ enum ExtensionsClipboard {
     }
 }
 
+#if FULL_FLAVOR
 /// 外链：只放行 http(s)，其余原样当文本展示（挑战 / 主页均不可信）。
 struct SafeLinkText: View {
     let text: String
@@ -156,6 +160,7 @@ enum QRCodeImage {
         return UIImage(cgImage: cgImage)
     }
 }
+#endif
 
 // MARK: - 版本 / 时间文案
 
@@ -183,6 +188,7 @@ enum ExtensionsFormat {
     }
 }
 
+#if FULL_FLAVOR
 /// 组件标题键（依赖提醒与组件页共用）。
 enum ComponentTitles {
     static func titleKey(_ kind: ComponentKind) -> String? {
@@ -198,3 +204,4 @@ enum ComponentTitles {
         return wire
     }
 }
+#endif

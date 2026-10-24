@@ -129,32 +129,47 @@ class ExternalDownloadTest {
             "download.remember_last_save_dir" to true,
             "download.last_save_dir" to " /last ",
         )
-        // 分类目录 > 跟随上次 > 主机默认
-        assertEquals("/videos", SilentCapture.plan(video, state(remembered + ("custom_categories" to categories)))?.request?.saveDir)
+        // 跟随上次 > 主机默认；分类目录不再在 Kotlin 侧决定，offeredSaveDir 交给 Rust 路由
+        val withCategories = SilentCapture.plan(video, state(remembered + ("custom_categories" to categories)))!!.request
+        assertEquals("/last", withCategories.saveDir)
+        assertEquals("/last", withCategories.offeredSaveDir)
         assertEquals("/last", SilentCapture.plan(video, state(remembered))?.request?.saveDir)
-        assertEquals("/dl", SilentCapture.plan(video, state(remembered - "download.remember_last_save_dir"))?.request?.saveDir)
+        val fallback = SilentCapture.plan(video, state(remembered - "download.remember_last_save_dir"))!!.request
+        assertEquals("/dl", fallback.saveDir)
+        assertEquals("/dl", fallback.offeredSaveDir)
         // 一个目录都算不出：退回确认弹层
         assertNull(SilentCapture.plan(video, state(mapOf(SilentCapture.SILENT_PREF to true), config = emptyMap())))
     }
 
-    @Test fun silentPlanUsesHostDefaultsAndBuildsCreateParams() {
+    @Test fun categorySaveDirFollowsRulesAndIgnoresUnconfiguredDirs() {
+        val categories = listOf(
+            mapOf("id" to "builtin_video", "name" to "", "extensions" to listOf("mp4"), "position" to 1,
+                "isBuiltin" to true, "builtinType" to "video", "saveDir" to " /videos "),
+            mapOf("id" to "builtin_archive", "name" to "", "extensions" to listOf("zip"), "position" to 2,
+                "isBuiltin" to true, "builtinType" to "archive", "saveDir" to ""),
+        )
+        val configured = state(mapOf("custom_categories" to categories))
+        // 命中且配置了目录 → 该目录（修剪空白）；确认弹层与免打扰共用
+        assertEquals("/videos", video.categorySaveDir(configured))
+        // 命中但未配置目录 / 未命中任何分类 → null，由调用方回落到默认目录
+        assertNull(ExternalDownload(url = "https://x.test/a.zip").categorySaveDir(configured))
+        assertNull(video.categorySaveDir(state(emptyMap())))
+    }
+
+    @Test fun silentPlanUsesHostDefaultsAndBuildsCreateRequest() {
         val prefs = mapOf(SilentCapture.SILENT_PREF to true, SilentCapture.SKIP_SELECTION_PREF to true)
         val plan = SilentCapture.plan(video, state(prefs, mapOf("default_save_dir" to "/dl", "default_segments" to "16")))!!
         assertTrue(plan.unattended)
-        assertEquals(Queue.MAIN, plan.request.queueId)
-        assertEquals(16, plan.request.segments)
-        val params = Json.parse(plan.params().toJson())
-        assertTrue(params.bool("unattended"))
-        val request = params["request"]
-        assertEquals("https://x.test/v/movie.mp4", request.str("url"))
-        assertEquals("/dl", request.str("saveDir"))
-        assertEquals("c=1", request.str("cookies"))
-        assertEquals("https://x.test/", request.str("referrer"))
-        assertEquals(16, request.int("segments"))
-        // 无请求头时不发 headers（serde Option = None）
-        assertNull(request["headers"])
+        val request = plan.request
+        assertEquals(Queue.MAIN, request.queueId)
+        assertEquals(16, request.segments)
+        assertEquals("https://x.test/v/movie.mp4", request.url)
+        assertEquals("/dl", request.saveDir)
+        assertEquals("c=1", request.cookies)
+        assertEquals("https://x.test/", request.referrer)
+        assertTrue(request.headers.isEmpty())
         val withHeaders = SilentCapture.plan(video.copy(headers = mapOf("User-Agent" to "UA")), state(prefs))!!
-        assertEquals("UA", Json.parse(withHeaders.params().toJson())["request"]["headers"].str("User-Agent"))
+        assertEquals("UA", withHeaders.request.headers["User-Agent"])
         assertFalse(SilentCapture.plan(video, state(mapOf(SilentCapture.SILENT_PREF to true)))!!.unattended)
     }
 

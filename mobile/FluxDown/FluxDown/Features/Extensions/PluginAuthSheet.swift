@@ -1,6 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
+#if FULL_FLAVOR
 
 /// S11.5 · 插件平台登录。流程与 GPUI `plugin_auth.rs` / Web `PluginAuthDialog` 一致：
 /// 打开即 `status` → `begin` →（二维码挑战每 2s 自动 `poll`，仅前台；其它挑战手动「检查状态」）→ success；
@@ -292,3 +293,4 @@ private struct PluginChallengeView: View {
         return QRCodeImage.make(value)
     }
 }
+#endif

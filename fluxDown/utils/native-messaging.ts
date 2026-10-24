@@ -10,7 +10,9 @@
  *   FluxDown App
  *
  * 设计决策：
- *   - 使用 connectNative() 持久连接，复用同一 NMH 进程
+ *   - 使用 connectNative() 持久连接，复用同一 NMH 进程；后台休眠（Service Worker / Firefox event page）
+ *     会丢弃端口及内存状态，下一次请求按需重建，不依赖端口保活
+ *   - 端口上的请求串行处理；队首卡死即回收端口（见 nmh-shared.ts）
  *   - 请求-响应通过 msg_id 匹配（递增 ID + pending Map）
  *   - App 未运行时由 NMH 自动启动，扩展端无需关心唤起逻辑
  *   - "warmup" 消息由 NMH 本地应答（确保 App 已拉起 + 管道已连接，不转发给 App），
@@ -19,10 +21,11 @@
  */
 
 import { browser } from "wxt/browser";
-import type { Browser } from "wxt/browser";
 import { recordConnectionDiagnostic } from "./connection-diagnostics";
+import type { NmhPortLike } from "./nmh-dedicated";
+import { createSharedChannel } from "./nmh-shared";
 
-const NMH_NAME = "com.fluxdown.nmh";
+export const NMH_NAME = "com.fluxdown.nmh";
 
 // 每请求超时时间（NMH 启动 App 最多需要 ~7.5s，预留充足余量）
 const REQUEST_TIMEOUT_MS = 12000;
@@ -132,139 +135,42 @@ export interface TaskBrief {
 }
 
 // ──────────────────────────────────────────────────────────────
-// 内部状态
+// 常驻共享端口（连接管理、串行队列与卡死回收见 nmh-shared.ts）
 // ──────────────────────────────────────────────────────────────
 
-let _port: Browser.runtime.Port | null = null;
-let _nextMsgId = 1;
-let _connected = false;
-
-interface PendingRequest {
-  action: string;
-  resolve: (value: ApiResponse) => void;
-  timer: ReturnType<typeof setTimeout>;
-}
-
-const _pendingRequests = new Map<number, PendingRequest>();
-
-// ──────────────────────────────────────────────────────────────
-// 端口管理
-// ──────────────────────────────────────────────────────────────
-
-function getPort(): Browser.runtime.Port | null {
-  if (_port) return _port;
-
-  try {
-    _port = browser.runtime.connectNative(NMH_NAME);
-  } catch (e) {
-    // connectNative() throws synchronously if the API is unavailable (e.g. permission denied).
-    console.error("[FluxDown NMH] connectNative() threw:", e);
-    recordConnectionDiagnostic({ event: "native.connect_failed", detail: e instanceof Error ? e.message : String(e) });
-    return null;
+/** Firefox 把断开原因放在 port.error（runtime.lastError 恒为 null），Chrome 用 runtime.lastError。 */
+function disconnectReason(port: NmhPortLike): string | undefined {
+  const portError = "error" in port ? port.error : undefined;
+  const error = portError ?? browser.runtime.lastError;
+  if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
+    return error.message;
   }
-
-  _port.onMessage.addListener((msg: any) => {
-    const msgId = msg?.msg_id;
-    if (msgId == null) return;
-
-    const pending = _pendingRequests.get(msgId);
-    if (!pending) return;
-
-    _pendingRequests.delete(msgId);
-    clearTimeout(pending.timer);
-    if (msg.success === true && pending.action !== "warmup") {
-      if (!_connected) recordConnectionDiagnostic({ event: "native.connected", action: pending.action });
-      _connected = true;
-    } else if (msg.success !== true) {
-      if (msg.message === "app_not_running") _connected = false;
-      recordConnectionDiagnostic({ event: "native.request_failed", action: pending.action,
-        detail: msg.message === "app_not_running" ? "app_not_running" : "host_rejected_request" });
-    }
-
-    pending.resolve({
-      success: msg.success ?? false,
-      message: msg.message,
-      taskId: msg.taskId,
-      tasks: Array.isArray(msg.tasks) ? (msg.tasks as TaskBrief[]) : undefined,
-      data: msg.data,
-    });
-  });
-
-  _port.onDisconnect.addListener((p) => {
-    // Log disconnect reason to help diagnose NMH failures.
-    // IMPORTANT: Firefox exposes the error on the port parameter p.error,
-    // NOT on browser.runtime.lastError (which is always null in Firefox).
-    // Chrome uses browser.runtime.lastError instead.
-    // Common errors: "No such native application", "Access to the specified
-    // native messaging host is forbidden" (extension ID mismatch).
-    const err = (p as any).error ?? browser.runtime.lastError;
-    _connected = false;
-    recordConnectionDiagnostic({ event: "native.disconnected", detail: err?.message || "port disconnected (no error reason)" });
-    if (err?.message) {
-      console.error("[FluxDown NMH] port disconnected, reason:", err.message);
-    } else {
-      console.warn("[FluxDown NMH] port disconnected (no error reason)");
-    }
-    _port = null;
-    // Reject all pending requests
-    for (const [id, pending] of _pendingRequests) {
-      clearTimeout(pending.timer);
-      pending.resolve({ success: false, message: "port disconnected" });
-      _pendingRequests.delete(id);
-    }
-  });
-
-  return _port;
+  return undefined;
 }
+
+const shared = createSharedChannel({
+  connect: () => browser.runtime.connectNative(NMH_NAME) as NmhPortLike,
+  disconnectReason,
+  record: recordConnectionDiagnostic,
+});
 
 function disconnectPort() {
-  _connected = false;
-  if (_port) {
-    try {
-      _port.disconnect();
-    } catch {
-      /* ignore */
-    }
-    _port = null;
-  }
+  shared.recycle();
 }
 
-// ──────────────────────────────────────────────────────────────
-// 消息发送
-// ──────────────────────────────────────────────────────────────
-
-function sendMessage(
+async function sendMessage(
   action: string,
-  payload: Record<string, any> = {},
+  payload: Record<string, unknown> = {},
   timeoutMs: number = REQUEST_TIMEOUT_MS,
 ): Promise<ApiResponse> {
-  return new Promise<ApiResponse>((resolve) => {
-    const port = getPort();
-    if (!port) {
-      resolve({ success: false, message: "native_messaging_unavailable" });
-      return;
-    }
-
-    const msgId = _nextMsgId++;
-    const timer = setTimeout(() => {
-      _pendingRequests.delete(msgId);
-      _connected = false;
-      recordConnectionDiagnostic({ event: "native.request_failed", action, detail: "timeout" });
-      resolve({ success: false, message: "timeout" });
-    }, timeoutMs);
-
-    _pendingRequests.set(msgId, { action, resolve, timer });
-
-    try {
-      port.postMessage({ action, msg_id: msgId, ...payload });
-    } catch {
-      _pendingRequests.delete(msgId);
-      clearTimeout(timer);
-      disconnectPort();
-      recordConnectionDiagnostic({ event: "native.request_failed", action, detail: "postMessage failed" });
-      resolve({ success: false, message: "postMessage failed" });
-    }
-  });
+  const reply = await shared.send(action, payload, timeoutMs);
+  return {
+    success: reply.success === true,
+    message: typeof reply.message === "string" ? reply.message : undefined,
+    taskId: typeof reply.taskId === "string" ? reply.taskId : undefined,
+    tasks: Array.isArray(reply.tasks) ? (reply.tasks as TaskBrief[]) : undefined,
+    data: reply.data,
+  };
 }
 
 /**

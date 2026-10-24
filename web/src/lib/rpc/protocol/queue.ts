@@ -25,11 +25,25 @@ export interface QueueDto {
   scheduleDays: number;
 }
 
-/** 任务在队列中的位置。 */
+/**
+ * 任务在队列中的位置。全量列表按 `order` 升序排列，`position` = 下标 + 1。
+ * 增量见 `WsServerMsg` 的 `queueOrderChanged`。
+ */
 export interface QueuePositionDto {
   taskId: string;
   /** 1-based，0 = 不在队列中。 */
   position: number;
+  /**
+   * 引擎分配的排序键：升序即启动顺序；任务留在队列期间不变（队首出队不改其余任务的键），
+   * 只有用户调整顺序时整表重排。客户端排序用它，展示序号按键的名次计算。缺省按 0。
+   */
+  order: number;
+}
+
+/** 队列顺序增量的单项（`queueOrderChanged` 的 `added`）。 */
+export interface QueueOrderEntryDto {
+  taskId: string;
+  order: number;
 }
 
 /** 创建/更新队列的字段（更新时同时需要 `queueId`）。除 `name` 外可省略。 */

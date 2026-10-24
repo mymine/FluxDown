@@ -19,6 +19,9 @@ const MAX_URL_LEN: usize = 8 * 1024;
 const MAX_ORIGIN_RULES: usize = 32;
 /// 连接上限的取值上界（与显式线程数上限一致）。
 const MAX_CONNECTIONS: i32 = 512;
+/// 单个 HTTP 请求 Range 跨度上限（`maxRangeBytes`）的取值下界：更小的窗口会把请求数放大到
+/// 不合理的程度，也远低于任何已知 CDN 的单请求限制。
+const MIN_RANGE_BYTES: i64 = 64 * 1024;
 
 const FTP_HEADER_REJECT: &str = "FTP 任务不支持请求头类改写";
 
@@ -37,6 +40,9 @@ pub struct RequestPatch {
     pub origin_headers: Option<Vec<OriginHeaders>>,
     pub segments: Option<i32>,
     pub max_connections: Option<i32>,
+    /// 仅 HTTP：每个数据请求的 Range 跨度最多 N 字节（≥ 64 KiB）。用于只接受小区间的
+    /// 直链（如网盘 CDN）：分段 worker 在段内逐窗口请求，单流 / 回退单流也只发有界 Range。
+    pub max_range_bytes: Option<i64>,
     pub file_name: Option<String>,
     /// 一次性 / 防探测凭据：跳过探测，按 hint 路径保守启动（同 resolver `ephemeral`）。
     pub ephemeral: Option<bool>,
@@ -317,6 +323,20 @@ pub fn apply_request_patch(
         }
     }
 
+    // 12b. maxRangeBytes。
+    if let Some(n) = patch.max_range_bytes {
+        if kind != ProtocolKind::Http {
+            return Err("仅 HTTP 任务可设置 maxRangeBytes".to_string());
+        }
+        if n < MIN_RANGE_BYTES {
+            return Err(format!(
+                "maxRangeBytes 不能小于 {MIN_RANGE_BYTES}（64 KiB）"
+            ));
+        }
+        spec.max_range_bytes = Some(n);
+        out.mark("Range 跨度上限");
+    }
+
     // 13. fileName。
     if let Some(name) = &patch.file_name {
         if !valid_file_name(name) {
@@ -394,6 +414,7 @@ pub fn check_refresh_patch(patch: &RequestPatch, kind: ProtocolKind) -> Result<(
         ("body", patch.body.is_some() || patch.clear_body),
         ("segments", patch.segments.is_some()),
         ("maxConnections", patch.max_connections.is_some()),
+        ("maxRangeBytes", patch.max_range_bytes.is_some()),
         ("fileName", patch.file_name.is_some()),
         (
             "ephemeral",
@@ -723,5 +744,104 @@ mod tests {
             f.apply(ProtocolKind::Ftp, false, &ftp),
             Err("FTP 任务不支持请求头类改写".to_string())
         );
+    }
+
+    #[test]
+    fn max_range_bytes_parses_from_wire_and_sets_spec() {
+        let patch: RequestPatch =
+            serde_json::from_str(r#"{"maxRangeBytes": 5242880}"#).expect("camelCase wire field");
+        assert_eq!(patch.max_range_bytes, Some(5_242_880));
+
+        let mut f = Fixture::new("https://example.com/a.bin");
+        let out = f.apply(ProtocolKind::Http, false, &patch).expect("patch");
+        assert_eq!(out.changed, vec!["Range 跨度上限"]);
+        assert_eq!(f.spec.max_range_bytes, Some(5_242_880));
+        assert_eq!(f.spec.range_window_cap(), Some(5_242_880));
+
+        // 不声明时不改动：行为零变化。
+        let mut untouched = Fixture::new("https://example.com/a.bin");
+        untouched
+            .apply(ProtocolKind::Http, false, &RequestPatch::default())
+            .expect("empty patch");
+        assert_eq!(untouched.spec.max_range_bytes, None);
+        assert_eq!(untouched.spec.range_window_cap(), None);
+    }
+
+    #[test]
+    fn max_range_bytes_rejects_small_values_and_non_http() {
+        let too_small = format!("maxRangeBytes 不能小于 {MIN_RANGE_BYTES}（64 KiB）");
+        for n in [i64::MIN, -1, 0, 1, MIN_RANGE_BYTES - 1] {
+            let mut f = Fixture::new("https://example.com/a.bin");
+            let patch = RequestPatch {
+                max_range_bytes: Some(n),
+                ..Default::default()
+            };
+            assert_eq!(
+                f.apply(ProtocolKind::Http, false, &patch),
+                Err(too_small.clone()),
+                "{n}"
+            );
+            assert_eq!(f.spec.max_range_bytes, None);
+        }
+        let mut min = Fixture::new("https://example.com/a.bin");
+        let patch = RequestPatch {
+            max_range_bytes: Some(MIN_RANGE_BYTES),
+            ..Default::default()
+        };
+        min.apply(ProtocolKind::Http, false, &patch)
+            .expect("minimum accepted");
+        assert_eq!(min.spec.max_range_bytes, Some(MIN_RANGE_BYTES));
+
+        for (kind, url) in [
+            (ProtocolKind::Ftp, "ftp://example.com/a.bin"),
+            (ProtocolKind::Hls, "https://example.com/v.m3u8"),
+        ] {
+            let mut f = Fixture::new(url);
+            let patch = RequestPatch {
+                max_range_bytes: Some(1 << 20),
+                ..Default::default()
+            };
+            assert_eq!(
+                f.apply(kind, false, &patch),
+                Err("仅 HTTP 任务可设置 maxRangeBytes".to_string())
+            );
+            assert_eq!(f.spec.max_range_bytes, None);
+        }
+    }
+
+    #[test]
+    fn max_range_bytes_is_atomic_with_other_fields_and_not_refreshable() {
+        let mut f = Fixture::new("https://example.com/a.bin");
+        let patch = RequestPatch {
+            user_agent: Some("Valid/1".to_string()),
+            max_range_bytes: Some(1),
+            ..Default::default()
+        };
+        assert!(f.apply(ProtocolKind::Http, false, &patch).is_err());
+        assert!(!f.spec.pins.user_agent);
+
+        let patch = RequestPatch {
+            max_range_bytes: Some(1 << 20),
+            ..Default::default()
+        };
+        assert_eq!(
+            check_refresh_patch(&patch, ProtocolKind::Http),
+            Err("refresh 阶段不能改写 maxRangeBytes".to_string())
+        );
+    }
+
+    #[test]
+    fn range_window_cap_ignores_non_get_requests() {
+        let spec = RequestSpec {
+            method: reqwest::Method::POST,
+            max_range_bytes: Some(1 << 20),
+            ..Default::default()
+        };
+        assert_eq!(spec.range_window_cap(), None);
+        let spec = RequestSpec {
+            max_range_bytes: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(spec.range_window_cap(), None);
     }
 }

@@ -90,6 +90,14 @@ struct AgentAPI: Sendable {
         try await session.callVoid(HostMethod.agentProfileChangePassword, params: params)
     }
 
+    func sendDeleteCode() async throws(HostError) -> TtlResult {
+        try await session.call(HostMethod.agentProfileSendDeleteCode)
+    }
+
+    func deleteAccount(_ params: DeleteAccountParams) async throws(HostError) {
+        try await session.callVoid(HostMethod.agentProfileDeleteAccount, params: params)
+    }
+
     // MARK: 服务地址（仅调试 / TestFlight 构建 `editable == true`）
 
     func cloudEndpoint() async throws(HostError) -> CloudEndpointDto {
@@ -162,8 +170,13 @@ struct AgentAPI: Sendable {
         try await session.call(HostMethod.agentLinkPairingCode)
     }
 
-    func linkStopPairing() async throws(HostError) {
-        try await session.callVoid(HostMethod.agentLinkStopPairing)
+    /// 停止展示配对码；带 `code` 时只有它仍是当前码才作废（多客户端互不干扰），省略 = 无条件停止。
+    func linkStopPairing(code: String? = nil) async throws(HostError) {
+        if let code {
+            try await session.callVoid(HostMethod.agentLinkStopPairing, params: LinkStopPairingParams(code: code))
+        } else {
+            try await session.callVoid(HostMethod.agentLinkStopPairing)
+        }
     }
 
     func linkDiscoverySet(enabled: Bool) async throws(HostError) {
@@ -189,6 +202,11 @@ struct AgentAPI: Sendable {
 
     func linkRemove(fingerprint: String) async throws(HostError) {
         try await session.callVoid(HostMethod.agentLinkRemove, params: LinkDeviceParams(fingerprint: fingerprint))
+    }
+
+    /// 向（本机）agent 申请对已配对主机 `fingerprint` 的设备控制凭据；未以「请求完全控制」配对 / 已撤销时抛 `PeerNotPaired`。
+    func linkControlCredential(fingerprint: String) async throws(HostError) -> LinkControlCredentialDto {
+        try await session.call(HostMethod.agentLinkControlCredential, params: LinkDeviceParams(fingerprint: fingerprint))
     }
 
     /// 设置 / 清除本机备注名（`name` 空白 = 清除）。

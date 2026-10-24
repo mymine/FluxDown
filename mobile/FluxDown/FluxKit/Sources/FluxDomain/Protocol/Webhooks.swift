@@ -172,7 +172,7 @@ public struct WebhookSimulateResponse: Codable, Sendable, Hashable {
 
 /// 事件 wire 名（与引擎 `WebhookEventKind::wire()` 逐字一致）及其 i18n 键。
 public enum WebhookEvent: CaseIterable, Sendable, Hashable {
-    case created, started, completed, failed, paused, queueDrained
+    case created, started, completed, failed, paused, queueStarted, queueDrained
 
     public var wire: String {
         switch self {
@@ -181,6 +181,7 @@ public enum WebhookEvent: CaseIterable, Sendable, Hashable {
         case .completed: "task.completed"
         case .failed: "task.failed"
         case .paused: "task.paused"
+        case .queueStarted: "queue.started"
         case .queueDrained: "queue.drained"
         }
     }
@@ -192,6 +193,7 @@ public enum WebhookEvent: CaseIterable, Sendable, Hashable {
         case .completed: "webhookEventCompleted"
         case .failed: "webhookEventFailed"
         case .paused: "webhookEventPaused"
+        case .queueStarted: "webhookEventQueueStarted"
         case .queueDrained: "webhookEventQueueDrained"
         }
     }

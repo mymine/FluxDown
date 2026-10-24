@@ -271,7 +271,7 @@ jobs:
           mkdir -p ../build/extension
           (cd .output && zip -qr "../../build/extension/FluxDown-${VERSION}-chrome.zip" chrome-mv3)
           npx web-ext build \
-            --source-dir .output/firefox-mv2 \
+            --source-dir .output/firefox-mv3 \
             --artifacts-dir ../build/extension \
             --filename "FluxDown-${VERSION}-firefox.zip" \
             --overwrite-dest

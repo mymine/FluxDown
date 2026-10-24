@@ -23,11 +23,6 @@ export function useIsMobile(): boolean {
   return useMediaQuery(MOBILE_QUERY)
 }
 
-/** 宽度 <= 480px。 */
-export function useIsNarrow(): boolean {
-  return useMediaQuery(NARROW_QUERY)
-}
-
 /** 主要指针为触屏（无 hover）。 */
 export function useIsCoarsePointer(): boolean {
   return useMediaQuery(COARSE_QUERY)

@@ -6,9 +6,10 @@ import FluxUI
 @MainActor
 enum HostFlow {
     /// 主机连接失败 → 用户可读文案：先按 code（Unauthorized / Timeout / Unavailable / ProtocolIncompatible），其余回退通用失败。
-    static func errorText(_ error: HostError) -> String {
+    /// `paired` = 该主机是经局域网配对添加的：被拒时说明授权已撤销、需要重新配对，而不是密钥错误。
+    static func errorText(_ error: HostError, paired: Bool = false) -> String {
         switch error.code {
-        case .unauthorized: L("webLoginInvalidKey")
+        case .unauthorized: L(paired ? "mobileHostRepairNeeded" : "webLoginInvalidKey")
         case .timeout: L("mobileHostErrTimeout")
         case .unavailable: L("webLoginUnreachable")
         case .protocolIncompatible: L("mobileHostErrIncompatible")
@@ -31,13 +32,30 @@ enum HostFlow {
             container.toasts.show(text: L("mobileHostSwitched", ["name": name]), tone: .success, systemImage: FluxSymbol.done)
             return true
         case let .failure(error):
-            container.toasts.show(
-                text: L("mobileHostSwitchFailed", ["name": name, "reason": errorText(error)]),
-                tone: .error,
-                systemImage: FluxSymbol.offline
-            )
+            let repair = needsRepair(error, ref: ref, container: container)
+            let reason = errorText(error, paired: repair)
+            if case let .remote(_, _, endpoint) = ref, repair {
+                container.toasts.show(
+                    text: L("mobileHostSwitchFailed", ["name": name, "reason": reason]),
+                    tone: .error,
+                    systemImage: FluxSymbol.offline,
+                    actionTitle: L("mobileHostRepair")
+                ) { [router = container.router] in router.presentRepair(address: endpoint) }
+            } else {
+                container.toasts.show(
+                    text: L("mobileHostSwitchFailed", ["name": name, "reason": reason]),
+                    tone: .error,
+                    systemImage: FluxSymbol.offline
+                )
+            }
             return false
         }
+    }
+
+    /// 经局域网配对添加的主机被拒（Unauthorized）= 主机侧撤销了这台手机的控制授权（或重装 / 重配对后凭据失效）：
+    /// 不再提示「更换访问密钥」，而是引导重新配对。
+    static func needsRepair(_ error: HostError, ref: HostRef, container: AppContainer) -> Bool {
+        error.code == .unauthorized && container.linkFingerprint(ofHost: ref.id) != nil
     }
 
     /// 移除已保存的远程主机（本机不可移除）。移除当前主机时 `AppContainer.removeHost` 会先回到本机。

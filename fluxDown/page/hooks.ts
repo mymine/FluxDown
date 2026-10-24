@@ -1,9 +1,8 @@
 /**
  * MAIN world 钩子：fetch / XHR 嗅探、MSE 与响应来源归因、history 事件。
  *
- * 运行在页面自己的 JS 环境里（Chrome 由 page-hooks.content.ts 以 world: MAIN 注入，
- * Firefox 由 sensor 注入 page-hooks-main.js），通过 {@link ./bridge} 的 CustomEvent 与 ISOLATED world
- * 的 sensor 通信，detail 一律是 JSON 字符串。
+ * 运行在页面自己的 JS 环境里（所有浏览器均由 page-hooks.content.ts 以 world: MAIN 声明式注入），
+ * 通过 {@link ./bridge} 的 CustomEvent 与 ISOLATED world 的 sensor 通信，detail 一律是 JSON 字符串。
  *
  * 铁律：所有钩子异常都必须走原函数，页面可见行为不变（#329 #337）。
  *

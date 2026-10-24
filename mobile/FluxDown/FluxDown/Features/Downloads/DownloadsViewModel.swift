@@ -28,8 +28,9 @@ nonisolated struct PendingSelection: Equatable {
     let countdownKey: String
     let deadlineUnixMs: Int64
 
-    /// 横幅对应队首请求；队首是「文件已存在」时聚合全部同类请求（最早的到期时间）。
+    /// 横幅对应队首（本构建可处理的）请求；队首是「文件已存在」时聚合全部同类请求（最早的到期时间）。
     static func make(_ selections: [SelectionRequest], taskName: (String) -> String?) -> PendingSelection? {
+        let selections = selections.presentable
         guard let request = selections.first else { return nil }
         func plain(_ titleKey: String) -> PendingSelection {
             PendingSelection(
@@ -42,10 +43,14 @@ nonisolated struct PendingSelection: Equatable {
             )
         }
         switch request.kind {
+        #if FULL_FLAVOR
         case .bt: return plain("btFileSelectTitle")
-        case .hls: return plain("hlsQualityTitle")
         case .variant: return plain("resolveVariantTitle")
         case .plugin: return plain("pluginChoiceTitle")
+        #else
+        case .bt, .variant, .plugin: return nil
+        #endif
+        case .hls: return plain("hlsQualityTitle")
         case let .fileExists(conflict):
             let conflicts = selections.fileConflicts
             let many = conflicts.count > 1
@@ -88,6 +93,8 @@ final class DownloadsModel {
     private(set) var list = DownloadsList.initial
     private(set) var facets = Facets.initial
     private(set) var chrome = DownloadsChrome()
+    /// 排队顺序：可见排队行按稳定键取名次（`QueueOrder.rank`），顺序变化不重建行模型。
+    private(set) var queueOrder = QueueOrder.empty
     private(set) var collapsed: Set<String>
     private(set) var selectionCaps = SelectionCaps()
 
@@ -169,11 +176,13 @@ final class DownloadsModel {
         )
         if result.list != list { list = result.list }
         if result.facets != facets { facets = result.facets }
+        if state.queueOrder != queueOrder { queueOrder = state.queueOrder }
 
         let nextChrome = Self.chrome(for: state)
         if nextChrome != chrome { chrome = nextChrome }
 
-        if !selection.isEmpty {
+        // 任务表分页载入中不能据空表裁剪选择（「已不存在」是删除推断，半份列表不成立）；载入完成再裁。
+        if !selection.isEmpty, !state.tasksLoading {
             let kept = selection.intersection(state.tasks.lazy.map(\.taskId))
             if kept != selection { selection = kept } else { updateCaps() }
         }
@@ -281,7 +290,13 @@ final class DownloadsModel {
             switch task.status {
             case .paused, .failed: caps.resumeIds.append(task.taskId)
             case .downloading, .pending, .preparing: caps.pauseIds.append(task.taskId)
-            case .completed, .unknown: break
+            case .completed:
+                if task.presentsSeeding {
+                    caps.pauseIds.append(task.taskId)
+                } else if task.presentsResumeSeeding {
+                    caps.resumeIds.append(task.taskId)
+                }
+            case .unknown: break
             }
             if task.status != .completed, task.status != .unknown { caps.moveIds.append(task.taskId) }
         }

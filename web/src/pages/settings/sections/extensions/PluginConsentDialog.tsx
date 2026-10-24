@@ -4,7 +4,7 @@
 import { useEffect, useState } from 'react'
 import { useT } from '../../../../i18n'
 import { rpc } from '../../../../lib/rpc'
-import type { PluginDto, PluginRisk } from '../../../../lib/rpc'
+import type { PluginDto, PluginPageScriptDeclDto, PluginRisk } from '../../../../lib/rpc'
 import { Badge, CheckRow, ConfirmFooter, Dialog, toast } from '../../../../ui'
 import { extensionErrorText } from './errors'
 import { permissionKeys, riskKeys } from './logic'
@@ -16,6 +16,8 @@ export interface ConsentView {
   intro?: string
   permissions: readonly string[]
   networkHosts: readonly string[]
+  /** 页面脚本声明；市场安装前确认不携带。 */
+  pageScripts?: readonly PluginPageScriptDeclDto[]
   risk: PluginRisk
   okLabel: string
 }
@@ -93,6 +95,17 @@ export function PluginConsentDialog({
               </div>
             ))
           )}
+          {consent.pageScripts && consent.pageScripts.length > 0 ? (
+            <>
+              <div className="pt-2 text-caption font-medium text-text-tertiary">{t('pluginConsentPageScripts')}</div>
+              {consent.pageScripts.map((script) => (
+                <div key={script.id} className="flex w-full flex-col gap-0.5">
+                  <div className="text-sm font-medium text-foreground">{script.title}</div>
+                  <div className="break-all text-xs text-muted-foreground">{script.matches.join(', ')}</div>
+                </div>
+              ))}
+            </>
+          ) : null}
           {risk === 'full' ? <div className="pt-2 text-xs text-destructive">{t('pluginConsentFullTrustWarning')}</div> : null}
           <div className="text-xs text-muted-foreground">{t('pluginConsentNativeNotAudited')}</div>
           {risk === 'full' ? (
@@ -115,6 +128,7 @@ export function GrantConsentDialog({ plugin, onClose }: { plugin: PluginDto | nu
         title: t('pluginConsentTitle', { name: plugin.name }),
         permissions: plugin.permissions,
         networkHosts: plugin.networkHosts,
+        pageScripts: plugin.contributions.pageScripts,
         risk: plugin.risk,
         okLabel: t('pluginConsentGrant'),
       }

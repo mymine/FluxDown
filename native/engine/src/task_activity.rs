@@ -113,49 +113,41 @@ impl JournalSink {
                     }
                 };
                 let Some(cmd) = cmd else { break };
+                // 一次取出队列里已积压的连续 Add（上限 `ACTIVITY_BATCH_MAX`），整批一个事务；
+                // 遇到 Flush 先落完前面的批次再处理它，保持与入队一致的顺序。
+                let mut batch = Vec::new();
+                let mut flush = None;
                 match cmd {
                     JournalCommand::Add(entry) => {
-                        // 有限退避；永久损坏时快速排空待写队列成明确缺口，
-                        // tick 定期尝试持久化缺口，flush 始终可以返回错误。
-                        if unavailable {
-                            let mut pending = overflows.lock().unwrap_or_else(|e| e.into_inner());
-                            pending.entry(entry.task_id).or_default().storage_failures += 1;
-                            continue;
-                        }
-                        let mut saved = None;
-                        for attempt in 0..3 {
-                            match db.append_task_activity(&entry).await {
-                                Ok(value) => {
-                                    saved = Some(value);
+                        batch.push(entry);
+                        while batch.len() < ACTIVITY_BATCH_MAX {
+                            match rx.try_recv() {
+                                Ok(JournalCommand::Add(entry)) => batch.push(entry),
+                                Ok(JournalCommand::Flush(reply)) => {
+                                    flush = Some(reply);
                                     break;
                                 }
-                                Err(error) => {
-                                    tracing::error!(%error, task_id=%entry.task_id, attempt, "task activity persistence failed");
-                                    if attempt < 2 {
-                                        tokio::time::sleep(Duration::from_millis(
-                                            100 * (1 << attempt),
-                                        ))
-                                        .await;
-                                    }
-                                }
+                                Err(_) => break,
                             }
-                        }
-                        if let Some(saved) = saved {
-                            if let Some(saved) = saved {
-                                downstream.emit(EngineEvent::TaskActivityAdded(saved));
-                            }
-                        } else {
-                            unavailable = true;
-                            let mut pending = overflows.lock().unwrap_or_else(|e| e.into_inner());
-                            pending.entry(entry.task_id).or_default().storage_failures += 1;
                         }
                     }
-                    JournalCommand::Flush(reply) => {
-                        let result = persist_overflows(&db, downstream.as_ref(), &overflows).await;
-                        unavailable = result.is_err();
-                        if reply.send(result).is_err() {
-                            tracing::debug!("activity journal flush caller stopped waiting");
-                        }
+                    JournalCommand::Flush(reply) => flush = Some(reply),
+                }
+                if !batch.is_empty() {
+                    persist_batch(
+                        &db,
+                        downstream.as_ref(),
+                        &overflows,
+                        batch,
+                        &mut unavailable,
+                    )
+                    .await;
+                }
+                if let Some(reply) = flush {
+                    let result = persist_overflows(&db, downstream.as_ref(), &overflows).await;
+                    unavailable = result.is_err();
+                    if reply.send(result).is_err() {
+                        tracing::debug!("activity journal flush caller stopped waiting");
                     }
                 }
             }
@@ -179,6 +171,49 @@ impl JournalSink {
         })
         .await
         .map_err(|_| "activity journal flush timed out".to_owned())?
+    }
+}
+
+/// 单批落库的活动条数上限：积压时摊薄事务提交与容量裁剪，同时让单个事务保持短小。
+const ACTIVITY_BATCH_MAX: usize = 256;
+
+/// 一批活动落库并逐条按原顺序发布 `TaskActivityAdded`。
+/// 有限退避；永久损坏时快速排空待写队列成明确缺口，tick 定期尝试持久化缺口，
+/// flush 始终可以返回错误。
+async fn persist_batch(
+    db: &Db,
+    sink: &dyn EventSink,
+    overflows: &Mutex<HashMap<String, ActivityLoss>>,
+    batch: Vec<TaskActivity>,
+    unavailable: &mut bool,
+) {
+    let mut saved = None;
+    if !*unavailable {
+        for attempt in 0..3 {
+            match db.append_task_activities(&batch).await {
+                Ok(value) => {
+                    saved = Some(value);
+                    break;
+                }
+                Err(error) => {
+                    tracing::error!(%error, entries = batch.len(), attempt, "task activity persistence failed");
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(saved) = saved {
+        for entry in saved.into_iter().flatten() {
+            sink.emit(EngineEvent::TaskActivityAdded(entry));
+        }
+    } else {
+        *unavailable = true;
+        let mut pending = overflows.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in batch {
+            pending.entry(entry.task_id).or_default().storage_failures += 1;
+        }
     }
 }
 

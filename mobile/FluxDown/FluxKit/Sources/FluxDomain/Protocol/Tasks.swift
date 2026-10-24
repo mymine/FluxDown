@@ -178,6 +178,28 @@ public enum PluginFailure {
     }
 }
 
+/// 引擎产出的稳定任务错误消息；客户端按整串（trim 后）匹配并本地化展示，其余消息原样显示。
+public enum TaskErrorMessage {
+    /// 镜像 `native/engine/src/downloader.rs` 的 `POST_ONLY_ENDPOINT_MESSAGE`。
+    public static let postOnlyEndpoint = "This link only accepts POST requests (HTTP 405); start the download from the browser"
+    /// 镜像 `native/engine/src/downloader.rs` 的 `POST_ONLY_RESUME_MESSAGE`。
+    public static let postOnlyResume = "This task was started by a browser POST request and cannot be resumed; start it again from the browser"
+
+    /// 命中稳定消息时返回共享 i18n 键，否则 nil。
+    public static func localizationKey(for message: String) -> String? {
+        switch message.trimmingCharacters(in: .whitespacesAndNewlines) {
+        case postOnlyEndpoint: "taskErrorPostOnlyEndpoint"
+        case postOnlyResume: "taskErrorPostOnlyResume"
+        default: nil
+        }
+    }
+
+    /// 展示用文本：命中则本地化，否则原样返回。
+    public static func displayText(_ message: String, localize: (String) -> String = { L($0) }) -> String {
+        localizationKey(for: message).map(localize) ?? message
+    }
+}
+
 // MARK: - 做种限制（D4）
 
 public enum SeedLimit {

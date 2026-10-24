@@ -46,9 +46,11 @@ struct Track {
 
 /// 本窗口的守卫。
 pub(super) struct TickGuards {
-    /// 可采样（未限速）：限速窗口的速率反映限速器而非链路。
+    /// 可采样：本窗口未被限速器节流。限速器饱和的窗口速率反映限速器而非链路；
+    /// 限速值高于链路速率时连接并非 app-limited，窗口照常采样。
     pub sampling: bool,
-    /// 可改道（Range 已验证、非串行、非连接敏感、非重连敌对、未限速）。
+    /// 可改道（Range 已验证、非串行、非连接敏感、非重连敌对、本窗口未被
+    /// 限速器节流）。
     pub may_reroute: bool,
     /// 任务剩余字节。
     pub remaining_total: i64,
@@ -482,6 +484,7 @@ impl Multipath {
             crate::route_health::record_no_switch(&labeler.ctx.host, db);
             labeler.pinned = true;
         }
+        record_path_failures(&labeler.ctx.host, nodes, db, Some(task_id));
         let in_flight = in_flight(nodes, segments);
         let label = labeler.desired(&nodes.route_bytes(&in_flight), nodes.alternates_explored());
         if label == labeler.published {
@@ -498,14 +501,30 @@ impl Multipath {
         });
     }
 
-    /// 任务结束：把已实测的各路径单连接估计写入跨任务折扣先验。
+    /// 任务结束：把已实测的各路径单连接估计写入跨任务折扣先验，并抽干末窗
+    /// 新增的路径失败（先失败后先验：先验不含本任务失败过的路径）。
     pub(super) fn record_priors(&self, nodes: &NodePool, db: &Db) {
         let Some(labeler) = self.labeler.as_ref() else {
             return;
         };
+        record_path_failures(&labeler.ctx.host, nodes, db, None);
         for (route, bps) in nodes.path_estimates() {
             crate::route_health::record_path_rate(&labeler.ctx.host, route, bps, db);
         }
+    }
+}
+
+/// 把节点池暂存的 Auto 路径传输失败写入跨任务路径健康度。池内已按路径去重
+/// （同一任务同一路径只出现一次），此处不再重复判断。
+fn record_path_failures(host: &str, nodes: &NodePool, db: &Db, task_id: Option<&str>) {
+    for route in nodes.take_path_failures() {
+        log_info!(
+            "[multipath] task {} host {} {:?} 路径传输失败，记入路径健康度",
+            task_id.unwrap_or("-"),
+            host,
+            route
+        );
+        crate::route_health::record_path_failure(host, route, db);
     }
 }
 

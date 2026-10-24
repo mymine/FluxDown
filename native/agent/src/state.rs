@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use fluxdown_protocol::local_service::{GATEWAY_ENDPOINT_FILE, LocalEndpoint};
 use fluxdown_protocol::{
     AgentPreferencesDto, AgentSessionDto, GatewayStatusDto, RemoteTaskDto, SyncStatusDto,
 };
@@ -357,15 +358,9 @@ impl StateStore {
         directory: &Path,
         bound: std::net::SocketAddr,
     ) -> Result<(), StateError> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct GatewayEndpoint {
-            rpc_url: String,
-        }
-
-        let path = directory.join("gateway-endpoint.json");
+        let path = directory.join(GATEWAY_ENDPOINT_FILE);
         let rpc_address = gateway_client_address(bound);
-        let bytes = serde_json::to_vec(&GatewayEndpoint {
+        let bytes = serde_json::to_vec(&LocalEndpoint {
             rpc_url: format!("ws://{rpc_address}/rpc"),
         })?;
         match tokio::fs::read(&path).await {
@@ -386,7 +381,7 @@ impl StateStore {
         directory: &Path,
         bound: std::net::SocketAddr,
     ) -> Result<(), StateError> {
-        let endpoint_path = directory.join("gateway-endpoint.json");
+        let endpoint_path = directory.join(GATEWAY_ENDPOINT_FILE);
         let old_state = read_optional_file(&self.state_path).await?;
         let old_endpoint = read_optional_file(&endpoint_path).await?;
         let result = async {
@@ -560,7 +555,9 @@ async fn remove_stale_temp_files(dir: &Path) {
         };
         let name = entry.file_name().to_string_lossy().into_owned();
         // 清理时已消失的文件已达成目的；保留其他失败的诊断。
-        if (name.starts_with(".agent-state.") || name.starts_with(".gateway-endpoint."))
+        if (name.starts_with(".agent-state.")
+            || name.starts_with(".gateway-endpoint.")
+            || name.starts_with(crate::startup_failure::TEMP_PREFIX))
             && name.ends_with(".tmp")
             && let Err(error) = tokio::fs::remove_file(entry.path()).await
             && error.kind() != std::io::ErrorKind::NotFound

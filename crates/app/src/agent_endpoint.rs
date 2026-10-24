@@ -4,17 +4,10 @@ use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 
-use serde::Deserialize;
+use fluxdown_protocol::local_service::{GATEWAY_ENDPOINT_FILE, LocalEndpoint};
 use tokio_tungstenite::tungstenite::http::Uri;
 
 pub(crate) const DEFAULT_RPC_URL: &str = "ws://127.0.0.1:17800/rpc";
-const ENDPOINT_FILE: &str = "gateway-endpoint.json";
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PublishedEndpoint {
-    rpc_url: String,
-}
 
 pub(crate) async fn discover_rpc_url<'a>(
     override_url: Option<&'a str>,
@@ -27,7 +20,7 @@ pub(crate) async fn discover_rpc_url<'a>(
     let path = bearer_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(ENDPOINT_FILE);
+        .join(GATEWAY_ENDPOINT_FILE);
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -35,7 +28,7 @@ pub(crate) async fn discover_rpc_url<'a>(
         }
         Err(source) => return Err(EndpointError::Read { path, source }),
     };
-    let endpoint: PublishedEndpoint =
+    let endpoint: LocalEndpoint =
         serde_json::from_slice(&bytes).map_err(|source| EndpointError::Parse {
             path: path.clone(),
             source,
@@ -107,8 +100,16 @@ pub(crate) enum EndpointError {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{DEFAULT_RPC_URL, ENDPOINT_FILE, EndpointError, discover_rpc_url, socket_target};
-    use crate::service_bootstrap::connect_listener;
+    use fluxdown_protocol::local_service::GATEWAY_ENDPOINT_FILE;
+
+    use super::{DEFAULT_RPC_URL, EndpointError, discover_rpc_url, socket_target};
+    use crate::service_bootstrap::{ListenerProbe, PROBE_TIMEOUT, connect_listener};
+
+    async fn probe(endpoint: &str) -> ListenerProbe {
+        connect_listener(endpoint, PROBE_TIMEOUT)
+            .await
+            .expect("probe endpoint")
+    }
 
     struct Fixture(PathBuf);
 
@@ -127,7 +128,7 @@ mod tests {
         fn publish(&self, url: &str) {
             let bytes = serde_json::to_vec(&serde_json::json!({ "rpcUrl": url }))
                 .expect("serialize endpoint");
-            std::fs::write(self.0.join(ENDPOINT_FILE), bytes).expect("publish endpoint");
+            std::fs::write(self.0.join(GATEWAY_ENDPOINT_FILE), bytes).expect("publish endpoint");
         }
     }
 
@@ -154,10 +155,9 @@ mod tests {
         let endpoint = discover_rpc_url(None, &fixture.bearer())
             .await
             .expect("cold start endpoint");
-        let stream = connect_listener(&endpoint)
-            .await
-            .expect("probe published endpoint")
-            .expect("current agent is listening");
+        let ListenerProbe::Listening(stream) = probe(&endpoint).await else {
+            panic!("current agent must be listening");
+        };
         assert_eq!(stream.peer_addr().expect("current peer"), current_address);
         drop(stream);
 
@@ -165,19 +165,16 @@ mod tests {
         let restarted_address = restarted.local_addr().expect("restarted address");
         drop(current);
         assert!(
-            connect_listener(&endpoint)
-                .await
-                .expect("probe obsolete endpoint")
-                .is_none()
+            matches!(probe(&endpoint).await, ListenerProbe::Refused),
+            "obsolete endpoint must be refused"
         );
         fixture.publish(&format!("ws://{restarted_address}/rpc"));
         let endpoint = discover_rpc_url(None, &fixture.bearer())
             .await
             .expect("restart endpoint");
-        let stream = connect_listener(&endpoint)
-            .await
-            .expect("probe restarted endpoint")
-            .expect("restarted agent is listening");
+        let ListenerProbe::Listening(stream) = probe(&endpoint).await else {
+            panic!("restarted agent must be listening");
+        };
         assert_eq!(
             stream.peer_addr().expect("restarted peer"),
             restarted_address
@@ -187,7 +184,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_url_precedes_even_a_corrupt_endpoint_but_still_requires_loopback() {
         let fixture = Fixture::new("priority");
-        std::fs::write(fixture.0.join(ENDPOINT_FILE), "{broken").expect("corrupt endpoint");
+        std::fs::write(fixture.0.join(GATEWAY_ENDPOINT_FILE), "{broken").expect("corrupt endpoint");
         assert_eq!(
             discover_rpc_url(Some("ws://[::1]:19300/rpc"), &fixture.bearer())
                 .await
@@ -213,8 +210,9 @@ mod tests {
             discover_rpc_url(None, &fixture.bearer()).await,
             Err(EndpointError::Invalid(_))
         ));
-        std::fs::remove_file(fixture.0.join(ENDPOINT_FILE)).expect("remove bad endpoint");
-        std::fs::create_dir(fixture.0.join(ENDPOINT_FILE)).expect("make endpoint unreadable");
+        std::fs::remove_file(fixture.0.join(GATEWAY_ENDPOINT_FILE)).expect("remove bad endpoint");
+        std::fs::create_dir(fixture.0.join(GATEWAY_ENDPOINT_FILE))
+            .expect("make endpoint unreadable");
         assert!(matches!(
             discover_rpc_url(None, &fixture.bearer()).await,
             Err(EndpointError::Read { .. })

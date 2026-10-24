@@ -78,6 +78,7 @@ pub(super) fn trim_for_upload(notice: &TaskNoticeDto, prefs: CloudNotifyPrefs) -
 /// `catalog` 为目录缓存：`Some(空)` = 管理员关闭了全部云端渠道，不上报；`None` = 尚未拉到，
 /// 不据此拦截（概览里是否有匹配渠道仍然把关）。
 /// `overview` 为缓存的云端概览；从未拉取成功（`None`）一律不上报。
+/// FluxCloud 不认识的本机专属事件（`queue.started`）恒不上报。
 pub(super) fn should_report(
     logged_in: bool,
     prefs: CloudNotifyPrefs,
@@ -85,6 +86,9 @@ pub(super) fn should_report(
     overview: Option<&CloudNotifyOverviewDto>,
     event: &str,
 ) -> bool {
+    if is_local_only_event(event) {
+        return false;
+    }
     if !logged_in || !prefs.reporting || catalog.is_some_and(<[CloudNotifyKindDto]>::is_empty) {
         return false;
     }
@@ -95,6 +99,11 @@ pub(super) fn should_report(
         && overview.channels.iter().any(|channel| {
             channel.enabled && channel.events.iter().any(|subscribed| subscribed == event)
         })
+}
+
+/// 仅在本机 webhook / 通知面使用、FluxCloud 不认识的事件；上传前一律丢弃。
+fn is_local_only_event(event: &str) -> bool {
+    event == "queue.started"
 }
 
 /// 有界 FIFO：满时丢最旧。
@@ -306,6 +315,30 @@ mod tests {
         drained.task = None;
         let wire = trim_for_upload(&drained, on());
         assert!(wire.task.is_none());
+    }
+
+    /// FluxCloud 不认识 `queue.started`：即使渠道订阅里出现了这个名字也不上报，
+    /// 同一份概览下已知事件照常上报。
+    #[test]
+    fn queue_started_is_never_reported_to_cloud() {
+        let subscribed = overview(
+            true,
+            vec![channel(true, &["queue.started", "queue.drained"])],
+        );
+        assert!(!should_report(
+            true,
+            on(),
+            None,
+            Some(&subscribed),
+            "queue.started"
+        ));
+        assert!(should_report(
+            true,
+            on(),
+            None,
+            Some(&subscribed),
+            "queue.drained"
+        ));
     }
 
     #[test]

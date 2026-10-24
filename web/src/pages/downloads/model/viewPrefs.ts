@@ -7,12 +7,12 @@ import type { DownloadTaskView, TaskState } from './task'
 export const VIEW_PREFS_KEY = 'desktop.downloads.view'
 
 export type ViewDensity = 'comfortable' | 'compact' | 'relaxed'
-export type ViewGroupBy = 'none' | 'status' | 'date' | 'type' | 'queue' | 'site' | 'group'
+export type ViewGroupBy = 'none' | 'status' | 'date' | 'type' | 'queue' | 'site'
 export type ViewSortKey = 'smart' | 'created' | 'name' | 'size' | 'progress' | 'speed' | 'status'
 export type SortDir = 'asc' | 'desc'
 export type DetailPlacement = 'bottom' | 'right'
 
-export const GROUP_BY_OPTIONS: readonly ViewGroupBy[] = ['none', 'status', 'date', 'type', 'queue', 'site', 'group']
+export const GROUP_BY_OPTIONS: readonly ViewGroupBy[] = ['none', 'status', 'date', 'type', 'queue', 'site']
 export const SORT_KEY_OPTIONS: readonly ViewSortKey[] = ['smart', 'created', 'name', 'size', 'progress', 'speed', 'status']
 
 export type ColumnKind =
@@ -88,19 +88,6 @@ export const FILE_NAME_MAX_WIDTH = 1600
 
 /** 数字列：单元格与表头右对齐。 */
 export const NUMERIC_COLUMNS = new Set<ColumnKind>(['size', 'speed', 'eta', 'created'])
-
-/** 宽松密度把这些列并入文件名主列（镜像 GPUI `DownloadColumnKind::merged_in_relaxed`）。 */
-const RELAXED_MERGED_COLUMNS: Partial<Record<ColumnKind, true>> = { size: true, progress: true, speed: true, eta: true }
-
-/**
- * 列在当前密度下是否实际渲染：宽松密度主列恒显示、被并入的列不单独显示；
- * 列偏好本身不改，切回其他密度原样恢复。
- */
-export function columnShown(kind: ColumnKind, visible: boolean, density: ViewDensity): boolean {
-  if (density !== 'relaxed') return visible
-  if (kind === 'file_name') return true
-  return visible && RELAXED_MERGED_COLUMNS[kind] !== true
-}
 
 /** 点击表头切换到的排序键（「智能排序」不对应任何列）；「状态」列按状态优先级排序。 */
 export const COLUMN_SORT_KEY: Partial<Record<ColumnKind, ViewSortKey>> = {
@@ -253,8 +240,6 @@ export function nextHeaderSort(current: ViewPrefs, key: ViewSortKey): ViewPrefs 
   return { ...current, sort_key: 'smart', sort_dir: 'desc' }
 }
 
-const NO_POSITION = Number.MAX_SAFE_INTEGER
-
 /**
  * 智能排序档位：
  * 0 优先下载（boosted 且 下载中/排队）→ 1 下载中或准备中 → 2 排队 → 3 失败 → 4 暂停 → 5 已完成。
@@ -350,8 +335,8 @@ function compareSmart(left: DownloadTaskView, right: DownloadTaskView): number {
   if (diff !== 0) return diff
   if (tier <= 1) return addedAsc(left, right)
   if (tier === 2) {
-    const l = left.queuePosition > 0 ? left.queuePosition : NO_POSITION
-    const r = right.queuePosition > 0 ? right.queuePosition : NO_POSITION
+    const l = left.queueKey ?? Infinity
+    const r = right.queueKey ?? Infinity
     return l === r ? addedAsc(left, right) : l < r ? -1 : 1
   }
   return addedDesc(left, right)
@@ -362,7 +347,7 @@ function compareSmart(left: DownloadTaskView, right: DownloadTaskView): number {
  * - `smart` 忽略 `sort_dir`，见 `smartTier` 与档内顺序；
  * - 其他键主键按 `sort_dir`（`status` 用 `STATE_RANK`，`name` 用自然序），相等回落「添加顺序倒序」。
  */
-export function compareViews(prefs: ViewPrefs, left: DownloadTaskView, right: DownloadTaskView): number {
+export function compareViews(prefs: Pick<ViewPrefs, 'sort_key' | 'sort_dir'>, left: DownloadTaskView, right: DownloadTaskView): number {
   if (prefs.sort_key === 'smart') return compareSmart(left, right)
   let order = 0
   switch (prefs.sort_key) {
@@ -428,9 +413,7 @@ export const stateGroupKey = (state: TaskState): string => state
 /** 搜索：名称 / url / 站点（小写包含）。 */
 export function matchesQuery(view: DownloadTaskView, query: string): boolean {
   if (query === '') return true
-  return (
-    view.name.toLowerCase().includes(query) ||
-    view.url.toLowerCase().includes(query) ||
-    view.site.toLowerCase().includes(query)
-  )
+  // 三个字段以换行拼接（搜索框是单行输入，查询词里不会有换行，不会跨字段误命中）。
+  if (view.searchFold === '') view.searchFold = `${view.nameFold}\n${view.url.toLowerCase()}\n${view.site.toLowerCase()}`
+  return view.searchFold.includes(query)
 }

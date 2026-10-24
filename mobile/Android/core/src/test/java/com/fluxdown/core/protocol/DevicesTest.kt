@@ -81,6 +81,16 @@ class DevicesTest {
     }
 
     @Test
+    fun cloudDevicesSortByPresenceOnlyWhenKnown() {
+        fun d(name: String, online: Boolean = false, current: Boolean = false) =
+            CloudDevice(name, name, null, isOnline = online, isCurrent = current, appVersion = null)
+        val devices = listOf(d("zeta", online = true), d("Alpha"), d("beta", online = true), d("me", current = true), d("Gamma"))
+        assertEquals(listOf("me", "beta", "zeta", "Alpha", "Gamma"), DeviceRules.sorted(devices, presenceKnown = true).map { it.name })
+        // presence 未知：不按在线分组，纯名称序（未知不当离线沉底）。
+        assertEquals(listOf("me", "Alpha", "beta", "Gamma", "zeta"), DeviceRules.sorted(devices, presenceKnown = false).map { it.name })
+    }
+
+    @Test
     fun sameMachineMergesIntoOneCloudEntry() {
         val cloud = listOf(
             CloudDevice("pc", "Office", "windows", isOnline = false, isCurrent = false, appVersion = null),

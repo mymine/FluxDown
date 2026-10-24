@@ -3,7 +3,7 @@
 //! 版本选择与引擎 `MarketClient::latest_entry` 同一规则（`yanked == "none"` 中 sequence
 //! 最大者），保证列表展示的版本就是 `daemon.plugin.marketInstall` 实际装上的版本。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use fluxdown_protocol::{MarketEntryDto, PluginDto};
 
@@ -64,6 +64,68 @@ pub fn filter_market<'a>(entries: &'a [MarketEntryDto], query: &str) -> Vec<&'a 
                 || entry.tags.iter().any(|tag| hit(tag))
         })
         .collect()
+}
+
+/// 市场列表排序方式；仅内存态，不持久化。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarketSort {
+    /// 保持索引顺序。
+    #[default]
+    Default,
+    /// 发布时间倒序。
+    Newest,
+    /// 收藏数倒序（同数按发布时间倒序）。
+    Favorites,
+}
+
+impl MarketSort {
+    pub const ALL: [Self; 3] = [Self::Default, Self::Newest, Self::Favorites];
+
+    /// 下拉项 / 当前值的 i18n 键。
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Self::Default => "marketSortDefault",
+            Self::Newest => "marketSortNewest",
+            Self::Favorites => "marketSortFavorites",
+        }
+    }
+}
+
+/// 发布时间降序比较（ISO-8601 字符串序）；空串排最后。
+fn newest_first(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => b.cmp(a),
+    }
+}
+
+/// 收藏筛选 + 排序（与 Web `arrangeMarket` 共用 `market_sort_cases.json`）。
+/// 排序均为稳定排序，平手保持输入（索引）顺序。
+pub fn arrange_market<'a>(
+    mut entries: Vec<&'a MarketEntryDto>,
+    sort: MarketSort,
+    counts: &BTreeMap<String, u64>,
+    mine: &HashSet<String>,
+    favorites_only: bool,
+) -> Vec<&'a MarketEntryDto> {
+    if favorites_only {
+        entries.retain(|entry| mine.contains(&entry.plugin_id));
+    }
+    let count_of = |entry: &MarketEntryDto| counts.get(&entry.plugin_id).copied().unwrap_or(0);
+    match sort {
+        MarketSort::Default => {}
+        MarketSort::Newest => {
+            entries.sort_by(|a, b| newest_first(&a.publish_time, &b.publish_time));
+        }
+        MarketSort::Favorites => entries.sort_by(|a, b| {
+            count_of(b)
+                .cmp(&count_of(a))
+                .then_with(|| newest_first(&a.publish_time, &b.publish_time))
+        }),
+    }
+    entries
 }
 
 /// 解析 `MAJOR.MINOR.PATCH`（可带前导 `v`，忽略预发布 / 构建后缀），与引擎
@@ -167,7 +229,7 @@ pub fn installed_version_yanked<'a>(
 /// 权限集合对应的风险等级（与引擎 `PluginManifest::risk` 同规则，夹具共享）。
 pub fn risk_of(permissions: &[String]) -> &'static str {
     let has = |name: &str| permissions.iter().any(|p| p == name);
-    if has("desktop") {
+    if has("desktop") || has("pageScripts") {
         "full"
     } else if [
         "ffmpeg",
@@ -277,6 +339,50 @@ mod tests {
     }
 
     #[test]
+    fn arrange_market_follows_shared_fixture() {
+        use std::collections::{BTreeMap, HashSet};
+
+        use super::{MarketSort, arrange_market};
+
+        let text = include_str!("../tests/fixtures/market_sort_cases.json");
+        let doc: serde_json::Value = serde_json::from_str(text).expect("market sort fixture");
+        for case in doc["cases"].as_array().expect("cases") {
+            let entries: Vec<MarketEntryDto> = case["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .map(|raw| {
+                    let mut built =
+                        entry(raw["pluginId"].as_str().expect("id"), "1.0.0", 1, "none");
+                    built.publish_time = raw["publishTime"].as_str().expect("time").to_owned();
+                    built
+                })
+                .collect();
+            let counts: BTreeMap<String, u64> =
+                serde_json::from_value(case["counts"].clone()).expect("counts");
+            let mine: HashSet<String> = fixture_list(case, "mine").into_iter().collect();
+            let sort = match case["sort"].as_str().expect("sort") {
+                "default" => MarketSort::Default,
+                "newest" => MarketSort::Newest,
+                "favorites" => MarketSort::Favorites,
+                other => panic!("unknown sort {other}"),
+            };
+            let favorites_only = case["favoritesOnly"].as_bool().expect("favoritesOnly");
+            let got = arrange_market(
+                entries.iter().collect(),
+                sort,
+                &counts,
+                &mine,
+                favorites_only,
+            )
+            .into_iter()
+            .map(|entry| entry.plugin_id.clone())
+            .collect::<Vec<_>>();
+            assert_eq!(got, fixture_list(case, "expected"), "{}", case["name"]);
+        }
+    }
+
+    #[test]
     fn risk_follows_shared_fixture() {
         for case in fixture()["risk"].as_array().expect("risk cases") {
             let permissions = fixture_list(case, "permissions");
@@ -368,6 +474,7 @@ mod tests {
             consent_pending_hosts: Vec::new(),
             network_hosts: Vec::new(),
             package_dir: None,
+            package_revision: 0,
         }
     }
 

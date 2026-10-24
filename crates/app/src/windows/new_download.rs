@@ -209,7 +209,10 @@ pub fn install_captures(cx: &mut App) {
             }
             _ => {}
         },
-        SessionSignal::Stale | SessionSignal::Fatal(_) | SessionSignal::ServiceStopped => {
+        SessionSignal::Stale
+        | SessionSignal::Fatal(_)
+        | SessionSignal::ServiceStopped
+        | SessionSignal::ServiceFailed(_) => {
             cx.global_mut::<CaptureDispatch>().agent_current = false;
             sync_targets(cx);
         }

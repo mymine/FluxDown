@@ -212,8 +212,23 @@ else
   IDENTITY=-
   echo "!! no signing identity: ad-hoc signing (not distributable)"
 fi
+# Apple 在线服务（codesign --timestamp 的时间戳服务、notarytool、stapler 的 CloudKit 票据）在 GitHub
+# macOS runner 上偶发断连（NSURLErrorDomain -1005 / -1009、"A timestamp was expected but was not
+# found"）：这些步骤都幂等，按 15s 递增退避，最多 5 次。
+retry() {
+  local attempt=1
+  until "$@"; do
+    if [ "$attempt" -ge 5 ]; then
+      echo "$1 failed after $attempt attempts" >&2
+      return 1
+    fi
+    echo "!! $1 failed (attempt $attempt/5), retrying in $((attempt * 15))s" >&2
+    sleep $((attempt * 15))
+    attempt=$((attempt + 1))
+  done
+}
 # macOS 自带 bash 3.2 在 `set -u` 下展开空数组会报 unbound variable（ad-hoc 签名时 SIGN_ARGS 为空）。
-sign() { codesign --force ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} -s "$IDENTITY" "$@"; }
+sign() { retry codesign --force ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} -s "$IDENTITY" "$@"; }
 
 # 插件桌面界面（gpui-shell，Longbridge quickjs-jit）在界面进程内生成机器码：加固运行时下
 # 主程序必须带 allow-jit。后台 helper（agent / daemon / nmh）不执行 JIT，不加。
@@ -244,30 +259,29 @@ DMG="$OUT_DIR/$PREFIX.dmg"
 rm -f "$DMG"
 ln -s /Applications "$WORK/dmg_src/Applications"
 hdiutil create -quiet -volname "FluxDown $VERSION" -srcfolder "$WORK/dmg_src" -ov -format UDZO "$DMG"
-[ "$IDENTITY" != - ] && codesign --force --timestamp ${KC:+--keychain "$KC"} -s "$IDENTITY" "$DMG"
+[ "$IDENTITY" != - ] && retry codesign --force --timestamp ${KC:+--keychain "$KC"} -s "$IDENTITY" "$DMG"
 
 # ── 公证 ──
-# stapler 经 api.apple-cloudkit.com 取公证票据，GitHub macOS runner 偶发断连
-# （NSURLErrorDomain -1005，退出码 68）：按 15s 递增退避，最多 5 次。
-stapler_retry() {
-  local attempt=1
-  until xcrun stapler "$@"; do
-    if [ "$attempt" -ge 5 ]; then
-      echo "stapler $1 failed after $attempt attempts" >&2
-      return 1
-    fi
-    echo "!! stapler $1 failed (attempt $attempt/5), retrying in $((attempt * 15))s" >&2
-    sleep $((attempt * 15))
-    attempt=$((attempt + 1))
-  done
-}
+stapler_retry() { retry xcrun stapler "$@"; }
 if [ -n "${APPLE_API_KEY_PATH:-}" ]; then
   [ "$IDENTITY" != - ] || { echo "notarization requires Developer ID signing" >&2; exit 1; }
   echo "== notarize"
   NOTARY=(--key "$APPLE_API_KEY_PATH" --key-id "${APPLE_API_KEY_ID:?}" --issuer "${APPLE_API_ISSUER_ID:?}")
-  xcrun notarytool submit "$DMG" "${NOTARY[@]}" --wait --output-format json | tee "$WORK/notary.json"
-  SUB=$(plutil -extract id raw "$WORK/notary.json")
-  xcrun notarytool log "$SUB" "${NOTARY[@]}" "$WORK/notary-log.json" || true
+  # 提交与等待分开：`submit --wait` 轮询途中断网会丢掉整次公证（v0.5.9）。提交失败可安全重试
+  # （新提交）；拿到 id 后断网只续等同一个提交，不重复上传。
+  to_file() { local out=$1; shift; "$@" > "$out"; }
+  retry to_file "$WORK/notary-submit.json" xcrun notarytool submit "$DMG" "${NOTARY[@]}" --output-format json
+  SUB=$(plutil -extract id raw "$WORK/notary-submit.json")
+  echo "notarization submission: $SUB"
+  # wait 的非零退出可能是断网，也可能是公证被拒：结论一律以下面的 info 状态为准。
+  if ! retry xcrun notarytool wait "$SUB" "${NOTARY[@]}" --timeout 2h; then
+    echo "!! notarytool wait did not report success for $SUB; checking final status" >&2
+  fi
+  retry to_file "$WORK/notary.json" xcrun notarytool info "$SUB" "${NOTARY[@]}" --output-format json
+  cat "$WORK/notary.json"
+  if ! xcrun notarytool log "$SUB" "${NOTARY[@]}" "$WORK/notary-log.json"; then
+    echo "!! notarytool log unavailable for $SUB" >&2
+  fi
   [ "$(plutil -extract status raw "$WORK/notary.json")" = Accepted ] || { cat "$WORK/notary-log.json" >&2; exit 1; }
   stapler_retry staple "$DMG"
   stapler_retry validate "$DMG"

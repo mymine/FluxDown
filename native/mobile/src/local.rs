@@ -110,7 +110,8 @@ impl LocalHost {
                 daemon_token: ready.token,
                 client_platform: config.platform.clone(),
                 client_device_name: config.device_name.clone(),
-                enable_link: false,
+                // 只做出站（发现 + 发起配对）：局域网配对添加远程主机时本机会话调 `agent.link.*`。
+                enable_link: true,
             },
             host_cancel.child_token(),
         )

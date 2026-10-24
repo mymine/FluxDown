@@ -1,5 +1,7 @@
 # 发布 fluxdown-plugin-sdk 到 npm。只由 `plugin-sdk-v*` tag 触发，与应用发布（v* tag）互不影响。
 # 前置：包归属 npm 用户 `zerx-lab`（`@fluxdown` 作用域属他人），仓库 secret `NPM_TOKEN` 为该账号的发布令牌。
+# 发布后通知插件索引仓同步准入规则（dist/manifest.mjs）：secret `PLUGIN_INDEX_TOKEN` 为对
+# zerx-lab/fluxdown-plugin-index 有 Actions 写权限的令牌；缺失时跳过，索引仓每日定时同步兜底。
 name: Plugin SDK Release
 
 on:
@@ -46,3 +48,14 @@ jobs:
         run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Sync the plugin index's admission rules
+        env:
+          GH_TOKEN: ${{ secrets.PLUGIN_INDEX_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::PLUGIN_INDEX_TOKEN not set; the index picks up ${TAG#plugin-sdk-v} on its daily sync."
+            exit 0
+          fi
+          gh workflow run sync-validator.yml -R zerx-lab/fluxdown-plugin-index -f version="${TAG#plugin-sdk-v}"

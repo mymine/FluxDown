@@ -204,7 +204,7 @@ extension NotificationSpec {
                     title: L("downloadCompleted"), body: event.fileName, category: category, userInfo: info
                 )
             case .failed:
-                let reason = event.errorMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                let reason = TaskErrorMessage.displayText(event.errorMessage).trimmingCharacters(in: .whitespacesAndNewlines)
                 return NotificationSpec(
                     identifier: "fail.\(hostID).\(event.taskId)", threadID: thread,
                     title: L("subtitleError"), body: reason.isEmpty ? event.fileName : "\(event.fileName)\n\(reason)",
@@ -419,9 +419,10 @@ final class NotificationService: NSObject {
 
     private func process(state: HostState, hostID: String) {
         DiagnosticsSummary.shared.reset(ifHostIsNot: hostID)
+        // 任务表分页载入中视同未就绪：空表 / 半份表不是「任务被删除 / 新出现」，丢弃基线，载入完成后静默重新播种。
         let delta = tracker.ingest(
-            hostID: hostID, isLive: state.connection == .live, tasks: state.tasks, selections: state.selections,
-            now: Int64(Date().timeIntervalSince1970)
+            hostID: hostID, isLive: state.connection == .live && !state.tasksLoading, tasks: state.tasks,
+            selections: state.selections, now: Int64(Date().timeIntervalSince1970)
         )
         guard !delta.isEmpty else { return }
 
@@ -440,7 +441,7 @@ final class NotificationService: NSObject {
 
         // 选择请求：App 在前台时壳层已自动弹出请求 Sheet，只在不活跃时通知。
         if !delta.newSelections.isEmpty, UIApplication.shared.applicationState != .active {
-            for request in state.selections where delta.newSelections.contains(request.requestId) {
+            for request in state.selections.presentable where delta.newSelections.contains(request.requestId) {
                 if let conflict = request.fileConflict {
                     post(NotificationSpec.fileConflict(requestId: request.requestId, taskId: request.taskId, fileName: conflict.fileName, hostID: hostID))
                 } else {

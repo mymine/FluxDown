@@ -1,12 +1,13 @@
 //! shell 的可编辑 chrome：按 [`ChromeLayout`] 把路由按钮、窗口级动作与宿主控件摆进
 //! 顶栏 / 活动栏 / 状态栏。编辑模式下条目可拖放（落点规则见 [`ChromeLayout::move_item`]），
-//! 布局变化经宿主回调持久化，再由 [`ShellView::apply_layout`] 回流。
+//! 可隐藏的条目可在角上切换隐藏（[`ChromeLayout::set_hidden`]）；布局变化经宿主回调持久化，
+//! 再由 [`ShellView::apply_layout`] 回流。
 
 use std::rc::Rc;
 
 use fluxdown_ui_components::{
     ButtonVariant, FluxIcon, SlidingHighlight, activity_button, button, color_transition,
-    nav_icon_color,
+    nav_icon_color, tooltip_view,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -16,14 +17,13 @@ use gpui::{
     size,
 };
 use gpui_component::{
-    Icon, h_flex,
+    Icon, IconName, h_flex,
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
-    tooltip::Tooltip,
     v_flex,
 };
 use serde_json::Value;
 
-use crate::view::{ShellAction, ShellActionContent, ShellLabel, ShellRoute, ShellView};
+use crate::view::{RouteId, ShellAction, ShellActionContent, ShellLabel, ShellRoute, ShellView};
 use crate::{ChromeFamilies, ChromeFamily, ChromeItemSpec, ChromeLayout, ChromeZone};
 
 /// 活动栏轨宽度：32px 按钮居中 + 左右各 8px 留白。
@@ -38,6 +38,10 @@ const ACTIVITY_ICON_EXTRA: Pixels = px(2.);
 const EMPTY_ZONE_MIN_WIDTH: Pixels = px(48.);
 /// 编辑模式下活动栏区域的虚线框内缩（框宽 = 轨宽 − 2 × 内缩）。
 const RAIL_ZONE_INSET: Pixels = px(4.);
+/// 编辑模式下被隐藏条目的不透明度。
+const HIDDEN_ITEM_OPACITY: f32 = 0.4;
+/// 编辑模式下条目角上隐藏 / 显示按钮的边长。
+const VISIBILITY_TOGGLE_SIZE: Pixels = px(16.);
 
 /// 宿主控件渲染：参数为所在区域（决定紧凑形态与菜单弹出方向）；`None` = 当前无内容。
 pub type ShellWidgetRender = Rc<dyn Fn(ChromeZone, &mut Window, &mut App) -> Option<AnyElement>>;
@@ -45,7 +49,10 @@ pub type ShellWidgetRender = Rc<dyn Fn(ChromeZone, &mut Window, &mut App) -> Opt
 /// 布局变化回调：参数是新的持久化值（[`ChromeLayout::to_value`]）。
 pub type LayoutChangeHandler = Rc<dyn Fn(Value, &mut App)>;
 
-/// 由应用注入、可在 chrome 区域间拖动的控件（速度读数、限速、代理…）。
+/// 宿主控件「被隐藏时仍临时显示」的判定（如快捷键唤出的搜索框）。
+pub type ShellWidgetReveal = Rc<dyn Fn(&App) -> bool>;
+
+/// 由应用注入、可在 chrome 区域间拖动的控件（速度读数、限速、代理、搜索框…）。
 ///
 /// 控件在 shell 的渲染里绘制：宿主须经 [`ShellView::observe_widget_source`] 登记数据源，
 /// 数据变化时 shell 才会重绘。
@@ -53,6 +60,9 @@ pub struct ShellWidget {
     id: &'static str,
     label_key: &'static str,
     render: ShellWidgetRender,
+    /// 只在该路由活跃时有内容（页面专属控件）；`None` = 任何页面都显示。
+    route: Option<RouteId>,
+    reveal: Option<ShellWidgetReveal>,
 }
 
 impl ShellWidget {
@@ -66,7 +76,23 @@ impl ShellWidget {
             id,
             label_key,
             render: Rc::new(render),
+            route: None,
+            reveal: None,
         }
+    }
+
+    /// 限定为页面专属控件：只在 `route` 活跃时渲染。
+    #[must_use]
+    pub fn on_route(mut self, route: RouteId) -> Self {
+        self.route = Some(route);
+        self
+    }
+
+    /// 被用户隐藏时，`reveal` 为真则仍临时显示（不改变布局里的隐藏标记）。
+    #[must_use]
+    pub fn revealed_when(mut self, reveal: impl Fn(&App) -> bool + 'static) -> Self {
+        self.reveal = Some(Rc::new(reveal));
+        self
     }
 }
 
@@ -174,6 +200,13 @@ impl ShellView {
         }
     }
 
+    fn set_item_hidden(&mut self, id: &str, hidden: bool, cx: &mut Context<Self>) {
+        if self.layout.set_hidden(&self.catalog, id, hidden) {
+            self.persist_layout(cx);
+            cx.notify();
+        }
+    }
+
     fn persist_layout(&mut self, cx: &mut App) {
         let value = self.layout.to_value();
         self.stored_layout = Some(value.clone());
@@ -205,7 +238,8 @@ impl ShellView {
         }
     }
 
-    /// 渲染一个条目；隐藏的路由 / 动作与（非编辑模式下）无内容的控件返回 `None`。
+    /// 渲染一个条目；隐藏的路由 / 动作、（非编辑模式下）被用户隐藏或无内容的条目返回 `None`。
+    /// 编辑模式下被用户隐藏的条目照常摆放但变淡，便于取消隐藏。
     fn place_item(
         &self,
         id: &SharedString,
@@ -214,7 +248,18 @@ impl ShellView {
         cx: &mut Context<Self>,
     ) -> Option<Placed> {
         let rail = zone.family() == ChromeFamily::Rail;
-        let (element, selected, anchors_rail, label) = match self.item(id)? {
+        let item = self.item(id)?;
+        let hidden = self.layout.is_hidden(id);
+        if hidden && !self.editing {
+            let revealed = match &item {
+                Item::Widget(widget) => widget.reveal.as_ref().is_some_and(|reveal| reveal(cx)),
+                Item::Route(_) | Item::Action(_) => false,
+            };
+            if !revealed {
+                return None;
+            }
+        }
+        let (element, selected, anchors_rail, label) = match item {
             Item::Route(route) => {
                 if !route.visible {
                     return None;
@@ -245,7 +290,16 @@ impl ShellView {
             }
             Item::Widget(widget) => {
                 let render = Rc::clone(&widget.render);
-                let element = match render(zone, window, cx) {
+                let in_scope = widget
+                    .route
+                    .as_ref()
+                    .is_none_or(|route| self.active_route.as_ref() == Some(route));
+                let rendered = if in_scope {
+                    render(zone, window, cx)
+                } else {
+                    None
+                };
+                let element = match rendered {
                     Some(element) if rail => rail_tile().child(element).into_any_element(),
                     Some(element) => element,
                     None if self.editing => self.widget_placeholder(widget, rail, cx),
@@ -255,7 +309,22 @@ impl ShellView {
             }
         };
         let element = if self.editing {
-            self.editable(id, zone, element, self.resolve_label(&label, cx), cx)
+            let element = if hidden {
+                div()
+                    .opacity(HIDDEN_ITEM_OPACITY)
+                    .child(element)
+                    .into_any_element()
+            } else {
+                element
+            };
+            self.editable(
+                id,
+                zone,
+                element,
+                hidden,
+                self.resolve_label(&label, cx),
+                cx,
+            )
         } else if zone.family() == ChromeFamily::Title {
             // 顶栏条目拦截左键按下：否则冒泡到标题栏开始拖动窗口。
             div()
@@ -287,12 +356,13 @@ impl ShellView {
     }
 
     /// 编辑模式的条目外壳：顶层遮罩接管指针（条目自身的点击 / 菜单失效），可拖动，
-    /// 也是落点（占据该条目的位置）。
+    /// 也是落点（占据该条目的位置）；可隐藏的条目右上角另有隐藏 / 显示按钮。
     fn editable(
         &self,
         id: &SharedString,
         zone: ChromeZone,
         element: AnyElement,
+        hidden: bool,
         label: SharedString,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -300,11 +370,9 @@ impl ShellView {
         let tokens = theme.tokens();
         let accent = tokens.colors.primary;
         let family = zone.family();
-        let families = self
-            .catalog
-            .iter()
-            .find(|spec| spec.id == *id)
-            .map_or(ChromeFamilies::default(), |spec| spec.families);
+        let spec = self.catalog.iter().find(|spec| spec.id == *id);
+        let families = spec.map_or(ChromeFamilies::default(), |spec| spec.families);
+        let hideable = spec.is_some_and(|spec| spec.hideable);
         let drag = ChromeDrag {
             id: id.clone(),
             label,
@@ -340,6 +408,67 @@ impl ShellView {
                         this.drop_item(&drag.id, zone, Some(&target), cx);
                     }))
                     .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone())),
+            )
+            .when(hideable, |this| {
+                this.child(self.visibility_toggle(id, hidden, cx))
+            })
+            .into_any_element()
+    }
+
+    /// 条目右上角的隐藏 / 显示按钮：位于拖拽遮罩之上，按下不触发拖动。
+    fn visibility_toggle(
+        &self,
+        id: &SharedString,
+        hidden: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended();
+        let accent = tokens.colors.primary;
+        let tooltip = self.label(
+            if hidden {
+                "chromeLayoutShowItem"
+            } else {
+                "chromeLayoutHideItem"
+            },
+            cx,
+        );
+        let target = id.clone();
+        let offset = VISIBILITY_TOGGLE_SIZE / 3.;
+        div()
+            .id(SharedString::from(format!("shell-chrome-visibility-{id}")))
+            .absolute()
+            .top(-offset)
+            .right(-offset)
+            .size(VISIBILITY_TOGGLE_SIZE)
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .cursor_pointer()
+            .rounded_full()
+            .border_1()
+            .border_color(tokens.colors.border)
+            .bg(tokens.colors.surface)
+            .text_color(if hidden {
+                accent
+            } else {
+                tokens.colors.muted_foreground
+            })
+            .hover(move |style| style.border_color(accent).text_color(accent))
+            .tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_item_hidden(&target, !hidden, cx);
+            }))
+            .child(
+                Icon::new(if hidden {
+                    IconName::EyeOff
+                } else {
+                    IconName::Eye
+                })
+                .size(extended.icon.sm),
             )
             .into_any_element()
     }
@@ -392,7 +521,7 @@ impl ShellView {
         let route_id = route.id.clone();
         rail_tile()
             .id(route.tooltip_id.clone())
-            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
+            .tooltip(move |window, cx| tooltip_view(tooltip_label.clone(), window, cx))
             .child(
                 activity_button(
                     route.button_id.clone(),
@@ -434,7 +563,7 @@ impl ShellView {
             .flex_none()
             .rounded(radius)
             .when(selected, |this| this.bg(selected_bg))
-            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
+            .tooltip(move |window, cx| tooltip_view(tooltip_label.clone(), window, cx))
             .child(
                 activity_button(
                     route.button_id.clone(),
@@ -487,7 +616,7 @@ impl ShellView {
         let icon_color = active_theme(cx).tokens().colors.muted_foreground;
         frame
             .id(tooltip_id)
-            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
+            .tooltip(move |window, cx| tooltip_view(tooltip_label.clone(), window, cx))
             .child(
                 activity_button(
                     action.button_id,

@@ -1,6 +1,7 @@
 import FluxDomain
 import Foundation
 
+#if FULL_FLAVOR
 // X1 的文件树模型（纯逻辑，同 Android `BtFileSelection.kt` 的 `buildBtTree` / `flatten` / `folderState`）。
 
 nonisolated final class BtFolderNode {
@@ -130,3 +131,4 @@ nonisolated func initialBtSelection(files: [BtFile], defaultIndices: [Int32]) ->
     let preset = Set(defaultIndices).intersection(known)
     return preset.isEmpty ? known : preset
 }
+#endif

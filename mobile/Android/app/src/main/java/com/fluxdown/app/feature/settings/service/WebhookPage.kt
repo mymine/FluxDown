@@ -104,6 +104,7 @@ private fun WebhookEvent.labelRes(): Int = when (this) {
     WebhookEvent.Completed -> R.string.webhookEventCompleted
     WebhookEvent.Failed -> R.string.webhookEventFailed
     WebhookEvent.Paused -> R.string.webhookEventPaused
+    WebhookEvent.QueueStarted -> R.string.webhookEventQueueStarted
     WebhookEvent.QueueDrained -> R.string.webhookEventQueueDrained
 }
 

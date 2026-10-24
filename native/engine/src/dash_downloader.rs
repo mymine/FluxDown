@@ -267,13 +267,10 @@ pub async fn run_dash_download(params: DownloadParams) {
     let task_id_log = params.task_id.clone();
     let result = match run_dash_download_inner(&params).await {
         Ok(total) => {
-            // 插件后处理：成功写状态 3 前执行；替换文件时只更新 total
-            // （文件名随后从 DB 读取）。
-            match crate::downloader::finalize_with_interceptors(
-                &params,
-                crate::intercept::ProtocolKind::Dash,
-            )
-            .await
+            // 插件后处理与分类目录复核：成功写状态 3 前执行；替换文件时只更新 total
+            // （文件名与目录随后从 DB 读取）。
+            match crate::downloader::finalize_output(&params, crate::intercept::ProtocolKind::Dash)
+                .await
             {
                 Ok(replaced) => {
                     let total = replaced.map_or(total, |(_, size)| size);

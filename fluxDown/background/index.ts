@@ -1,16 +1,18 @@
 /**
- * FluxDown Background Service Worker 入口。
+ * FluxDown Background 入口（Chrome：Service Worker；Firefox：非持久 event page）。
  *
  * 职责：拦截浏览器下载并转发给桌面应用（见 intercept.ts 的三层防线）、被动嗅探
  * （sniff.ts + sensor 上报 + 规则引擎）、右键菜单、与桌面端通信、统计、多语言。
  *
- * `startBackground` 同步注册全部 listener（MV3 要求事件监听器在 SW 首次执行时注册）。
+ * `startBackground` 同步注册全部 listener（两种后台都要求事件监听器在首次执行时同步注册，
+ * 休眠后由事件唤醒重新执行本入口；跨休眠的状态落 storage.session，见各模块）。
  */
 import { browser } from "wxt/browser";
 import { initI18n, t } from "@/utils/i18n";
 import { loadSettings, persistSettings } from "@/utils/settings";
 import type { ContentMessage } from "./protocol";
 import { restoreBreakerState } from "./breaker";
+import { installBrowserDownloadNotices } from "./browser-downloads";
 import { installCaptureTracker } from "./capture-tracker";
 import {
   installIntercept,
@@ -21,6 +23,7 @@ import { installLinkCapture } from "./link-capture";
 import { createContextMenus, installMenus } from "./menus";
 import { downloadPlayingMedia } from "./downloads";
 import { installMessages } from "./messages";
+import { installPageScripts } from "./page-scripts";
 import { notify } from "./notify";
 import { installPorts } from "./ports";
 import { installProbe } from "./probe";
@@ -78,8 +81,11 @@ export function startBackground(): void {
   installMenus();
   installLinkCapture();
   installTaskListeners();
+  installBrowserDownloadNotices();
   installCaptureTracker();
   installMessages();
+  // 页面脚本管理器：onUserScriptMessage / onInstalled 等监听器必须在顶层同步注册。
+  installPageScripts();
   installPorts();
   restoreBreakerState();
   // 拦截同步路径需要 SW 作用域登记表就绪，启动即恢复

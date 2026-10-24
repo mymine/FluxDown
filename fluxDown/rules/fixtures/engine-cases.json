@@ -1898,6 +1898,140 @@
     }
   },
   {
+    "name": "[pdf] iframe 内联 PDF：无扩展名按 MIME 收录",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/file/view?id=42",
+        "pageUrl": "https://x.com/doc",
+        "resourceType": "sub_frame",
+        "mime": "application/pdf",
+        "status": 200,
+        "size": 1048576,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "document",
+      "rule": {
+        "id": "builtin.mime.pdf"
+      }
+    }
+  },
+  {
+    "name": "[pdf] embed 旧式 MIME application/x-pdf 带参数也收录",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/preview/42",
+        "pageUrl": "https://x.com/doc",
+        "resourceType": "object",
+        "mime": "Application/X-PDF; charset=binary",
+        "status": 200,
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "document",
+      "rule": {
+        "id": "builtin.mime.pdf"
+      }
+    }
+  },
+  {
+    "name": "[pdf] 页面内阅读器的 Range 分段请求（接口路径）不被噪音规则吞掉",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/api/v1/files/42/content",
+        "pageUrl": "https://x.com/doc",
+        "resourceType": "xmlhttprequest",
+        "mime": "application/pdf",
+        "status": 206,
+        "size": 5242880,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "resource",
+      "type": "document",
+      "rule": {
+        "id": "builtin.mime.pdf"
+      }
+    }
+  },
+  {
+    "name": "[pdf] 同一地址的 HTML 预览页不收录",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/file/view?id=42",
+        "pageUrl": "https://x.com/doc",
+        "resourceType": "sub_frame",
+        "mime": "text/html",
+        "status": 200,
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[pdf] 无扩展名 octet-stream 不因 PDF 规则误收",
+    "call": "classifyResponse",
+    "args": [
+      {
+        "url": "https://x.com/preview/42",
+        "pageUrl": "https://x.com/doc",
+        "resourceType": "object",
+        "mime": "application/octet-stream",
+        "status": 200,
+        "size": -1,
+        "attachment": false
+      }
+    ],
+    "expect": {
+      "decision": "none"
+    }
+  },
+  {
+    "name": "[pdf] 入库复核带上 MIME 时接口路径 PDF 不被忽略",
+    "call": "isIgnored",
+    "args": [
+      "https://x.com/api/v1/files/42/content",
+      "https://x.com/doc",
+      false,
+      "application/pdf"
+    ],
+    "expect": null
+  },
+  {
+    "name": "[pdf] 入库复核不带 MIME 时接口路径仍被忽略",
+    "call": "isIgnored",
+    "args": [
+      "https://x.com/api/v1/files/42/content",
+      "https://x.com/doc",
+      false
+    ],
+    "expect": {
+      "id": "builtin.noise.paths"
+    }
+  },
+  {
+    "name": "[pdf] 无扩展名地址按 MIME 归类为文档",
+    "call": "classify",
+    "args": [
+      "https://x.com/file/view?id=42",
+      "application/pdf"
+    ],
+    "expect": "document"
+  },
+  {
     "name": "[noise] 查询串含 sentry.io 不被忽略",
     "call": "classifyResponse",
     "args": [

@@ -11,6 +11,8 @@ object HostMethod {
     const val systemHello = "system.hello"
     const val systemPing = "system.ping"
     const val systemSnapshot = "system.snapshot"
+    /** 任务表 / 队列位置表分页（协议 v17）：`{section:"tasks"|"queue", cursor?, limit?}`。分页载入由 Rust 会话完成，Kotlin 不直接调用。 */
+    const val systemTaskPage = "system.taskPage"
     /** 让服务优雅退出：daemon 关停引擎后退出；agent 先关停 daemon 再退出（完全退出）。允许作为连接首帧（握手前）调用。 */
     const val systemShutdown = "system.shutdown"
     const val daemonTaskList = "daemon.task.list"
@@ -83,6 +85,8 @@ object HostMethod {
     const val daemonLinkProbe = "daemon.link.probe"
     const val daemonPluginList = "daemon.plugin.list"
     const val daemonPluginSniffRules = "daemon.plugin.sniffRules"
+    const val daemonPluginPageScripts = "daemon.plugin.pageScripts"
+    const val daemonPluginPageScriptSource = "daemon.plugin.pageScriptSource"
     const val daemonPluginAuth = "daemon.plugin.auth"
     const val daemonPluginSetEnabled = "daemon.plugin.setEnabled"
     const val daemonPluginUpdateSettings = "daemon.plugin.updateSettings"
@@ -107,6 +111,7 @@ object HostMethod {
     const val daemonPluginViewKeepalive = "daemon.plugin.view.keepalive"
     const val daemonPluginCommand = "daemon.plugin.command"
     const val daemonPluginInvoke = "daemon.plugin.invoke"
+    const val daemonPluginPageInvoke = "daemon.plugin.pageInvoke"
     const val daemonComponentGet = "daemon.component.get"
     const val daemonComponentListVersions = "daemon.component.listVersions"
     const val daemonComponentInstall = "daemon.component.install"
@@ -154,6 +159,8 @@ object HostMethod {
     const val agentProfileChangeNickname = "agent.profile.changeNickname"
     const val agentProfileSendPasswordCode = "agent.profile.sendPasswordCode"
     const val agentProfileChangePassword = "agent.profile.changePassword"
+    const val agentProfileSendDeleteCode = "agent.profile.sendDeleteCode"
+    const val agentProfileDeleteAccount = "agent.profile.deleteAccount"
     const val agentGatewayGet = "agent.gateway.get"
     const val agentGatewayPatch = "agent.gateway.patch"
     /** 仅供本机官方 UI 展示/复制用户 token；结果 `{ "userToken": "..." }`（未配置为空串）。 */
@@ -200,6 +207,8 @@ object HostMethod {
     const val agentLinkRefresh = "agent.link.refresh"
     /** `LinkDispatchParams` → `LinkDispatchResult`：下发下载到已配对设备。 */
     const val agentLinkDispatch = "agent.link.dispatch"
+    /** `LinkDeviceParams` → `LinkControlCredentialDto`：本机对已配对且可控制的主机签发设备专属控制凭据（仅发起方）。 */
+    const val agentLinkControlCredential = "agent.link.controlCredential"
     const val agentPlanList = "agent.plan.list"
     const val agentOrderCreate = "agent.order.create"
     const val agentOrderGet = "agent.order.get"
@@ -219,6 +228,8 @@ object HostMethod {
     const val agentPlatformSetUrlProtocol = "agent.platform.setUrlProtocol"
     /** 系统文件管理器为文件显示的图标（PNG）；参数见 `PlatformFileIconParams`。 */
     const val agentPlatformFileIcon = "agent.platform.fileIcon"
+    /** 由 agent 在本机播放一次提示音偏好值；仅桌面，移动端不使用。 */
+    const val agentSoundPreview = "agent.sound.preview"
     const val agentCaptureSubmit = "agent.capture.submit"
     /** 从本机 `.torrent` 文件建任务：agent 读文件、上传 daemon blob 后调用 `daemon.task.create`。 */
     const val agentCaptureSubmitTorrentFile = "agent.capture.submitTorrentFile"

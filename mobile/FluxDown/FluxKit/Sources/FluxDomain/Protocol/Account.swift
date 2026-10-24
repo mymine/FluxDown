@@ -374,6 +374,17 @@ public struct ChangeNicknameParams: Sendable, Hashable, Codable {
     public init(nickname: String) { self.nickname = nickname }
 }
 
+/// 删除账号：`currentPassword` 与 `code`（`sendDeleteCode` 发到绑定邮箱）二选一，nil 字段不编码。
+public struct DeleteAccountParams: Sendable, Hashable, Codable {
+    public var currentPassword: String?
+    public var code: String?
+
+    public init(currentPassword: String? = nil, code: String? = nil) {
+        self.currentPassword = currentPassword
+        self.code = code
+    }
+}
+
 /// 已登录修改 / 设置密码：`currentPassword` 与 `code`（`sendPasswordCode` 发到绑定邮箱）二选一。
 public struct ChangePasswordParams: Sendable, Hashable, Codable {
     public var newPassword: String
@@ -593,6 +604,8 @@ public enum AccountRules {
         case "pairingSignatureInvalid": "errReasonPairingSignatureInvalid"
         case "pairingSelf": "errReasonPairingSelf"
         case "pairingVersionMismatch": "errReasonPairingVersionMismatch"
+        case "pairingTimeout": "errReasonPairingTimeout"
+        case "peerClockSkew": "errReasonPeerClockSkew"
         case "peerNotPaired": "errReasonPeerNotPaired"
         case "peerOffline": "errReasonPeerOffline"
         case "peerOutdated": "errReasonPeerOutdated"
@@ -632,7 +645,8 @@ public enum AccountRules {
         case .pairing:
             switch error.code {
             case .invalidArgument: return "localPairingAddressInvalid"
-            default: if network { return "errReasonPairingPeerUnreachable" }
+            // 不带 reason 的 `unavailable` 是本机服务 / 会话问题，不是「对端地址不可达」（那种情形 agent 会带 `pairingPeerUnreachable`）。
+            default: break
             }
         case .general:
             break

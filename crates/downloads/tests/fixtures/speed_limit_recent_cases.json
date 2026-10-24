@@ -1,0 +1,27 @@
+{
+  "limit": 3,
+  "read": [
+    { "name": "missing", "value": null, "expected": [] },
+    { "name": "not an array", "value": 750, "expected": [] },
+    {
+      "name": "drops non-integer, non-positive, preset and duplicates",
+      "value": [750, "300", null, 0, -5, 1024, 5120, 10240, 51200, 750, 2048],
+      "expected": [750, 2048]
+    },
+    { "name": "caps at limit", "value": [1, 2, 3, 4, 5], "expected": [1, 2, 3] },
+    { "name": "presets do not use up the cap", "value": [1024, 1, 5120, 2, 3, 4], "expected": [1, 2, 3] }
+  ],
+  "push": [
+    { "name": "into empty", "recent": [], "kbps": 750, "expected": [750] },
+    { "name": "new value goes first", "recent": [100, 200], "kbps": 300, "expected": [300, 100, 200] },
+    { "name": "existing value moves to front", "recent": [100, 200, 300], "kbps": 300, "expected": [300, 100, 200] },
+    { "name": "already first is unchanged", "recent": [100, 200], "kbps": 100, "expected": null },
+    { "name": "oldest drops past limit", "recent": [100, 200, 300], "kbps": 400, "expected": [400, 100, 200] },
+    { "name": "zero is ignored", "recent": [100], "kbps": 0, "expected": null },
+    { "name": "negative is ignored", "recent": [100], "kbps": -1, "expected": null },
+    { "name": "1 MB/s preset is ignored", "recent": [], "kbps": 1024, "expected": null },
+    { "name": "5 MB/s preset is ignored", "recent": [], "kbps": 5120, "expected": null },
+    { "name": "10 MB/s preset is ignored", "recent": [], "kbps": 10240, "expected": null },
+    { "name": "50 MB/s preset is ignored", "recent": [], "kbps": 51200, "expected": null }
+  ]
+}

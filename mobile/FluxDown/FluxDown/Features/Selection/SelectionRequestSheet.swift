@@ -62,11 +62,9 @@ private struct SelectionHost: View {
     private func content(_ request: SelectionRequest) -> some View {
         let task = container.store.state.task(request.taskId)
         switch request.kind {
+        #if FULL_FLAVOR
         case let .bt(files):
             BtSelectionView(request: request, files: files, task: task, resolver: resolver, close: { dismiss() })
-                .id(request.requestId)
-        case let .hls(options):
-            HlsSelectionView(request: request, options: options, task: task, resolver: resolver, close: { dismiss() })
                 .id(request.requestId)
         case let .variant(options):
             VariantSelectionView(request: request, options: options, task: task, resolver: resolver, close: { dismiss() })
@@ -82,6 +80,14 @@ private struct SelectionHost: View {
                 close: { dismiss() }
             )
             .id(request.requestId)
+        #else
+        case .bt, .variant, .plugin:
+            // store 构建不处理（`SelectionRequest.isPresentable`），根视图不会以此路由呈现。
+            EmptyView()
+        #endif
+        case let .hls(options):
+            HlsSelectionView(request: request, options: options, task: task, resolver: resolver, close: { dismiss() })
+                .id(request.requestId)
         case .fileExists:
             // 聚合进 `.fileConflicts` 路由（`FileConflictSheet`），不会以单请求 Sheet 呈现。
             EmptyView()
@@ -93,6 +99,7 @@ private func hlsLabel(height: Int64, bandwidth: Int64) -> String {
     height > 0 ? "\(height)p" : L("mobileKbps", ["n": bandwidth / 1000])
 }
 
+#if FULL_FLAVOR
 // MARK: - X1 · BT 文件
 
 private struct BtSelectionView: View {
@@ -297,6 +304,7 @@ private struct BtSelectionView: View {
         .accessibilityHidden(true)
     }
 }
+#endif
 
 // MARK: - X2 · HLS 画质
 
@@ -393,6 +401,7 @@ private struct HlsSelectionView: View {
     }
 }
 
+#if FULL_FLAVOR
 // MARK: - X3 · 插件变体
 
 private struct VariantSelectionView: View {
@@ -628,3 +637,4 @@ private struct PluginChoiceView: View {
         .contentShape(Rectangle())
     }
 }
+#endif

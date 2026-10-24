@@ -52,9 +52,12 @@ const binaries: RowSpec[] = [
   { path: `${s}.macos_x64`, label: t.os.macos, detail: t.arch.intel, ext: ".tar.gz" },
 ];
 const openwrt: RowSpec[] = [
-  { path: `${s}.openwrt_x64`, label: "x86_64", ext: ".ipk" },
-  { path: `${s}.openwrt_arm64`, label: "aarch64", ext: ".ipk" },
-  { path: `${s}.openwrt_luci`, label: t.server.luci, ext: ".ipk" },
+  { path: `${s}.openwrt_apk_x64`, label: "x86_64", detail: t.server.openwrtApk, ext: ".apk" },
+  { path: `${s}.openwrt_apk_arm64`, label: "aarch64", detail: t.server.openwrtApk, ext: ".apk" },
+  { path: `${s}.openwrt_apk_luci`, label: t.server.luci, detail: t.server.openwrtApk, ext: ".apk" },
+  { path: `${s}.openwrt_x64`, label: "x86_64", detail: t.server.openwrtIpk, ext: ".ipk" },
+  { path: `${s}.openwrt_arm64`, label: "aarch64", detail: t.server.openwrtIpk, ext: ".ipk" },
+  { path: `${s}.openwrt_luci`, label: t.server.luci, detail: t.server.openwrtIpk, ext: ".ipk" },
 ];
 const qnap: RowSpec[] = [
   { path: `${s}.qnap_x64`, label: "x64", ext: ".qpkg" },
@@ -70,7 +73,6 @@ const fnos: RowSpec[] = [
   { path: `${s}.fnos_x64`, label: "x64", ext: ".fpk" },
   { path: `${s}.fnos_arm64`, label: "ARM64", ext: ".fpk" },
 ];
-const notify = "#subscribe";
 ---
 
 <section class="frame" id="server" aria-labelledby="server-title">
@@ -101,23 +103,23 @@ const notify = "#subscribe";
   </div>
 
   <div class="cells grid-2 border-t border-line">
-    <AssetGroup lang={lang} id="server-binaries" title={t.server.binariesTitle} desc={t.server.binariesDesc} versionPath="server.version" fallback={fallback} rows={binaries} notifyHref={notify}>
+    <AssetGroup lang={lang} id="server-binaries" title={t.server.binariesTitle} desc={t.server.binariesDesc} versionPath="server.version" fallback={fallback} rows={binaries}>
       <Fragment slot="icon"><Server size={16} strokeWidth={1.75} /></Fragment>
       <a class="link mt-auto self-start text-[13px]" href={setupGuide}>{t.server.guide}</a>
     </AssetGroup>
-    <AssetGroup lang={lang} id="openwrt" title="OpenWrt" desc={t.server.openwrtDesc} versionPath="server.version" fallback={fallback} rows={openwrt} notifyHref={notify}>
+    <AssetGroup lang={lang} id="openwrt" title="OpenWrt" desc={t.server.openwrtDesc} versionPath="server.version" fallback={fallback} rows={openwrt}>
       <Fragment slot="icon"><Router size={16} strokeWidth={1.75} /></Fragment>
       <a class="link mt-auto self-start text-[13px]" href={setupGuide}>{t.server.guide}</a>
     </AssetGroup>
-    <AssetGroup lang={lang} id="qnap" title="QNAP" desc={t.server.qnapDesc} versionPath="server.version" fallback={fallback} rows={qnap} notifyHref={notify}>
+    <AssetGroup lang={lang} id="qnap" title="QNAP" desc={t.server.qnapDesc} versionPath="server.version" fallback={fallback} rows={qnap}>
       <Fragment slot="icon"><HardDrive size={16} strokeWidth={1.75} /></Fragment>
       <a class="link mt-auto self-start text-[13px]" href={setupGuide}>{t.server.guide}</a>
     </AssetGroup>
-    <AssetGroup lang={lang} id="synology" title="Synology" desc={t.server.synologyDesc} versionPath="server.version" fallback={fallback} rows={synology} notifyHref={notify}>
+    <AssetGroup lang={lang} id="synology" title="Synology" desc={t.server.synologyDesc} versionPath="server.version" fallback={fallback} rows={synology}>
       <Fragment slot="icon"><HardDrive size={16} strokeWidth={1.75} /></Fragment>
       <a class="link mt-auto self-start text-[13px]" href={dockerGuide}>{t.server.dockerGuide}</a>
     </AssetGroup>
-    <AssetGroup lang={lang} id="fnos" title={t.server.fnosTitle} desc={t.server.fnosDesc} versionPath="server.version" fallback={fallback} rows={fnos} notifyHref={notify}>
+    <AssetGroup lang={lang} id="fnos" title={t.server.fnosTitle} desc={t.server.fnosDesc} versionPath="server.version" fallback={fallback} rows={fnos}>
       <Fragment slot="icon"><HardDrive size={16} strokeWidth={1.75} /></Fragment>
       <a class="link mt-auto self-start text-[13px]" href={dockerGuide}>{t.server.dockerGuide}</a>
     </AssetGroup>
@@ -151,6 +153,10 @@ const notify = "#subscribe";
   @media (min-width: 760px) {
     .grid-2 {
       grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    /* 分组数为奇数时末项横跨整行,避免右下角露出网格底色 */
+    .grid-2 > :global(:last-child:nth-child(odd)) {
+      grid-column: 1 / -1;
     }
   }
 </style>

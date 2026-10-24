@@ -14,6 +14,7 @@ import { cn } from '../lib/cn'
 import { useIsMobile } from './hooks'
 import { Icon } from './Icon'
 import { Sheet } from './Sheet'
+import { PathText } from './PathText'
 
 export type MenuEntry =
   | {
@@ -25,6 +26,12 @@ export type MenuEntry =
       destructive?: boolean
       disabled?: boolean
       shortcut?: string
+      /** 标签下方的单行次要说明（超长省略）。 */
+      description?: string
+      /** 说明是文件路径：中间省略、保留末段目录名，宽度封顶。 */
+      descriptionIsPath?: boolean
+      /** 选中态：右侧显示勾选。 */
+      checked?: boolean
     }
   | { type: 'check'; key: string; label: string; checked: boolean; onSelect: () => void; disabled?: boolean }
   | { type: 'sub'; key: string; label: string; icon?: LucideIcon; entries: readonly MenuEntry[]; disabled?: boolean }
@@ -38,6 +45,12 @@ const PANEL =
   'animate-fx-pop z-50 max-h-[calc(100dvh-16px)] min-w-[10rem] max-w-[calc(100vw-16px)] overflow-y-auto rounded-md border border-hairline bg-surface p-1 shadow-md'
 
 type Kit = typeof Dropdown | typeof Context
+
+function MenuDescription({ entry }: { entry: Extract<MenuEntry, { type: 'item' }> }) {
+  if (!entry.description) return null
+  if (entry.descriptionIsPath) return <PathText path={entry.description} className="max-w-[26rem] text-caption text-text-tertiary" />
+  return <span className="truncate text-caption text-text-tertiary">{entry.description}</span>
+}
 
 function renderEntries(kit: Kit, entries: readonly MenuEntry[]): ReactNode {
   return entries.map((entry) => {
@@ -87,8 +100,12 @@ function renderEntries(kit: Kit, entries: readonly MenuEntry[]): ReactNode {
             className={cn(ITEM, entry.destructive && 'text-destructive')}
           >
             {entry.icon ? <Icon icon={entry.icon} size="md" /> : null}
-            <span className="flex-1">{entry.label}</span>
+            <span className="flex min-w-0 flex-1 flex-col py-1">
+              <span>{entry.label}</span>
+              <MenuDescription entry={entry} />
+            </span>
             {entry.shortcut ? <span className="text-caption text-text-tertiary">{entry.shortcut}</span> : null}
+            {entry.checked ? <Icon icon={Check} size="md" className="text-nav-selected-icon" /> : null}
           </kit.Item>
         )
     }
@@ -145,8 +162,11 @@ function SheetList({ entries, close, title }: { entries: readonly MenuEntry[]; c
                 )}
               >
                 {icon ? <Icon icon={icon} /> : entry.type === 'check' ? <span className="size-4" /> : null}
-                <span className="flex-1">{entry.label}</span>
-                {entry.type === 'check' && entry.checked ? <Icon icon={Check} className="text-nav-selected-icon" /> : null}
+                <span className="flex min-w-0 flex-1 flex-col">
+                  <span>{entry.label}</span>
+                  {entry.type === 'item' ? <MenuDescription entry={entry} /> : null}
+                </span>
+                {(entry.type === 'check' || entry.type === 'item') && entry.checked ? <Icon icon={Check} className="text-nav-selected-icon" /> : null}
                 {entry.type === 'sub' ? <Icon icon={ChevronRight} className="text-text-tertiary" /> : null}
               </button>
             )

@@ -193,3 +193,56 @@ async fn consent_corrupt_record_is_treated_as_ungranted() {
     f.manager.load_all().await;
     assert_eq!(info(&f).await.consent_pending, ["tasks"]);
 }
+
+fn write_dev_plugin(f: &Fixture, identity: &str) -> PathBuf {
+    let dir = f.root.join(format!("src-{identity}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = serde_json::json!({ "identity": identity, "name": "Dev", "version": "0.1.0" });
+    std::fs::write(dir.join("manifest.json"), manifest.to_string()).unwrap();
+    dir
+}
+
+async fn revision_of(f: &Fixture, identity: &str) -> u64 {
+    f.manager
+        .list()
+        .await
+        .into_iter()
+        .find(|p| p.identity == identity)
+        .expect("plugin listed")
+        .package_revision
+}
+
+/// 包修订号只随「替换包代码」的动作变化，且只变被操作的插件：桌面端据此重挂脚本视图，
+/// 启停等其他整表重载不能让无关插件的界面被拆掉重建。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn package_revision_tracks_only_code_replacing_actions() {
+    const OTHER: &str = "other@demo";
+    let f = fixture().await;
+    let dir = write_dev_plugin(&f, ID);
+    f.manager.install_dev(&dir).await.unwrap();
+    let other_dir = write_dev_plugin(&f, OTHER);
+    f.manager.install_dev(&other_dir).await.unwrap();
+    let installed = revision_of(&f, ID).await;
+    let other = revision_of(&f, OTHER).await;
+
+    f.manager.set_enabled(ID, false).await.unwrap();
+    f.manager.set_enabled(ID, true).await.unwrap();
+    f.manager.load_all().await;
+    assert_eq!(revision_of(&f, ID).await, installed);
+
+    f.manager.reload_dev(ID).await.unwrap();
+    let reloaded = revision_of(&f, ID).await;
+    assert_ne!(reloaded, installed);
+    assert_eq!(revision_of(&f, OTHER).await, other);
+
+    // 校验失败的重载不替换生效代码，修订号不变。
+    std::fs::write(dir.join("manifest.json"), "{broken").unwrap();
+    assert!(f.manager.reload_dev(ID).await.is_err());
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::json!({ "identity": ID, "name": "Dev", "version": "0.1.0" }).to_string(),
+    )
+    .unwrap();
+    f.manager.load_all().await;
+    assert_eq!(revision_of(&f, ID).await, reloaded);
+}

@@ -1,6 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
+#if FULL_FLAVOR
 
 // D4 做种限制（02-downloads §5.5 / §6）：做种页的 5 行摘要 + 推入的编辑页。
 // 当前值不在 `DownloadTask` 里：进入做种页时 `daemon.task.get` 读取，保存（`daemon.task.setSeedLimits`）后更新并重读。
@@ -365,3 +366,4 @@ private struct SeedLimitInputRow: View {
         .frame(minHeight: 44)
     }
 }
+#endif

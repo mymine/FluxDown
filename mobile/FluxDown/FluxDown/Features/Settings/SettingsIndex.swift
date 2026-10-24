@@ -35,7 +35,7 @@ enum SettingsIndex {
             ["searchKeywordsSaveDir", "searchKeywordsThreads", "searchKeywordsConcurrent", "searchKeywordsSpeedLimit"]
         ))
         list += DownloadPage.searchEntries(ctx)
-        #if FULL_P2P
+        #if FULL_FLAVOR
         list.append(category(.bt, "settingsCatBt", "settingsCatBtDesc", "point.3.connected.trianglepath.dotted", ["searchKeywordsBtSettings"]))
         list += BtPage.searchEntries(ctx)
         list.append(category(.ed2k, "ed2kSettings", "ed2kSettingsDesc", "server.rack", ["searchKeywordsEd2kSettings"]))
@@ -43,7 +43,9 @@ enum SettingsIndex {
         #endif
         list.append(category(.network, "settingsCatProxy", "settingsCatProxyDesc", "globe", ["searchKeywordsProxy"]))
         list += NetworkPage.searchEntries(ctx)
+        #if FULL_FLAVOR
         list.append(category(.extensions, "settingsCatExtensions", "settingsCatExtensionsDesc", "puzzlepiece.extension.fill"))
+        #endif
         if FeatureFlags.webhooks {
             list.append(category(.webhook, "webhookNavTitle", nil, "bolt.horizontal.fill", ["searchKeywordsWebhook"]))
         }
@@ -81,7 +83,7 @@ enum SettingsIndex {
         "general.sidebarStatus": ["searchKeywordsSidebarVisibility"],
         "general.sidebarQueues": ["searchKeywordsSidebarVisibility"],
         "general.sidebarCategory": ["searchKeywordsSidebarVisibility"],
-        "general.categories": ["searchKeywordsCustomCategories"],
+        "download.categories": ["searchKeywordsCustomCategories"],
         "appearance.language": ["searchKeywordsLanguage"],
         "appearance.mode": ["searchKeywordsThemeMode"],
         "appearance.color": ["searchKeywordsThemeColor"],

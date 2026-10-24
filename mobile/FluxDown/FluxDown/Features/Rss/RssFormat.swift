@@ -143,9 +143,13 @@ extension RssFormat {
     }
 
     /// 状态 chip：已下载条目以关联任务的真实状态为准，任务已删除 = 「关联任务已删除 · 可重新下载」。
-    static func chip(for item: RssItemDto, task: RssLinkedTask?) -> RssItemChip {
+    /// `tasksLoading`：任务表还在分页载入，查不到关联任务不代表已删除，不得显示「任务已删除」。
+    static func chip(for item: RssItemDto, task: RssLinkedTask?, tasksLoading: Bool = false) -> RssItemChip {
         switch item.state {
         case .downloaded:
+            if task == nil, tasksLoading, !item.taskId.isEmpty {
+                return RssItemChip(titleKey: "rssTaskCreated", systemImage: "tray.and.arrow.down", tone: .neutral)
+            }
             guard !item.taskId.isEmpty, let task else {
                 return RssItemChip(titleKey: "rssTaskMissing", systemImage: "exclamationmark.circle", tone: .failure)
             }

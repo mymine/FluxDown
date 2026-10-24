@@ -100,7 +100,7 @@ enum Host {
         events: AgentEventHub,
         request_restart: Box<dyn Fn() + Send + Sync>,
     },
-    /// 宿主语言执行安装（Android PackageInstaller）。
+    /// 宿主语言执行安装（Android：交给安装程序）。
     Delegated(Arc<dyn UpdateDelegate>),
 }
 

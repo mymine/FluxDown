@@ -1,4 +1,5 @@
 // 任务相关 DTO（daemon.rs TaskDto / CreateTaskRequest、task_activity.rs）。
+import type { CategoryRouteDto } from './agent';
 import type { RpcErrorData } from './error';
 
 /** `TaskDto.status` 取值。 */
@@ -90,11 +91,28 @@ export interface TaskDto {
   seedTimeLimitMinutes: number;
   /** 不活跃做种时长上限（分钟），哨兵同上。 */
   seedInactiveTimeLimitMinutes: number;
-  /** 做种上传限速（字节/秒），0 = 未设置（跟随全局）；旧 daemon 不返回。 */
-  seedUploadLimitBps?: number;
-  /** 持久化的加速路径字节（旧 daemon 不返回）。 */
-  sourceBytes?: TaskSourceBytesDto;
+  /** 做种上传限速（字节/秒），0 = 未设置（跟随全局）。 */
+  seedUploadLimitBps: number;
+  /** 持久化的加速路径字节。 */
+  sourceBytes: TaskSourceBytesDto;
 }
+
+/** 线上必带的 `TaskDto` 字段（其余默认值字段为 `skip_serializing_if`，缺省即默认值）。 */
+export type TaskDtoRequiredKey =
+  | 'taskId'
+  | 'url'
+  | 'fileName'
+  | 'saveDir'
+  | 'status'
+  | 'downloadedBytes'
+  | 'totalBytes'
+  | 'createdAt';
+
+/**
+ * 线上形态的 `TaskDto`（协议 v17）：默认值字段不上线，解码必须经 `normalizeTask`
+ * （见 `../normalize.ts`）补齐后才能进入 store。
+ */
+export type TaskDtoWire = Pick<TaskDto, TaskDtoRequiredKey> & Partial<Omit<TaskDto, TaskDtoRequiredKey>>;
 
 /** 文件字节区间进度；`active` 未知（null）时不要推断其传输状态。 */
 export interface TaskSegmentDto {
@@ -203,6 +221,8 @@ export interface DaemonCreateTaskParams {
   hintFileSize?: number | null;
   /** 参照文件名（浏览器捕获的原始名）：显式名缺扩展名时借它的扩展名补全。 */
   nameHint?: string | null;
+  /** 分类目录路由：`request.saveDir` 为未命中时的基准目录，引擎按初始名与完成时的最终文件名定落点。 */
+  categoryRoute?: CategoryRouteDto | null;
 }
 
 /** `daemon.task.create` 结果。 */
@@ -243,6 +263,8 @@ export interface DaemonCreateTasksParams {
   common: CreateTaskRequest;
   /** 1..={@link CREATE_TASKS_MAX_ITEMS} 条。 */
   items: CreateTaskItem[];
+  /** 分类目录路由：应用于整块每一条；`common.saveDir` 为未命中时的基准目录。 */
+  categoryRoute?: CategoryRouteDto | null;
 }
 
 /** `daemon.task.createMany` 的单条链接。 */

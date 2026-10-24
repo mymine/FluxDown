@@ -6,6 +6,7 @@
  */
 import { browser } from "wxt/browser";
 import type { Browser } from "wxt/browser";
+import { onCapabilities } from "./host";
 import { onEngineChanged } from "./rules-store";
 import { onSettingsChanged } from "./settings-cache";
 import { scheduleProbeCheck } from "./probe";
@@ -76,6 +77,14 @@ export function installPorts(): void {
   });
   onEngineChanged(scheduleAllKnown);
   onSettingsChanged(scheduleAllKnown);
+  // 视图只限时等待 handoff 探测（tab-view.ts）；探测结果变化后补推，handoff 卡片随之更新。
+  let lastCapabilities = "";
+  onCapabilities((caps) => {
+    const key = JSON.stringify(caps);
+    if (key === lastCapabilities) return;
+    lastCapabilities = key;
+    scheduleAllKnown();
+  });
   // tab-state 自己的 onRemoved 负责清状态；这里只停止该 tab 的视图推送。
   browser.tabs.onRemoved.addListener((tabId) => {
     closedTabs.add(tabId);

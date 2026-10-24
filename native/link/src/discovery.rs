@@ -109,24 +109,50 @@ impl Drop for MdnsAdvertiser {
     }
 }
 
+/// 浏览器汇出的事件：解析出一台设备，或一个服务实例消失（对端下线 / 记录 TTL 过期）。
+#[derive(Debug, Clone)]
+pub enum BrowseEvent {
+    Found(DiscoveredPeer),
+    /// 服务实例名：`<短指纹>._fluxdown._tcp.local.` 的第一段，即设备指纹的前 12 位
+    /// （见 `MdnsAdvertiser::service_info`）。
+    Lost {
+        instance: String,
+    },
+}
+
+/// mDNS 服务实例全名 → 实例名（第一段，非空）。
+fn instance_of(fullname: &str) -> Option<String> {
+    let first = fullname.split('.').next()?;
+    (!first.is_empty()).then(|| first.to_owned())
+}
+
+/// mDNS 浏览事件 → [`BrowseEvent`]（与网络无关的纯映射，便于单测）。
+fn browse_event(event: ServiceEvent) -> Option<BrowseEvent> {
+    match event {
+        ServiceEvent::ServiceResolved(info) => resolved_to_peer(&info).map(BrowseEvent::Found),
+        ServiceEvent::ServiceRemoved(_, fullname) => {
+            instance_of(&fullname).map(|instance| BrowseEvent::Lost { instance })
+        }
+        _ => None,
+    }
+}
+
 /// mDNS 浏览器：发现局域网内的 fluxdown 设备，解析后经 `sink` 汇出
-/// [`DiscoveredPeer`]。持有 daemon 句柄，`Drop` 时优雅关闭。
+/// [`BrowseEvent`]。持有 daemon 句柄，`Drop` 时优雅关闭。
 pub struct MdnsBrowser {
     daemon: ServiceDaemon,
 }
 
 impl MdnsBrowser {
-    /// 开始浏览，把解析出的设备推送到 `sink`（满时丢弃，关闭后退出，不阻塞）。
-    pub fn start(sink: mpsc::Sender<DiscoveredPeer>) -> LinkResult<Self> {
+    /// 开始浏览，把解析出的设备 / 消失的实例推送到 `sink`（满时丢弃，关闭后退出，不阻塞）。
+    pub fn start(sink: mpsc::Sender<BrowseEvent>) -> LinkResult<Self> {
         let daemon = ServiceDaemon::new().map_err(map_mdns_err)?;
         let receiver = daemon.browse(SERVICE_TYPE).map_err(map_mdns_err)?;
         tokio::spawn(async move {
             let mut full_reported = false;
             while let Ok(event) = receiver.recv_async().await {
-                if let ServiceEvent::ServiceResolved(info) = event
-                    && let Some(peer) = resolved_to_peer(&info)
-                {
-                    match sink.try_send(peer) {
+                if let Some(event) = browse_event(event) {
+                    match sink.try_send(event) {
                         Ok(()) => full_reported = false,
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             if !full_reported {
@@ -230,13 +256,14 @@ fn pick_best_v4(addrs: &[Ipv4Addr]) -> Option<Ipv4Addr> {
         .copied()
 }
 
-/// 手动地址探测：GET `{base}/ping`，解析设备身份/名称/平台/版本。
-/// 供「本地配对」的「手动输入地址」兜底路径（Docker bridge / AP 隔离等 mDNS 失效场景），
-/// 地址可以是 https / 域名 / 带反代子路径（见 [`PeerAddress`]）。
+/// GET `{base}/ping` 并确认应答来自 FluxDown，返回应答 JSON 对象。
 ///
 /// 错误语义：网络失败 → [`LinkError::Io`]（带完整根因）；对端（或反代）返回的不是
 /// FluxDown `/ping` 应答 → [`LinkError::NotFluxDown`]。
-pub async fn probe(client: &reqwest::Client, address: &PeerAddress) -> LinkResult<DiscoveredPeer> {
+async fn fetch_ping(
+    client: &reqwest::Client,
+    address: &PeerAddress,
+) -> LinkResult<serde_json::Value> {
     let resp = client
         .get(address.url("/ping"))
         .timeout(Duration::from_secs(3))
@@ -252,6 +279,16 @@ pub async fn probe(client: &reqwest::Client, address: &PeerAddress) -> LinkResul
             "/ping response is not from FluxDown".into(),
         ));
     }
+    Ok(json)
+}
+
+/// 手动地址探测：GET `{base}/ping`，解析设备身份/名称/平台/版本。
+/// 供「本地配对」的「手动输入地址」兜底路径（Docker bridge / AP 隔离等 mDNS 失效场景），
+/// 地址可以是 https / 域名 / 带反代子路径（见 [`PeerAddress`]）。
+///
+/// 错误语义见 [`fetch_ping`]。
+pub async fn probe(client: &reqwest::Client, address: &PeerAddress) -> LinkResult<DiscoveredPeer> {
+    let json = fetch_ping(client, address).await?;
     let get = |k: &str| {
         json.get(k)
             .and_then(|v| v.as_str())
@@ -269,6 +306,20 @@ pub async fn probe(client: &reqwest::Client, address: &PeerAddress) -> LinkResul
         app_version: clean("version", MAX_VERSION_CHARS),
         kind: DiscoveryKind::Manual,
     })
+}
+
+/// GET `{base}/ping` 读取对端自报的设备控制配对能力版本（`linkControl`；旧版对端没有该字段 = 0）。
+/// 发起方请求「完全控制」前用它预检，错误语义见 [`fetch_ping`]。
+pub async fn probe_link_control(
+    client: &reqwest::Client,
+    address: &PeerAddress,
+) -> LinkResult<u32> {
+    let json = fetch_ping(client, address).await?;
+    Ok(json
+        .get("linkControl")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or(0))
 }
 
 /// 计算本机朝向 `peer_host` 的出站本地 IP（UDP connect 技巧，不真正发包），
@@ -382,5 +433,28 @@ mod tests {
             Ipv4Addr::new(172, 17, 0, 2),
         ];
         assert!(pick_best_v4(&addrs).is_none());
+    }
+
+    #[test]
+    fn removed_service_instances_map_to_lost_events_keyed_by_the_short_fingerprint() {
+        let fingerprint = "ab12cd34ef56".repeat(5) + "abcd";
+        let short: String = fingerprint.chars().take(12).collect();
+        let removed = ServiceEvent::ServiceRemoved(
+            SERVICE_TYPE.to_owned(),
+            format!("{short}.{SERVICE_TYPE}"),
+        );
+        match browse_event(removed) {
+            Some(BrowseEvent::Lost { instance }) => assert_eq!(instance, short),
+            other => panic!("expected a Lost event, got {other:?}"),
+        }
+        // 没有实例名的残缺事件被忽略；与发现无关的事件不产生任何输出。
+        assert!(
+            browse_event(ServiceEvent::ServiceRemoved(
+                SERVICE_TYPE.to_owned(),
+                String::new()
+            ))
+            .is_none()
+        );
+        assert!(browse_event(ServiceEvent::SearchStopped(SERVICE_TYPE.to_owned())).is_none());
     }
 }

@@ -149,6 +149,18 @@ describe('parseEntries 集成', () => {
     expect(seq[1].fileName).toBe('two.zip')
   })
 
+  test('前导空白 / 零宽字符 / BOM 不吞链接，选项行语义不变', () => {
+    const url = 'https://a.example/x.exe'
+    for (const text of [` ${url}`, `\t${url}`, `\u200B${url}`, `\uFEFF${url}`, `  \u2060${url}\u200D`]) {
+      expect(parseEntries(text, false)).toEqual([entry(url)])
+    }
+    expect(parseEntries('https://a.example/a\n  out=a.bin\n  https://a.example/b\n\tchecksum=md5=ff', false)).toEqual([
+      { url: 'https://a.example/a', fileName: 'a.bin', checksum: '' },
+      { url: 'https://a.example/b', fileName: '', checksum: 'md5=ff' },
+    ])
+    expect(parseEntries('  out=orphan.bin', false)).toEqual([])
+  })
+
   test('hints 取首条产出条目的命令', () => {
     const parsed = parseInput("aria2c -i x.txt -U ignored\naria2c -U first https://a.example/1\naria2c -U second https://a.example/2", false)
     expect(parsed.entries.map((e) => e.url)).toEqual(['https://a.example/1', 'https://a.example/2'])

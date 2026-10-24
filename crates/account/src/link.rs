@@ -74,9 +74,10 @@ pub(crate) fn discovered_entries(
             continue;
         }
         let is_paired = peer.fingerprint.as_deref().is_some_and(|fingerprint| {
+            // 被对端解除（revoked）的设备不算已配对，保留可选以便重新配对。
             paired
                 .iter()
-                .any(|device| device.fingerprint == fingerprint)
+                .any(|device| !device.revoked && device.fingerprint == fingerprint)
         });
         entries.push(DiscoveredEntry {
             name: if peer.name.trim().is_empty() {
@@ -113,6 +114,16 @@ pub(crate) fn seconds_until(expires_at_unix_ms: i64, now_unix_ms: i64) -> u64 {
     }
 }
 
+/// 配对码 / 入站请求的本机截止时刻：以收到 DTO 的本机时刻 + `ttl_ms` 计算（免疫主机与本机的时钟偏差）；
+/// `ttl_ms == 0`（旧主机未下发）才回退主机绝对时间 `expires_at_unix_ms`。
+pub(crate) fn local_deadline_ms(ttl_ms: u64, expires_at_unix_ms: i64, received_at_ms: i64) -> i64 {
+    if ttl_ms == 0 {
+        expires_at_unix_ms
+    } else {
+        received_at_ms.saturating_add(i64::try_from(ttl_ms).unwrap_or(i64::MAX))
+    }
+}
+
 /// 短认证串按 3 位一组展示（`123456` → `123 456`），便于两台设备肉眼比对。
 pub(crate) fn group_sas(sas: &str) -> String {
     let chars: Vec<char> = sas.chars().filter(|ch| !ch.is_whitespace()).collect();
@@ -137,12 +148,20 @@ pub(crate) enum PairFlow {
         peer_name: String,
     },
     /// `pairFinish` 在途（等待对端确认）。
-    Finishing { peer_name: String },
+    Finishing { token: String, peer_name: String },
     /// 已完成。
     Done { device_name: String },
 }
 
 impl PairFlow {
+    /// 仍持有 agent 会话（核对中 / 等待对端确认）时的 `pairFinish` token；放弃时据此释放或中止。
+    pub(crate) fn session_token(&self) -> Option<&str> {
+        match self {
+            Self::Verify { token, .. } | Self::Finishing { token, .. } => Some(token),
+            _ => None,
+        }
+    }
+
     /// 表单可编辑且允许发起。
     pub(crate) fn can_begin(&self) -> bool {
         matches!(self, Self::Form)
@@ -167,7 +186,9 @@ impl PairFlow {
     /// 用户点击「确认配对」。
     pub(crate) fn confirming(self) -> Self {
         match self {
-            Self::Verify { peer_name, .. } => Self::Finishing { peer_name },
+            Self::Verify {
+                token, peer_name, ..
+            } => Self::Finishing { token, peer_name },
             other => other,
         }
     }
@@ -175,7 +196,7 @@ impl PairFlow {
     /// `pairFinish` 返回：`paired=false`（被拒绝 / 放弃）回到表单，成功进入完成态。
     pub(crate) fn finished(self, paired: bool, device_name: Option<String>) -> Self {
         match self {
-            Self::Finishing { peer_name } if paired => Self::Done {
+            Self::Finishing { peer_name, .. } if paired => Self::Done {
                 device_name: device_name
                     .filter(|name| !name.is_empty())
                     .unwrap_or(peer_name),
@@ -224,6 +245,8 @@ mod tests {
             custom_name: None,
             app_version: None,
             cloud_device_id: None,
+            grants_control: false,
+            controllable: false,
             revoked: false,
         }
     }
@@ -348,6 +371,7 @@ mod tests {
     #[test]
     fn paired_without_reported_name_falls_back_to_peer_name() {
         let flow = PairFlow::Finishing {
+            token: "tok".into(),
             peer_name: "Peer".into(),
         };
         assert_eq!(
@@ -356,5 +380,38 @@ mod tests {
                 device_name: "Peer".into()
             }
         );
+    }
+
+    #[test]
+    fn session_token_is_kept_while_waiting_for_the_peer_so_it_can_be_aborted() {
+        let verify = PairFlow::Verify {
+            token: "tok".into(),
+            sas: "1".into(),
+            peer_name: "P".into(),
+        };
+        assert_eq!(verify.session_token(), Some("tok"));
+        let finishing = verify.confirming();
+        assert_eq!(finishing.session_token(), Some("tok"));
+        assert_eq!(finishing.finished(true, None).session_token(), None);
+        assert_eq!(PairFlow::Form.session_token(), None);
+    }
+
+    #[test]
+    fn deadline_uses_relative_ttl_and_ignores_host_clock_skew() {
+        // 主机时钟比本机快 10 分钟：绝对过期时间早已「过去」，相对 TTL 仍给出完整窗口。
+        assert_eq!(local_deadline_ms(30_000, 1_000, 5_000_000), 5_030_000);
+        // 旧主机没有 ttlMs（0）：回退主机绝对时间。
+        assert_eq!(local_deadline_ms(0, 1_000, 5_000_000), 1_000);
+    }
+
+    #[test]
+    fn revoked_devices_can_be_paired_again_from_the_discovered_list() {
+        let mut revoked = paired("fp-a");
+        revoked.revoked = true;
+        let entries = discovered_entries(
+            &[peer("Alpha", "192.168.1.5", 17800, Some("fp-a"))],
+            &[revoked],
+        );
+        assert!(!entries[0].paired);
     }
 }

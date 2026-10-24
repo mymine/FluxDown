@@ -166,7 +166,6 @@ impl Tracker {
                 .iter()
                 .filter_map(|task_id| self.task_deleted(task_id))
                 .collect(),
-            DaemonEvent::SnapshotReplaced(snapshot) => self.replace(&snapshot.tasks),
             _ => Vec::new(),
         }
     }
@@ -233,11 +232,22 @@ impl TaskEventHub {
                         continue;
                     }
                     let events = match frame.event {
+                        // 整表替换在广播里只带头 / 重载宣告，任务表不在帧内：按 hub 当前
+                        // 完整投影对账（只在对账那一刻持 hub 锁，回放无关）。
+                        ServiceEvent::Agent(
+                            AgentEvent::DaemonSnapshotReplaced(_)
+                            | AgentEvent::Daemon(DaemonEvent::SnapshotReplaced(_)),
+                        ) => hub.inspect(|snapshot| {
+                            lock_or_recover(&self.tracker).replace(&snapshot.daemon.tasks)
+                        }),
+                        ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::TablesReloading {
+                            tasks: Some(_),
+                            ..
+                        })) => hub.inspect(|snapshot| {
+                            lock_or_recover(&self.tracker).reconcile(&snapshot.daemon.tasks)
+                        }),
                         ServiceEvent::Agent(AgentEvent::Daemon(event)) => {
                             lock_or_recover(&self.tracker).apply(&event)
-                        }
-                        ServiceEvent::Agent(AgentEvent::DaemonSnapshotReplaced(snapshot)) => {
-                            lock_or_recover(&self.tracker).replace(&snapshot.tasks)
                         }
                         _ => continue,
                     };
@@ -560,11 +570,7 @@ mod tests {
         assert_eq!(tracker.speeds.len(), 1);
         assert!(tracker.speeds.contains_key("a"));
 
-        let replaced = DaemonEvent::SnapshotReplaced(DaemonSnapshot {
-            tasks: vec![task("a", 1)],
-            ..DaemonSnapshot::default()
-        });
-        assert!(tracker.apply(&replaced).is_empty());
+        assert!(tracker.replace(&[task("a", 1)]).is_empty());
         assert!(tracker.speeds.is_empty());
     }
 
@@ -598,6 +604,40 @@ mod tests {
         let speeds = task_hub.live_speeds();
         assert_eq!(speeds.get("live").map(|s| s.download_bps), Some(42));
         assert!(!speeds.contains_key("old"));
+        Ok(())
+    }
+
+    /// 超过内联上限的整表替换在广播里只是重载宣告：对账改读 hub 的完整投影，消失的任务照常
+    /// 得到 `Stop`，而不是被空表（宣告里没有任务）清空整个前态。
+    #[tokio::test]
+    async fn pump_reconciles_from_the_projection_when_a_large_table_is_only_announced()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let hub = AgentEventHub::new(AgentSnapshot::default());
+        hub.replace_daemon_snapshot(DaemonSnapshot {
+            tasks: vec![task("gone", 1), task("kept", 1)],
+            ..DaemonSnapshot::default()
+        });
+        let task_hub = TaskEventHub::spawn(&hub);
+        let mut rx = task_hub.subscribe();
+
+        let mut tasks: Vec<TaskDto> = (0..=fluxdown_protocol::TABLE_INLINE_LIMIT)
+            .map(|index| task(&format!("n{index}"), 2))
+            .collect();
+        tasks.push(task("kept", 1));
+        hub.apply_daemon_event(DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks }));
+
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await??;
+        assert_eq!(
+            (event.task_id.as_str(), event.kind),
+            ("gone", TaskEventKind::Stop)
+        );
+        // `kept` 的前态没有被冲掉：同状态进度不再触发事件。
+        hub.apply_daemon_event(progress("kept", 1, 5));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .is_err()
+        );
         Ok(())
     }
 }

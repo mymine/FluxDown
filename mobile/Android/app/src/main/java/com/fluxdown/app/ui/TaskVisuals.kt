@@ -74,15 +74,16 @@ fun Queue.label(): String = when (queueId) {
 /** 派生显示状态（§2.6：颜色 + 图形冗余）。 */
 enum class TaskVisualState { Downloading, Queued, Pending, Preparing, Verifying, Paused, Failed, Seeding, Missing, Completed }
 
-fun Task.visualState(queuePosition: Int?): TaskVisualState = when (status) {
+/** [queued]：任务在引擎排队顺序里（有排序键）。 */
+fun Task.visualState(queued: Boolean): TaskVisualState = when (status) {
     TaskStatus.Downloading -> TaskVisualState.Downloading
-    TaskStatus.Pending -> if ((queuePosition ?: 0) > 0) TaskVisualState.Queued else TaskVisualState.Pending
+    TaskStatus.Pending -> if (queued) TaskVisualState.Queued else TaskVisualState.Pending
     TaskStatus.Preparing -> if (totalBytes > 0) TaskVisualState.Verifying else TaskVisualState.Preparing
     TaskStatus.Paused -> TaskVisualState.Paused
     TaskStatus.Failed -> TaskVisualState.Failed
     TaskStatus.Completed -> when {
         fileMissing -> TaskVisualState.Missing
-        seedingStatus == com.fluxdown.core.model.SeedingStatus.Seeding -> TaskVisualState.Seeding
+        isSeeding -> TaskVisualState.Seeding
         else -> TaskVisualState.Completed
     }
     TaskStatus.Unknown -> TaskVisualState.Pending

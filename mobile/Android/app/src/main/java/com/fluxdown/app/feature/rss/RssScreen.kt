@@ -59,7 +59,6 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.fluxdown.app.R
 import com.fluxdown.app.actions.LocalTaskActions
 import com.fluxdown.app.actions.TaskActions
-import com.fluxdown.app.feature.devices.DockMiniEffect
 import com.fluxdown.app.feature.devices.GlyphTile
 import com.fluxdown.app.feature.devices.localizedName
 import com.fluxdown.app.i18n.str
@@ -146,7 +145,6 @@ fun RssScreen() {
     val nowMin = nowSec / 60
 
     val listState = rememberLazyListState()
-    DockMiniEffect(listState)
     val swipe = LocalSwipeRevealCoordinator.current
     val gate = rememberFlowInGate()
     val margin = space.screenMargin

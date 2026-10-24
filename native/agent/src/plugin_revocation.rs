@@ -102,6 +102,7 @@ mod tests {
             consent_pending_hosts: Vec::new(),
             network_hosts: Vec::new(),
             package_dir: None,
+            package_revision: 0,
         }
     }
 

@@ -157,6 +157,12 @@ async fn wait_daemon_released(data_dir: &Path, budget: Duration) {
     }
 }
 
+/// 本数据目录是否有 daemon 持有进程租约（`daemon.lock`）。探测拿到锁会立刻释放；租约文件
+/// 不存在或无法探测时按「未持有」处理。
+pub(crate) fn daemon_lease_held(lock_path: &Path) -> bool {
+    !daemon_lease_released(lock_path)
+}
+
 fn daemon_lease_released(lock_path: &Path) -> bool {
     let file = match std::fs::OpenOptions::new()
         .read(true)

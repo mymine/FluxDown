@@ -40,12 +40,15 @@ export interface RpcState {
   connection: ConnectionState
   snapshot: AgentSnapshot | null
   hello: ServiceHello | null
+  /** 分页载入进度（仅载入期间非 null）：已载入的任务行数；总数见 `snapshot.daemon.taskTotal`。 */
+  tableLoad: { loadedTasks: number } | null
 }
 
 const INITIAL: RpcState = {
   connection: { phase: 'idle', attempt: 0, nextRetryAt: null, lastError: null, restarting: false },
   snapshot: null,
   hello: null,
+  tableLoad: null,
 }
 
 type Listener = () => void

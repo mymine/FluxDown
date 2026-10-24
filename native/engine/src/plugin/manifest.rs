@@ -10,9 +10,9 @@
 //! 本文件（纯模块）只做结构校验：`pattern` 仅 string 有效、非空即存储；实际编译/
 //! 匹配在持有 runtime 的 manager 侧完成。
 //!
-//! 官方插件索引（`zerx-lab/fluxdown-plugin-index`）的 `scripts/package-lib.mjs` 镜像本文件
-//! 与 `install.rs` 的准入规则，市场收录的包必须能在客户端安装：改字段、权限、事件、
-//! 设置矩阵或安装限制时同步该脚本。
+//! 官方插件索引（`zerx-lab/fluxdown-plugin-index`）用已发布 SDK 的 `dist/manifest.mjs`
+//! （`packages/plugin-sdk/src/manifest.ts::validatePackage`）做准入，市场收录的包必须能在客户端
+//! 安装：改字段、权限、事件、设置矩阵或安装限制时同步 SDK 并发版，索引仓自动同步。
 
 use std::collections::HashSet;
 
@@ -141,6 +141,11 @@ pub struct ResolverDecl {
     /// 单次 resolve 超时（毫秒）。可下调宿主预算，不可超 30s 硬顶。
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// 单次 resolve 的 QuickJS 堆上限（MiB）。缺省取宿主默认 64 MiB；可上调，超过
+    /// [`super::manager::RESOLVE_MEMORY_CEILING`] 按硬顶裁剪；不可为 0。供要在脚本内
+    /// 处理大体量数据的 resolver 声明（如把 YouTube 播放器 JS 解析成 AST）。
+    #[serde(default)]
+    pub memory_limit_mb: Option<u64>,
     /// 声明该 resolver 支持多文件清单前置预解析（`ResolveResult::manifest`）。
     /// `false`（默认）的单文件插件不会被前置预解析无谓触发（避免解析昂贵的
     /// 单文件插件白跑一次）；未声明却在 start 阶段返回清单的插件仍由引擎
@@ -279,6 +284,10 @@ pub struct ViewDecl {
     /// 仅允许与 `desktop` 同时出现；未声明 `desktop` 的 view 恒为可移植。
     #[serde(default)]
     pub portable: bool,
+    /// 视图图标：包内相对路径的 `.svg` 文件（单色，按宿主主题着色）。加载期读入并随
+    /// 插件 DTO 内联下发；未声明时宿主用默认图标。
+    #[serde(default)]
+    pub icon: Option<String>,
 }
 
 impl ViewDecl {
@@ -300,6 +309,62 @@ pub struct CommandDecl {
     pub task_menu: bool,
 }
 
+/// 页面脚本运行时机（对应浏览器 `userScripts` 的 `runAt`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PageScriptRunAt {
+    DocumentStart,
+    DocumentEnd,
+    #[default]
+    DocumentIdle,
+}
+
+impl PageScriptRunAt {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PageScriptRunAt::DocumentStart => "document_start",
+            PageScriptRunAt::DocumentEnd => "document_end",
+            PageScriptRunAt::DocumentIdle => "document_idle",
+        }
+    }
+}
+
+/// 页面脚本运行世界：`isolated` 有 `fluxdown` 桥，`main` 为页面 world（无桥）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PageScriptWorld {
+    #[default]
+    Isolated,
+    Main,
+}
+
+impl PageScriptWorld {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PageScriptWorld::Isolated => "isolated",
+            PageScriptWorld::Main => "main",
+        }
+    }
+}
+
+/// 页面脚本贡献：由浏览器扩展经 `userScripts` API 注册到匹配网页。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PageScriptDecl {
+    pub id: String,
+    pub title: String,
+    pub matches: Vec<String>,
+    #[serde(default)]
+    pub exclude_matches: Vec<String>,
+    pub js: Vec<String>,
+    #[serde(default)]
+    pub run_at: PageScriptRunAt,
+    #[serde(default)]
+    pub world: PageScriptWorld,
+    #[serde(default)]
+    pub all_frames: bool,
+}
+
 /// 贡献点。空数组等同未声明。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -311,6 +376,9 @@ pub struct ContributesDecl {
     /// 浏览器扩展嗅探规则包（相对路径，`.json`），需 `browserRules` 权限。
     #[serde(default)]
     pub sniff_rules: Option<String>,
+    /// 浏览器页面脚本（0..=16 条），需 `pageScripts` 权限。
+    #[serde(default)]
+    pub page_scripts: Vec<PageScriptDecl>,
 }
 
 /// 插件风险等级（由权限推导）。
@@ -341,9 +409,19 @@ pub const VIEWS_MAX: usize = 16;
 pub const COMMANDS_MAX: usize = 32;
 /// view / command 标题的最大字符数。
 const TITLE_MAX_CHARS: usize = 40;
+/// 视图图标（`contributes.views[].icon`）文件大小上限。
+pub const VIEW_ICON_MAX_BYTES: usize = 16 * 1024;
 /// sniff 规则包文件大小与规则数上限。
 pub const SNIFF_PACK_MAX_BYTES: usize = 256 * 1024;
 pub const SNIFF_PACK_MAX_RULES: usize = 500;
+/// `contributes.pageScripts` 条目数、每条 `matches` / `excludeMatches` / `js` 条数上限。
+pub const PAGE_SCRIPTS_MAX: usize = 16;
+pub const PAGE_SCRIPT_MATCHES_MAX: usize = 32;
+pub const PAGE_SCRIPT_JS_MAX: usize = 8;
+/// 页面脚本单个 js 文件大小上限。
+pub const PAGE_SCRIPT_FILE_MAX_BYTES: usize = 256 * 1024;
+/// 单条页面脚本（各 js 文件以 `"\n;\n"` 拼接后）大小上限。
+pub const PAGE_SCRIPT_MAX_BYTES: usize = 384 * 1024;
 
 /// 插件 manifest。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,8 +485,10 @@ pub const PERMISSION_DESKTOP: &str = "desktop";
 pub const PERMISSION_BACKGROUND: &str = "background";
 /// 下载拦截平面权限名。
 pub const PERMISSION_INTERCEPT: &str = "intercept";
+/// 浏览器页面脚本权限名（风险 Full：脚本在用户任意匹配网页内运行）。
+pub const PERMISSION_PAGE_SCRIPTS: &str = "pageScripts";
 /// 合法能力权限（manifest `permissions`）。
-pub const VALID_PERMISSIONS: [&str; 8] = [
+pub const VALID_PERMISSIONS: [&str; 9] = [
     PERMISSION_FFMPEG,
     PERMISSION_YTDLP,
     PERMISSION_AUTH,
@@ -417,6 +497,7 @@ pub const VALID_PERMISSIONS: [&str; 8] = [
     PERMISSION_DESKTOP,
     PERMISSION_BACKGROUND,
     PERMISSION_INTERCEPT,
+    PERMISSION_PAGE_SCRIPTS,
 ];
 
 impl PluginManifest {
@@ -482,6 +563,13 @@ impl PluginManifest {
             {
                 return Err(PluginError::ManifestInvalid(
                     "resolver timeoutMs 不可为 0".to_string(),
+                ));
+            }
+            if let Some(m) = r.memory_limit_mb
+                && m == 0
+            {
+                return Err(PluginError::ManifestInvalid(
+                    "resolver memoryLimitMb 不可为 0".to_string(),
                 ));
             }
         }
@@ -661,7 +749,7 @@ impl PluginManifest {
 
     /// 风险等级：`desktop` → Full；其余任一提权能力 → Elevated；否则 Standard。
     pub fn risk(&self) -> PluginRisk {
-        if self.has_permission(PERMISSION_DESKTOP) {
+        if self.has_permission(PERMISSION_DESKTOP) || self.has_permission(PERMISSION_PAGE_SCRIPTS) {
             PluginRisk::Full
         } else if self.permissions.iter().any(|p| {
             matches!(
@@ -695,7 +783,8 @@ impl PluginManifest {
         hosts
     }
 
-    /// 包内必须存在的文件：`main.entry`、各 `desktop.entry`、`sniffRules`。
+    /// 包内必须存在的文件：`main.entry`、各 `desktop.entry`、各视图 `icon`、`sniffRules`、
+    /// 页面脚本 `js`。
     pub fn package_files(&self) -> Vec<String> {
         let mut files = Vec::new();
         if let Some(main) = &self.main {
@@ -708,7 +797,9 @@ impl PluginManifest {
                     .filter_map(|v| v.desktop.as_ref())
                     .map(|d| d.entry.clone()),
             );
+            files.extend(c.views.iter().filter_map(|v| v.icon.clone()));
             files.extend(c.sniff_rules.iter().cloned());
+            files.extend(c.page_scripts.iter().flat_map(|s| s.js.iter().cloned()));
         }
         files
     }
@@ -815,6 +906,14 @@ fn validate_contributes(m: &PluginManifest) -> Result<(), PluginError> {
         if v.is_portable() && m.main.is_none() {
             return manifest_err(format!("view '{}' 有可移植实现，必须声明 main", v.id));
         }
+        if let Some(icon) = &v.icon {
+            if !is_safe_relative_path(icon) {
+                return manifest_err(format!("view '{}' icon 路径 '{icon}' 非法", v.id));
+            }
+            if !has_extension(icon, &[".svg"]) {
+                return manifest_err(format!("view '{}' icon '{icon}' 扩展名须为 .svg", v.id));
+            }
+        }
     }
     if c.commands.len() > COMMANDS_MAX {
         return manifest_err(format!("contributes.commands 至多 {COMMANDS_MAX} 项"));
@@ -852,6 +951,7 @@ fn validate_contributes(m: &PluginManifest) -> Result<(), PluginError> {
             return manifest_err("声明 sniffRules 时 permissions 必须包含 browserRules".into());
         }
     }
+    validate_page_scripts(m, c)?;
     Ok(())
 }
 
@@ -913,6 +1013,159 @@ fn validate_desktop_entry(
     Ok(())
 }
 
+/// match pattern：`<scheme>://<host><path>`，scheme ∈ http|https|*；host 为 `domain` 或
+/// `*.domain`（`domain` 仅 `[a-z0-9.-]`、含 `.`、首尾非 `.`/`-`）；无端口；path 以 `/` 开头。
+fn is_valid_match_pattern(pattern: &str) -> bool {
+    let Some((scheme, rest)) = pattern.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "http" | "https" | "*") {
+        return false;
+    }
+    let Some(slash) = rest.find('/') else {
+        return false;
+    };
+    let (host, path) = rest.split_at(slash);
+    if path.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    let domain = host.strip_prefix("*.").unwrap_or(host);
+    !domain.is_empty()
+        && domain.contains('.')
+        && domain
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        && !domain.starts_with(['.', '-'])
+        && !domain.ends_with(['.', '-'])
+        && !domain.contains("..")
+}
+
+/// 页面脚本 id：`^[a-z0-9][a-z0-9_-]{0,31}$`。
+fn is_valid_page_script_id(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && s.len() <= 32
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// 校验 `contributes.pageScripts`。
+fn validate_page_scripts(m: &PluginManifest, c: &ContributesDecl) -> Result<(), PluginError> {
+    if c.page_scripts.is_empty() {
+        return Ok(());
+    }
+    if c.page_scripts.len() > PAGE_SCRIPTS_MAX {
+        return manifest_err(format!(
+            "contributes.pageScripts 至多 {PAGE_SCRIPTS_MAX} 项"
+        ));
+    }
+    if !m.has_permission(PERMISSION_PAGE_SCRIPTS) {
+        return manifest_err("声明 pageScripts 时 permissions 必须包含 pageScripts".into());
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for s in &c.page_scripts {
+        if !is_valid_page_script_id(&s.id) {
+            return manifest_err(format!(
+                "pageScript id '{}' 非法：须匹配 ^[a-z0-9][a-z0-9_-]{{0,31}}$",
+                s.id
+            ));
+        }
+        if !seen.insert(s.id.as_str()) {
+            return manifest_err(format!("pageScript id '{}' 重复", s.id));
+        }
+        let title_len = s.title.chars().count();
+        if !(1..=TITLE_MAX_CHARS).contains(&title_len) {
+            return manifest_err(format!(
+                "pageScript '{}' title 须为 1–{TITLE_MAX_CHARS} 个字符",
+                s.id
+            ));
+        }
+        if !(1..=PAGE_SCRIPT_MATCHES_MAX).contains(&s.matches.len()) {
+            return manifest_err(format!(
+                "pageScript '{}' matches 须为 1–{PAGE_SCRIPT_MATCHES_MAX} 项",
+                s.id
+            ));
+        }
+        if s.exclude_matches.len() > PAGE_SCRIPT_MATCHES_MAX {
+            return manifest_err(format!(
+                "pageScript '{}' excludeMatches 至多 {PAGE_SCRIPT_MATCHES_MAX} 项",
+                s.id
+            ));
+        }
+        for (field, list) in [
+            ("matches", &s.matches),
+            ("excludeMatches", &s.exclude_matches),
+        ] {
+            for pattern in list {
+                if !is_valid_match_pattern(pattern) {
+                    return manifest_err(format!(
+                        "pageScript '{}' {field} '{pattern}' 非法 match pattern",
+                        s.id
+                    ));
+                }
+            }
+        }
+        if !(1..=PAGE_SCRIPT_JS_MAX).contains(&s.js.len()) {
+            return manifest_err(format!(
+                "pageScript '{}' js 须为 1–{PAGE_SCRIPT_JS_MAX} 项",
+                s.id
+            ));
+        }
+        let mut files: HashSet<&str> = HashSet::new();
+        for file in &s.js {
+            if !is_safe_relative_path(file) {
+                return manifest_err(format!("pageScript '{}' js 路径 '{file}' 非法", s.id));
+            }
+            if !has_extension(file, &[".js"]) {
+                return manifest_err(format!("pageScript '{}' js '{file}' 扩展名须为 .js", s.id));
+            }
+            if !files.insert(file.as_str()) {
+                return manifest_err(format!("pageScript '{}' js '{file}' 重复", s.id));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 页面脚本文件内容校验：每个文件 ≤256 KiB 且为合法 UTF-8；拼接后 ≤384 KiB。
+/// `read` 按包内相对路径返回文件字节（`None` 视为缺失）。返回拼接后的源码。
+pub fn concat_page_script(
+    script: &PageScriptDecl,
+    read: impl Fn(&str) -> Option<Vec<u8>>,
+) -> Result<String, PluginError> {
+    let mut code = String::new();
+    for (i, file) in script.js.iter().enumerate() {
+        let Some(bytes) = read(file) else {
+            return manifest_err(format!("pageScript '{}' 读取 '{file}' 失败", script.id));
+        };
+        if bytes.len() > PAGE_SCRIPT_FILE_MAX_BYTES {
+            return manifest_err(format!(
+                "pageScript '{}' 文件 '{file}' 超过 {PAGE_SCRIPT_FILE_MAX_BYTES} 字节",
+                script.id
+            ));
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| {
+            PluginError::ManifestInvalid(format!(
+                "pageScript '{}' 文件 '{file}' 不是合法 UTF-8",
+                script.id
+            ))
+        })?;
+        if i > 0 {
+            code.push_str("\n;\n");
+        }
+        code.push_str(text);
+        if code.len() > PAGE_SCRIPT_MAX_BYTES {
+            return manifest_err(format!(
+                "pageScript '{}' 拼接后超过 {PAGE_SCRIPT_MAX_BYTES} 字节",
+                script.id
+            ));
+        }
+    }
+    Ok(code)
+}
+
 /// 校验 sniff 规则包文件内容：≤256 KiB、合法 JSON、`format` 正确、`rules` 数组 ≤500 条。
 pub fn validate_sniff_pack(bytes: &[u8]) -> Result<(), PluginError> {
     if bytes.len() > SNIFF_PACK_MAX_BYTES {
@@ -930,6 +1183,27 @@ pub fn validate_sniff_pack(bytes: &[u8]) -> Result<(), PluginError> {
         return manifest_err(format!("sniffRules 至多 {SNIFF_PACK_MAX_RULES} 条规则"));
     }
     Ok(())
+}
+
+/// 校验视图图标文件内容：≤16 KiB、合法 UTF-8、根元素为 `<svg>`（允许前置 BOM / 空白 /
+/// XML 声明）。返回图标 SVG 文本。宿主只把它当单色蒙版渲染（GPUI `svg` / Web CSS
+/// `mask-image`），这两种上下文都不执行脚本、不加载外部资源。
+pub fn validate_view_icon(view_id: &str, bytes: Vec<u8>) -> Result<String, PluginError> {
+    if bytes.len() > VIEW_ICON_MAX_BYTES {
+        return manifest_err(format!(
+            "view '{view_id}' icon 超过 {VIEW_ICON_MAX_BYTES} 字节"
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|_| {
+        PluginError::ManifestInvalid(format!("view '{view_id}' icon 不是合法 UTF-8"))
+    })?;
+    let head = text
+        .trim_start_matches(|c: char| c == '\u{feff}' || c.is_whitespace())
+        .to_ascii_lowercase();
+    if !(head.starts_with("<svg") || head.starts_with("<?xml")) || !head.contains("<svg") {
+        return manifest_err(format!("view '{view_id}' icon 不是 SVG 文档"));
+    }
+    Ok(text)
 }
 
 /// 小写 DNS 主机名（RFC 1123 标签，总长 ≤253）或 IP 字面量；禁 scheme/端口/路径/通配符。
@@ -1428,6 +1702,25 @@ mod tests {
     }
 
     #[test]
+    fn view_icon_content_validation() {
+        use super::{VIEW_ICON_MAX_BYTES, validate_view_icon};
+        let svg = "\u{feff}\n <SVG viewBox=\"0 0 24 24\"><path d=\"M4 12h16\"/></SVG>";
+        assert_eq!(validate_view_icon("v", svg.into()).unwrap(), svg);
+        let declared = "<?xml version=\"1.0\"?><svg viewBox=\"0 0 1 1\"/>";
+        assert!(validate_view_icon("v", declared.into()).is_ok());
+        // XML 声明后没有 svg 根、非 SVG 文档、非 UTF-8、超限都拒绝。
+        assert!(validate_view_icon("v", "<?xml version=\"1.0\"?><html/>".into()).is_err());
+        assert!(validate_view_icon("v", "<html><svg/></html>".into()).is_err());
+        assert!(validate_view_icon("v", vec![b'<', b's', b'v', b'g', 0xff]).is_err());
+        let mut big = b"<svg>".to_vec();
+        big.resize(VIEW_ICON_MAX_BYTES + 1, b' ');
+        assert!(validate_view_icon("v", big).is_err());
+        let mut edge = b"<svg>".to_vec();
+        edge.resize(VIEW_ICON_MAX_BYTES, b' ');
+        assert!(validate_view_icon("v", edge).is_ok());
+    }
+
+    #[test]
     fn helper_label_requires_helper_script() {
         let m = parse_ok(
             r#"{"identity":"a@b","name":"N","version":"1.0.0",
@@ -1452,6 +1745,37 @@ mod tests {
                 "hooks":{"entry":"h.js","events":["onBogus"]}}"#,
         );
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn page_script_concat_limits() {
+        use super::{PageScriptDecl, PageScriptRunAt, PageScriptWorld, concat_page_script};
+        let script = |js: &[&str]| PageScriptDecl {
+            id: "s".into(),
+            title: "T".into(),
+            matches: vec!["https://example.com/*".into()],
+            exclude_matches: Vec::new(),
+            js: js.iter().map(|s| (*s).to_string()).collect(),
+            run_at: PageScriptRunAt::default(),
+            world: PageScriptWorld::default(),
+            all_frames: false,
+        };
+        let code = concat_page_script(&script(&["a.js", "b.js"]), |p| {
+            Some(format!("// {p}").into_bytes())
+        })
+        .unwrap();
+        assert_eq!(code, "// a.js\n;\n// b.js");
+        // 缺失 / 非 UTF-8 / 单文件超限 / 拼接超限。
+        assert!(concat_page_script(&script(&["a.js"]), |_| None).is_err());
+        assert!(concat_page_script(&script(&["a.js"]), |_| Some(vec![0xff, 0xfe])).is_err());
+        assert!(
+            concat_page_script(&script(&["a.js"]), |_| Some(vec![b'x'; 256 * 1024 + 1])).is_err()
+        );
+        assert!(concat_page_script(&script(&["a.js"]), |_| Some(vec![b'x'; 200 * 1024])).is_ok());
+        assert!(
+            concat_page_script(&script(&["a.js", "b.js"]), |_| Some(vec![b'x'; 200 * 1024]))
+                .is_err()
+        );
     }
     use super::{is_safe_relative_path, is_valid_identity, url_glob_match};
 

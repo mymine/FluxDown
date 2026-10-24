@@ -7,14 +7,15 @@
 use std::collections::HashMap;
 
 use fluxdown_protocol::{
-    AgentEvent, AgentSnapshot, DaemonEvent, EventFrame, ServiceEvent, Snapshot, SnapshotBody,
-    WsServerMsg, accepted_runtime_status, apply_agent_event,
+    AgentEvent, AgentSnapshot, CUSTOM_CATEGORIES_PREF_KEY, CategoryRouteDto, DaemonEvent,
+    EventFrame, FrameVerdict, ServiceEvent, Snapshot, SnapshotBody, TableSync, WsServerMsg,
+    accepted_runtime_status, apply_agent_event, judge_frame,
 };
 
 use crate::dto::{
     CategoryDto, CloudDeviceDto, GroupDto, HostEventDto, HostInfoDto, HostSignalDto,
-    HostSnapshotDto, LinkDeviceDto, QueueDto, RssSourceDto, RuntimeStatsDto, SelectionRequestDto,
-    positions_map, string_map,
+    HostSnapshotDto, LinkDeviceDto, QueueDto, QueueOrderDto, RssSourceDto, RuntimeStatsDto,
+    SelectionRequestDto, queue_order_dtos, string_map,
 };
 use crate::sections::{self, Section};
 
@@ -81,6 +82,16 @@ impl Projection {
         &self.epoch
     }
 
+    /// 当前偏好 `custom_categories` 构建的分类路由；没有任何分类配置目录时为 `None`。
+    pub(crate) fn category_route(&self) -> Option<CategoryRouteDto> {
+        CategoryRouteDto::from_preference(
+            self.snapshot
+                .preferences
+                .values
+                .get(CUSTOM_CATEGORIES_PREF_KEY),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn sequence(&self) -> u64 {
         self.sequence
@@ -95,8 +106,10 @@ impl Projection {
         HostSnapshotDto::from_agent(&self.info, &self.snapshot, sections)
     }
 
+    /// 整表替换后的下发信号：分类 / 分区基线同步刷新，避免随后的增量事件误判为变化。
+    /// 投影处于加载态时 DTO 里 `tasks` 为空、`tasks_loading = true`；载入完成后由
+    /// [`Self::finish_load`] 再发一次完整快照。
     fn snapshot_signal(&mut self) -> HostSignalDto {
-        // 整表替换后分类 / 分区基线也同步，避免随后的增量事件误判为变化。
         self.categories = CategoryDto::from_preferences(&self.snapshot.preferences);
         self.sections = sections::render_all(&self.snapshot);
         HostSignalDto::Snapshot {
@@ -104,17 +117,27 @@ impl Projection {
         }
     }
 
-    /// 游标规则：epoch 不同 → 重同步；`seq <= cursor` → 跳过；`seq == cursor + 1` → 应用；
-    /// 其余（断档）→ 重同步。
+    /// 投影处于加载态时，以当前游标为基准帧建立一轮分页载入；否则 `None`。
+    pub(crate) fn table_sync(&self) -> Option<TableSync> {
+        TableSync::for_snapshot(self.epoch.as_str(), self.sequence, &self.snapshot.daemon)
+    }
+
+    /// 载入完成：把表装入投影，返回完整快照信号与需按游标回放的缓冲帧。
+    pub(crate) fn finish_load(&mut self, sync: TableSync) -> (HostSignalDto, Vec<EventFrame>) {
+        let backlog = sync.finish(&mut self.snapshot.daemon);
+        (self.snapshot_signal(), backlog)
+    }
+
+    /// 游标规则统一走 `judge_frame`：epoch 不同 → 重同步；`seq <= cursor` → 跳过；
+    /// 覆盖区间 `(previous, seq]` 与游标相接（含越过游标的合并帧）→ 应用；其余（断档）→ 重同步。
     pub(crate) fn accept(&mut self, frame: EventFrame) -> FrameOutcome {
-        if frame.epoch != self.epoch {
-            return FrameOutcome::Resync(ResyncReason::EpochChanged);
-        }
-        if frame.sequence <= self.sequence {
-            return FrameOutcome::Skip;
-        }
-        if frame.sequence != self.sequence.saturating_add(1) {
-            return FrameOutcome::Resync(ResyncReason::Gap);
+        match judge_frame(&self.epoch, self.sequence, &frame) {
+            FrameVerdict::Resync if frame.epoch != self.epoch => {
+                return FrameOutcome::Resync(ResyncReason::EpochChanged);
+            }
+            FrameVerdict::Resync => return FrameOutcome::Resync(ResyncReason::Gap),
+            FrameVerdict::Skip => return FrameOutcome::Skip,
+            FrameVerdict::Accept => {}
         }
         let ServiceEvent::Agent(event) = &frame.event else {
             return FrameOutcome::Resync(ResyncReason::ForeignService);
@@ -214,6 +237,7 @@ impl Projection {
             | AgentEvent::CloudNotifyChanged(_)
             | AgentEvent::UpdateChanged(_)
             | AgentEvent::CaptureTasksStarted(_)
+            | AgentEvent::CaptureTasksResumed(_)
             | AgentEvent::SessionRevoked(_) => {
                 apply_agent_event(&mut self.snapshot, event);
                 Vec::new()
@@ -261,7 +285,10 @@ impl Projection {
             | DaemonEvent::WebhooksChanged(_)
             | DaemonEvent::WebhooksCleared
             | DaemonEvent::RssChanged { .. } => None,
-            DaemonEvent::SnapshotReplaced(_) => Some(self.snapshot_signal()),
+            // 整表替换 / 宣告重载：投影已进入加载态，下发「加载态」快照（`tasks_loading = true`）。
+            DaemonEvent::SnapshotReplaced(_) | DaemonEvent::TablesReloading { .. } => {
+                Some(self.snapshot_signal())
+            }
             DaemonEvent::Engine(message) => {
                 self.translate_engine(message, geometry_task, geometry_prev)
             }
@@ -366,7 +393,13 @@ impl Projection {
             WsServerMsg::QueuesChanged { queues } => Some(queues_signal(queues)),
             WsServerMsg::QueuePositionsChanged { positions } => {
                 Some(event_signal(HostEventDto::QueuePositionsChanged {
-                    positions: positions_map(positions),
+                    order: queue_order_dtos(positions),
+                }))
+            }
+            WsServerMsg::QueueOrderChanged { removed, added } => {
+                Some(event_signal(HostEventDto::QueueOrderChanged {
+                    removed: removed.clone(),
+                    added: added.iter().map(QueueOrderDto::from).collect(),
                 }))
             }
             WsServerMsg::GroupsChanged { groups } => Some(groups_signal(groups)),
@@ -470,10 +503,28 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// 快照头：任务表 / 队列位置表待载入，`tasks` / `queuePositions` 为空。
+    pub(crate) fn header(sequence: u64, task_total: u64, queue_total: Option<u64>) -> Snapshot {
+        Snapshot {
+            epoch: EPOCH.to_owned(),
+            sequence,
+            body: SnapshotBody::Agent(Box::new(AgentSnapshot {
+                daemon: DaemonSnapshot {
+                    task_total: Some(task_total),
+                    queue_total,
+                    ..Default::default()
+                },
+                daemon_connected: true,
+                ..Default::default()
+            })),
+        }
+    }
+
     pub(crate) fn frame(sequence: u64, event: AgentEvent) -> EventFrame {
         EventFrame {
             epoch: EPOCH.to_owned(),
             sequence,
+            previous: None,
             event: ServiceEvent::Agent(event),
         }
     }
@@ -492,7 +543,7 @@ mod tests {
 
     use super::fixtures::{EPOCH, daemon_frame, frame, snapshot, task};
     use super::{FrameOutcome, Projection, ResyncReason, Section, runtime_dtos, task_dtos};
-    use crate::dto::{HostEventDto, HostInfoDto, HostSignalDto};
+    use crate::dto::{HostEventDto, HostInfoDto, HostSignalDto, HostSnapshotDto, QueueOrderDto};
 
     fn info() -> HostInfoDto {
         HostInfoDto {
@@ -631,6 +682,7 @@ mod tests {
         let foreign = EventFrame {
             epoch: EPOCH.to_owned(),
             sequence: 2,
+            previous: None,
             event: ServiceEvent::Daemon(DaemonEvent::SelectionResolved {
                 request_id: "r".to_owned(),
             }),
@@ -739,6 +791,84 @@ mod tests {
     }
 
     #[test]
+    fn queue_order_delta_forwards_only_changes_and_advances_projection() {
+        use fluxdown_protocol::{QueueOrderEntryDto, QueuePositionDto};
+        let position = |id: &str, order: i64| QueuePositionDto {
+            task_id: id.to_owned(),
+            position: 0,
+            order,
+        };
+        let mut projection = projection(1, vec![task("a", 3), task("b", 3), task("c", 3)]);
+        projection.accept(daemon_frame(
+            2,
+            DaemonEvent::Engine(WsServerMsg::QueuePositionsChanged {
+                positions: vec![position("a", 10), position("b", 20), position("c", 30)],
+            }),
+        ));
+        let outcome = projection.accept(daemon_frame(
+            3,
+            DaemonEvent::Engine(WsServerMsg::QueueOrderChanged {
+                removed: vec!["a".to_owned()],
+                added: vec![QueueOrderEntryDto {
+                    task_id: "d".to_owned(),
+                    order: 25,
+                }],
+            }),
+        ));
+        assert_eq!(
+            outcome,
+            FrameOutcome::Applied(vec![HostSignalDto::Event {
+                event: HostEventDto::QueueOrderChanged {
+                    removed: vec!["a".to_owned()],
+                    added: vec![QueueOrderDto {
+                        task_id: "d".to_owned(),
+                        order: 25
+                    }],
+                }
+            }])
+        );
+        // 快照侧：增量后整表按键升序，队首出队不改其余任务的键。
+        let HostSnapshotDto { queue_order, .. } = projection.snapshot_dto();
+        let ids: Vec<(&str, i64)> = queue_order
+            .iter()
+            .map(|entry| (entry.task_id.as_str(), entry.order))
+            .collect();
+        assert_eq!(ids, [("b", 20), ("d", 25), ("c", 30)]);
+    }
+
+    #[test]
+    fn merged_frame_overlapping_cursor_is_accepted_but_gap_is_not() {
+        let mut projection = projection(5, vec![task("a", 1)]);
+        // 覆盖 (3, 7]，游标 5 落在区间内：接受并推进到 7。
+        let mut merged = daemon_frame(
+            7,
+            DaemonEvent::TaskDeleted {
+                task_id: "a".to_owned(),
+            },
+        );
+        merged.previous = Some(3);
+        assert!(matches!(
+            projection.accept(merged),
+            FrameOutcome::Applied(_)
+        ));
+        assert_eq!(projection.sequence(), 7);
+
+        // 覆盖 (8, 10]，游标 7 与区间之间缺 8：重同步且不推进。
+        let mut gapped = daemon_frame(
+            10,
+            DaemonEvent::TaskDeleted {
+                task_id: "a".to_owned(),
+            },
+        );
+        gapped.previous = Some(8);
+        assert_eq!(
+            projection.accept(gapped),
+            FrameOutcome::Resync(ResyncReason::Gap)
+        );
+        assert_eq!(projection.sequence(), 7);
+    }
+
+    #[test]
     fn queue_positions_priority_and_file_missing_map_to_dtos() {
         let mut projection = projection(1, vec![task("a", 3)]);
         let positions = projection.accept(daemon_frame(
@@ -747,6 +877,7 @@ mod tests {
                 positions: vec![fluxdown_protocol::QueuePositionDto {
                     task_id: "a".to_owned(),
                     position: 2,
+                    order: 2,
                 }],
             }),
         ));
@@ -754,7 +885,10 @@ mod tests {
             positions,
             FrameOutcome::Applied(vec![HostSignalDto::Event {
                 event: HostEventDto::QueuePositionsChanged {
-                    positions: [("a".to_owned(), 2)].into_iter().collect()
+                    order: vec![QueueOrderDto {
+                        task_id: "a".to_owned(),
+                        order: 2
+                    }]
                 }
             }])
         );

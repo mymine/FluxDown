@@ -1,0 +1,90 @@
+---
+/** 下载页底部帮助链接。 */
+import { ArrowUpRight, ArrowRight } from "lucide-react";
+import { download } from "@/i18n/messages/download";
+import { href } from "@/i18n/routing";
+import type { Lang } from "@/i18n/config";
+import { GITHUB_URL } from "@/lib/site-nav";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = download[lang];
+const help = [
+  { label: t.help.signing, desc: t.help.signingDesc, href: href("/code-signing", lang), external: false },
+  { label: t.help.changelog, desc: t.help.changelogDesc, href: href("/changelog", lang), external: false },
+  { label: t.help.releases, desc: t.help.releasesDesc, href: `${GITHUB_URL}/releases`, external: true },
+];
+---
+
+<section class="frame">
+  <nav class="flex flex-col" aria-label={t.help.eyebrow}>
+    <span class="eyebrow px-[clamp(24px,3.4vw,48px)] pt-[clamp(24px,3.4vw,48px)] pb-4">{t.help.eyebrow}</span>
+    <ul class="help">
+      {
+        help.map((item) => (
+          <li>
+            <a
+              href={item.href}
+              class="help-link"
+              target={item.external ? "_blank" : undefined}
+              rel={item.external ? "noopener" : undefined}
+            >
+              <span class="flex flex-col gap-0.5">
+                <span class="text-[15px] font-medium text-fg">{item.label}</span>
+                <span class="text-[13px] text-muted">{item.desc}</span>
+              </span>
+              {item.external ? (
+                <ArrowUpRight size={16} strokeWidth={1.75} className="help-arrow" aria-hidden="true" />
+              ) : (
+                <ArrowRight size={16} strokeWidth={1.75} className="help-arrow" aria-hidden="true" />
+              )}
+            </a>
+          </li>
+        ))
+      }
+    </ul>
+  </nav>
+</section>
+
+<style>
+  .help {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    border-top: 1px solid var(--line);
+  }
+  @media (min-width: 900px) {
+    .help {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .help li + li {
+      border-left: 1px solid var(--line);
+    }
+  }
+  @media (max-width: 899px) {
+    .help li + li {
+      border-top: 1px solid var(--line);
+    }
+  }
+  .help-link {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 16px clamp(24px, 3.4vw, 48px);
+    transition: background-color 160ms;
+  }
+  .help-link:hover {
+    background: var(--bg-sunken);
+  }
+  .help-link :global(.help-arrow) {
+    flex: none;
+    color: var(--fg-subtle);
+    transition: transform 200ms var(--ease-out), color 160ms;
+  }
+  .help-link:hover :global(.help-arrow) {
+    color: var(--accent-ink);
+    transform: translateX(2px);
+  }
+</style>

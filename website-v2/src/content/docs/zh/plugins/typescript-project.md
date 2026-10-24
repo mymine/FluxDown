@@ -377,4 +377,4 @@ npm run pack          # packed …/me@mirror-demo-0.1.0.fxplug
 - **更多能力：** [事件钩子指南](/docs/zh/plugins/hooks-guide/)（重试、ffmpeg、yt-dlp）、[账号登录与认证指南](/docs/zh/plugins/auth-guide/)（登录流程）、[订阅源指南](/docs/zh/plugins/subscription-guide/)、[可移植界面指南](/docs/zh/plugins/ui-guide/)（输入控件、表格、定时器、设置与任务详情页签）、[桌面原生界面指南](/docs/zh/plugins/desktop-ui-guide/)。
 - **出了问题：** [调试与排错](/docs/zh/plugins/debugging/)。
 - **参考：** [SDK 与 CLI](/docs/zh/plugins/sdk/)、[Manifest](/docs/zh/plugins/manifest/)、[API](/docs/zh/plugins/api-reference/)、[视图](/docs/zh/plugins/views/)。
-- **完整示例**在仓库里：[`feature-demo`](https://github.com/zerx-lab/FluxDown/tree/main/packages/plugin-sdk/examples/feature-demo)（覆盖全部能力，附验收清单）和 [`youtube-down`](https://github.com/zerx-lab/FluxDown/tree/main/packages/plugin-sdk/examples/youtube-down)（yt-dlp、多文件清单、DOM 嗅探规则）。
+- **完整示例**在仓库里：[`feature-demo`](https://github.com/zerx-lab/FluxDown/tree/main/packages/plugin-sdk/examples/feature-demo)（覆盖全部能力，附验收清单）和 [`youtube-down`](https://github.com/zerx-lab/FluxDown/tree/main/packages/plugin-sdk/examples/youtube-down)（在插件内自研站点解析、打包第三方脚本、`memoryLimitMb`、多文件清单、DOM 嗅探规则）。

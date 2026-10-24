@@ -11,6 +11,7 @@ import { confirmDialog, toast } from '../../../ui'
 import { toastRpcError } from '../../../lib/rpcToast'
 import { rpcErrorKind, rpcErrorText } from '../../../lib/rpcErrorText'
 import { planTaskCommand } from './batchPlan'
+import { folderAnchorMember } from './groupTree'
 import { PLUGIN_ERROR_PREFIX, shareUrl } from './task'
 import type { DownloadTaskView } from './task'
 
@@ -104,8 +105,14 @@ export function moveViewsToQueue(views: readonly DownloadTaskView[], queueId: st
   )
 }
 
-/** Boost：同 id 再次调用即取消。 */
-export const toggleBoost = (taskId: string) => guarded(() => rpc.daemon.queue.boost({ id: taskId }))
+/** Boost：同 id 再次调用即取消。只有未结束的任务能优先下载：已完成 / 失败直接提示，不下发命令。 */
+export function toggleBoost(view: DownloadTaskView): Promise<boolean> {
+  if (view.state === 'completed' || view.state === 'failed') {
+    toast.warning(t(view.state === 'completed' ? 'boostTaskCompleted' : 'boostTaskEnded'))
+    return Promise.resolve(false)
+  }
+  return guarded(() => rpc.daemon.queue.boost({ id: view.taskId }))
+}
 
 /** 更换链接 / 修改线程数成功后，失败任务立即重试（暂停 / 等待保持原状态）；重试失败 toast。 */
 export async function resumeIfFailed(taskId: string, wasFailed: boolean): Promise<boolean> {
@@ -271,4 +278,14 @@ export function copySourceLink(url: string): void {
   if (url === '') return
   copyText(url)
   toast.key('urlCopied', 'success')
+}
+
+/** 「打开组文件夹」：agent 与浏览器同机时可用（与「在文件夹中显示」同一能力）。 */
+export const canOpenGroupFolder = (): boolean => hostOpensTaskFiles()
+
+/** 打开任务组文件夹：定位一个位于组根目录的成员，没有则第一个成员。`views` 为全部视图（取该组成员）。 */
+export async function openGroupFolder(views: readonly DownloadTaskView[], groupId: string, groupDir: string): Promise<boolean> {
+  const members = views.filter((view) => view.source === 'local' && view.groupId === groupId)
+  const anchor = folderAnchorMember(members, groupDir)
+  return anchor === undefined ? false : revealTaskFile(anchor.taskId)
 }

@@ -103,12 +103,11 @@ class FluxOrbState internal constructor() {
 fun rememberFluxOrbState(): FluxOrbState = remember { FluxOrbState() }
 
 /**
- * 新建球（01 §12.3）：与导航坞等高的强调色实心按钮，仅以色彩与细边界突出，不使用投影。
+ * 新建球（01 §12.3）：与导航坞等高的强调色实心按钮，与坞同一柔和投影托起。
  *
  * - 点按 → [onClick]；按住 [com.fluxdown.fluxui.theme.FluxMotion.orbHoldMs]（380ms）→ `longPress` 触感 + 扇形展开
  *   （由 [FluxOrbFanLayer] 绘制），手指滑过扇形项每进入新项 `tick`，在项上松手 → `confirm` + [onAction]，落空则收起。
  * - [selectionMode]：球就地变形为“退出选择”（与导航坞同一不透明面、ink 图标、`+` 转 45°），点按 = [onClick]，不展开扇形。
- * - [mini]：视觉缩至主题 touch 大小；手势区域保持 dockHeight。
  * - a11y：`Role.Button`；`customActions` 等价于扇形各项（TalkBack 用户无需按住）。
  *
  * 球自身宽高均为主题 dockHeight，位置由应用摆放；其根坐标位置经 [state] 传给扇形层。
@@ -121,7 +120,6 @@ fun FluxOrb(
     onAction: (Int) -> Unit,
     modifier: Modifier = Modifier,
     selectionMode: Boolean = false,
-    mini: Boolean = false,
     contentDescription: String = "新建下载",
     exitDescription: String = "退出选择",
 ) {
@@ -130,7 +128,6 @@ fun FluxOrb(
     val haptics = FluxTheme.haptics
     val holdMs = motion.orbHoldMs
     val orbSize = FluxTheme.space.dockHeight
-    val miniScale = (FluxTheme.space.touch / orbSize).coerceAtMost(1f)
     SideEffect { state.actions = actions }
 
     val onClickState = rememberUpdatedState(onClick)
@@ -149,9 +146,8 @@ fun FluxOrb(
     LaunchedEffect(pressed, motion) {
         pressScale.animateTo(if (pressed) 0.92f else 1f, motion.of(motion.press))
     }
-    LaunchedEffect(mini, fanOpen, motion, miniScale) {
-        val base = if (mini) miniScale else 1f
-        stateScale.animateTo(if (fanOpen) base * 1.06f else base, motion.of(motion.fluid))
+    LaunchedEffect(fanOpen, motion) {
+        stateScale.animateTo(if (fanOpen) 1.06f else 1f, motion.of(motion.fluid))
     }
     LaunchedEffect(fanOpen, selectionMode, motion) {
         val target = if (selectionMode) 45f else if (fanOpen) 135f else 0f
@@ -244,7 +240,7 @@ fun FluxOrb(
                     scaleY = s
                 },
         ) {
-            // 强调色实心面，不通过阴影或辉光拔高层级（选择模式淡出）。
+            // 强调色实心面 + 与坞同一柔和投影（选择模式淡出）。
             Box(
                 Modifier
                     .fillMaxSize()
@@ -252,6 +248,7 @@ fun FluxOrb(
                         alpha = 1f - sel.value.coerceIn(0f, 1f)
                         compositingStrategy = CompositingStrategy.ModulateAlpha
                     }
+                    .floatingChromeShadow(CircleShape)
                     .background(c.accentFill, CircleShape)
                     .border(0.5.dp, c.onAccent.copy(alpha = 0.16f), CircleShape),
             )

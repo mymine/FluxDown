@@ -113,7 +113,7 @@ The desktop HTTP service defaults to `127.0.0.1:17800`. GPUI can enable LAN acce
 | Setting | Purpose | Default |
 |---|---|---|
 | Enable API Service | Master switch for the local HTTP server; the three feature toggles below only work while this is on. | On |
-| Listen Port | The port the local server binds to (1024–65535). | 17800 |
+| Listen Port | The port the local server binds to (1024–65535). If the saved port is in use or reserved by the system at startup (for example a Hyper-V / WSL / Docker reserved range on Windows), FluxDown switches to a free port chosen by the system and shows it here; point the userscript and aria2 clients at the port shown. | 17800 |
 | Access Token | Token used to authenticate API requests; generate or copy it with the buttons next to the field. Required once Management API is enabled. | Empty |
 | Browser Script Takeover | Lets the FluxDown userscript take over browser downloads at `http://127.0.0.1:<port>`. Includes a button to copy the userscript. | On |
 | aria2 RPC Compatible | Implements the aria2 JSON-RPC protocol (`addUri`, `getVersion`, `getGlobalStat`, `multicall`, …) at `/jsonrpc`, for "send to aria2" scripts or clients like AriaNg. | On |

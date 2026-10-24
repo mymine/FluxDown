@@ -56,8 +56,8 @@ describe('hostsToConfirm / permissionKeys', () => {
     expect(hostsToConfirm(entry, plugin({ networkHosts: ['a.com'] }))).toEqual(['b.com'])
     expect(hostsToConfirm(entry, plugin({ networkHosts: ['a.com'], consentPendingHosts: ['a.com'] }))).toEqual(['a.com', 'b.com'])
   })
-  test('八个权限都有文案键', () => {
-    for (const name of ['ffmpeg', 'ytdlp', 'auth', 'tasks', 'browserRules', 'desktop', 'background', 'intercept']) {
+  test('九个权限都有文案键', () => {
+    for (const name of ['ffmpeg', 'ytdlp', 'auth', 'tasks', 'browserRules', 'desktop', 'background', 'intercept', 'pageScripts']) {
       expect(permissionKeys(name)).not.toBeNull()
     }
     expect(permissionKeys('nope')).toBeNull()

@@ -6,7 +6,7 @@
 	<array>
 		<string>$(PRODUCT_BUNDLE_IDENTIFIER).download.*</string>
 	</array>
-#ifdef FULL_P2P
+#ifdef FULL_FLAVOR
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
@@ -38,7 +38,7 @@
 			<string>com.fluxdown.link</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-#ifdef FULL_P2P
+#ifdef FULL_FLAVOR
 				<string>magnet</string>
 				<string>ed2k</string>
 #endif
@@ -66,7 +66,7 @@
 		<key>UIImageName</key>
 		<string>LaunchMark</string>
 	</dict>
-#ifdef FULL_P2P
+#ifdef FULL_FLAVOR
 	<key>UTImportedTypeDeclarations</key>
 	<array>
 		<dict>

@@ -406,22 +406,22 @@ public enum QueueLookup {
 // MARK: - 队列内待处理任务顺序（`daemon.queue.reorder`）
 
 public enum QueueOrdering {
-    /// 队列内待下载（pending）任务，按引擎启动顺序：排队序号（`queuePositions`，>0）升序；无序号者排后并按创建时间。
+    /// 队列内待下载（pending）任务，按引擎启动顺序：排序键升序（即排队名次）；不在排队顺序里的排后并按创建时间。
     public static func pending(
         in queueId: String,
         tasks: [DownloadTask],
-        positions: [String: Int32]
+        order: QueueOrder
     ) -> [DownloadTask] {
         let key = QueueIds.normalized(queueId)
         return tasks
             .filter { $0.status == .pending && QueueIds.normalized($0.queueId) == key }
+            .map { (task: $0, order: order.order(of: $0.taskId) ?? .max) }
             .sorted { lhs, rhs in
-                let l = positions[lhs.taskId].flatMap { $0 > 0 ? $0 : nil } ?? .max
-                let r = positions[rhs.taskId].flatMap { $0 > 0 ? $0 : nil } ?? .max
-                if l != r { return l < r }
-                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
-                return lhs.taskId < rhs.taskId
+                if lhs.order != rhs.order { return lhs.order < rhs.order }
+                if lhs.task.createdAt != rhs.task.createdAt { return lhs.task.createdAt < rhs.task.createdAt }
+                return lhs.task.taskId < rhs.task.taskId
             }
+            .map(\.task)
     }
 
     /// 把 `index` 处的任务移动 `delta`（±1）位；越界返回 nil。

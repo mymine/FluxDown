@@ -176,7 +176,7 @@ struct QueuesProtocolTests {
         DownloadTask(taskId: id, url: "https://x/\(id)", fileName: id, status: status, createdAt: created, queueId: queue)
     }
 
-    @Test func pendingOrderUsesQueuePositions_thenCreationTime() {
+    @Test func pendingOrderUsesQueueOrderKeys_thenCreationTime() {
         let tasks = [
             task("a", .pending, created: 30),
             task("b", .pending, queue: "main", created: 20),
@@ -184,9 +184,11 @@ struct QueuesProtocolTests {
             task("d", .downloading),
             task("e", .pending, queue: "later"),
         ]
-        let ordered = QueueOrdering.pending(in: "main", tasks: tasks, positions: ["a": 1, "b": 2])
+        // 键是稳定的引擎排序键（可不连续），不是名次。
+        let order = QueueOrder(sorted: [QueueOrderEntry(taskId: "a", order: 100), QueueOrderEntry(taskId: "b", order: 250)])
+        let ordered = QueueOrdering.pending(in: "main", tasks: tasks, order: order)
         #expect(ordered.map(\.taskId) == ["a", "b", "c"])
-        #expect(QueueOrdering.pending(in: "later", tasks: tasks, positions: [:]).map(\.taskId) == ["e"])
+        #expect(QueueOrdering.pending(in: "later", tasks: tasks, order: .empty).map(\.taskId) == ["e"])
     }
 
     @Test func reorderHelpers() {

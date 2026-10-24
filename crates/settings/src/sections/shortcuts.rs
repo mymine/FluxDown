@@ -11,7 +11,7 @@ use fluxdown_protocol::shortcuts::{
     ResolvedShortcut, ShortcutDomain, ShortcutScope, ShortcutSpec, ShortcutTrigger,
     resolve_shortcuts, shortcuts_pref_key,
 };
-use fluxdown_ui_components::{ButtonVariant, CalloutTone, FluxIcon, RevealCallout};
+use fluxdown_ui_components::{ButtonVariant, CalloutTone, FluxIcon, RevealCallout, tooltip_view};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -20,9 +20,7 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
     prelude::FluentBuilder as _, px,
 };
-use gpui_component::{
-    Icon, WindowExt as _, h_flex, notification::Notification, tooltip::Tooltip, v_flex,
-};
+use gpui_component::{Icon, WindowExt as _, h_flex, notification::Notification, v_flex};
 use serde_json::Value;
 
 use super::SectionContext;
@@ -450,9 +448,7 @@ fn row_control(
                         .border_1()
                         .border_color(extended.colors.hairline)
                         .bg(extended.colors.chrome)
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(full_label.clone()).build(window, cx)
-                        })
+                        .tooltip(move |window, cx| tooltip_view(full_label.clone(), window, cx))
                         .children(keycaps)
                         .child(
                             div()
@@ -466,7 +462,7 @@ fn row_control(
                                 .text_color(extended.colors.text_tertiary)
                                 .hover(|this| this.bg(extended.colors.row_hover))
                                 .tooltip(move |window, cx| {
-                                    Tooltip::new(remove_hint.clone()).build(window, cx)
+                                    tooltip_view(remove_hint.clone(), window, cx)
                                 })
                                 .on_click(move |_, _, cx| {
                                     let pref = shortcuts_pref_key(remove_env.scope);
@@ -692,7 +688,7 @@ fn status_badge(
             .id(ElementId::from(SharedString::from(format!("{id}-badge"))))
             .text_color(color)
             .when_some(detail, |this, detail| {
-                this.tooltip(move |window, cx| Tooltip::new(detail.clone()).build(window, cx))
+                this.tooltip(move |window, cx| tooltip_view(detail.clone(), window, cx))
             })
             .child(label)
             .into_any_element(),

@@ -1495,6 +1495,10 @@ mod tests {
         // 侧栏设备区显隐、窗口边界是设备本地偏好，不得随账号同步到其他设备。
         assert!(!preference_is_synced("ui.show_sidebar_devices"));
         assert!(!preference_is_synced("desktop.window.main"));
+        // 提示音偏好是设备本地键：每台设备的音频文件路径各不相同。
+        for key in fluxdown_protocol::sound::SOUND_PREF_KEYS {
+            assert!(!preference_is_synced(key), "{key}");
+        }
         assert!(!preference_is_synced(fluxdown_ui_theme::FONT_FAMILY_KEY));
         assert!(!preference_is_synced("unknown.key"));
         // 同步目录内的键（含自定义分类与带每机属性的 BT / ED2K 开关）走同步链路，

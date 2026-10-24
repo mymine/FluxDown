@@ -6,8 +6,8 @@ package com.fluxdown.core.update
  * 逐条镜像桌面 `crates/settings/src/update_view.rs`（status_line / manual_line / can_install / can_cancel /
  * manual_url / download_percent / failure_key）。Android 差异只在文案：
  * - `Ready` 用「已下载，点按安装」（桌面是「重启即可完成」）；
- * - `Installing` 用「正在安装更新…」（桌面会重启）；
- * - `ElevationCancelled` 用「已取消安装」（Android = 系统安装确认被取消）；
+ * - `Installing` 用「正在安装更新…」（桌面会重启；Android = 已交给安装程序）；
+ * - `ElevationCancelled` 用「已取消安装」（Android = 安装前用户放弃）；
  * - `ManagedPackage` 用「应用商店安装」说明（桌面按 Docker / NAS 安装形态区分）；
  * - `Verify` 且详情为签名不符（[UpdatePolicy.SIGNATURE_MISMATCH]）用专门的签名说明。
  * 键为 [UpdateText]，由 `:app` 映射到 `R.string`。

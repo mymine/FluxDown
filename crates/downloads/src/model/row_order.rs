@@ -99,6 +99,20 @@ impl RowOrder {
         self.hold.until().max(throttle)
     }
 
+    /// 有被推迟的重排：当前显示顺序与最新排序结果不同。
+    pub(crate) fn is_stale(&self) -> bool {
+        self.stale
+    }
+
+    /// 等价于对「与上次完全相同的排序结果」调用 [`Self::apply`]（要求 [`Self::is_stale`]
+    /// 为假且 `content_only`）：保持期内什么都不变，保持期外只刷新重排时刻。调用方因此
+    /// 不必为一份没有变化的排序结果再整表复制 / 合并一遍。
+    pub(crate) fn settle_unchanged(&mut self, live_key: bool, now: Instant) {
+        if !self.holding(live_key, now) {
+            self.last_sorted_at = Some(now);
+        }
+    }
+
     fn holding(&self, live_key: bool, now: Instant) -> bool {
         self.hold.until().is_some_and(|until| now < until)
             || (live_key

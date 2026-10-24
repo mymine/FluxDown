@@ -114,7 +114,7 @@ function extractTaskIdFromNotificationId(
 /**
  * 发出"任务已完成"桌面通知。
  * Chrome：带「打开文件」「打开文件夹」两个按钮（onButtonClicked 处理）。
- * Firefox（MV2 不支持 buttons）：降级为点击通知主体 = 打开文件夹
+ * Firefox（通知不支持 buttons）：降级为点击通知主体 = 打开文件夹
  * （onClicked 处理，见下方监听器）。
  */
 function notifyTaskCompleted(task: TaskBrief): void {
@@ -218,7 +218,7 @@ export function installTaskListeners(): void {
   if (browser.notifications?.onClicked) {
     browser.notifications.onClicked.addListener((notificationId) => {
       // Chrome 下点击通知主体不做动作（两个按钮已覆盖打开文件/文件夹诉求）；
-      // Firefox MV2 不支持 buttons，点击主体降级为"打开文件夹"。
+      // Firefox 通知不支持 buttons，点击主体降级为"打开文件夹"。
       if (!import.meta.env.FIREFOX) return;
       const taskId = extractTaskIdFromNotificationId(notificationId);
       if (!taskId) return;

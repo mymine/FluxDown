@@ -484,6 +484,49 @@ pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
     }))
 }
 
+/// `ProxyMode::Auto` 的系统代理候选端点（Auto 自己按 host 实测选路，只需要
+/// 「系统代理指向哪个端点」）。静态系统代理优先；否则系统配置了 PAC URL 时
+/// 取 PAC 脚本里出现的第一个代理端点（见 [`crate::pac`]，不逐 URL 执行
+/// `FindProxyForURL`）。WPAD 自动发现（无 URL）不在范围内。探测失败按无候选
+/// 处理并记日志。
+pub fn detect_auto_system_proxy() -> Option<ProxyConfig> {
+    match detect_system_proxy() {
+        Ok(Some(found)) => return Some(found),
+        Ok(None) => {}
+        Err(error) => log_info!("[auto-proxy] 系统代理检测失败: {error}"),
+    }
+    let pac_url = detect_system_pac_url()?;
+    crate::pac::resolve_pac_endpoint(&pac_url)
+}
+
+/// Windows PAC URL：`Internet Settings\AutoConfigURL`。
+#[cfg(target_os = "windows")]
+fn detect_system_pac_url() -> Option<String> {
+    use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+
+    let inet = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        .ok()?;
+    let url: String = inet.get_value("AutoConfigURL").ok()?;
+    let url = url.trim();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url.to_string())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn detect_system_pac_url() -> Option<String> {
+    system_proxy_snapshot().pac_url
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn detect_system_pac_url() -> Option<String> {
+    None
+}
+
 /// macOS 系统代理检测：调用 `scutil --proxy` 读取 SystemConfiguration 的
 /// 代理字典（GUI 应用不继承终端 shell 的环境变量，而 `networksetup`/
 /// 系统偏好设置写入的代理只存在于 SystemConfiguration，读环境变量拿不到）。
@@ -491,14 +534,23 @@ pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
 /// 探测永远是尽力而为，绝不能因为它失败而拖垮整个下载流程。
 #[cfg(target_os = "macos")]
 pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
-    Ok(cached_system_proxy_probe(|| {
+    Ok(system_proxy_snapshot().static_proxy)
+}
+
+/// 同一次 `scutil --proxy` 同时产出静态代理与 PAC URL。
+#[cfg(target_os = "macos")]
+fn system_proxy_snapshot() -> SystemProxySnapshot {
+    cached_system_proxy_probe(|| {
         let output = run_command_with_timeout("scutil", &["--proxy"], SYSTEM_PROXY_PROBE_TIMEOUT);
         let text = match output {
             Some(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-            _ => return None,
+            _ => return SystemProxySnapshot::default(),
         };
-        parse_scutil_proxy_output(&text)
-    }))
+        SystemProxySnapshot {
+            static_proxy: parse_scutil_proxy_output(&text),
+            pac_url: parse_scutil_pac_url(&text),
+        }
+    })
 }
 
 /// Linux 系统代理检测：先看 `https_proxy`/`http_proxy`/`all_proxy` 环境变量
@@ -508,9 +560,32 @@ pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
 /// 的环境变量）。子进程/命令缺失一律静默回退，不影响非 GNOME 桌面环境。
 #[cfg(target_os = "linux")]
 pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
-    Ok(cached_system_proxy_probe(|| {
-        detect_proxy_from_env().or_else(detect_proxy_from_gsettings)
-    }))
+    Ok(system_proxy_snapshot().static_proxy)
+}
+
+#[cfg(target_os = "linux")]
+fn system_proxy_snapshot() -> SystemProxySnapshot {
+    cached_system_proxy_probe(|| {
+        let static_proxy = detect_proxy_from_env().or_else(detect_proxy_from_gsettings);
+        // 静态代理优先；只有没有静态代理时才多问一次 gsettings 取 PAC URL。
+        let pac_url = if static_proxy.is_none() {
+            detect_pac_url_from_gsettings()
+        } else {
+            None
+        };
+        SystemProxySnapshot {
+            static_proxy,
+            pac_url,
+        }
+    })
+}
+
+/// macOS/Linux 一次探测的产物：静态代理与 PAC URL 来自同一次探测，避免多跑子进程。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Default)]
+struct SystemProxySnapshot {
+    static_proxy: Option<ProxyConfig>,
+    pac_url: Option<String>,
 }
 
 /// macOS/Linux 探测结果的短时缓存 TTL。`ProxyConfig::resolve()` 在 actor 线程
@@ -521,13 +596,13 @@ pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
 const SYSTEM_PROXY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-static SYSTEM_PROXY_CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<ProxyConfig>)>> =
+static SYSTEM_PROXY_CACHE: std::sync::Mutex<Option<(std::time::Instant, SystemProxySnapshot)>> =
     std::sync::Mutex::new(None);
 
 /// 带 TTL 的探测缓存：命中未过期结果直接返回，否则执行 `probe` 并回填。
 /// 锁中毒直接取内部值——缓存只是一个可重算的快照。
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn cached_system_proxy_probe(probe: impl FnOnce() -> Option<ProxyConfig>) -> Option<ProxyConfig> {
+fn cached_system_proxy_probe(probe: impl FnOnce() -> SystemProxySnapshot) -> SystemProxySnapshot {
     let mut guard = SYSTEM_PROXY_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -676,6 +751,20 @@ fn parse_scutil_proxy_output(text: &str) -> Option<ProxyConfig> {
     None
 }
 
+/// 从 `scutil --proxy` 字典读取 PAC 脚本 URL：`ProxyAutoConfigEnable : 1`
+/// 且 `ProxyAutoConfigURLString` 非空。
+#[allow(dead_code)] // 仅 macOS 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn parse_scutil_pac_url(text: &str) -> Option<String> {
+    let map = parse_scutil_dict(text);
+    if map.get("ProxyAutoConfigEnable").map(|v| v.trim()) != Some("1") {
+        return None;
+    }
+    map.get("ProxyAutoConfigURLString")
+        .map(|u| u.trim())
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
 /// 按 `https_proxy` > `http_proxy` > `all_proxy` 优先读取代理环境变量
 /// （同时兼容大小写变体），用 `url` crate 解析出协议/host/port/凭据。
 /// 纯读取无子进程，Windows/macOS 上调用也无害（多数情况下这些变量本就
@@ -766,6 +855,17 @@ fn detect_proxy_from_gsettings() -> Option<ProxyConfig> {
         });
     }
     None
+}
+
+/// GNOME `gsettings` PAC 配置：`mode` 为 `auto` 时取 `autoconfig-url`。
+/// `auto` 模式下 URL 为空即 WPAD 自动发现，不在支持范围内（无 URL 可取）。
+#[allow(dead_code)] // 仅 Linux 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn detect_pac_url_from_gsettings() -> Option<String> {
+    let mode = gsettings_get("org.gnome.system.proxy", "mode")?;
+    if mode != "auto" {
+        return None;
+    }
+    gsettings_get("org.gnome.system.proxy", "autoconfig-url")
 }
 
 /// 剥掉 GNOME dconf 字符串取值外层的单引号（固定输出 `'value'`）；整数
@@ -2718,6 +2818,27 @@ mod tests {
         // GUI 关掉某个协议但残留旧字段时常见：*Enable=1 但 host 字段是空串。
         let text = "<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : 1087\n  HTTPProxy : \n}\n";
         assert!(parse_scutil_proxy_output(text).is_none());
+    }
+
+    #[test]
+    fn parse_scutil_pac_url_requires_enable_and_keeps_url_colons() {
+        let on = "<dictionary> {\n  HTTPEnable : 0\n  ProxyAutoConfigEnable : 1\n  ProxyAutoConfigURLString : http://127.0.0.1:9090/pac?x=1\n}\n";
+        assert_eq!(
+            super::parse_scutil_pac_url(on).as_deref(),
+            Some("http://127.0.0.1:9090/pac?x=1")
+        );
+        let off = on.replace("ProxyAutoConfigEnable : 1", "ProxyAutoConfigEnable : 0");
+        assert!(super::parse_scutil_pac_url(&off).is_none());
+        let empty =
+            "<dictionary> {\n  ProxyAutoConfigEnable : 1\n  ProxyAutoConfigURLString : \n}\n";
+        assert!(super::parse_scutil_pac_url(empty).is_none());
+        // PAC 与静态代理互不影响：同一份输出可同时产出两者。
+        let both = "<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : 1087\n  HTTPProxy : 127.0.0.1\n  ProxyAutoConfigEnable : 1\n  ProxyAutoConfigURLString : file:///tmp/a.pac\n}\n";
+        assert!(parse_scutil_proxy_output(both).is_some());
+        assert_eq!(
+            super::parse_scutil_pac_url(both).as_deref(),
+            Some("file:///tmp/a.pac")
+        );
     }
 
     // -----------------------------------------------------------------------

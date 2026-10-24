@@ -78,7 +78,8 @@ struct RowText {
 
     // MARK: 状态行（§1.3，13pt monospacedDigit）
 
-    func status(_ item: TaskItem, fields: Set<CardField>) -> StatusLine {
+    /// `queuePosition`：排队名次（1 起），只对排队行有意义，由渲染方按可见行取，不随行模型缓存。
+    func status(_ item: TaskItem, fields: Set<CardField>, queuePosition: Int = 0) -> StatusLine {
         let task = item.task
         if item.awaitingDecision { return StatusLine(text: t("fileConflictPending"), tone: .warning) }
         switch item.visual {
@@ -96,21 +97,21 @@ struct RowText {
         case .verifying:
             return StatusLine(text: t("statusVerifying"), tone: .secondary)
         case .queued:
-            return StatusLine(text: t("subtitleQueued", ["pos": item.queuePosition]), tone: .secondary)
+            return StatusLine(text: t("subtitleQueued", ["pos": queuePosition]), tone: .secondary)
         case .pending:
             return StatusLine(text: t("statusPending"), tone: .secondary)
         case .paused:
             return StatusLine(text: t("statusPaused"), tone: .secondary)
         case .failed:
             let base = t("statusError")
-            if let line = Self.firstLine(task.errorMessage) {
+            if let line = Self.firstLine(TaskErrorMessage.displayText(task.errorMessage, localize: { t($0) })) {
                 return StatusLine(text: base + " · " + line, tone: .failure)
             }
             return StatusLine(text: base, tone: .failure)
         case .completed:
             return StatusLine(text: t("statusCompleted"), tone: .secondary)
         case .seeding:
-            var text = t("statusSeeding")
+            var text = t(item.task.seedingStatus == .queuedForSlot ? "seedingStatusQueued" : "statusSeeding")
             if item.speedUp > 0, let up = Format.speed(item.speedUp) { text += " · ↑ " + up.description }
             return StatusLine(text: text, tone: .success)
         case .missing:
@@ -178,10 +179,10 @@ struct RowText {
     }
 
     /// 整行朗读：「{文件名}，{状态}，{进度}，{元信息}」。
-    func summary(_ item: TaskItem, fields: Set<CardField>, nowSec: Int64) -> String {
+    func summary(_ item: TaskItem, fields: Set<CardField>, nowSec: Int64, queuePosition: Int = 0) -> String {
         [
             item.task.fileName,
-            status(item, fields: fields).text,
+            status(item, fields: fields, queuePosition: queuePosition).text,
             percent(item),
             meta(item, fields: fields, nowSec: nowSec),
         ]

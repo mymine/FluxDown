@@ -3,7 +3,7 @@ title: 安装
 description: 在 Windows、macOS 或 Linux 上安装 FluxDown,完成首次启动配置。
 section: getting-started
 order: 1
-sourceHash: "0286acf9dcec"
+sourceHash: "51af74b174e5"
 ---
 
 FluxDown 为 Windows、macOS、Linux 三大平台提供完整的原生构建,每个安装包内置相同的 Rust 下载引擎与相同的界面——没有"精简版",也不需要注册账号。
@@ -41,7 +41,7 @@ scoop install extras/fluxdown
 - **DMG** —— `FluxDown-<版本号>-macos-<架构>.dmg`(Apple Silicon 选 `arm64`,Intel 选 `x64`)。打开后将 FluxDown 拖入**应用程序**文件夹。
 - **便携版** —— `FluxDown-<版本号>-macos-<架构>.tar.gz`。解压后直接运行其中的 App。
 
-安装包未经公证,首次启动会被 Gatekeeper 拦截并提示"身份不明的开发者"。右键(或 Control 键点击)应用图标选择**打开**,或在**系统设置 → 隐私与安全性**中选择**仍要打开**。
+两种形式都已使用 Apple Developer ID 签名并经 Apple 公证,打开时不会出现 Gatekeeper 拦截提示。
 
 ## Linux
 

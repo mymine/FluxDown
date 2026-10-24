@@ -45,10 +45,14 @@ data class LinkPairingRequest(
     val peerPlatform: String?,
     /** 双方肉眼核对的短认证串（6 位数字）。 */
     val sas: String,
+    /** 本机时钟下的到期时刻（Unix 毫秒）：收到 DTO 的本机时刻 + `ttlMs`；旧主机无 `ttlMs` 才回退主机时钟的 `expiresAtUnixMs`。 */
     val expiresAtUnixMs: Long,
+    /** 对端请求完全控制本机（批准 = 授予对端远程控制本机 FluxDown 的权限）。 */
+    val requestsControl: Boolean = false,
 ) {
     companion object {
-        fun fromJson(v: JsonValue?): LinkPairingRequest? {
+        /** [nowMs] = 收到 DTO 的本机时刻（相对 TTL 的起点）。 */
+        fun fromJson(v: JsonValue?, nowMs: Long = System.currentTimeMillis()): LinkPairingRequest? {
             val sessionId = v.strOrNull("sessionId") ?: return null
             return LinkPairingRequest(
                 sessionId = sessionId,
@@ -56,17 +60,20 @@ data class LinkPairingRequest(
                 peerFingerprint = v.str("peerFingerprint"),
                 peerPlatform = v.strOrNull("peerPlatform"),
                 sas = v.str("sas"),
-                expiresAtUnixMs = v.long("expiresAtUnixMs"),
+                expiresAtUnixMs = LinkRules.localDeadline(v.longOrNull("ttlMs"), v.long("expiresAtUnixMs"), nowMs),
+                requestsControl = v.bool("requestsControl"),
             )
         }
 
-        fun listFromJson(v: JsonValue?): List<LinkPairingRequest> = v.arrayOrNull.orEmpty().mapNotNull(::fromJson)
+        fun listFromJson(v: JsonValue?, nowMs: Long = System.currentTimeMillis()): List<LinkPairingRequest> =
+            v.arrayOrNull.orEmpty().mapNotNull { fromJson(it, nowMs) }
     }
 }
 
 /** `agent.link.pairingCode` 结果：本机当前展示的配对码。 */
 data class LinkPairingCode(
     val code: String,
+    /** 本机时钟下的到期时刻（Unix 毫秒），算法同 [LinkPairingRequest.expiresAtUnixMs]。 */
     val expiresAtUnixMs: Long,
     /** 本机可被对端直连的地址（`http(s)://host:port`）；空 = 网关仅回环（局域网未开启）。 */
     val addresses: List<String>,
@@ -74,9 +81,9 @@ data class LinkPairingCode(
     val deviceName: String,
 ) {
     companion object {
-        fun fromJson(v: JsonValue?): LinkPairingCode = LinkPairingCode(
+        fun fromJson(v: JsonValue?, nowMs: Long = System.currentTimeMillis()): LinkPairingCode = LinkPairingCode(
             code = v.str("code"),
-            expiresAtUnixMs = v.long("expiresAtUnixMs"),
+            expiresAtUnixMs = LinkRules.localDeadline(v.longOrNull("ttlMs"), v.long("expiresAtUnixMs"), nowMs),
             addresses = v.strings("addresses"),
             fingerprint = v.str("fingerprint"),
             deviceName = v.str("deviceName"),
@@ -119,8 +126,10 @@ data class LinkAddressParams(val address: String) {
     fun toJson(): JsonValue = jsonObject("address" to address)
 }
 
-data class LinkPairBeginParams(val address: String, val code: String) {
-    fun toJson(): JsonValue = jsonObject("address" to address, "code" to code)
+/** [requestControl] = 本次配对同时请求完全控制对端；false 时省略字段（旧主机 / 普通设备配对的 wire 与以前一致）。 */
+data class LinkPairBeginParams(val address: String, val code: String, val requestControl: Boolean = false) {
+    fun toJson(): JsonValue =
+        if (requestControl) jsonObject("address" to address, "code" to code, "requestControl" to true) else jsonObject("address" to address, "code" to code)
 }
 
 data class LinkPairFinishParams(val token: String, val accept: Boolean) {
@@ -134,6 +143,13 @@ data class LinkApproveParams(val sessionId: String, val accept: Boolean) {
 /** `agent.link.remove` 的设备定位参数。 */
 data class LinkDeviceParams(val fingerprint: String) {
     fun toJson(): JsonValue = jsonObject("fingerprint" to fingerprint)
+}
+
+/** `agent.link.controlCredential` 结果：本机对某已配对主机的设备专属控制凭据（连接该主机 `/rpc` 的 Bearer）。 */
+data class LinkControlCredential(val token: String) {
+    companion object {
+        fun fromJson(v: JsonValue?): LinkControlCredential = LinkControlCredential(token = v.str("token"))
+    }
 }
 
 /** `agent.link.rename` 参数：[name] 为 null = 清除备注名（恢复对方自报名）。 */
@@ -203,12 +219,12 @@ object LinkRules {
     }
 
     /** 校验并规整 `pairBegin` 输入：地址原样交给 agent 解析，配对码去掉空白 / 连字符后必须是 6 位数字。 */
-    fun validate(address: String, code: String): Validation {
+    fun validate(address: String, code: String, requestControl: Boolean = false): Validation {
         val trimmed = address.trim()
         if (!isManualAddressValid(trimmed)) return Validation.Failed(InputError.AddressMissing)
         val digits = code.filter { !it.isWhitespace() && it != '-' }
         if (!isPairingCodeComplete(digits)) return Validation.Failed(InputError.CodeIncomplete)
-        return Validation.Ok(LinkPairBeginParams(trimmed, digits))
+        return Validation.Ok(LinkPairBeginParams(trimmed, digits, requestControl))
     }
 
     /** 发现列表里的一台设备（已去重、标注是否已配对）。 */
@@ -219,11 +235,17 @@ object LinkRules {
         val address: String,
         /** 已与本机配对（按指纹判断，对方已解除的记录不算），不可再选。 */
         val paired: Boolean,
+        /** 对端指纹（mDNS 未探测到时为 null）。 */
+        val fingerprint: String? = null,
+        /** 已配对且本机可控制它：添加主机时可跳过配对，直接取控制凭据连接。 */
+        val controllable: Boolean = false,
     )
 
     /** 发现快照 → 列表：已配对标记、同一地址只保留一条、按名称（不区分大小写）排序。 */
     fun discoveredEntries(peers: List<LinkDiscoveredPeer>, paired: List<LinkDevice>): List<DiscoveredEntry> {
-        val known = paired.filter { !it.revoked }.mapTo(HashSet()) { it.fingerprint }
+        val live = paired.filter { !it.revoked }
+        val known = live.mapTo(HashSet()) { it.fingerprint }
+        val controllable = live.filter { it.controllable }.mapTo(HashSet()) { it.fingerprint }
         val seen = HashSet<String>()
         val entries = ArrayList<DiscoveredEntry>()
         for (peer in peers) {
@@ -234,10 +256,26 @@ object LinkRules {
                 platform = peer.platform,
                 address = hostPort,
                 paired = peer.fingerprint?.let { it in known } ?: false,
+                fingerprint = peer.fingerprint,
+                controllable = peer.fingerprint?.let { it in controllable } ?: false,
             )
         }
         return entries.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.name })
     }
+
+    /** 添加主机的发现列表：同 [discoveredEntries]，但可直接连接的已配对主机（[DiscoveredEntry.controllable]）排在最前。 */
+    fun hostEntries(peers: List<LinkDiscoveredPeer>, paired: List<LinkDevice>): List<DiscoveredEntry> =
+        discoveredEntries(peers, paired).sortedByDescending { it.controllable }
+
+    /** 以「请求控制」发起配对时对端不支持：配对协议版本不符 / 对端过旧（无 `linkControl` 能力）→ 提示更新主机或改用访问密钥。 */
+    fun isControlUnsupported(reason: String?): Boolean = reason == "pairingVersionMismatch" || reason == "peerOutdated"
+
+    /**
+     * 相对 TTL → 本机到期时刻：[ttlMs]（主机生成 DTO 时的剩余毫秒）从本机收到 DTO 的 [nowMs] 起算；
+     * 缺失 / 0（旧主机的 serde 缺省值；真到期的 DTO 本就马上被清理）才回退主机时钟的 [wireExpiresAtUnixMs]。
+     */
+    fun localDeadline(ttlMs: Long?, wireExpiresAtUnixMs: Long, nowMs: Long): Long =
+        if (ttlMs != null && ttlMs > 0) nowMs + ttlMs else wireExpiresAtUnixMs
 
     /** 配对码 / 入站请求距离过期还剩多少秒（向上取整，已过期为 0）。 */
     fun secondsUntil(expiresAtUnixMs: Long, nowMs: Long): Long {

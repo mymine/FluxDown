@@ -1,7 +1,7 @@
 // 新建下载：字段、顺序与提交语义对齐 GPUI `pages/new_download.rs`（纯规则见 `model.ts`）。
 //
-// - 链接文本框（一行一条，`out=` / `checksum=` 选项行）、打开 .torrent（浏览器选文件 → blob 上传）、导入 TXT（浏览器端读取）；
-// - 保存目录 + 服务端目录选择器；文件名 | 线程数；「高级」折叠区（HTTP 认证 / 代理 / UA / Cookie / 校验 / 请求头 / 忽略 TLS）；
+// - 链接文本框（一行一条，`out=` / `checksum=` 选项行；默认收起约 3 行，标签行右侧可展开，批量输入自动展开）、打开 .torrent（浏览器选文件 → blob 上传）、导入 TXT（浏览器端读取）；
+// - 保存目录 + 服务端目录选择器；文件名、线程数各占一行；「高级」折叠区（HTTP 认证 / 代理 / UA / Cookie / 校验 / 请求头 / 忽略 TLS）；
 // - 底栏：取消、「稍后下载」分体按钮（队列菜单）、主按钮「开始下载」分体按钮（队列菜单）；
 // - 单条 http(s) 链接先 `daemon.group.resolvePreview` 探测插件多文件清单，命中则进入清单选择建任务组；
 // - 外部捕获（`agent.capture.*`）作为链接行并入表单，提交时经 `agent.capture.resolve` 确认，关闭时未确认的一并忽略。
@@ -10,11 +10,14 @@ import { ChevronDown, ChevronRight, FileText, FolderOpen, Plus, X } from 'lucide
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import { useT } from '../../../i18n'
-import { LATER_QUEUE_ID, MAIN_QUEUE_ID, METHOD, RpcError, call, rpc, rpcStore, useAgent, useConfigValues, useConnection, useDaemon } from '../../../lib/rpc'
+import { CUSTOM_CATEGORIES_PREF_KEY, LATER_QUEUE_ID, MAIN_QUEUE_ID, METHOD, RpcError, call, rpc, rpcStore, useAgent, useConfigValues, useConnection, useDaemon } from '../../../lib/rpc'
+import { autoFollowDir, modeDir, pickableCategories, routeBaseDir, routeFollows, routeFromCategories, routeSaveDir } from '../../../lib/categoryRoute'
+import type { CategoryPickMode } from '../../../lib/categoryRoute'
+import { categoriesFromPreference } from '../model/categories'
 import { cloudPresenceKnown } from '../../../lib/cloud-presence'
 import { describeUploadError } from '../../../lib/rpcErrorText'
 import { ThreadsRiskCallout } from '../../../lib/ThreadsRiskCallout'
-import type { AgentSnapshot, CloudDevice, LinkDeviceInfo, PendingCaptureDto, QueueDto, ResolvePreviewResponse } from '../../../lib/rpc'
+import type { AgentSnapshot, CloudDevice, JsonValue, LinkDeviceInfo, PendingCaptureDto, QueueDto, ResolvePreviewResponse } from '../../../lib/rpc'
 import { Button, Dialog, DialogFooter, FieldError, FieldHint, FieldLabel, Form, FormField, FormRow, Icon, Input, InputWithAction, OptionGroup, OptionRow, Select, Spinner, Switch, Textarea, toast } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
 import { FsPickerDialog } from './FsPickerDialog'
@@ -31,6 +34,9 @@ import { SplitButton } from './SplitButton'
 import { capturesShown, closeNewDownload } from './store'
 import type { NewDownloadSession } from './store'
 import { isTorrentFile, submitTorrentFiles } from './torrents'
+import { SaveDirCombo } from './SaveDirCombo'
+import { CategoryPicker } from './CategoryPicker'
+import { SAVE_DIR_HISTORY_ENABLED_PREF, SAVE_DIR_HISTORY_PREF, readSaveDirHistory, recordSaveDir, saveDirChoices } from '../../../lib/saveDirHistory'
 import { accountErrorKey } from '../../settings/sections/account/errorText'
 import { buildRemoteTargets, checkRemoteSaveDir, dispatchRoute, LOCAL_TARGET, linkDispatchParams, pathExample, remoteDispatchParams, resolveTargetValue, summarizeDispatch } from './target'
 import type { RemoteTarget } from './target'
@@ -41,6 +47,8 @@ const RESOLVE_PREVIEW_TIMEOUT_MS = 90_000
 const SITE_AUTH_LOOKUP_DEBOUNCE_MS = 250
 /** 失败原因最多渲染的行数（超出的只显示计数，避免上万行 DOM）。 */
 const MAX_FAILURE_ROWS = 50
+/** 链接输入框随内容自增高的上限（行）；超出后框内滚动。与 GPUI `URLS_MAX_ROWS` 一致。 */
+const URLS_MAX_ROWS = 10
 
 const EMPTY_CAPTURES: readonly PendingCaptureDto[] = []
 const EMPTY_QUEUES: readonly QueueDto[] = []
@@ -89,10 +97,13 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     () => buildRemoteTargets(cloudDevices, linkedDevices, { cloud: cloudReady, local: localReady }),
     [cloudDevices, linkedDevices, cloudReady, localReady],
   )
-  const [targetValue, setTargetValue] = useState(LOCAL_TARGET)
+  const [targetValue, setTargetValue] = useState(session.target ?? LOCAL_TARGET)
   // 目标设备消失（登出 / 解除配对）时回落到本服务器。
   const target: RemoteTarget | null = resolveTargetValue(targetValue, remoteTargets)
   const [remoteSaveDir, setRemoteSaveDir] = useState('')
+  const historyEnabled = useAgent((snapshot) => snapshot.preferences.values[SAVE_DIR_HISTORY_ENABLED_PREF] !== false, true)
+  const historyValue = useAgent((snapshot) => snapshot.preferences.values[SAVE_DIR_HISTORY_PREF], undefined)
+  const saveDirHistory = useMemo(() => (historyEnabled ? readSaveDirHistory(historyValue) : null), [historyEnabled, historyValue])
 
   const [text, setText] = useState(() => session.initialUrls.join('\n'))
   const [captures, setCaptures] = useState<PendingCaptureDto[]>([])
@@ -159,6 +170,33 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
   const remoteDirCheck = target ? checkRemoteSaveDir(remoteSaveDir, target.pathStyle) : 'ok'
   const canSubmit = !busy && count > 0 && (target ? remoteDirCheck === 'ok' : saveDir.trim() !== '')
 
+  // ── 分类下拉：Auto 模式下目录框跟随识别出的文件名（规则见 `lib/categoryRoute.ts`）──
+  const categoriesPref = useAgent((snapshot) => snapshot.preferences.values[CUSTOM_CATEGORIES_PREF_KEY], undefined)
+  const categories = useMemo(() => categoriesFromPreference(categoriesPref), [categoriesPref])
+  const categoryRoute = useMemo(() => routeFromCategories(categories), [categories])
+  const categoryOptions = useMemo(() => pickableCategories(categories), [categories])
+  const [categoryMode, setCategoryMode] = useState<CategoryPickMode>({ kind: 'auto' })
+  /** 上一次自动写入目录框的值；用户手改后与之不等，不再覆盖。 */
+  const lastAutoDir = useRef<string | null>(null)
+  const categoryShown = categoryRoute !== null && !target
+  const predictedName = rename.trim() !== '' ? rename.trim() : (entries[0]?.fileName ?? '')
+  const predictedUrl = entries[0]?.url ?? ''
+  const predictedDir = categoryShown && categoryRoute ? routeSaveDir(categoryRoute, predictedName, predictedUrl) : null
+  useEffect(() => {
+    if (!categoryShown || categoryMode.kind !== 'auto') return
+    const next = autoFollowDir(saveDir, context.saveDir, lastAutoDir.current, predictedDir)
+    if (next === null) return
+    lastAutoDir.current = next
+    if (next !== saveDir) setSaveDir(next)
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 仅在预测输入 / 模式变化时跟随，目录框当前值取渲染时快照
+  }, [categoryShown, categoryMode.kind, predictedDir])
+  const pickCategory = (mode: CategoryPickMode) => {
+    setCategoryMode(mode)
+    const next = modeDir(mode, categoryOptions, context.saveDir, predictedDir)
+    lastAutoDir.current = mode.kind === 'auto' ? next : null
+    setSaveDir(next)
+  }
+
   // ── 外部捕获并入表单 ──
   const capturesRef = useRef<PendingCaptureDto[]>([])
   capturesRef.current = captures
@@ -173,7 +211,10 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
       const current = textRef.current
       if (current.trim() === '') {
         const dir = fresh.map((capture) => capture.saveDir.trim()).find((value) => value !== '')
-        if (dir) setSaveDir(dir)
+        if (dir) {
+          lastAutoDir.current = dir
+          setSaveDir(dir)
+        }
       }
       setText(appendEntries(current, fresh.map((capture) => captureEntry(capture.url, capture.fileName))))
       setCaptures((prev) => [...prev, ...fresh])
@@ -284,6 +325,9 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     return map
   }
 
+  // 保存目录历史（偏好关闭时为空）中除当前输入以外的目录，交给组合框下拉。
+  const saveDirOptions = saveDirHistory ? saveDirChoices(saveDirHistory, saveDir) : []
+
   const draftOptions = (later: boolean, queueOverride: string | undefined): DraftOptions => ({
     saveDir: saveDir.trim(),
     segments,
@@ -303,7 +347,14 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
 
   const rememberSaveDir = (dir: string) => {
     // 尽力而为：失败不影响建任务；无条件记录，「记住上次目录」开关开启后立即生效。
-    void rpc.agent.preferences.patch({ values: { 'download.last_save_dir': dir }, sync: false }).catch(() => undefined)
+    const values: Record<string, JsonValue> = { 'download.last_save_dir': dir }
+    // 历史（偏好关闭时不记）按提交时的最新快照计算，与 GPUI `record_save_dir_history` 同规则。
+    const prefs = rpcStore.peek().snapshot?.preferences.values ?? {}
+    if (prefs[SAVE_DIR_HISTORY_ENABLED_PREF] !== false) {
+      const next = recordSaveDir(readSaveDirHistory(prefs[SAVE_DIR_HISTORY_PREF]), dir)
+      if (next) values[SAVE_DIR_HISTORY_PREF] = next
+    }
+    void rpc.agent.preferences.patch({ values, sync: false }).catch(() => undefined)
   }
 
   /** 逐条下发到云账号设备 / 已配对设备；成功的从文本框移除，失败的保留并逐条显示原因。 */
@@ -417,11 +468,18 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
 
     let noticeText: string | null = null
     if (plain.length > 0) {
-      const { common, items } = buildBatch(
+      const batch = buildBatch(
         plain.map((index) => entries[index]),
         options,
         entries.length === 1,
       )
+      const { items } = batch
+      let { common } = batch
+      // 分类路由：只对本机提交生效；目录仍是表单初始值 / 分类目录时交给引擎按文件名定落点；
+      // 分类下拉选了「不分类」/ 指定分类时用户已显式定目录，不路由。
+      const route = categoryShown && categoryMode.kind === 'auto' ? categoryRoute : null
+      const followed = route !== null && routeFollows(route, options.saveDir, context.saveDir) ? route : null
+      if (followed) common = { ...common, saveDir: routeBaseDir(followed, options.saveDir, context.saveDir) }
       const controller = new AbortController()
       importAbort.current = controller
       setCancelling(false)
@@ -430,6 +488,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
       const report = await runImport({
         common,
         items,
+        categoryRoute: followed,
         call: rpc.daemon.task.createMany,
         sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
         signal: controller.signal,
@@ -661,11 +720,11 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
             </div>
             <Textarea
               id="new-download-urls"
-              rows={6}
+              maxAutoRows={URLS_MAX_ROWS}
               value={text}
               spellCheck={false}
               autoFocus
-              placeholder={t('batchUrlPlaceholder')}
+              placeholder={t('newDownloadUrlPlaceholder')}
               onChange={(event) => setText(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
@@ -750,7 +809,21 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
           ) : (
             <FormField label={t('saveDir')} htmlFor="new-download-save-dir">
               <InputWithAction
-                input={<Input id="new-download-save-dir" value={saveDir} placeholder={t('selectSaveDir')} spellCheck={false} onChange={(event) => setSaveDir(event.target.value)} />}
+                input={
+                  <div className="flex flex-wrap items-center gap-2">
+                    {categoryShown ? <CategoryPicker mode={categoryMode} options={categoryOptions} predicted={predictedDir} onChange={pickCategory} /> : null}
+                    <div className="min-w-[14rem] flex-1">
+                      <SaveDirCombo
+                        id="new-download-save-dir"
+                        value={saveDir}
+                        placeholder={t('selectSaveDir')}
+                        choices={saveDirOptions}
+                        label={t('saveDirRecent')}
+                        onChange={setSaveDir}
+                      />
+                    </div>
+                  </div>
+                }
                 action={
                   <Button icon={FolderOpen} onClick={() => setPickerOpen(true)}>
                     {t('browse')}
@@ -760,36 +833,34 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
             </FormField>
           )}
 
-          {/* 文件名 | 线程数：批量隐藏文件名，全磁力隐藏线程数 */}
-          {!batch || !allMagnet ? (
+          {/* 文件名：独占一行（与保存目录同宽），批量隐藏 */}
+          {!batch ? (
+            <FormField label={t('renameOptional')} htmlFor="new-download-rename">
+              <Input id="new-download-rename" value={rename} placeholder={t('autoDetectFilename')} spellCheck={false} onChange={(event) => setRename(event.target.value)} />
+            </FormField>
+          ) : null}
+
+          {/* 线程数：独占一行，全磁力隐藏；过高时下方风险提示 */}
+          {!allMagnet ? (
             <div className="flex flex-col">
-              <FormRow>
-                {!batch ? (
-                  <FormField label={t('renameOptional')} htmlFor="new-download-rename">
-                    <Input id="new-download-rename" value={rename} placeholder={t('autoDetectFilename')} spellCheck={false} onChange={(event) => setRename(event.target.value)} />
-                  </FormField>
-                ) : null}
-                {!allMagnet ? (
-                  <FormField label={t('threads')}>
-                    <div className="flex items-center gap-2">
-                      <div className={threads === 'custom' ? 'w-26 shrink-0' : 'min-w-0 flex-1'}>
-                        <Select value={threads} options={threadOptions} aria-label={t('threads')} onValueChange={changeThreads} />
-                      </div>
-                      {threads === 'custom' ? (
-                        <Input
-                          className="min-w-0 flex-1"
-                          inputMode="numeric"
-                          value={customThreads}
-                          placeholder={t('customRangeHint', { min: 1, max: MAX_THREADS })}
-                          aria-label={t('customThreads')}
-                          onChange={(event) => setCustomThreads(event.target.value.replace(/[^0-9]/g, ''))}
-                        />
-                      ) : null}
-                    </div>
-                  </FormField>
-                ) : null}
-              </FormRow>
-              {!allMagnet ? <ThreadsRiskCallout segments={segments} /> : null}
+              <FormField label={t('threads')}>
+                <div className="flex items-center gap-2">
+                  <div className={threads === 'custom' ? 'w-26 shrink-0' : 'min-w-0 flex-1'}>
+                    <Select value={threads} options={threadOptions} aria-label={t('threads')} onValueChange={changeThreads} />
+                  </div>
+                  {threads === 'custom' ? (
+                    <Input
+                      className="min-w-0 flex-1"
+                      inputMode="numeric"
+                      value={customThreads}
+                      placeholder={t('customRangeHint', { min: 1, max: MAX_THREADS })}
+                      aria-label={t('customThreads')}
+                      onChange={(event) => setCustomThreads(event.target.value.replace(/[^0-9]/g, ''))}
+                    />
+                  ) : null}
+                </div>
+              </FormField>
+              <ThreadsRiskCallout segments={segments} />
             </div>
           ) : null}
 

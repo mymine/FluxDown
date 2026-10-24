@@ -1213,18 +1213,17 @@ fn decrypt_segment(
 pub async fn run_hls_download(params: DownloadParams) -> Option<DownloadParams> {
     let task_id_log = params.task_id.clone();
     let result = match run_hls_download_inner(&params).await {
-        // 完成前先跑插件后处理(未声明 finalize 阶段时零调用);成功后才写状态 3。
-        Ok(total) => {
-            match crate::downloader::finalize_with_interceptors(&params, ProtocolKind::Hls).await {
-                Ok(replaced) => params
-                    .db
-                    .update_task_status(&params.task_id, 3, "")
-                    .await
-                    .map(|()| (total, replaced))
-                    .map_err(DownloadError::Db),
-                Err(error) => Err(error),
-            }
-        }
+        // 完成前先跑插件后处理(未声明 finalize 阶段时零调用)与分类目录复核;成功后才写
+        // 状态 3。转封装已在 inner 内完成,复核看到的是最终的 `.mp4` / `.ts`。
+        Ok(total) => match crate::downloader::finalize_output(&params, ProtocolKind::Hls).await {
+            Ok(replaced) => params
+                .db
+                .update_task_status(&params.task_id, 3, "")
+                .await
+                .map(|()| (total, replaced))
+                .map_err(DownloadError::Db),
+            Err(error) => Err(error),
+        },
         Err(error) => Err(error),
     };
 

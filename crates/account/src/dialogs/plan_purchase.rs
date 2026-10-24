@@ -12,6 +12,7 @@ use fluxdown_protocol::{
 use fluxdown_ui_components::{
     ButtonVariant, ControlExt as _, FluxIcon, QrPalette, button, caption_number, card,
     dialog_scroll_body, dialog_title, icon_button, loading_button, qr_image, tabular_numbers,
+    tooltip_view,
 };
 use fluxdown_ui_theme::{SemanticThemeTokens, active_theme};
 use gpui::{
@@ -26,7 +27,6 @@ use gpui_component::{
     notification::Notification,
     skeleton::Skeleton,
     spinner::Spinner,
-    tooltip::Tooltip,
     v_flex,
 };
 
@@ -831,7 +831,7 @@ impl PlanPurchaseDialog {
             .session()
             .and_then(|session| session.user.membership_ordinal);
         let badge = plan_badge(tokens, &extended, plan, membership);
-        let price = price_display(plan, self.credit_minor);
+        let price = price_display(plan, state, self.credit_minor);
         let progress = campaign_progress(plan);
         let ends = plan
             .campaign
@@ -1218,7 +1218,7 @@ impl PlanPurchaseDialog {
                             ButtonVariant::Ghost,
                             cx,
                         )
-                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                        .tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
                         .on_click(cx.listener(
                             |this, _: &ClickEvent, window, cx| {
                                 this.copy_order_no(window, cx);

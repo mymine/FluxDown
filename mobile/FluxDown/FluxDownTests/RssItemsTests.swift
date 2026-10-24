@@ -49,6 +49,15 @@ struct RssItemsTests {
         #expect(RssFormat.chip(for: item("a", status: 1, taskId: "gone"), task: nil).tone == .failure)
     }
 
+    /// 任务表分页载入中查不到关联任务不代表已删除：不得显示「任务已删除」。
+    @Test func missingLinkedTaskWhileTasksLoadAreNotMarkedMissing() {
+        let downloaded = item("a", status: 1, taskId: "t1")
+        #expect(RssFormat.chip(for: downloaded, task: nil, tasksLoading: true).titleKey == "rssTaskCreated")
+        // 已查到的任务仍以真实状态为准；载入完成后查不到才是「已删除」。
+        #expect(RssFormat.chip(for: downloaded, task: RssLinkedTask(status: .paused), tasksLoading: true).titleKey == "statusPaused")
+        #expect(RssFormat.chip(for: downloaded, task: nil, tasksLoading: false).titleKey == "rssTaskMissing")
+    }
+
     // MARK: 可见条目
 
     @Test func visibleFiltersByTitleCaseInsensitively() {

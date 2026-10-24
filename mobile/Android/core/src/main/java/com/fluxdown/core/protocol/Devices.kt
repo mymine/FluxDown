@@ -134,6 +134,17 @@ object DeviceRules {
     }
 
     /**
+     * 设备页云设备排序（iOS `DeviceRules.sorted`）：本机在前 → 在线 → 其余，同组按名称（忽略大小写）；稳定。
+     * [presenceKnown] = false 时在线状态不可信，不按在线分组（未知不当离线沉底）。
+     */
+    fun sorted(devices: List<CloudDevice>, presenceKnown: Boolean): List<CloudDevice> =
+        devices.sortedWith(
+            compareByDescending<CloudDevice> { it.isCurrent }
+                .thenByDescending { presenceKnown && it.isOnline }
+                .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name },
+        )
+
+    /**
      * 「下载到」候选（`crates/downloads/src/model/devices.rs::other_devices`），按「其他设备」合并规则：
      *
      * 1. 云条目：去掉本机与空 id，按 id 去重；

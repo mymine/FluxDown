@@ -59,6 +59,13 @@ impl BatchModel {
         true
     }
 
+    /// The task table is still loading: keep the batch queued and check again after a batch delay.
+    fn defer(&mut self, now: Instant) {
+        if let Some(due) = self.deadline.as_mut() {
+            *due = (*due).max(now + BATCH_DELAY);
+        }
+    }
+
     fn take_due(&mut self, now: Instant) -> Option<(VecDeque<String>, usize)> {
         if !self.enabled || self.deadline.is_none_or(|due| due > now) {
             return None;
@@ -297,14 +304,21 @@ fn flush(generation: u64, cx: &mut App) {
         shutdown(cx);
         return;
     }
+    let session = Desktop::global(cx).session.clone();
+    let loading = session.read(cx).tables_loading();
     let state = cx.global_mut::<CompletionWindows>();
     if state.generation != generation {
+        return;
+    }
+    if loading {
+        // The projection's task table is a placeholder while it pages in: judging "completed"
+        // against it would drop the whole batch. Keep the batch and look again shortly.
+        state.model.defer(Instant::now());
         return;
     }
     let Some((ids, count)) = state.model.take_due(Instant::now()) else {
         return;
     };
-    let session = Desktop::global(cx).session.clone();
     let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
     // Borrow only the current status/ID: all names, paths and actions come from the existing view.
     let completed: HashSet<&str> = session
@@ -389,6 +403,20 @@ mod tests {
         assert!(!model.enqueue("a".into(), now + CLOSE_COOLDOWN));
         model.forget("a");
         assert!(model.enqueue("a".into(), now + CLOSE_COOLDOWN));
+    }
+
+    #[test]
+    fn deferring_while_tables_load_keeps_the_batch_and_pushes_the_deadline() {
+        let now = Instant::now();
+        let mut model = enabled_model();
+        model.enqueue("a".into(), now);
+        model.defer(now + BATCH_DELAY);
+        assert_eq!(model.deadline, Some(now + BATCH_DELAY * 2));
+        assert!(model.take_due(now + BATCH_DELAY).is_none());
+        let (rows, count) = model
+            .take_due(now + BATCH_DELAY * 2)
+            .expect("deferred batch");
+        assert_eq!((rows.len(), count), (1, 1));
     }
 
     #[test]

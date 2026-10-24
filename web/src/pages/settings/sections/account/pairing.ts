@@ -24,11 +24,32 @@ export function isManualAddressValid(address: string): boolean {
   return address.trim() !== '' && !/\s/.test(address.trim())
 }
 
-/** 发现列表里去掉已配对的设备（按指纹）。指纹未知的 mDNS 条目保留。 */
+/** 发现列表里去掉已配对的设备（按指纹）。已被对端解除（revoked）的不算已配对，保留以便重新配对；指纹未知的 mDNS 条目保留。 */
 export function unpairedPeers(
   peers: readonly LinkDiscoveredPeer[],
-  paired: readonly Pick<LinkDeviceInfo, 'fingerprint'>[],
+  paired: readonly Pick<LinkDeviceInfo, 'fingerprint' | 'revoked'>[],
 ): LinkDiscoveredPeer[] {
-  const known = new Set(paired.map((device) => device.fingerprint))
+  const known = new Set(paired.filter((device) => !device.revoked).map((device) => device.fingerprint))
   return peers.filter((peer) => !peer.fingerprint || !known.has(peer.fingerprint))
+}
+
+/** 本机码续期的最小间隔（与移动端 `MIN_REFRESH_DELAY_MS` 一致）：时钟偏差时避免续码风暴。 */
+export const MIN_RENEW_DELAY_MS = 3000
+
+/**
+ * 配对码 / 入站请求的本机截止时刻：以收到 DTO 的本机时刻 + `ttlMs` 计算（免疫主机与客户端的时钟偏差）；
+ * 旧主机没有 `ttlMs` 时才回退主机绝对时间 `expiresAtUnixMs`。
+ */
+export function localDeadlineMs(dto: { ttlMs?: number; expiresAtUnixMs: number }, receivedAtMs: number): number {
+  return dto.ttlMs === undefined ? dto.expiresAtUnixMs : receivedAtMs + dto.ttlMs
+}
+
+/** 距截止的剩余秒数（向上取整，不为负）。 */
+export function secondsUntil(deadlineMs: number, nowMs: number): number {
+  return Math.max(0, Math.ceil((deadlineMs - nowMs) / 1000))
+}
+
+/** 续码定时器延迟：至少 `MIN_RENEW_DELAY_MS`。 */
+export function renewDelayMs(deadlineMs: number, nowMs: number): number {
+  return Math.max(MIN_RENEW_DELAY_MS, deadlineMs - nowMs)
 }

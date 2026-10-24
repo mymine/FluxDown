@@ -10,6 +10,7 @@ extension StatusFolder {
         case .all: L("tabAll")
         case .active: L("tabDownloading")
         case .completed: L("tabCompleted")
+        case .seeding: L("statusSeeding")
         case .failed: L("tabError")
         case .paused: L("tabPaused")
         }

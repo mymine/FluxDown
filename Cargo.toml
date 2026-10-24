@@ -6,6 +6,7 @@
 [workspace]
 resolver = "3"
 members = ["native/*", "crates/*", "scripts/desktop-dev"]
+exclude = ["poc/iroh-demo"]
 
 [workspace.package]
 edition = "2024"
@@ -16,12 +17,12 @@ edition = "2024"
 # GPUI API 不匹配。实际实现由下方 `[patch.crates-io]` 换成 gpui-fast（同名同版本的兼容壳）。
 gpui = { package = "gpui-pre", version = "=0.3.9" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui-base = "0.7.1"
-gpui-component = "0.7.1"
-gpui-component-assets = { package = "gpui-kit-assets", version = "0.7.1" }
+gpui-base = "0.8.0"
+gpui-component = "0.8.0"
+gpui-component-assets = { package = "gpui-kit-assets", version = "0.8.0" }
 # GPUI Shell（gpui-kit 的 JS 插件 UI 运行时，未发布到 crates.io）：与上面的 gpui-kit 组件同一
 # commit。关 `webview`（会引入 wry 与 gpui-fast 直连），保留 `quickjs` 引擎与 `components` 组件目录。
-gpui-shell = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563", default-features = false, features = ["quickjs", "components"] }
+gpui-shell = { git = "https://github.com/longbridge/gpui-kit", rev = "4d63c733f77b6803a57d2ff56fa6f85cb751c9b4", default-features = false, features = ["quickjs", "components"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0"
@@ -55,20 +56,23 @@ librqbit-dualstack-sockets = { path = "third_party/librqbit-dualstack-sockets" }
 # 必须等 gpui-fast 的 compat 跟到同一快照版本，否则补丁不生效（cargo 警告 patch 未使用）。
 # 渲染读取的状态须在 entity / global / ListState / ScrollHandle 内，改了要 notify 读者；
 # 排查界面陈旧时用 `GPUI_VIEW_RETENTION=0`（关复用）/ `GPUI_SCROLL_LAYERS=0`（关滚动图层）对照。
-gpui-pre = { git = "https://github.com/longbridge/gpui-fast", rev = "fa133a1dd970532dce4ffaee8577438971e5dec9" }
-gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast", rev = "fa133a1dd970532dce4ffaee8577438971e5dec9" }
-gpui-pre-macros = { git = "https://github.com/longbridge/gpui-fast", rev = "fa133a1dd970532dce4ffaee8577438971e5dec9" }
-gpui-pre-sum-tree = { git = "https://github.com/longbridge/gpui-fast", rev = "fa133a1dd970532dce4ffaee8577438971e5dec9" }
+gpui-pre = { git = "https://github.com/longbridge/gpui-fast", rev = "b836dd970b26830f2124b7cf91b0e19018fd12da" }
+gpui-pre-platform = { git = "https://github.com/longbridge/gpui-fast", rev = "b836dd970b26830f2124b7cf91b0e19018fd12da" }
+gpui-pre-macros = { git = "https://github.com/longbridge/gpui-fast", rev = "b836dd970b26830f2124b7cf91b0e19018fd12da" }
+gpui-pre-sum-tree = { git = "https://github.com/longbridge/gpui-fast", rev = "b836dd970b26830f2124b7cf91b0e19018fd12da" }
+# gpui-kit 0.8 起经 `gpui-kit` crate 引入 `gpui-pre-web`（仅 wasm 目标）；同样换成 compat，免得锁文件里
+# 再挂一份 crates.io 的 gpui-pre-web / gpui-pre-wgpu / wgpu 29。
+gpui-pre-web = { git = "https://github.com/longbridge/gpui-fast", rev = "b836dd970b26830f2124b7cf91b0e19018fd12da" }
 # gpui-kit 组件统一走 main 钉 commit（gpui-shell 只存在于 git，且其 `components` 组件目录
 # 必须与 FluxDown 使用的 gpui-component 是同一份类型），四个包必须同 rev。
-gpui-base = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563" }
-gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563" }
-gpui-component-macros = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563" }
-gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563" }
+gpui-base = { git = "https://github.com/longbridge/gpui-kit", rev = "4d63c733f77b6803a57d2ff56fa6f85cb751c9b4" }
+gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "4d63c733f77b6803a57d2ff56fa6f85cb751c9b4" }
+gpui-component-macros = { git = "https://github.com/longbridge/gpui-kit", rev = "4d63c733f77b6803a57d2ff56fa6f85cb751c9b4" }
+gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "4d63c733f77b6803a57d2ff56fa6f85cb751c9b4" }
 # gpui-shell 的 LLRT 标准库按 crates.io 名 `rquickjs` 依赖绑定；gpui-kit 用同仓的兼容外壳把它
 # 指到 Longbridge `quickjs-jit` 分叉，使 shell 与 LLRT 共享同一 VM 类型。patch 对整个工作区生效，
 # 所以 engine 插件运行时（`rquickjs` full-async + parallel）也随之换成同一分叉。
-rquickjs = { git = "https://github.com/longbridge/gpui-kit", rev = "d4c56812984d5fb2640ed922fe230c3113479563" }
+rquickjs = { git = "https://github.com/longbridge/gpui-kit", rev = "4d63c733f77b6803a57d2ff56fa6f85cb751c9b4" }
 
 [profile.dev]
 codegen-units = 16

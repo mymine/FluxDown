@@ -674,6 +674,12 @@ fn linked_row(
                                                 t(translator, "linkedDeviceSameAccountTag"),
                                                 cx,
                                             ))
+                                        })
+                                        .when(device.grants_control && !device.revoked, |this| {
+                                            this.child(tag_badge(
+                                                t(translator, "linkControlGrantedTag"),
+                                                cx,
+                                            ))
                                         }),
                                 )
                                 .child(

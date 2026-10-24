@@ -24,7 +24,6 @@ use gpui_component::{
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
-    tooltip::Tooltip,
     v_flex,
 };
 
@@ -35,7 +34,7 @@ use crate::theme_library::{
     export_file_name, parse_import, store_import,
 };
 use crate::ui::{Control, SettingsPage, SettingsSection, meta_text, row_button};
-use fluxdown_ui_components::{ButtonVariant, ControlExt as _, FluxIcon};
+use fluxdown_ui_components::{ButtonVariant, ControlExt as _, FluxIcon, tooltip_view};
 
 /// 官方主题画廊地址。
 const THEME_GALLERY_URL: &str = "https://fluxdown.com/themes";
@@ -384,7 +383,7 @@ fn theme_card(
             .rounded(tokens.radius.sm)
             .text_color(colors.muted_foreground)
             .hover(move |style| style.text_color(colors.destructive))
-            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .tooltip(move |window, cx| tooltip_view(label.clone(), window, cx))
             .on_click(move |_, window, cx| {
                 cx.stop_propagation();
                 on_delete(window, cx);
@@ -749,7 +748,7 @@ fn color_dot(
         .flex()
         .items_center()
         .justify_center()
-        .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
+        .tooltip(move |window, cx| tooltip_view(tooltip_label.clone(), window, cx))
         .when(!disabled, |this| {
             this.cursor_pointer()
                 .when(!selected, |this| {

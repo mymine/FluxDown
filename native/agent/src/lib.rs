@@ -21,6 +21,7 @@ pub mod diagnostics;
 pub mod egress;
 pub mod embedded;
 pub mod event_hub;
+mod event_pump;
 pub mod gateway;
 #[cfg(feature = "desktop")]
 mod hotkey;
@@ -41,6 +42,8 @@ pub mod runtime;
 pub mod server_mode;
 pub mod shell;
 pub mod sniff_rules;
+mod sound;
+mod startup_failure;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
@@ -48,6 +51,7 @@ mod task_events;
 pub mod update;
 mod web_assets;
 
+pub use category_dir::route_save_dir;
 pub use embedded::{AgentStartError, EmbeddedAgent, EmbeddedConfig, start_embedded};
 pub use gateway::{LocalConnection, LocalEventError};
 

@@ -56,6 +56,9 @@ const NO_LAUNCH_ACTIONS: &[&str] = &[
     "capabilities",
     "capture_status",
     "sniff_rules",
+    "page_scripts",
+    "page_script_source",
+    "plugin_invoke",
 ];
 
 /// Whether `action` belongs to [`NO_LAUNCH_ACTIONS`].
@@ -768,6 +771,9 @@ mod tests {
             "capabilities",
             "capture_status",
             "sniff_rules",
+            "page_scripts",
+            "page_script_source",
+            "plugin_invoke",
         ] {
             assert!(is_no_launch_action(action), "{action} should be no-launch");
         }

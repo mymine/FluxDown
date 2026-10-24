@@ -1,5 +1,9 @@
 //! 用户交互式下载的自动窗口策略。任务事件只更新状态索引和相关意图；不轮询、不为任务建定时器。
 //! 所有未结束意图共用一个 oneshot 保活，完成集合接管保活后才释放本模块的等待。
+//!
+//! 判定交给 [`ProgressWindowTracker`]：本模块只提供窗口环境——该任务是否已有窗口、主窗口此刻
+//! 是否可见 / 在前台、任务是否有待答复的选择请求。选择请求结束时重新判定仍在等待的意图，
+//! 使选择窗口先于进度窗口出现，进度窗口不会抢走选择窗口的焦点。
 
 use std::{
     collections::{HashMap, HashSet},
@@ -8,8 +12,8 @@ use std::{
 
 use fluxdown_protocol::{AgentEvent, AgentSnapshot, DaemonEvent, ServiceEvent, WsServerMsg};
 use fluxdown_ui_downloads::{
-    MAX_TRACKED_WINDOW_TASKS, ProgressWindowEffect, ProgressWindowPrefs, ProgressWindowTracker,
-    UserStartIntent,
+    MAX_TRACKED_WINDOW_TASKS, MainWindowState, ProgressWindowEffect, ProgressWindowPrefs,
+    ProgressWindowTracker, StartOrigin, UserStartIntent, WindowContext,
 };
 use gpui::{App, AppContext as _, Global};
 use tokio::sync::oneshot;
@@ -33,10 +37,11 @@ struct RestartObservation {
     replaces_task: bool,
     after_deletion: bool,
     proof_deadline: Option<Instant>,
+    origin: StartOrigin,
 }
 
 impl RestartObservation {
-    fn new(previous: Option<i32>, replaces_task: bool) -> Self {
+    fn new(previous: Option<i32>, replaces_task: bool, origin: StartOrigin) -> Self {
         Self {
             previous,
             fresh: None,
@@ -44,6 +49,7 @@ impl RestartObservation {
             replaces_task,
             after_deletion: false,
             proof_deadline: None,
+            origin,
         }
     }
 
@@ -166,7 +172,7 @@ pub fn install(cx: &mut App) {
         }
         SessionSignal::Event(frame) => on_event(&frame.event, cx),
         SessionSignal::Fatal(_) | SessionSignal::ServiceStopped => clear(cx),
-        SessionSignal::Stale => {}
+        SessionSignal::Stale | SessionSignal::ServiceFailed(_) => {}
     })
     .detach();
     let store = Desktop::global(cx).settings_store.clone();
@@ -198,15 +204,20 @@ pub fn install(cx: &mut App) {
     }
 }
 
-/// 新建任务可接受当前 completed；已有任务必须以命令前后的状态转移证明本轮完成。
+/// 应用内入口（主窗口、新建下载表单、任务详情）的开始意图。
 pub fn user_started(intent: UserStartIntent, cx: &mut App) {
+    start(intent, StartOrigin::App, cx);
+}
+
+/// 新建任务可接受当前 completed；已有任务必须以命令前后的状态转移证明本轮完成。
+fn start(intent: UserStartIntent, origin: StartOrigin, cx: &mut App) {
     if Desktop::global(cx).quitting {
         return;
     }
     match intent {
         UserStartIntent::Created(task_id) => {
             let state = cx.global_mut::<ProgressWindows>();
-            if state.tracker.arm_created(&task_id) {
+            if state.tracker.arm_created(&task_id, origin) {
                 let status = state.statuses.get(&task_id).copied();
                 state.tracker.update_prefs(state.prefs);
                 if let Some(status) = status {
@@ -234,9 +245,10 @@ pub fn user_started(intent: UserStartIntent, cx: &mut App) {
                 return;
             }
             let previous = state.statuses.get(&task_id).copied();
-            state
-                .restarting
-                .insert(task_id, RestartObservation::new(previous, replaces_task));
+            state.restarting.insert(
+                task_id,
+                RestartObservation::new(previous, replaces_task, origin),
+            );
         }
         UserStartIntent::RestartSucceeded(task_id) => {
             if let Some(restart) = cx
@@ -260,24 +272,43 @@ pub fn user_started(intent: UserStartIntent, cx: &mut App) {
 
 fn resolve_restart(task_id: &str, cx: &mut App) {
     let state = cx.global_mut::<ProgressWindows>();
-    let Some(status) = state
+    let Some((status, origin)) = state
         .restarting
         .get(task_id)
         .filter(|restart| restart.confirmed)
-        .and_then(|restart| restart.fresh)
+        .and_then(|restart| restart.fresh.map(|status| (status, restart.origin)))
     else {
         return;
     };
     state.restarting.remove(task_id);
-    if state.tracker.arm_restart(task_id) {
+    if state.tracker.arm_restart(task_id, origin) {
         crate::completion_windows::forget(task_id, cx);
         observe(task_id, status, cx);
     }
 }
 
-/// CLI 与 CaptureTasksStarted 都是新建任务证明；相同 ID 的重复启动提示幂等。
+/// CLI / 单实例唤起与 CaptureTasksStarted 都是外部入口的新建任务证明；相同 ID 的重复启动
+/// 提示幂等。
 pub fn user_started_on_launch(task_id: String, cx: &mut App) {
-    user_started(UserStartIntent::Created(task_id), cx);
+    start(UserStartIntent::Created(task_id), StartOrigin::External, cx);
+}
+
+/// 外部入口（插件页面脚本）恢复的已有任务：命令已在 daemon 成功，仍须见到命令后的新状态才
+/// 算本轮开始，与主窗口「继续」同一套证明。
+fn external_resumed(task_id: String, cx: &mut App) {
+    start(
+        UserStartIntent::RestartRequested {
+            task_id: task_id.clone(),
+            replaces_task: false,
+        },
+        StartOrigin::External,
+        cx,
+    );
+    start(
+        UserStartIntent::RestartSucceeded(task_id),
+        StartOrigin::External,
+        cx,
+    );
 }
 
 fn clear(cx: &mut App) {
@@ -368,9 +399,16 @@ fn on_event(event: &ServiceEvent, cx: &mut App) {
         }
         AgentEvent::CaptureTasksStarted(task_ids) => {
             if let [task_id] = task_ids.as_slice() {
-                user_started(UserStartIntent::Created(task_id.clone()), cx);
+                user_started_on_launch(task_id.clone(), cx);
             }
         }
+        AgentEvent::CaptureTasksResumed(task_ids) => {
+            if let [task_id] = task_ids.as_slice() {
+                external_resumed(task_id.clone(), cx);
+            }
+        }
+        // 会话已先移除该请求；选择窗口的订阅更早注册，此时已关窗。
+        AgentEvent::Daemon(DaemonEvent::SelectionResolved { .. }) => reobserve_armed(cx),
         AgentEvent::Daemon(DaemonEvent::TaskDeleted { task_id }) => {
             let state = cx.global_mut::<ProgressWindows>();
             state.statuses.remove(task_id);
@@ -421,8 +459,10 @@ fn observe_all(body: &AgentSnapshot, cx: &mut App) {
     }
 }
 
+/// 任务状态表；任务表仍在分页载入（`tasks` 只是占位）时返回 `None`：用占位表对账会把所有任务
+/// 当成已删除，并让载入后「状态变化」的通知判定失去对照。
 fn snapshot_statuses(body: &AgentSnapshot) -> Option<HashMap<String, i32>> {
-    body.daemon_connected.then(|| {
+    (body.daemon_connected && !body.daemon.tables_loading()).then(|| {
         body.daemon
             .tasks
             .iter()
@@ -471,13 +511,66 @@ fn observe_recorded_status(task_id: &str, status: i32, changed: bool, cx: &mut A
     }
 }
 
+/// 选择请求结束：仍在等的意图按当前状态补判（答复后的新状态可能早于本事件到达）。
+fn reobserve_armed(cx: &mut App) {
+    let state = cx.global::<ProgressWindows>();
+    let waiting: Vec<(String, i32)> = state
+        .tracker
+        .armed_ids()
+        .filter_map(|task_id| {
+            state
+                .statuses
+                .get(task_id)
+                .map(|status| (task_id.to_owned(), *status))
+        })
+        .collect();
+    for (task_id, status) in waiting {
+        observe(&task_id, status, cx);
+    }
+}
+
+/// 主窗口此刻的可见 / 前台状态。句柄暂不可更新只发生在主窗口自己的 update 栈内，即用户
+/// 正在主窗口里操作，按在场处理。
+fn main_window_state(cx: &mut App) -> MainWindowState {
+    let Some(handle) = WindowRegistry::handle(cx, &WindowKey::Main) else {
+        return MainWindowState::default();
+    };
+    handle
+        .update(cx, |_, window, _| MainWindowState {
+            visible: window.is_visible(),
+            active: window.is_window_active(),
+        })
+        .unwrap_or_else(|error| {
+            log::debug!("main window busy while judging task windows: {error:#}");
+            MainWindowState {
+                visible: true,
+                active: true,
+            }
+        })
+}
+
+fn selection_pending(task_id: &str, cx: &App) -> bool {
+    Desktop::global(cx)
+        .session
+        .read(cx)
+        .agent_snapshot()
+        .is_some_and(|body| {
+            body.daemon
+                .pending_selections
+                .iter()
+                .any(|request| request.task_id == task_id)
+        })
+}
+
 fn observe(task_id: &str, status: i32, cx: &mut App) {
     let key = WindowKey::Progress(task_id.to_owned());
-    let window_open = WindowRegistry::is_open(cx, &key);
+    let context = WindowContext {
+        window_open: WindowRegistry::is_open(cx, &key),
+        main: main_window_state(cx),
+        selection_pending: selection_pending(task_id, cx),
+    };
     let state = cx.global_mut::<ProgressWindows>();
-    let effect = state
-        .tracker
-        .observe(task_id, status, window_open, state.prefs);
+    let effect = state.tracker.observe(task_id, status, context, state.prefs);
     match effect {
         Some(ProgressWindowEffect::OpenProgress) => {
             let mut open =
@@ -506,11 +599,15 @@ fn observe(task_id: &str, status: i32, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use fluxdown_ui_downloads::{StartOrigin, WindowContext};
+
     use super::{ProgressWindowPrefs, ProgressWindows, RestartObservation, snapshot_statuses};
+
+    const APP: StartOrigin = StartOrigin::App;
 
     #[test]
     fn old_completed_snapshot_does_not_complete_a_restart() {
-        let mut restart = RestartObservation::new(Some(3), true);
+        let mut restart = RestartObservation::new(Some(3), true, APP);
         restart.observe(3);
         assert_eq!(restart.fresh, None);
         restart.observe(5);
@@ -518,16 +615,34 @@ mod tests {
         assert_eq!(restart.fresh, Some(3));
     }
 
+    /// 任务表分页载入期间不产出状态表：用占位空表对账会把所有任务当成已删除。
+    #[test]
+    fn statuses_are_withheld_while_the_task_table_is_loading() {
+        let mut body = fluxdown_protocol::AgentSnapshot {
+            daemon_connected: true,
+            ..fluxdown_protocol::AgentSnapshot::default()
+        };
+        assert_eq!(
+            snapshot_statuses(&body).map(|statuses| statuses.len()),
+            Some(0)
+        );
+        body.daemon.task_total = Some(230_000);
+        assert!(snapshot_statuses(&body).is_none());
+        body.daemon.task_total = None;
+        body.daemon.queue_total = Some(3);
+        assert!(snapshot_statuses(&body).is_none());
+    }
+
     #[test]
     fn fast_resume_completion_before_command_reply_is_fresh() {
-        let mut restart = RestartObservation::new(Some(2), false);
+        let mut restart = RestartObservation::new(Some(2), false, APP);
         restart.observe(3);
         assert_eq!(restart.fresh, Some(3));
     }
 
     #[test]
     fn deletion_proves_recreated_completed_task_is_new() {
-        let mut restart = RestartObservation::new(Some(3), true);
+        let mut restart = RestartObservation::new(Some(3), true, APP);
         restart.deleted();
         restart.observe(3);
         assert_eq!(restart.fresh, Some(3));
@@ -535,7 +650,7 @@ mod tests {
 
     #[test]
     fn missing_restart_baseline_does_not_accept_old_completed() {
-        let mut restart = RestartObservation::new(None, true);
+        let mut restart = RestartObservation::new(None, true, APP);
         restart.observe(3);
         assert_eq!(restart.fresh, None);
     }
@@ -552,14 +667,16 @@ mod tests {
         let mut wait = None;
         for index in 0..1000 {
             let task_id = index.to_string();
-            state.tracker.arm_created(&task_id);
+            state.tracker.arm_created(&task_id, APP);
             let next = state.update_waiter();
             if index == 0 {
                 wait = next;
             } else {
                 assert!(next.is_none(), "同一突发不得产生每任务等待");
             }
-            state.tracker.observe(&task_id, 1, false, state.prefs);
+            state
+                .tracker
+                .observe(&task_id, 1, WindowContext::default(), state.prefs);
             assert!(state.update_waiter().is_none());
             assert!(state.waiter.is_some(), "进入活跃态不能释放仅完成模式的保活");
         }
@@ -571,7 +688,7 @@ mod tests {
         for index in 0..1000 {
             state
                 .tracker
-                .observe(&index.to_string(), 3, false, state.prefs);
+                .observe(&index.to_string(), 3, WindowContext::default(), state.prefs);
             assert!(state.update_waiter().is_none());
         }
         assert!(state.waiter.is_none());
@@ -581,7 +698,7 @@ mod tests {
     #[test]
     fn disabling_both_and_service_cleanup_release_the_global_waiter() {
         let mut state = ProgressWindows::default();
-        state.tracker.arm_created("t");
+        state.tracker.arm_created("t", APP);
         let mut wait = state.update_waiter().expect("开始意图保活");
         state.prefs = ProgressWindowPrefs {
             progress: false,
@@ -592,7 +709,7 @@ mod tests {
         assert_eq!(wait.try_recv(), Ok(()));
 
         state.prefs = ProgressWindowPrefs::default();
-        state.tracker.arm_created("next");
+        state.tracker.arm_created("next", APP);
         let mut wait = state.update_waiter().expect("下一次开始独立等待");
         state.tracker.clear();
         state.restarting.clear();
@@ -603,7 +720,7 @@ mod tests {
     #[test]
     fn disconnected_initial_snapshot_cannot_discard_a_launch_intent() {
         let mut state = ProgressWindows::default();
-        state.tracker.arm_created("launched");
+        state.tracker.arm_created("launched", APP);
         let snapshot = fluxdown_protocol::AgentSnapshot::default();
         assert!(snapshot_statuses(&snapshot).is_none());
         assert!(state.tracker.needs_keep_alive(state.prefs));
@@ -617,7 +734,7 @@ mod tests {
     #[test]
     fn snapshot_before_first_task_event_preserves_intent_but_known_deletion_releases_it() {
         let mut state = ProgressWindows::default();
-        state.tracker.arm_created("new");
+        state.tracker.arm_created("new", APP);
         state.reconcile_snapshot(&std::collections::HashMap::new());
         assert!(state.tracker.is_armed("new"));
         state.statuses.insert("new".to_owned(), 0);
@@ -630,7 +747,7 @@ mod tests {
         let now = std::time::Instant::now();
         let mut state = ProgressWindows::default();
         for index in 0..1000 {
-            let mut restart = RestartObservation::new(Some(2), false);
+            let mut restart = RestartObservation::new(Some(2), false, APP);
             restart.confirm(now);
             state.restarting.insert(index.to_string(), restart);
         }
@@ -640,7 +757,7 @@ mod tests {
         state.expire_unproven_restarts(deadline - std::time::Duration::from_secs(1));
         assert_eq!(state.restarting.len(), 1000);
         let later_now = now + std::time::Duration::from_secs(1);
-        let mut later = RestartObservation::new(Some(3), true);
+        let mut later = RestartObservation::new(Some(3), true, APP);
         later.confirm(later_now);
         state.restarting.insert("later".to_owned(), later);
         state.expire_unproven_restarts(deadline);
@@ -659,10 +776,10 @@ mod tests {
         assert!(state.update_waiter().is_none());
         assert_eq!(wait.try_recv(), Ok(()));
 
-        state.tracker.arm_created("really-active");
+        state.tracker.arm_created("really-active", APP);
         state
             .tracker
-            .observe("really-active", 1, false, state.prefs);
+            .observe("really-active", 1, WindowContext::default(), state.prefs);
         state.expire_unproven_restarts(deadline + super::RESTART_PROOF_WAIT);
         assert!(state.tracker.needs_keep_alive(state.prefs));
     }
@@ -670,12 +787,12 @@ mod tests {
     #[test]
     fn confirmed_running_or_pending_restart_needs_no_proof_timer() {
         for status in [0, 1, 5] {
-            let mut restart = RestartObservation::new(Some(status), false);
+            let mut restart = RestartObservation::new(Some(status), false, APP);
             restart.confirm(std::time::Instant::now());
             assert_eq!(restart.fresh, Some(status));
             assert!(restart.proof_deadline.is_none());
         }
-        let mut completed = RestartObservation::new(Some(3), true);
+        let mut completed = RestartObservation::new(Some(3), true, APP);
         completed.confirm(std::time::Instant::now());
         assert_eq!(completed.fresh, None);
         assert!(completed.proof_deadline.is_some());

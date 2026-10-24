@@ -11,8 +11,8 @@
 //! 超时 / OOM 之后 JS 状态不再可信，actor 随即退出，由 manager 熔断计数并丢弃句柄。
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use rquickjs::prelude::Async;
@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::quickjs::{FLUX_PRELUDE, info_json, inject_bridge, set_json_global};
 use super::runtime::{
     HostCall, HostContext, HostEvents, HostFuture, HostReply, PluginBridge, PluginError,
-    PluginHost, PluginScript, PluginTaskPort, WallPause,
+    PluginHost, PluginScript, PluginTaskPort, StartedTasks, WallPause,
 };
 
 /// 宿主 JS 内存上限。
@@ -33,6 +33,17 @@ const HOST_CPU_BUDGET: Duration = Duration::from_secs(2);
 const HOST_WALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 中断截止的「未武装」值：取 `u64::MAX / 2`，使挂起补偿的 `fetch_add` 永不回绕。
 const DISARMED_NS: u64 = u64::MAX / 2;
+/// `flux.tasks.*` 允许的方法里，算作「开始任务」的两个。
+const TASK_CREATE: &str = "daemon.task.create";
+const TASK_RESUME: &str = "daemon.task.resume";
+
+/// 当前页面脚本调用开始的任务。actor 串行执行调用：页面调用开始时置 `Some`、结束时取走，
+/// 其余调用期间为 `None`。调用返回后仍在运行的悬空 Promise 不归属任何页面调用（`None` 时不记）。
+type StartScope = Arc<Mutex<Option<StartedTasks>>>;
+
+fn scope_lock(scope: &StartScope) -> std::sync::MutexGuard<'_, Option<StartedTasks>> {
+    scope.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// 中断预算状态：handler 读、actor / 桥接函数写。
 struct Budget {
@@ -127,6 +138,8 @@ pub(super) async fn start(
     let source = plugin.source;
     let interrupt_ns = budget.deadline_ns.clone();
     let wall_pause = Arc::new(WallPause::default());
+    let scope: StartScope = Arc::default();
+    let bridge_scope = scope.clone();
     budget.arm();
     let init = ctx.async_with(async move |ctx| -> Result<(), PluginError> {
         inject_bridge(
@@ -139,12 +152,20 @@ pub(super) async fn start(
             None,
             host.ytdlp_permitted,
             host.auth_permitted,
+            host.private_network_allowed,
             interrupt_ns.clone(),
             wall_pause,
         )
         .map_err(|e| PluginError::Runtime(format!("注入 flux 失败: {e}")))?;
-        inject_host_bridge(&ctx, &identity, &events, task_port, &interrupt_ns)
-            .map_err(|e| PluginError::Runtime(format!("注入宿主桥接失败: {e}")))?;
+        inject_host_bridge(
+            &ctx,
+            &identity,
+            &events,
+            task_port,
+            &interrupt_ns,
+            bridge_scope,
+        )
+        .map_err(|e| PluginError::Runtime(format!("注入宿主桥接失败: {e}")))?;
         set_json_global(&ctx, "__flux_settings_json", &settings_json)?;
         set_json_global(&ctx, "__flux_info", &info)?;
         ctx.eval::<rquickjs::Value, _>(FLUX_PRELUDE)
@@ -167,7 +188,7 @@ pub(super) async fn start(
 
     let (tx, rx) = mpsc::unbounded_channel();
     let (shutdown, shutdown_rx) = watch::channel(false);
-    handle.spawn(actor_main(rt, ctx, budget, rx, shutdown_rx));
+    handle.spawn(actor_main(rt, ctx, budget, scope, rx, shutdown_rx));
     Ok(Arc::new(QuickJsHost { tx, shutdown }))
 }
 
@@ -176,6 +197,7 @@ async fn actor_main(
     rt: AsyncRuntime,
     ctx: AsyncContext,
     budget: Arc<Budget>,
+    scope: StartScope,
     mut rx: mpsc::UnboundedReceiver<Message>,
     mut shutdown: watch::Receiver<bool>,
 ) {
@@ -196,7 +218,7 @@ async fn actor_main(
                 }
                 break;
             }
-            outcome = run_call(&ctx, &budget, call) => outcome,
+            outcome = run_call(&ctx, &budget, &scope, call) => outcome,
         };
         let fatal = matches!(
             outcome,
@@ -246,9 +268,14 @@ fn encode(call: &HostCall) -> Result<(&'static str, String), PluginError> {
             "command",
             serde_json::json!({ "id": id, "taskIds": task_ids }),
         ),
-        HostCall::Invoke { name, args } => {
-            ("invoke", serde_json::json!({ "name": name, "args": args }))
-        }
+        HostCall::Invoke {
+            name,
+            args,
+            page_url,
+        } => (
+            "invoke",
+            serde_json::json!({ "name": name, "args": args, "pageUrl": page_url }),
+        ),
         HostCall::Event(event) => (
             "event",
             serde_json::json!({ "hook": event.hook_fn_name(), "payload": event }),
@@ -264,10 +291,10 @@ fn encode(call: &HostCall) -> Result<(&'static str, String), PluginError> {
 }
 
 /// 按调用种类把 JS 返回值映射为 [`HostReply`]。
-fn decode(kind: &str, value: serde_json::Value) -> HostReply {
+fn decode(kind: &str, value: serde_json::Value, started: StartedTasks) -> HostReply {
     match kind {
         "viewOpen" | "viewEvent" | "viewRefresh" => HostReply::Tree(value),
-        "invoke" => HostReply::Value(value),
+        "invoke" => HostReply::Value { value, started },
         _ => HostReply::None,
     }
 }
@@ -276,9 +303,18 @@ fn decode(kind: &str, value: serde_json::Value) -> HostReply {
 async fn run_call(
     ctx: &AsyncContext,
     budget: &Budget,
+    scope: &StartScope,
     call: HostCall,
 ) -> Result<HostReply, PluginError> {
     let (kind, payload) = encode(&call)?;
+    let page_call = matches!(
+        call,
+        HostCall::Invoke {
+            page_url: Some(_),
+            ..
+        }
+    );
+    *scope_lock(scope) = page_call.then(StartedTasks::default);
     budget.arm();
     let exec = ctx.async_with(async move |ctx| -> Result<String, PluginError> {
         let host_obj: Object = ctx
@@ -300,6 +336,8 @@ async fn run_call(
     });
     let raced = tokio::time::timeout(HOST_WALL_TIMEOUT, exec).await;
     budget.disarm();
+    // 无论成败都结束本次归属：之后的 `flux.tasks.*` 不再记到这次页面调用上。
+    let started = scope_lock(scope).take().unwrap_or_default();
     let raw = match raced {
         Err(_) => return Err(PluginError::Timeout),
         Ok(result) => result.map_err(reclassify)?,
@@ -311,7 +349,7 @@ async fn run_call(
             .get("v")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        return Ok(decode(kind, value));
+        return Ok(decode(kind, value, started));
     }
     let message = envelope
         .get("e")
@@ -358,6 +396,7 @@ fn inject_host_bridge(
     events: &Arc<dyn HostEvents>,
     task_port: Option<Arc<dyn PluginTaskPort>>,
     interrupt_ns: &Arc<AtomicU64>,
+    scope: StartScope,
 ) -> Result<(), rquickjs::Error> {
     let globals = ctx.globals();
 
@@ -447,12 +486,21 @@ fn inject_host_bridge(
             Async(move |method: String, params_json: String| {
                 let port = port.clone();
                 let dl = dl.clone();
+                let scope = scope.clone();
                 async move {
                     let payload = match serde_json::from_str::<serde_json::Value>(&params_json) {
-                        Ok(params) => match credited(&dl, port.call(&method, params)).await {
-                            Ok(value) => serde_json::json!({ "value": value }),
-                            Err(e) => serde_json::json!({ "__fluxError": plain_error(&e) }),
-                        },
+                        Ok(params) => {
+                            let resumed = (method == TASK_RESUME)
+                                .then(|| task_id_param(&params))
+                                .flatten();
+                            match credited(&dl, port.call(&method, params)).await {
+                                Ok(value) => {
+                                    record_started(&scope, &method, resumed, &value);
+                                    serde_json::json!({ "value": value })
+                                }
+                                Err(e) => serde_json::json!({ "__fluxError": plain_error(&e) }),
+                            }
+                        }
                         Err(e) => serde_json::json!({
                             "__fluxError": format!("任务参数非法: {e}")
                         }),
@@ -466,6 +514,35 @@ fn inject_host_bridge(
     }
 
     Ok(())
+}
+
+/// `daemon.task.resume` 的任务 ID（daemon 同时接受 `taskId` 与 `id`）。
+fn task_id_param(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("taskId")
+        .or_else(|| params.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// 页面调用期间成功的 `create` / `resume` 记入当前归属；非页面调用（`None`）不记。
+fn record_started(
+    scope: &StartScope,
+    method: &str,
+    resumed: Option<String>,
+    value: &serde_json::Value,
+) {
+    let mut scope = scope_lock(scope);
+    let Some(started) = scope.as_mut() else {
+        return;
+    };
+    if method == TASK_CREATE {
+        if let Some(task_id) = value.get("taskId").and_then(serde_json::Value::as_str) {
+            started.created.push(task_id.to_owned());
+        }
+    } else if let Some(task_id) = resumed {
+        started.resumed.push(task_id);
+    }
 }
 
 /// 宿主门面：在 `flux` 上挂 `ui` / `commands` / `rpc` / `events` / `timers`（及授权后的
@@ -556,9 +633,15 @@ const HOST_PRELUDE: &str = r#"
     },
   };
   flux.rpc = {
-    handle(name, fn) {
-      if (typeof name !== 'string' || typeof fn !== 'function') throw new TypeError('rpc.handle(name, fn)');
-      rpcs.set(name, fn);
+    handle(name, fn, opts) {
+      if (typeof name !== 'string' || typeof fn !== 'function') throw new TypeError('rpc.handle(name, fn, opts?)');
+      if (opts !== undefined && (opts === null || typeof opts !== 'object' || Array.isArray(opts))) {
+        throw new TypeError('rpc.handle opts must be an object');
+      }
+      if (opts !== undefined && opts.page !== undefined && typeof opts.page !== 'boolean') {
+        throw new TypeError('rpc.handle opts.page must be a boolean');
+      }
+      rpcs.set(name, { fn, page: !!(opts && opts.page) });
     },
   };
   flux.events = {
@@ -590,7 +673,8 @@ const HOST_PRELUDE: &str = r#"
       return r.value;
     });
     flux.tasks = {
-      list: () => call('daemon.task.list', {}),
+      // 任务数超过 5000 时无参调用会被拒绝：传 `{ cursor, limit }`（cursor = 上一页最后一个 taskId）分页。
+      list: (params) => call('daemon.task.list', params && typeof params === 'object' ? params : {}),
       get: (id) => call('daemon.task.get', { taskId: String(id) }),
       create: (params) => call('daemon.task.create', params),
       pause: (id) => call('daemon.task.pause', { taskId: String(id) }),
@@ -660,9 +744,16 @@ const HOST_PRELUDE: &str = r#"
       return null;
     },
     async invoke(a) {
-      const fn = rpcs.get(a.name);
-      if (!fn) throw new Error('rpc not registered: ' + a.name);
-      const r = await fn(a.args);
+      const entry = rpcs.get(a.name);
+      if (!entry) throw new Error('rpc not registered: ' + a.name);
+      let ctx;
+      if (typeof a.pageUrl === 'string') {
+        if (!entry.page) throw new Error('rpc not exposed to page: ' + a.name);
+        ctx = { caller: 'page', pageUrl: a.pageUrl };
+      } else {
+        ctx = { caller: 'desktop' };
+      }
+      const r = await entry.fn(a.args, ctx);
       return r === undefined ? null : r;
     },
     async event(a) {

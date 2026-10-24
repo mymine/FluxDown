@@ -18,11 +18,16 @@ fn catalog(cases: &Value) -> Option<Vec<ChromeItemSpec>> {
                 .try_fold(ChromeFamilies::default(), |families, family| {
                     family.map(|family| families.with(family))
                 })?;
-            Some(ChromeItemSpec::new(
+            let spec = ChromeItemSpec::new(
                 item["id"].as_str()?.to_owned(),
                 ChromeZone::from_key(item["defaultZone"].as_str()?)?,
                 families,
-            ))
+            );
+            Some(if item["fixed"].as_bool() == Some(true) {
+                spec.fixed()
+            } else {
+                spec
+            })
         })
         .collect()
 }
@@ -61,11 +66,29 @@ fn move_cases() {
 }
 
 #[test]
+fn visibility_cases() {
+    let cases: Value = serde_json::from_str(CASES).expect("fixture json");
+    let catalog = catalog(&cases).expect("fixture catalog");
+    for case in cases["visibility"].as_array().expect("visibility cases") {
+        let mut layout = ChromeLayout::from_value(stored(case), &catalog);
+        let set = &case["set"];
+        let changed = layout.set_hidden(
+            &catalog,
+            set["id"].as_str().expect("set id"),
+            set["hidden"].as_bool().expect("set hidden"),
+        );
+        assert_eq!(Value::Bool(changed), case["changed"], "{}", case["name"]);
+        assert_eq!(layout.to_value(), case["expected"], "{}", case["name"]);
+    }
+}
+
+#[test]
 fn serialized_layout_round_trips() {
     let cases: Value = serde_json::from_str(CASES).expect("fixture json");
     let catalog = catalog(&cases).expect("fixture catalog");
     let mut layout = ChromeLayout::default_for(&catalog);
     assert!(layout.move_item(&catalog, "limit", ChromeZone::TitleLeading, None));
+    assert!(layout.set_hidden(&catalog, "limit", true));
     let restored = ChromeLayout::from_value(Some(&layout.to_value()), &catalog);
     assert_eq!(restored, layout);
 }

@@ -86,11 +86,11 @@ internal class CategoryIndexCache {
 
 internal fun buildDetailModel(state: HostState, taskId: String, categories: CategoryIndexCache): DetailModel? {
     val task = state.task(taskId) ?: return null
-    val pos = state.queuePositions[taskId] ?: 0
+    val pos = state.queueOrder.rank(taskId)
     val speed = state.speeds[taskId]
     return DetailModel(
         task = task,
-        visual = task.visualState(pos),
+        visual = task.visualState(pos > 0),
         queuePosition = pos,
         queue = state.queues.firstOrNull { it.queueId == task.queueId || (task.queueId.isEmpty() && it.queueId == Queue.MAIN) },
         group = task.groupId.takeIf { it.isNotEmpty() }?.let { id -> state.groups.firstOrNull { it.groupId == id } },

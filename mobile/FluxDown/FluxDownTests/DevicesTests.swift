@@ -175,5 +175,8 @@ struct DevicesTests {
         #expect(HostFlow.errorText(HostError(.unavailable)) == L("webLoginUnreachable"))
         #expect(HostFlow.errorText(HostError(.protocolIncompatible)) == L("mobileHostErrIncompatible"))
         #expect(HostFlow.errorText(HostError(.conflict)) == L("localServiceActionFailed"))
+        // 经局域网配对添加的主机被拒：授权已撤销，提示重新配对而不是「密钥错误」。
+        #expect(HostFlow.errorText(HostError(.unauthorized), paired: true) == L("mobileHostRepairNeeded"))
+        #expect(HostFlow.errorText(HostError(.timeout), paired: true) == L("mobileHostErrTimeout"))
     }
 }

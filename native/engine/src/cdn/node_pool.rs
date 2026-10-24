@@ -180,8 +180,25 @@ struct PoolInner {
     live: HashMap<u64, LiveConn>,
     /// 因 validator 不一致被踢除的代理路径（coordinator 取走后记 NoSwitch）。
     validator_kicked: Vec<RoutePath>,
+    /// 待写入跨任务路径健康度的 Auto 路径传输失败（coordinator 取走）。
+    path_failures: Vec<RoutePath>,
+    /// 本任务已登记过传输失败的路径（同一路径只记一次，避免反复写盘）。
+    path_failures_noted: Vec<RoutePath>,
     /// 无 sink 的池挂了网卡链路时暂存的节点事件（coordinator 每窗转发）。
     deferred: Vec<EngineEvent>,
+}
+
+impl PoolInner {
+    /// 登记一条 Auto 路径的传输失败（直连 / 代理；网卡链路不属于 Auto 路径）。
+    /// 同一路径整个任务只登记一次：跨任务健康度写盘是同步落库，不能随每个
+    /// 失败段反复触发。
+    fn note_path_failure(&mut self, route: RoutePath) {
+        if route.is_link() || self.path_failures_noted.contains(&route) {
+            return;
+        }
+        self.path_failures_noted.push(route);
+        self.path_failures.push(route);
+    }
 }
 
 /// 多路径节点池。见模块文档。
@@ -195,7 +212,7 @@ pub struct NodePool {
     task_id: String,
     /// 引擎事件接收端（踢除/熔断事件；单节点池为 None，零事件）。
     sink: Option<Arc<dyn EventSink>>,
-    /// 是否允许探索冷路径（coordinator 按限速/串行/连接敏感等守卫每窗更新）。
+    /// 是否允许探索冷路径（coordinator 按限速器节流/串行/连接敏感等守卫每窗更新）。
     explore: AtomicBool,
     next_lease_id: AtomicU64,
     /// 剩余 SYS 传输失败改道次数（见 [`Self::try_sys_transport_fallback`]）。
@@ -323,6 +340,8 @@ impl NodePool {
                 last_leases_sig: Vec::new(),
                 live: HashMap::new(),
                 validator_kicked: Vec::new(),
+                path_failures: Vec::new(),
+                path_failures_noted: Vec::new(),
                 deferred: Vec::new(),
             }),
         })
@@ -473,21 +492,45 @@ impl NodePool {
     /// SYS 路径传输层失败的改道配额：仍有与 SYS 不同路径的存活槽位（Auto
     /// 多路径）且本任务配额未耗尽时消耗一次并返回 `true`——该失败回收重派，
     /// 由其它路径接手，不让整个任务失败。配额有界，保证整体断网时失败仍会
-    /// 按原语义上抛（进而触发 manager 的 failover/通用重试）。
+    /// 按原语义上抛（进而触发 manager 的 failover/通用重试）。授予改道的同时
+    /// 登记 SYS 路径的传输失败（同一路径整个任务只登记一次）。
     pub fn try_sys_transport_fallback(&self) -> bool {
-        let alternate_alive = self
-            .inner
-            .lock()
-            .map(|inner| {
-                let start = inner.slots.first().map_or(RoutePath::Direct, |s| s.route);
-                inner.slots.iter().any(|s| !s.kicked && s.route != start)
-            })
-            .unwrap_or(false);
-        alternate_alive
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        let start = inner.slots.first().map_or(RoutePath::Direct, |s| s.route);
+        if !Self::alternate_alive(&inner, start) {
+            return false;
+        }
+        if self
+            .sys_fallback_budget
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_err()
+        {
+            return false;
+        }
+        inner.note_path_failure(start);
+        true
+    }
+
+    /// SYS 路径的传输失败当前是否仍有改道可用：存在与 SYS 不同路径的存活槽位
+    /// 且改道配额未耗尽（只读，不消耗配额）。coordinator 据此对 SYS 租约的
+    /// **传输层失败**收紧段内重试预算——失败可由节点池改道时不必在已坏的路径上
+    /// 耗时间重试；HTTP 类瞬时错误换路修不好，仍按原预算重试。
+    pub fn sys_fallback_available(&self) -> bool {
+        self.sys_fallback_budget.load(Ordering::Relaxed) > 0
             && self
-                .sys_fallback_budget
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
-                .is_ok()
+                .inner
+                .lock()
+                .map(|inner| {
+                    let start = inner.slots.first().map_or(RoutePath::Direct, |s| s.route);
+                    Self::alternate_alive(&inner, start)
+                })
+                .unwrap_or(false)
+    }
+
+    fn alternate_alive(inner: &PoolInner, start: RoutePath) -> bool {
+        inner.slots.iter().any(|s| !s.kicked && s.route != start)
     }
 
     /// 允许/禁止探索冷路径（coordinator 每窗按守卫更新）。
@@ -866,6 +909,7 @@ impl NodePool {
                 Err(poisoned) => poisoned.into_inner(),
             };
             let mut validator_kick: Option<RoutePath> = None;
+            let mut path_failure: Option<RoutePath> = None;
             let Some(slot) = inner.slots.get_mut(lease.node_id) else {
                 return;
             };
@@ -914,6 +958,14 @@ impl NodePool {
                     if should_kick {
                         slot.kicked = true;
                         let streak = slot.fail_streak;
+                        // 仅 Auto 路径（hostname 路由的直连/代理槽位）的传输失败写
+                        // 跨任务路径健康度；CDN 钉定 IP 与网卡链路另有各自的记忆。
+                        if ip.is_none()
+                            && slot.link.is_none()
+                            && crate::net_failure::classify_download_error(e).is_some()
+                        {
+                            path_failure = Some(slot.route);
+                        }
                         if immediate && matches!(slot.route, RoutePath::Proxy(_)) {
                             validator_kick = Some(slot.route);
                         }
@@ -949,6 +1001,9 @@ impl NodePool {
             }
             if let Some(route) = validator_kick {
                 inner.validator_kicked.push(route);
+            }
+            if let Some(route) = path_failure {
+                inner.note_path_failure(route);
             }
         }
         self.emit_all(events);
@@ -1122,8 +1177,19 @@ impl NodePool {
             .unwrap_or_default()
     }
 
+    /// 取走本任务新增的 Auto 路径传输失败（每条路径整个任务至多出现一次），
+    /// 由 coordinator 写入跨任务路径健康度（`route_health::record_path_failure`）。
+    pub fn take_path_failures(&self) -> Vec<RoutePath> {
+        self.inner
+            .lock()
+            .map(|mut inner| std::mem::take(&mut inner.path_failures))
+            .unwrap_or_default()
+    }
+
     /// 已实测的 hostname 路径估计（SYS 与备选路径；钉定节点另有 IP 级
-    /// 健康度），供任务结束时写跨任务先验。
+    /// 健康度），供任务结束时写跨任务先验。本任务登记过传输失败的路径不在
+    /// 其列：`record_path_rate` 会清零该路径的失败权重，早先的实测不能抹掉
+    /// 后来的断流（被中途阻断的直连恰恰是「先测得到速度、后来不通」）。
     pub fn path_estimates(&self) -> Vec<(RoutePath, f64)> {
         let Ok(inner) = self.inner.lock() else {
             return Vec::new();
@@ -1131,7 +1197,12 @@ impl NodePool {
         inner
             .slots
             .iter()
-            .filter(|s| s.ip.is_none() && s.measured_windows > 0 && s.ewma_bps > 0.0)
+            .filter(|s| {
+                s.ip.is_none()
+                    && s.measured_windows > 0
+                    && s.ewma_bps > 0.0
+                    && !inner.path_failures_noted.contains(&s.route)
+            })
             .map(|s| (s.route, s.ewma_bps))
             .collect()
     }
@@ -1602,6 +1673,113 @@ mod tests {
             super::SYS_FALLBACK_BUDGET as usize,
             "配额耗尽后失败按原语义上抛"
         );
+    }
+
+    fn stall_err() -> DownloadError {
+        DownloadError::Other("segment 1 stalled: no data".to_string())
+    }
+
+    /// 备选路径因传输失败被踢除：该路径记一次失败，之后的失败不再重复登记。
+    #[test]
+    fn kicked_alternate_path_reports_transport_failure_once() {
+        for (start, alt) in [(RoutePath::Direct, MANUAL), (MANUAL, RoutePath::Direct)] {
+            let pool = NodePool::single(reqwest::Client::new());
+            pool.add_paths(start, None, vec![(alt, reqwest::Client::new(), Some(1e6))]);
+            let alt_node = node_of(&pool, alt);
+            pool.observe_window(&[(0, 1e3), (alt_node, 1e6)]);
+            let lease = pool.lease();
+            assert_eq!(lease.route(), alt);
+            for _ in 0..KICK_STREAK {
+                pool.report(&lease, 0, Duration::from_secs(1), Err(&stall_err()));
+            }
+            assert_eq!(pool.take_path_failures(), vec![alt]);
+            // 被踢后再有失败回报（在途租约收尾）不重复登记。
+            pool.report(&lease, 0, Duration::from_secs(1), Err(&stall_err()));
+            assert!(pool.take_path_failures().is_empty());
+        }
+    }
+
+    /// 只有传输失败才登记：HTTP 状态类失败即使把路径踢除也不是「路径不通」；
+    /// CDN 钉定节点不属于 Auto 路径。
+    #[test]
+    fn non_transport_kicks_and_pinned_nodes_do_not_report_path_failure() {
+        let pool = NodePool::single(reqwest::Client::new());
+        pool.add_paths(
+            RoutePath::Direct,
+            None,
+            vec![(MANUAL, reqwest::Client::new(), Some(1e6))],
+        );
+        let manual = node_of(&pool, MANUAL);
+        pool.observe_window(&[(0, 1e3), (manual, 1e6)]);
+        let lease = pool.lease();
+        assert_eq!(lease.route(), MANUAL);
+        let http = DownloadError::Other("segment 1: HTTP 503 Service Unavailable".to_string());
+        for _ in 0..KICK_STREAK {
+            pool.report(&lease, 0, Duration::from_secs(1), Err(&http));
+        }
+        assert!(pool.take_path_failures().is_empty());
+
+        let pinned_pool = test_pool(&[ip(2)]);
+        let (pinned, _held) = pinned_lease(&pinned_pool);
+        for _ in 0..KICK_STREAK {
+            pinned_pool.report(&pinned, 0, Duration::from_secs(1), Err(&stall_err()));
+        }
+        assert!(pinned_pool.take_path_failures().is_empty());
+    }
+
+    /// SYS 起飞路径触发传输改道：登记 SYS 路径失败（一次），且该路径此后不再
+    /// 以早先的实测速率写先验（`record_path_rate` 会清掉刚记的失败）。
+    #[test]
+    fn sys_fallback_reports_start_path_once_and_drops_its_prior() {
+        let pool = NodePool::single(reqwest::Client::new());
+        pool.add_paths(
+            RoutePath::Direct,
+            None,
+            vec![(MANUAL, reqwest::Client::new(), Some(1e6))],
+        );
+        let manual = node_of(&pool, MANUAL);
+        pool.observe_window(&[(0, 5e6), (manual, 2e6)]);
+        assert_eq!(pool.path_estimates().len(), 2);
+
+        assert!(pool.try_sys_transport_fallback());
+        assert!(pool.try_sys_transport_fallback());
+        assert_eq!(pool.take_path_failures(), vec![RoutePath::Direct]);
+        assert!(pool.take_path_failures().is_empty());
+        let estimates = pool.path_estimates();
+        assert_eq!(estimates.len(), 1);
+        assert_eq!(estimates[0].0, MANUAL);
+    }
+
+    /// 无改道可用（无备选 / 备选被踢 / 配额耗尽）时 SYS 租约保持完整重试预算。
+    #[test]
+    fn sys_fallback_availability_follows_alternates_and_budget() {
+        let single = NodePool::single(reqwest::Client::new());
+        assert!(!single.sys_fallback_available());
+
+        let kicked = NodePool::single(reqwest::Client::new());
+        kicked.add_paths(
+            RoutePath::Direct,
+            None,
+            vec![(MANUAL, reqwest::Client::new(), Some(1e6))],
+        );
+        assert!(kicked.sys_fallback_available());
+        let manual = node_of(&kicked, MANUAL);
+        kicked.observe_window(&[(0, 1e3), (manual, 1e6)]);
+        let lease = kicked.lease();
+        let err = DownloadError::Other("segment 2: validator mismatch — probe etag".to_string());
+        kicked.report(&lease, 0, Duration::from_secs(1), Err(&err));
+        assert!(!kicked.sys_fallback_available(), "备选被踢后无改道可用");
+
+        let drained = NodePool::single(reqwest::Client::new());
+        drained.add_paths(
+            RoutePath::Direct,
+            None,
+            vec![(MANUAL, reqwest::Client::new(), Some(1e6))],
+        );
+        for _ in 0..super::SYS_FALLBACK_BUDGET {
+            assert!(drained.try_sys_transport_fallback());
+        }
+        assert!(!drained.sys_fallback_available(), "配额耗尽后恢复耐心");
     }
 
     #[test]

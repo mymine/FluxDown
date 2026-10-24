@@ -2,15 +2,10 @@ import FluxDomain
 import FluxUI
 import SwiftUI
 
-/// S3 · 通用。分组（03-settings §4）：后台下载 → 系统 → 下载页显示 → 入口 → 自定义分类。
+/// S3 · 通用。分组（03-settings §4）：后台下载 → 系统 → 下载页显示 → 入口。
 /// 偏好键一律经 `ConfigEditor` 写入（agent 偏好，☁︎ 键同步）；`mobile.bg_continue` 是设备本地（`UserDefaults`）。
 struct GeneralPage: View {
     @Environment(HostStore.self) private var store
-    @Environment(ConfigEditor.self) private var editor
-    @Environment(AppContainer.self) private var container
-
-    @State private var categoryTarget: GeneralCategoryTarget?
-
 
     var body: some View {
         let readOnly = store.state.isReadOnly
@@ -19,21 +14,6 @@ struct GeneralPage: View {
             systemSection(readOnly: readOnly)
             downloadsViewSection(readOnly: readOnly)
             entriesSection(readOnly: readOnly)
-            CategoriesSection(editing: $categoryTarget, readOnly: readOnly)
-        }
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                EditButton().disabled(readOnly)
-            }
-        }
-        .fluxAnimation(.smooth, value: editor.form.pref(CustomCategoryDto.preferenceKey))
-        .sheet(item: $categoryTarget) { target in
-            let categories = GeneralCategoryStore(editor: editor, toasts: container.toasts)
-            CategoryEditorSheet(
-                existing: target.existing,
-                onSave: { categories.save($0) },
-                onDelete: target.existing.map { entry in { categories.delete(entry) } }
-            )
         }
     }
 
@@ -65,7 +45,7 @@ struct GeneralPage: View {
             if let item = GeneralRow.analytics.item {
                 ConfigToggleRow(item: item).disabled(readOnly)
             }
-            #if FULL_P2P
+            #if FULL_FLAVOR
             GeneralLinkHandlingRows()
             #endif
         } header: {
@@ -104,7 +84,7 @@ struct GeneralPage: View {
     }
 }
 
-#if FULL_P2P
+#if FULL_FLAVOR
 // MARK: - 链接与文件打开方式（只读）
 
 /// 读取 Info.plist 的静态声明：`magnet:` / `ed2k://` / `.torrent`。iOS 无法检测是否被其它 App 抢占，只展示本 App 是否声明。
@@ -149,12 +129,5 @@ extension GeneralPage {
                 breadcrumb: "\(name) › \(L(row.group.titleKey))", symbol: row.symbol
             )
         }
-    }
-
-    /// 设置首页读数：分类条数（偏好尚未下发时用默认说明）。
-    static func readout(_ ctx: SettingsSearchContext) -> String? {
-        guard ctx.form.pref(CustomCategoryDto.preferenceKey) != nil else { return nil }
-        let count = CustomCategoryDto.fromPreference(ctx.form.pref(CustomCategoryDto.preferenceKey)).count
-        return L("mobileGeneralReadoutCategories", ["n": count])
     }
 }

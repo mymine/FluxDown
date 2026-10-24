@@ -4,11 +4,13 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 局域网配对的 mDNS 发现：Wi-Fi 省电模式默认丢弃组播包，发现期间持有 MulticastLock -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- 打开已下载的 .apk：系统安装器要求调用方声明此权限，否则静默关闭（无任何提示） -->
+    <!-- 打开已下载的 .apk / 应用自更新交给安装程序：系统安装器要求调用方声明此权限，否则静默关闭（无任何提示） -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- 用户把保存目录指向应用专属目录以外的共享存储时按需授权：Android 11+ 引导系统“所有文件访问”，
          Android 10 及以下申请存储运行时权限（Android 10 另需 application 的 requestLegacyExternalStorage） -->
@@ -194,10 +196,7 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- 应用更新：安装会话结果（系统回调，不对外导出）+ 周期后台检查任务 -->
-        <receiver
-            android:name=".update.InstallResultReceiver"
-            android:exported="false" />
+        <!-- 应用更新：周期后台检查任务 -->
         <service
             android:name=".update.UpdateCheckJobService"
             android:exported="false"

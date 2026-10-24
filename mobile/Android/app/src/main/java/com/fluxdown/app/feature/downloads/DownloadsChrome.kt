@@ -35,6 +35,7 @@ private fun StatusFolder.icon() = when (this) {
     StatusFolder.All -> FluxIcons.Layers
     StatusFolder.Active -> FluxIcons.Download
     StatusFolder.Completed -> FluxIcons.CheckCheck
+    StatusFolder.Seeding -> FluxIcons.Upload
     StatusFolder.Failed -> FluxIcons.FileWarning
     StatusFolder.Paused -> FluxIcons.Pause
 }
@@ -171,11 +172,8 @@ private fun SelectionDockContent(modifier: Modifier, reservedEnd: Dp) {
                 val sel = nav.selection
                 for (t in host.value.tasks) {
                     if (t.taskId !in sel) continue
-                    when (t.status) {
-                        TaskStatus.Paused, TaskStatus.Failed -> resume = true
-                        TaskStatus.Downloading, TaskStatus.Pending, TaskStatus.Preparing -> pause = true
-                        else -> Unit
-                    }
+                    if (t.canResume) resume = true
+                    if (t.canPause) pause = true
                 }
                 SelectionCaps(resume, pause)
             }
@@ -191,7 +189,8 @@ private fun SelectionDockContent(modifier: Modifier, reservedEnd: Dp) {
             }
         }
         container.store.state.collect { s ->
-            if (nav.selection.isEmpty()) return@collect
+            // 任务表载入中列表是空的，不能据此判定“已选任务都被删除了”。
+            if (nav.selection.isEmpty() || s.tasksLoading) return@collect
             val ids = if (nav.selection.size > 8) s.tasks.mapTo(HashSet()) { it.taskId } else null
             val gone = nav.selection.filter { id -> if (ids != null) id !in ids else s.tasks.none { it.taskId == id } }
             if (gone.isNotEmpty()) nav.selection.removeAll(gone.toSet())

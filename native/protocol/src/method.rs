@@ -3,6 +3,10 @@
 pub const SYSTEM_HELLO: &str = "system.hello";
 pub const SYSTEM_PING: &str = "system.ping";
 pub const SYSTEM_SNAPSHOT: &str = "system.snapshot";
+/// 分页拉取 `system.snapshot` / 重载事件宣告「待载入」的任务表与队列位置表
+/// （[`crate::TablePageParams`] → [`crate::TablePage`]）。与 `system.snapshot` 同权限、同服务：
+/// 页应答自带服务端当时的 `(epoch, sequence)`，客户端按 [`crate::TableSync`] 载入并回放。
+pub const SYSTEM_TASK_PAGE: &str = "system.taskPage";
 /// 让服务优雅退出：daemon 关停引擎后退出；agent 先关停 daemon 再退出（完全退出）。
 ///
 /// 允许作为连接首帧（握手前）调用：协议版本不兼容的新旧进程替换只能靠它完成。
@@ -88,6 +92,10 @@ pub const DAEMON_LINK_PROBE: &str = "daemon.link.probe";
 
 pub const DAEMON_PLUGIN_LIST: &str = "daemon.plugin.list";
 pub const DAEMON_PLUGIN_SNIFF_RULES: &str = "daemon.plugin.sniffRules";
+/// 插件页面脚本索引（`PluginPageScriptsDto`）：浏览器扩展据此注册 / 更新 / 注销用户脚本。
+pub const DAEMON_PLUGIN_PAGE_SCRIPTS: &str = "daemon.plugin.pageScripts";
+/// 读取单个页面脚本源码（`PluginPageScriptSourceParams` → `PluginPageScriptSourceDto`）。
+pub const DAEMON_PLUGIN_PAGE_SCRIPT_SOURCE: &str = "daemon.plugin.pageScriptSource";
 pub const DAEMON_PLUGIN_AUTH: &str = "daemon.plugin.auth";
 pub const DAEMON_PLUGIN_SET_ENABLED: &str = "daemon.plugin.setEnabled";
 pub const DAEMON_PLUGIN_UPDATE_SETTINGS: &str = "daemon.plugin.updateSettings";
@@ -125,6 +133,9 @@ pub const DAEMON_PLUGIN_VIEW_KEEPALIVE: &str = "daemon.plugin.view.keepalive";
 pub const DAEMON_PLUGIN_COMMAND: &str = "daemon.plugin.command";
 /// 调用插件 `flux.rpc.handle` 注册的处理器（`{identity, name, args}`）。慢方法。
 pub const DAEMON_PLUGIN_INVOKE: &str = "daemon.plugin.invoke";
+/// 页面脚本调用插件处理器（`PluginPageInvokeParams` → `PluginPageInvokeResultDto`）：只命中以
+/// `{ page: true }` 注册的处理器，且插件须已授权 `pageScripts`。慢方法。
+pub const DAEMON_PLUGIN_PAGE_INVOKE: &str = "daemon.plugin.pageInvoke";
 pub const DAEMON_COMPONENT_GET: &str = "daemon.component.get";
 pub const DAEMON_COMPONENT_LIST_VERSIONS: &str = "daemon.component.listVersions";
 pub const DAEMON_COMPONENT_INSTALL: &str = "daemon.component.install";
@@ -180,6 +191,8 @@ pub const AGENT_PROFILE_CHANGE_ORIGIN_ID: &str = "agent.profile.changeOriginId";
 pub const AGENT_PROFILE_CHANGE_NICKNAME: &str = "agent.profile.changeNickname";
 pub const AGENT_PROFILE_SEND_PASSWORD_CODE: &str = "agent.profile.sendPasswordCode";
 pub const AGENT_PROFILE_CHANGE_PASSWORD: &str = "agent.profile.changePassword";
+pub const AGENT_PROFILE_SEND_DELETE_CODE: &str = "agent.profile.sendDeleteCode";
+pub const AGENT_PROFILE_DELETE_ACCOUNT: &str = "agent.profile.deleteAccount";
 
 pub const AGENT_GATEWAY_GET: &str = "agent.gateway.get";
 pub const AGENT_GATEWAY_PATCH: &str = "agent.gateway.patch";
@@ -227,6 +240,9 @@ pub const AGENT_LINK_REMOVE: &str = "agent.link.remove";
 pub const AGENT_LINK_RENAME: &str = "agent.link.rename";
 /// 探测全部已配对设备在线状态 → `Vec<LinkDeviceInfo>`（同时推送 `LinkedDevicesChanged`）。
 pub const AGENT_LINK_REFRESH: &str = "agent.link.refresh";
+/// `LinkDeviceParams` → `LinkControlCredentialDto`：为「本机可控制」的已配对主机签发 `/rpc`
+/// 设备控制凭据（仅 `controllable && !revoked` 的记录）。
+pub const AGENT_LINK_CONTROL_CREDENTIAL: &str = "agent.link.controlCredential";
 /// `LinkDispatchParams` → `LinkDispatchResult`：下发下载到已配对设备。
 pub const AGENT_LINK_DISPATCH: &str = "agent.link.dispatch";
 
@@ -240,6 +256,10 @@ pub const AGENT_REFERRAL_CREATE_CODE: &str = "agent.referral.createCode";
 pub const AGENT_REFERRAL_DELETE_CODE: &str = "agent.referral.deleteCode";
 pub const AGENT_REFERRAL_LIST_RECORDS: &str = "agent.referral.listRecords";
 pub const AGENT_REFERRAL_VALIDATE: &str = "agent.referral.validate";
+/// 插件市场收藏：公开计数 + （已登录时）本人收藏 → `PluginFavoritesDto`。
+pub const AGENT_PLUGIN_FAVORITE_LIST: &str = "agent.pluginFavorite.list";
+/// 收藏 / 取消收藏单个插件 → `PluginFavoriteResultDto`。
+pub const AGENT_PLUGIN_FAVORITE_SET: &str = "agent.pluginFavorite.set";
 
 /// 云端推送状态 → `CloudNotifyStateDto`（读本机缓存；过期时后台刷新并经 `CloudNotifyChanged` 推送）。
 pub const AGENT_CLOUD_NOTIFY_GET: &str = "agent.cloudNotify.get";
@@ -277,6 +297,8 @@ pub const AGENT_PLATFORM_SET_FILE_ASSOCIATION: &str = "agent.platform.setFileAss
 pub const AGENT_PLATFORM_SET_URL_PROTOCOL: &str = "agent.platform.setUrlProtocol";
 /// 系统文件管理器为文件显示的图标（PNG）；参数见 `PlatformFileIconParams`。
 pub const AGENT_PLATFORM_FILE_ICON: &str = "agent.platform.fileIcon";
+/// `SoundPreviewParams` → `{ "ok": true }`：由 agent 在本机播放一次提示音偏好值（`off` / `system` / `file:<绝对路径>`）。
+pub const AGENT_SOUND_PREVIEW: &str = "agent.sound.preview";
 pub const AGENT_CAPTURE_SUBMIT: &str = "agent.capture.submit";
 /// 从本机 `.torrent` 文件建任务：agent 读文件、上传 daemon blob 后调用 `daemon.task.create`。
 pub const AGENT_CAPTURE_SUBMIT_TORRENT_FILE: &str = "agent.capture.submitTorrentFile";
@@ -335,6 +357,7 @@ pub const ALL_METHODS: &[&str] = &[
     SYSTEM_HELLO,
     SYSTEM_PING,
     SYSTEM_SNAPSHOT,
+    SYSTEM_TASK_PAGE,
     SYSTEM_SHUTDOWN,
     DAEMON_TASK_LIST,
     DAEMON_TASK_GET,
@@ -397,6 +420,8 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_LINK_PROBE,
     DAEMON_PLUGIN_LIST,
     DAEMON_PLUGIN_SNIFF_RULES,
+    DAEMON_PLUGIN_PAGE_SCRIPTS,
+    DAEMON_PLUGIN_PAGE_SCRIPT_SOURCE,
     DAEMON_PLUGIN_AUTH,
     DAEMON_PLUGIN_SET_ENABLED,
     DAEMON_PLUGIN_UPDATE_SETTINGS,
@@ -420,6 +445,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_PLUGIN_VIEW_KEEPALIVE,
     DAEMON_PLUGIN_COMMAND,
     DAEMON_PLUGIN_INVOKE,
+    DAEMON_PLUGIN_PAGE_INVOKE,
     DAEMON_COMPONENT_GET,
     DAEMON_COMPONENT_LIST_VERSIONS,
     DAEMON_COMPONENT_INSTALL,
@@ -465,6 +491,8 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_PROFILE_CHANGE_NICKNAME,
     AGENT_PROFILE_SEND_PASSWORD_CODE,
     AGENT_PROFILE_CHANGE_PASSWORD,
+    AGENT_PROFILE_SEND_DELETE_CODE,
+    AGENT_PROFILE_DELETE_ACCOUNT,
     AGENT_GATEWAY_GET,
     AGENT_GATEWAY_PATCH,
     AGENT_GATEWAY_REVEAL_TOKEN,
@@ -494,6 +522,7 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_LINK_REMOVE,
     AGENT_LINK_RENAME,
     AGENT_LINK_REFRESH,
+    AGENT_LINK_CONTROL_CREDENTIAL,
     AGENT_LINK_DISPATCH,
     AGENT_PLAN_LIST,
     AGENT_ORDER_CREATE,
@@ -505,6 +534,8 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_REFERRAL_DELETE_CODE,
     AGENT_REFERRAL_LIST_RECORDS,
     AGENT_REFERRAL_VALIDATE,
+    AGENT_PLUGIN_FAVORITE_LIST,
+    AGENT_PLUGIN_FAVORITE_SET,
     AGENT_CLOUD_NOTIFY_GET,
     AGENT_CLOUD_NOTIFY_REFRESH,
     AGENT_CLOUD_NOTIFY_SET_REPORTING,
@@ -526,6 +557,7 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_PLATFORM_SET_FILE_ASSOCIATION,
     AGENT_PLATFORM_SET_URL_PROTOCOL,
     AGENT_PLATFORM_FILE_ICON,
+    AGENT_SOUND_PREVIEW,
     AGENT_CAPTURE_SUBMIT,
     AGENT_CAPTURE_SUBMIT_TORRENT_FILE,
     AGENT_CAPTURE_LIST,
@@ -559,6 +591,7 @@ pub const SLOW_DAEMON_METHODS: &[&str] = &[
     DAEMON_PLUGIN_VIEW_OPEN,
     DAEMON_PLUGIN_COMMAND,
     DAEMON_PLUGIN_INVOKE,
+    DAEMON_PLUGIN_PAGE_INVOKE,
     DAEMON_GROUP_RESOLVE_PREVIEW,
     DAEMON_RSS_VALIDATE,
     DAEMON_LINK_PROBE,

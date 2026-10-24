@@ -140,7 +140,11 @@ export function checkElement(el: Element, by: DetectionMethod, ctx: ScanContext)
     case "embed":
     case "object": {
       const url = (el as HTMLEmbedElement).src || (el as HTMLObjectElement).data;
-      if (url?.startsWith("http")) out.push({ url, type: "other", detectedBy: by });
+      if (!url?.startsWith("http")) break;
+      // 作者声明的 type（如 application/pdf）：服务端回 octet-stream 时浏览器按它渲染（HTML 规范），
+      // 也是无扩展名地址唯一的类型线索；入库时由规则引擎按 MIME 归类。
+      const mimeType = (el as HTMLEmbedElement | HTMLObjectElement).type.split(";")[0].trim().toLowerCase();
+      out.push({ url, type: "other", ...(mimeType ? { mimeType } : {}), detectedBy: by });
       break;
     }
   }

@@ -127,6 +127,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     resp_name TEXT NOT NULL DEFAULT '',
     resp_mime TEXT NOT NULL DEFAULT '',
     source_changed INTEGER NOT NULL DEFAULT 0,
+    category_route TEXT NOT NULL DEFAULT '',
+    request_method TEXT NOT NULL DEFAULT '',
     queue_order INTEGER NOT NULL DEFAULT 0,
     uploaded_bytes BIGINT NOT NULL DEFAULT 0,
     uploaded_at_completion BIGINT NOT NULL DEFAULT 0,
@@ -360,6 +362,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     resp_name TEXT NOT NULL DEFAULT '',
     resp_mime TEXT NOT NULL DEFAULT '',
     source_changed INTEGER NOT NULL DEFAULT 0,
+    category_route TEXT NOT NULL DEFAULT '',
+    request_method TEXT NOT NULL DEFAULT '',
     queue_order INTEGER NOT NULL DEFAULT 0,
     uploaded_bytes BIGINT NOT NULL DEFAULT 0,
     uploaded_at_completion BIGINT NOT NULL DEFAULT 0,
@@ -568,10 +572,15 @@ CREATE INDEX IF NOT EXISTS idx_task_create_batches_created ON task_create_batche
 /// checkpoint 时同步；进程崩溃不丢已提交事务，仅整机掉电可能丢失最近
 /// 数秒的提交（数据库本身不会损坏）。下载进度/任务元数据可由续传重建，
 /// 换来批量导入与进度落库的 fsync 开销归零。
+/// cache_size=-16384（16MiB，负值单位为 KiB）：23 万任务级别的库里 UUID 主键
+/// 的 B 树随机访问，512KiB 页缓存几乎必然未命中并反复 pread；16MiB 足以容纳
+/// 常用索引的热页。内存取舍：该值是「每连接」上限且按需增长（空库不预占），
+/// 连接池上限 5 条，最坏占用 = 5 × 16MiB，对桌面/NAS/手机均可接受，
+/// 因此不按平台区分，避免出现两套行为。
 const SQLITE_PRAGMAS: &str = "PRAGMA journal_mode=WAL;\
  PRAGMA synchronous=NORMAL;\
  PRAGMA busy_timeout=5000;\
- PRAGMA cache_size=-512;\
+ PRAGMA cache_size=-16384;\
  PRAGMA temp_store=MEMORY;\
  PRAGMA mmap_size=0;\
  PRAGMA wal_autocheckpoint=1000;";
@@ -761,6 +770,10 @@ pub struct NewTaskRow<'a> {
     pub unattended: bool,
     /// `bt_selected_files` 列的编码值（`""` / `"all"` / `"0,2,5"`）。
     pub bt_selected_files: &'a str,
+    /// 分类目录路由列值（`CategoryRoute` JSON；空串 = 不路由）。
+    pub category_route: &'a str,
+    /// 浏览器捕获的非 GET 请求方法（`POST` 等）；空串 = GET。请求体不落库。
+    pub request_method: &'a str,
     /// `.torrent` 字节；非空时同事务写入 `torrent_files`。
     pub torrent_file_bytes: &'a [u8],
 }
@@ -837,37 +850,65 @@ pub struct FissionSpec {
 const TASK_ACTIVITY_MAX_ROWS: i64 = 50_000;
 const TASK_ACTIVITY_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
+/// 容量清理的滞回比例分母：行数超过 `max_rows + max_rows / 10` 才触发，
+/// 触发后一次性清回 `max_rows`。避免到达上限后每条新增都付一次整表偏移扫描。
+const TASK_ACTIVITY_PRUNE_SLACK_DIVISOR: i64 = 10;
+
 async fn prune_task_activity(
     tx: &mut sqlx::Transaction<'_, Any>,
     cutoff_ms: i64,
     max_rows: i64,
 ) -> Result<(), DbError> {
-    let removed = sqlx::query(
-        "DELETE FROM task_activity WHERE timestamp_ms < $1 OR id <= COALESCE(\
-         (SELECT id FROM task_activity ORDER BY id DESC LIMIT 1 OFFSET $2), 0) RETURNING task_id, id",
+    let high_water = max_rows.saturating_add(max_rows / TASK_ACTIVITY_PRUNE_SLACK_DIVISOR);
+    // 容量阈值：0 表示不做容量清理（id 自增且 > 0，`id <= 0` 恒假）。
+    // 行数 <= id 跨度 + 1，跨度未达高水位时必然未超限，省掉偏移扫描。
+    // MAX 与 MIN 分成两个子查询：SQLite 只对单独的 min()/max() 走主键 O(log n)
+    // 优化，写在同一个 SELECT 里会退化为整表扫描（每次追加都在写锁内付一次）。
+    let (span, oldest_ms): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT (SELECT MAX(id) FROM task_activity) - (SELECT MIN(id) FROM task_activity), \
+         (SELECT MIN(timestamp_ms) FROM task_activity)",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let mut capacity_threshold = 0_i64;
+    if span.is_some_and(|span| span >= high_water) {
+        let over: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM task_activity ORDER BY id DESC LIMIT 1 OFFSET $1")
+                .bind(high_water)
+                .fetch_optional(&mut **tx)
+                .await?;
+        if over.is_some() {
+            let keep_boundary: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM task_activity ORDER BY id DESC LIMIT 1 OFFSET $1",
+            )
+            .bind(max_rows)
+            .fetch_optional(&mut **tx)
+            .await?;
+            capacity_threshold = keep_boundary.unwrap_or(0);
+        }
+    }
+    // 既无过期行也未超容量：常见情形直接返回，不在写锁内跑带 OR 的聚合 / 删除扫描。
+    if capacity_threshold == 0 && oldest_ms.is_none_or(|oldest| oldest >= cutoff_ms) {
+        return Ok(());
+    }
+    // 先按 task_id 聚合记录被清理的最大 id，再删除；同一条件两处使用，保证一致。
+    sqlx::query(
+        "INSERT INTO task_activity_retention (task_id, pruned_through_id) \
+         SELECT task_id, MAX(id) FROM task_activity \
+         WHERE timestamp_ms < $1 OR id <= $2 GROUP BY task_id \
+         ON CONFLICT(task_id) DO UPDATE SET pruned_through_id = \
+         CASE WHEN excluded.pruned_through_id > task_activity_retention.pruned_through_id \
+              THEN excluded.pruned_through_id ELSE task_activity_retention.pruned_through_id END",
     )
     .bind(cutoff_ms)
-    .bind(max_rows)
-    .fetch_all(&mut **tx)
+    .bind(capacity_threshold)
+    .execute(&mut **tx)
     .await?;
-    let mut boundaries: HashMap<String, i64> = HashMap::new();
-    for row in removed {
-        let task_id: String = row.try_get("task_id")?;
-        let id: i64 = row.try_get("id")?;
-        boundaries
-            .entry(task_id)
-            .and_modify(|previous| *previous = (*previous).max(id))
-            .or_insert(id);
-    }
-    for (task_id, id) in boundaries {
-        sqlx::query(
-            "INSERT INTO task_activity_retention (task_id, pruned_through_id) VALUES ($1, $2) \
-             ON CONFLICT(task_id) DO UPDATE SET pruned_through_id = \
-             CASE WHEN excluded.pruned_through_id > task_activity_retention.pruned_through_id \
-                  THEN excluded.pruned_through_id ELSE task_activity_retention.pruned_through_id END",
-        )
-        .bind(task_id).bind(id).execute(&mut **tx).await?;
-    }
+    sqlx::query("DELETE FROM task_activity WHERE timestamp_ms < $1 OR id <= $2")
+        .bind(cutoff_ms)
+        .bind(capacity_threshold)
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -994,32 +1035,65 @@ impl Db {
         &self,
         activity: &crate::task_activity::TaskActivity,
     ) -> Result<Option<crate::task_activity::TaskActivity>, DbError> {
+        Ok(self
+            .append_task_activities(std::slice::from_ref(activity))
+            .await?
+            .pop()
+            .flatten())
+    }
+
+    /// 批量持久化源端活动：一个事务内按入参顺序逐条插入（ID 随之递增）、只裁剪一次。
+    /// 返回与入参一一对应的结果：任务已删除（不产生孤儿行）的项为 `None`。
+    /// 整个批次要么全部提交要么全部回滚。
+    pub async fn append_task_activities(
+        &self,
+        activities: &[crate::task_activity::TaskActivity],
+    ) -> Result<Vec<Option<crate::task_activity::TaskActivity>>, DbError> {
+        self.append_task_activities_pruning(
+            activities,
+            crate::task_activity::timestamp_ms() - TASK_ACTIVITY_MAX_AGE_MS,
+            TASK_ACTIVITY_MAX_ROWS,
+        )
+        .await
+    }
+
+    /// [`Self::append_task_activities`] 的保留参数显式版本（测试用小容量覆盖裁剪边界）。
+    async fn append_task_activities_pruning(
+        &self,
+        activities: &[crate::task_activity::TaskActivity],
+        cutoff_ms: i64,
+        max_rows: i64,
+    ) -> Result<Vec<Option<crate::task_activity::TaskActivity>>, DbError> {
+        if activities.is_empty() {
+            return Ok(Vec::new());
+        }
         let _guard = self.activity_lock.lock().await;
         let mut tx = self.pool.begin().await?;
-        let id: Option<i64> = sqlx::query_scalar(
-            "INSERT INTO task_activity (task_id, timestamp_ms, kind, message, status) \
-             SELECT $1, $2, $3, $4, $5 WHERE EXISTS (SELECT 1 FROM tasks WHERE id = $1) RETURNING id",
-        )
-        .bind(&activity.task_id)
-        .bind(activity.timestamp_ms)
-        .bind(&activity.kind)
-        .bind(&activity.message)
-        .bind(activity.status)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if id.is_some() {
-            prune_task_activity(
-                &mut tx,
-                crate::task_activity::timestamp_ms() - TASK_ACTIVITY_MAX_AGE_MS,
-                TASK_ACTIVITY_MAX_ROWS,
+        let mut saved = Vec::with_capacity(activities.len());
+        let mut inserted_any = false;
+        for activity in activities {
+            let id: Option<i64> = sqlx::query_scalar(
+                "INSERT INTO task_activity (task_id, timestamp_ms, kind, message, status) \
+                 SELECT $1, $2, $3, $4, $5 WHERE EXISTS (SELECT 1 FROM tasks WHERE id = $1) RETURNING id",
             )
+            .bind(&activity.task_id)
+            .bind(activity.timestamp_ms)
+            .bind(&activity.kind)
+            .bind(&activity.message)
+            .bind(activity.status)
+            .fetch_optional(&mut *tx)
             .await?;
+            inserted_any |= id.is_some();
+            saved.push(id.map(|id| crate::task_activity::TaskActivity {
+                id,
+                ..activity.clone()
+            }));
+        }
+        if inserted_any {
+            prune_task_activity(&mut tx, cutoff_ms, max_rows).await?;
         }
         tx.commit().await?;
-        Ok(id.map(|id| crate::task_activity::TaskActivity {
-            id,
-            ..activity.clone()
-        }))
+        Ok(saved)
     }
 
     /// 按任务分页。最新页和 before 向前分页均先查 DESC 再升序返回；
@@ -1441,6 +1515,13 @@ impl Db {
         // 按零容差比对新旧大小（不一致即清空进度）并清回 0。
         self.add_column_if_missing("tasks", "source_changed", "INTEGER NOT NULL DEFAULT 0")
             .await?;
+        // 外部捕获的分类目录路由（JSON，见 `category_route.rs`；空 = 保存目录即最终目录）。
+        self.add_column_if_missing("tasks", "category_route", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        // 浏览器 POST 接管任务的请求方法（空 = GET）。请求体（常含一次性令牌）不落库，
+        // 恢复 / 重试时据此明确拒绝，而不是改发 GET。
+        self.add_column_if_missing("tasks", "request_method", "TEXT NOT NULL DEFAULT ''")
+            .await?;
         Ok(())
     }
 
@@ -1614,9 +1695,9 @@ impl Db {
                 "INSERT INTO tasks (id, url, file_name, name_inferred, save_dir, segments, status, error_message, \
                  created_at, proxy_url, queue_id, checksum, ignore_tls_errors, queue_order, cookies, referrer, \
                  extra_headers, origin_url, audio_url, resolver_plugin_id, group_id, resolver_item, unattended, \
-                 bt_selected_files, resolver_choice_pending) \
+                 bt_selected_files, resolver_choice_pending, category_route, request_method) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, \
-                 $20, $21, $22, $23, $24, $25)",
+                 $20, $21, $22, $23, $24, $25, $26, $27)",
             )
             .bind(row.id)
             .bind(row.url)
@@ -1643,6 +1724,8 @@ impl Db {
             .bind(i32::from(row.unattended))
             .bind(row.bt_selected_files)
             .bind(i32::from(row.resolver_choice_pending))
+            .bind(row.category_route)
+            .bind(row.request_method)
             .execute(&mut *tx)
             .await?;
             if !row.torrent_file_bytes.is_empty() {
@@ -3316,6 +3399,9 @@ impl Db {
             // 任务的文件被删除或移动时的动作："keep" = 保留任务记录（默认，
             // 仅标记 file_missing）；"delete" = 扫描到文件消失后自动删除任务记录。
             ("file_missing_action", "keep"),
+            // 已完成任务记录保留天数：超期的「已完成」记录被自动清理（只删记录，
+            // 不删文件，做种中的任务跳过）；"0" = 永不清理（默认）。
+            ("completed_record_retention_days", "0"),
             // 空闲（无活跃/排队任务）时是否仍执行周期性文件跟踪扫描：
             // "0" = 完全空闲期跳过定时扫描（默认，避免唤醒 NAS 休眠硬盘）；
             // "1"/"true" = 照常扫描。窗口聚焦、手动重扫不受影响。
@@ -3415,6 +3501,7 @@ impl Db {
             .await?;
         }
         self.migrate_idle_file_scan_default_off().await?;
+        self.migrate_completed_at_backfill().await?;
         #[cfg(feature = "ed2k")]
         self.migrate_ed2k_server_sub_https().await?;
         Ok(())
@@ -3441,6 +3528,72 @@ impl Db {
             .await?;
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// 一次性迁移：保留期清理依赖 `completed_at`，而旧版本完成的任务可能没有该时间戳。
+    /// 仅在迁移标记首次写入成功时，把「已完成但 completed_at 为空」的行补写为当前时刻，
+    /// 让遗留记录的保留窗口从升级时开始计算（不会因缺时间戳而被立即清理或永不清理）。
+    /// 标记与回填在同一事务。
+    async fn migrate_completed_at_backfill(&self) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let marked = sqlx::query(
+            "INSERT INTO config (key, value) VALUES ('migration_completed_at_backfill', '1')
+             ON CONFLICT (key) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if marked > 0 {
+            sqlx::query(
+                "UPDATE tasks SET completed_at = $1 WHERE status = 3 AND completed_at = ''",
+            )
+            .bind(chrono_now())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 列出已超过保留期的「已完成」任务 id：`status = 3`、`completed_at` 非空且早于
+    /// `cutoff_secs`（Unix 秒），并排除做种中 / 排队做种的任务。最多返回 `limit` 条，
+    /// 按完成时间从旧到新。
+    pub async fn list_expired_completed_task_ids(
+        &self,
+        cutoff_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<String>, DbError> {
+        let sql = format!(
+            "SELECT id FROM tasks
+             WHERE status = 3 AND completed_at <> ''
+               AND seeding_status NOT IN ({active}, {queued})
+               AND (CASE WHEN completed_at = '' THEN 0 ELSE CAST(completed_at AS BIGINT) END) < $1
+             ORDER BY completed_at ASC, id ASC
+             LIMIT $2",
+            active = crate::bt_seeding::SEEDING_STATUS_ACTIVE,
+            queued = crate::bt_seeding::SEEDING_STATUS_QUEUED,
+        );
+        let ids = sqlx::query_scalar(AssertSqlSafe(sql))
+            .bind(cutoff_secs)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(ids)
+    }
+
+    /// 测试专用：直接写入 `completed_at`（正常路径只会写入当前时刻，无法造出「旧」记录）。
+    #[cfg(test)]
+    pub(crate) async fn set_completed_at_for_test(
+        &self,
+        id: &str,
+        completed_at: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE tasks SET completed_at = $1 WHERE id = $2")
+            .bind(completed_at)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -4477,24 +4630,63 @@ impl Db {
     }
 
     /// 单条目清单原地改写任务的落盘目标（外部无 UI 入口的自动裂变单条目
-    /// 分支，D6）：不建组，仅覆盖 `save_dir`/`file_name`/`total_bytes`，
-    /// `checksum` 清空（旧值针对改写前的下载目标，保留必致校验失败）。
+    /// 分支，D6）：不建组，仅覆盖 `save_dir`/`file_name`/`total_bytes`/
+    /// `category_route`，`checksum` 清空（旧值针对改写前的下载目标，保留必致校验失败）。
     pub async fn rewrite_task_for_item(
         &self,
         id: &str,
         save_dir: &str,
         file_name: &str,
         total_bytes: i64,
+        category_route: &str,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "UPDATE tasks SET save_dir = $1, file_name = $2, total_bytes = $3, checksum = '' WHERE id = $4",
+            "UPDATE tasks SET save_dir = $1, file_name = $2, total_bytes = $3, checksum = '', \
+             category_route = $4 WHERE id = $5",
         )
         .bind(save_dir)
         .bind(file_name)
         .bind(total_bytes)
+        .bind(category_route)
         .bind(id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// 任务的分类目录路由列值（空串 = 不路由 / 任务不存在）。
+    pub async fn load_task_category_route(&self, id: &str) -> Result<String, DbError> {
+        let route: Option<String> =
+            sqlx::query_scalar("SELECT category_route FROM tasks WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(route.unwrap_or_default())
+    }
+
+    /// 任务落库的非 GET 请求方法（空串 = GET / 任务不存在）。
+    pub async fn load_task_request_method(&self, id: &str) -> Result<String, DbError> {
+        let method: Option<String> =
+            sqlx::query_scalar("SELECT request_method FROM tasks WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(method.unwrap_or_default())
+    }
+
+    /// 产物移入分类目录后同步任务位置（单条 UPDATE，目录与文件名不会分离）。
+    pub async fn set_task_location(
+        &self,
+        id: &str,
+        save_dir: &str,
+        file_name: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE tasks SET save_dir = $1, file_name = $2 WHERE id = $3")
+            .bind(save_dir)
+            .bind(file_name)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -4535,9 +4727,10 @@ impl Db {
         .execute(&mut *tx)
         .await?;
 
+        // 母任务成为组成员：组以基准目录为根、成员保持组内结构，不再按分类路由。
         sqlx::query(
             "UPDATE tasks SET group_id = $1, resolver_item = $2, file_name = $3, save_dir = $4, \
-             total_bytes = $5, checksum = '', status = $6 WHERE id = $7",
+             total_bytes = $5, checksum = '', status = $6, category_route = '' WHERE id = $7",
         )
         .bind(&spec.group_id)
         .bind(&spec.mother_resolver_item)
@@ -4583,46 +4776,8 @@ impl Db {
         Ok(())
     }
 
-    /// 插入或更新一条已配对设备（link 名册）。冲突（同指纹 = 同一设备）时刷新
-    /// 展示名/平台/候选端点/**链路密钥**/配对与最近活跃时间——重新配对会用新
-    /// ECDH 派生的密钥覆盖旧值（支持密钥轮换）。`identity_pub` 由指纹决定，不变。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn link_upsert_device(
-        &self,
-        fingerprint: &str,
-        identity_pub: &[u8],
-        name: &str,
-        platform: &str,
-        link_secret: &[u8],
-        candidates_json: &str,
-        paired_at: i64,
-        last_seen_at: i64,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO link_devices (fingerprint, identity_pub, name, platform, link_secret, candidates, paired_at, last_seen_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-             ON CONFLICT (fingerprint) DO UPDATE SET
-                 name = excluded.name,
-                 platform = excluded.platform,
-                 link_secret = excluded.link_secret,
-                 candidates = excluded.candidates,
-                 paired_at = excluded.paired_at,
-                 last_seen_at = excluded.last_seen_at",
-        )
-        .bind(fingerprint)
-        .bind(identity_pub)
-        .bind(name)
-        .bind(platform)
-        .bind(link_secret)
-        .bind(candidates_json)
-        .bind(paired_at)
-        .bind(last_seen_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// 读取全部已配对设备，按最近活跃降序。
+    /// 读取旧版遗留的已配对设备名册（按最近活跃降序），仅供 daemon 向 agent
+    /// 一次性迁移（`link_migration_export`）；互联状态现由 agent 自行持久化。
     pub async fn link_load_devices(&self) -> Result<Vec<LinkDeviceRow>, DbError> {
         let rows = sqlx::query(
             "SELECT fingerprint, identity_pub, name, platform, link_secret, candidates, paired_at, last_seen_at
@@ -4634,66 +4789,6 @@ impl Db {
             .map(link_device_from_row)
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
-    }
-
-    /// 按指纹读取单台已配对设备（数据面链路鉴权时查密钥用）。
-    pub async fn link_load_device(
-        &self,
-        fingerprint: &str,
-    ) -> Result<Option<LinkDeviceRow>, DbError> {
-        let row = sqlx::query(
-            "SELECT fingerprint, identity_pub, name, platform, link_secret, candidates, paired_at, last_seen_at
-             FROM link_devices WHERE fingerprint = $1",
-        )
-        .bind(fingerprint)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            Some(r) => Ok(Some(link_device_from_row(&r)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// 删除一台已配对设备（解除配对）。返回是否删到行。
-    pub async fn link_delete_device(&self, fingerprint: &str) -> Result<bool, DbError> {
-        let r = sqlx::query("DELETE FROM link_devices WHERE fingerprint = $1")
-            .bind(fingerprint)
-            .execute(&self.pool)
-            .await?;
-        Ok(r.rows_affected() > 0)
-    }
-
-    /// 刷新设备最近活跃时间（成功连接/探活后）。
-    pub async fn link_touch_device(
-        &self,
-        fingerprint: &str,
-        last_seen_at: i64,
-    ) -> Result<(), DbError> {
-        sqlx::query("UPDATE link_devices SET last_seen_at = $1 WHERE fingerprint = $2")
-            .bind(last_seen_at)
-            .bind(fingerprint)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// 刷新一台已配对设备的候选端点（mDNS 重新发现命中已配对指纹时调用，
-    /// 修复设备 DHCP 换 IP 后旧候选失效的问题）。**不**顺带刷新
-    /// `last_seen_at`——mDNS 广播只证明「对端在广播」，不证明「本机刚和它
-    /// 说上话」，与 [`Self::link_touch_device`]「拨通了才算在线」的语义
-    /// 冲突（否则设备开着但从未真正连接过也会被判定为「最近活跃」）。
-    /// 返回是否命中已配对设备。
-    pub async fn link_update_candidates(
-        &self,
-        fingerprint: &str,
-        candidates_json: &str,
-    ) -> Result<bool, DbError> {
-        let r = sqlx::query("UPDATE link_devices SET candidates = $1 WHERE fingerprint = $2")
-            .bind(candidates_json)
-            .bind(fingerprint)
-            .execute(&self.pool)
-            .await?;
-        Ok(r.rows_affected() > 0)
     }
 
     // -----------------------------------------------------------------------
@@ -5844,6 +5939,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activity_capacity_prune_has_hysteresis_and_aggregates_retention_per_task() {
+        let (db, dir) = open_test_db().await;
+        insert_task(&db, "a").await;
+        insert_task(&db, "b").await;
+        let now = crate::task_activity::timestamp_ms();
+        let cutoff = now - TASK_ACTIVITY_MAX_AGE_MS;
+        // 容量 20 → 高水位 22；a/b 交替写入，共 22 条正好停在高水位，不清理。
+        let first: Vec<_> = (0..22)
+            .map(|i| activity(if i % 2 == 0 { "a" } else { "b" }, "m", now))
+            .collect();
+        let saved = db
+            .append_task_activities_pruning(&first, cutoff, 20)
+            .await
+            .expect("append to high water");
+        let ids: Vec<i64> = saved
+            .iter()
+            .map(|s| s.as_ref().expect("saved").id)
+            .collect();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_activity")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+        assert_eq!(count, 22, "未超过高水位不得清理");
+        let retention_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM task_activity_retention")
+                .fetch_one(&db.pool)
+                .await
+                .expect("retention count");
+        assert_eq!(retention_rows, 0);
+
+        // 预置 b 的水位高于即将清理的边界，验证 upsert 取较大值而非被覆盖。
+        let b_preset = ids[21] + 1_000;
+        sqlx::query(
+            "INSERT INTO task_activity_retention (task_id, pruned_through_id) VALUES ('b', $1)",
+        )
+        .bind(b_preset)
+        .execute(&db.pool)
+        .await
+        .expect("preset retention");
+
+        // 第 23 条越过高水位：一次清回 20 条，即删除最旧 3 条（ids[0..3]）。
+        db.append_task_activities_pruning(&[activity("a", "m", now)], cutoff, 20)
+            .await
+            .expect("cross high water");
+        let remaining: Vec<i64> = sqlx::query_scalar("SELECT id FROM task_activity ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .expect("remaining");
+        assert_eq!(remaining.len(), 20);
+        assert_eq!(remaining[0], ids[3]);
+        // 被删：ids[0]=a, ids[1]=b, ids[2]=a → a 的边界是 ids[2]，b 的是 ids[1] 但预置更大。
+        let a_through: i64 = sqlx::query_scalar(
+            "SELECT pruned_through_id FROM task_activity_retention WHERE task_id = 'a'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("a retention");
+        assert_eq!(a_through, ids[2]);
+        let b_through: i64 = sqlx::query_scalar(
+            "SELECT pruned_through_id FROM task_activity_retention WHERE task_id = 'b'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("b retention");
+        assert_eq!(b_through, b_preset, "retention 不得回退");
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn activity_batch_is_one_ordered_transaction_with_one_prune_and_no_orphans() {
+        let (db, dir) = open_test_db().await;
+        insert_task(&db, "a").await;
+        insert_task(&db, "b").await;
+        let now = crate::task_activity::timestamp_ms();
+        let batch = [
+            activity("a", "a1", now),
+            activity("ghost", "orphan", now),
+            activity("b", "b1", now),
+            activity("a", "a2", now),
+            activity("a", "a3", now),
+        ];
+        // 容量 3：批内 4 条有效行，裁剪边界落在批内最早的一条（a1）上。
+        let saved = db
+            .append_task_activities_pruning(&batch, now - TASK_ACTIVITY_MAX_AGE_MS, 3)
+            .await
+            .expect("batch append");
+        assert_eq!(saved.len(), batch.len());
+        assert!(
+            saved[1].is_none(),
+            "deleted task must not get an orphan row"
+        );
+        let ids: Vec<i64> = [0, 2, 3, 4]
+            .iter()
+            .map(|&i| saved[i].as_ref().expect("task exists").id)
+            .collect();
+        assert!(
+            ids.windows(2).all(|w| w[0] < w[1]),
+            "ids follow batch order"
+        );
+        assert_eq!(saved[0].as_ref().map(|a| a.message.as_str()), Some("a1"));
+
+        let remaining: Vec<i64> = sqlx::query_scalar("SELECT id FROM task_activity ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .expect("remaining rows");
+        assert_eq!(remaining, ids[1..].to_vec());
+        let pruned_through: i64 = sqlx::query_scalar(
+            "SELECT pruned_through_id FROM task_activity_retention WHERE task_id = 'a'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("retention row for a");
+        assert_eq!(pruned_through, ids[0]);
+        let b_retention: Option<i64> = sqlx::query_scalar(
+            "SELECT pruned_through_id FROM task_activity_retention WHERE task_id = 'b'",
+        )
+        .fetch_optional(&db.pool)
+        .await
+        .expect("retention row for b");
+        assert_eq!(b_retention, None);
+
+        assert!(
+            db.append_task_activities(&[])
+                .await
+                .expect("empty batch")
+                .is_empty()
+        );
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn activity_batch_rolls_back_entirely_when_the_store_fails() {
+        let (db, dir) = open_test_db().await;
+        insert_task(&db, "a").await;
+        let now = crate::task_activity::timestamp_ms();
+        sqlx::query("DROP TABLE task_activity_retention")
+            .execute(&db.pool)
+            .await
+            .expect("break retention bookkeeping");
+        // 容量 1 的裁剪必然删除行并写 retention 表 → 失败 → 批内已插入的行必须回滚。
+        let batch = [activity("a", "x", now), activity("a", "y", now)];
+        assert!(
+            db.append_task_activities_pruning(&batch, now - TASK_ACTIVITY_MAX_AGE_MS, 1)
+                .await
+                .is_err()
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_activity")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+        assert_eq!(rows, 0);
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn activity_journal_backlog_is_persisted_in_order_and_published_one_by_one() {
+        struct RecordingSink(std::sync::Mutex<Vec<crate::task_activity::TaskActivity>>);
+        impl crate::events::EventSink for RecordingSink {
+            fn emit(&self, event: crate::events::EngineEvent) {
+                if let crate::events::EngineEvent::TaskActivityAdded(activity) = event {
+                    self.0
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .push(activity);
+                }
+            }
+        }
+        let (db, dir) = open_test_db().await;
+        insert_task(&db, "a").await;
+        let sink = std::sync::Arc::new(RecordingSink(std::sync::Mutex::new(Vec::new())));
+        let journal = crate::task_activity::JournalSink::start(db.clone(), sink.clone());
+        // 积压远超单批上限：必须分批落库，且发布顺序 = 入队顺序。
+        let total: i32 = 700;
+        for index in 0..total {
+            crate::events::EventSink::emit(
+                journal.as_ref(),
+                crate::events::EngineEvent::SegmentSplit {
+                    task_id: "a".to_owned(),
+                    parent_index: index,
+                    parent_new_end: 0,
+                    child_index: index + 1,
+                    child_start: 0,
+                    child_end: 0,
+                    is_proactive: true,
+                    total_segments: 2,
+                },
+            );
+        }
+        journal.flush().await.expect("flush backlog");
+        let published = sink
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        assert_eq!(published.len(), total as usize);
+        assert!(published.windows(2).all(|w| w[0].id < w[1].id));
+        for (index, entry) in published.iter().enumerate() {
+            assert!(
+                entry
+                    .message
+                    .starts_with(&format!("segment {index} split ")),
+                "entry {index}: {}",
+                entry.message
+            );
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_activity")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+        assert_eq!(rows, i64::from(total));
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
     async fn activity_db_failure_does_not_commit_or_report_success() {
         let (db, dir) = open_test_db().await;
         insert_task(&db, "a").await;
@@ -6157,7 +6466,7 @@ mod tests {
         .await
         .expect("insert task");
 
-        db.rewrite_task_for_item("t1", "/tmp/group/sub", "item.mp4", 12345)
+        db.rewrite_task_for_item("t1", "/tmp/group/sub", "item.mp4", 12345, "")
             .await
             .expect("rewrite");
 
@@ -8423,6 +8732,8 @@ mod tests {
             unattended: false,
             resolver_choice_pending: false,
             bt_selected_files: "",
+            category_route: "",
+            request_method: "",
             torrent_file_bytes: &[],
         }
     }
@@ -8655,6 +8966,90 @@ mod tests {
             db.get_config("ed2k_server_sub_urls").await.expect("read"),
             Some(user.to_owned())
         );
+        close_test_db(&db, dir).await;
+    }
+
+    /// 直接设置测试行的 status / completed_at / seeding_status。
+    async fn set_completion(db: &Db, id: &str, status: i32, completed_at: &str, seeding: i32) {
+        sqlx::query(
+            "UPDATE tasks SET status = $1, completed_at = $2, seeding_status = $3 WHERE id = $4",
+        )
+        .bind(status)
+        .bind(completed_at)
+        .bind(seeding)
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .expect("set completion");
+    }
+
+    /// 保留期查询契约：只选 status=3、completed_at 非空且严格早于 cutoff、
+    /// 非做种（1/8）的任务；其余（较新、空时间戳、未完成、做种中）一律不选。
+    #[tokio::test]
+    async fn list_expired_completed_selects_only_old_non_seeding_rows() {
+        let (db, dir) = open_test_db().await;
+        for id in [
+            "old", "boundary", "new", "blank", "paused", "seed1", "seed8", "seedstop",
+        ] {
+            insert_task_with_size(&db, id, 10).await;
+        }
+        set_completion(&db, "old", 3, "1000", 0).await;
+        set_completion(&db, "boundary", 3, "5000", 0).await;
+        set_completion(&db, "new", 3, "9000", 0).await;
+        set_completion(&db, "blank", 3, "", 0).await;
+        set_completion(&db, "paused", 2, "1000", 0).await;
+        set_completion(&db, "seed1", 3, "1000", 1).await;
+        set_completion(&db, "seed8", 3, "1000", 8).await;
+        // 其他做种终态（用户停止等）不是在做种，可清理。
+        set_completion(&db, "seedstop", 3, "2000", 2).await;
+
+        let ids = db
+            .list_expired_completed_task_ids(5000, 100)
+            .await
+            .expect("list");
+        assert_eq!(ids, ["old", "seedstop"]);
+
+        let limited = db
+            .list_expired_completed_task_ids(5000, 1)
+            .await
+            .expect("limit");
+        assert_eq!(limited, ["old"]);
+        close_test_db(&db, dir).await;
+    }
+
+    /// 迁移契约：已完成但无时间戳的遗留行仅在首次迁移时被补写；
+    /// 其他状态与已有时间戳不动，迁移后新出现的空时间戳行不再被改写。
+    #[tokio::test]
+    async fn completed_at_backfill_migrates_once() {
+        let (db, dir) = open_test_db().await;
+        db.init_default_config("/tmp").await.expect("init");
+        insert_task_with_size(&db, "legacy", 10).await;
+        insert_task_with_size(&db, "stamped", 10).await;
+        insert_task_with_size(&db, "running", 10).await;
+        set_completion(&db, "legacy", 3, "", 0).await;
+        set_completion(&db, "stamped", 3, "1234", 0).await;
+        set_completion(&db, "running", 1, "", 0).await;
+
+        db.delete_config("migration_completed_at_backfill")
+            .await
+            .expect("drop marker");
+        db.init_default_config("/tmp").await.expect("migrate");
+        let load = |id: &'static str| {
+            let db = db.clone();
+            async move { db.load_task_by_id(id).await.expect("load").expect("row") }
+        };
+        let legacy = load("legacy").await.completed_at;
+        assert!(
+            legacy.parse::<u64>().is_ok_and(|v| v > 1_000_000),
+            "遗留行必须补写当前时间，got {legacy:?}"
+        );
+        assert_eq!(load("stamped").await.completed_at, "1234");
+        assert_eq!(load("running").await.completed_at, "");
+
+        // 迁移后再次启动：新出现的空时间戳行不得被改写。
+        set_completion(&db, "legacy", 3, "", 0).await;
+        db.init_default_config("/tmp").await.expect("restart");
+        assert_eq!(load("legacy").await.completed_at, "");
         close_test_db(&db, dir).await;
     }
 }

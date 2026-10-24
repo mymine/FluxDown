@@ -512,7 +512,7 @@ export function ingestResources(
     const url = payload.url;
     if (!url || url.startsWith("blob:") || url.startsWith("data:")) continue;
     const effectivePageUrl = payload.pageUrl || pageUrl || state.pageUrl;
-    if (engine.isIgnored(url, effectivePageUrl, payload.isAttachment === true)) continue;
+    if (engine.isIgnored(url, effectivePageUrl, payload.isAttachment === true, payload.mimeType)) continue;
 
     const id = engine.dedupeKey(url, effectivePageUrl);
     const existing = state.resources.get(id);

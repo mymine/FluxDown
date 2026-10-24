@@ -7,12 +7,10 @@ import org.junit.Test
 
 class AppNavigatorTest {
     @Test
-    fun settledSwipeSelectsRootAndRestoresExpandedDock() {
+    fun settledSwipeSelectsRoot() {
         val nav = AppNavigator()
-        nav.dockMini = true
         assertTrue(nav.selectTabFromSwipe(AppTab.Devices, nav.revision))
         assertEquals(AppTab.Devices, nav.tab)
-        assertFalse(nav.dockMini)
         assertTrue(nav.stack.isEmpty())
     }
 

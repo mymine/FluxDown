@@ -33,7 +33,7 @@ struct QueueEditorView: View {
         let running = snapshot?.isRunning ?? model.detail?.isRunning ?? true
         let name = snapshot?.displayName ?? model.detail?.name ?? ""
         let pending = queueId.map {
-            QueueOrdering.pending(in: $0, tasks: state.tasks, positions: state.queuePositions)
+            QueueOrdering.pending(in: $0, tasks: state.tasks, order: state.queueOrder)
         } ?? []
         Form {
             if readOnly || model.errorText != nil {
@@ -66,6 +66,7 @@ struct QueueEditorView: View {
                             serverTasks: pending,
                             override: model.orderOverride,
                             readOnly: readOnly,
+                            loading: state.tasksLoading,
                             editMode: $editMode,
                             onReorder: { ids in Task { await model.reorder(ids, session: container.session) } }
                         )

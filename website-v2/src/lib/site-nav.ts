@@ -36,6 +36,7 @@ export interface NavLink {
 
 export const GITHUB_URL = githubUrl(MAIN_REPO);
 export const TELEGRAM_URL = "https://t.me/+tp8ie_FVjv02ZDNl";
+export const TESTFLIGHT_URL = "https://testflight.apple.com/join/PqemSBgt";
 
 export const PRODUCT_LINKS: NavLink[] = [
   { label: "features", desc: "featuresDesc", path: "/#features", icon: Sparkles },

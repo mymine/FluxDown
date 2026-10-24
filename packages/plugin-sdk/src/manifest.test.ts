@@ -2,8 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
   networkHostsOf,
+  reviewOf,
   riskOf,
+  validatePackage,
   validateManifest,
+  validatePageScriptFiles,
+  validateViewIcon,
   validateSniffPack,
   VALID_PERMISSIONS,
   type PluginRisk,
@@ -75,8 +79,8 @@ describe("misc rules", () => {
     const good = { ...base, settings: [{ key: "k", title: "K", type: "number", min: 1, max: 5, default: "3" }] };
     expect(validateManifest(good, new Set()).ok).toBe(true);
   });
-  test("eight permissions", () => {
-    expect(VALID_PERMISSIONS).toHaveLength(8);
+  test("nine permissions", () => {
+    expect(VALID_PERMISSIONS).toHaveLength(9);
   });
   test("ipv6 network hosts", () => {
     const m = (host: string) => ({
@@ -107,5 +111,99 @@ describe("validateSniffPack", () => {
     const many = `{"format":"fluxdown-sniff-pack","rules":[${Array(501).fill("{}").join(",")}]}`;
     expect(validateSniffPack(many).ok).toBe(false);
     expect(validateSniffPack(new Uint8Array(256 * 1024 + 1).fill(32)).ok).toBe(false);
+  });
+});
+
+describe("validatePageScriptFiles", () => {
+  const script = { id: "demo", js: ["a.js", "b.js"] };
+  const files: Record<string, Uint8Array | string> = {
+    "a.js": "var a = 1;",
+    "b.js": new TextEncoder().encode("var b = 2;"),
+  };
+  const read = (path: string) => files[path];
+  test("concatenates with \\n;\\n", () => {
+    const result = validatePageScriptFiles(script, read);
+    expect(result.ok).toBe(true);
+    expect(result.code).toBe("var a = 1;\n;\nvar b = 2;");
+  });
+  test("rejects missing, oversized, non-UTF-8 and over-concatenated files", () => {
+    expect(validatePageScriptFiles(script, () => undefined).ok).toBe(false);
+    expect(validatePageScriptFiles(script, () => new Uint8Array(256 * 1024 + 1).fill(97)).ok).toBe(false);
+    expect(validatePageScriptFiles(script, () => new Uint8Array([0xff, 0xfe])).ok).toBe(false);
+    // 2 × 200 KiB passes per-file but exceeds the 384 KiB concatenation cap.
+    const big = { id: "demo", js: ["a.js", "b.js"] };
+    expect(validatePageScriptFiles(big, () => new Uint8Array(200 * 1024).fill(97)).ok).toBe(false);
+    expect(validatePageScriptFiles({ id: "demo", js: ["a.js"] }, () => new Uint8Array(200 * 1024).fill(97)).ok).toBe(true);
+  });
+});
+
+describe("validateViewIcon", () => {
+  const enc = (s: string) => new TextEncoder().encode(s);
+  test("accepts BOM + whitespace prefix and XML declaration", () => {
+    expect(validateViewIcon("v", "\uFEFF \n<SVG viewBox='0 0 24 24'></SVG>").ok).toBe(true);
+    expect(validateViewIcon("v", enc('<?xml version="1.0"?>\n<svg xmlns="x"/>')).ok).toBe(true);
+  });
+  test("rejects non-SVG documents", () => {
+    expect(validateViewIcon("v", "<html></html>").errors).toEqual(["view 'v' icon 不是 SVG 文档"]);
+    expect(validateViewIcon("v", '<?xml version="1.0"?><root/>').ok).toBe(false);
+  });
+  test("rejects non-UTF-8", () => {
+    expect(validateViewIcon("v", new Uint8Array([0xff, 0xfe, 0x3c])).errors).toEqual(["view 'v' icon 不是合法 UTF-8"]);
+  });
+  test("size boundary 16384 / 16385", () => {
+    const svg = "<svg>";
+    const pad = (n: number) => enc(svg + " ".repeat(n - svg.length));
+    expect(validateViewIcon("v", pad(16384)).ok).toBe(true);
+    expect(validateViewIcon("v", pad(16385)).errors).toEqual(["view 'v' icon 超过 16384 字节"]);
+  });
+});
+
+describe("validatePackage", () => {
+  const base = { identity: "a@b", name: "N", version: "1.0.0", main: { entry: "main.js" } };
+  const files = (entries: Record<string, string>) => new Map(Object.entries(entries));
+
+  test("checks the contents of every referenced file, not just their presence", () => {
+    const manifest = {
+      ...base,
+      permissions: ["browserRules", "pageScripts"],
+      contributes: {
+        views: [{ id: "v", title: "V", location: "activity", icon: "v.svg" }],
+        sniffRules: "rules.json",
+        pageScripts: [{ id: "p", title: "P", matches: ["https://*.example.com/*"], js: ["p.js"] }],
+      },
+    };
+    const good = files({ "main.js": "", "v.svg": "<svg/>", "rules.json": '{"format":"fluxdown-sniff-pack","rules":[]}', "p.js": "1" });
+    expect(validatePackage(manifest, good)).toEqual({ ok: true, errors: [] });
+    const bad = files({ "main.js": "", "v.svg": "<html/>", "rules.json": "{}", "p.js": "1" });
+    expect(validatePackage(manifest, bad).errors).toEqual(["sniffRules format 须为 fluxdown-sniff-pack", "view 'v' icon 不是 SVG 文档"]);
+  });
+
+  test("backslash paths resolve to the forward-slash package entry", () => {
+    const manifest = { ...base, contributes: { views: [{ id: "v", title: "V", location: "activity", icon: "i\\v.svg" }] } };
+    expect(validatePackage(manifest, files({ "main.js": "", "i/v.svg": "<html/>" })).errors).toEqual(["view 'v' icon 不是 SVG 文档"]);
+  });
+
+  test("enforces the client's entry-count limit", () => {
+    const many = files(Object.fromEntries([["main.js", ""], ...Array.from({ length: 200 }, (_, i) => [`f${i}`, ""])]));
+    expect(validatePackage(base, many).errors).toEqual(["包内文件数 201 超过上限 200"]);
+  });
+});
+
+describe("reviewOf", () => {
+  test("collects every URL scope a reviewer approves, sorted and de-duplicated", () => {
+    const review = reviewOf({
+      permissions: ["intercept", "pageScripts"],
+      resolvers: [{ match: { urls: ["*://b.example/*"] } }],
+      hooks: { match: { urls: ["*://a.example/*", "*://b.example/*"] } },
+      interceptors: { match: { urls: ["*://c.example/*"] } },
+      contributes: { pageScripts: [{ matches: ["https://z.example/*"] }, { matches: ["https://y.example/*"] }] },
+    });
+    expect(review).toEqual({
+      permissions: ["intercept", "pageScripts"],
+      risk: "full",
+      networkHosts: [],
+      downloadUrls: ["*://a.example/*", "*://b.example/*", "*://c.example/*"],
+      pageScriptMatches: ["https://y.example/*", "https://z.example/*"],
+    });
   });
 });

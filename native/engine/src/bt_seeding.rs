@@ -42,6 +42,17 @@ pub const SEEDING_QUEUED_MESSAGE: &str = "queued for seeding";
 /// Interval between periodic evaluations of BT seeding ratio/time limits.
 pub const SEEDING_EVAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 做种上传采样与进度事件的节奏。
+///
+/// 宿主的总上传速率由相邻进度帧的累计上传增量折算（daemon `event_hub`），
+/// 那套账假定每个任务的进度帧间隔不超过约 500ms：单帧增量最多摊到 1 秒、
+/// 速率窗口只滞后 700ms。若按 [`SEEDING_EVAL_INTERVAL`] 的 5 秒节奏发帧，
+/// 5 秒的上传量会挤进 1 秒，状态栏在「约 5 倍真实速率」与 0 之间锯齿跳动，
+/// 看上去像突破了上传限速。采样只读 librqbit 计数并写内存，不写库；增量由
+/// 求值 tick 合并落库。
+pub const SEEDING_UPLOAD_SAMPLE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
 /// 做种时长的兜底落库间隔。
 ///
 /// 做种时长在内存里按墙钟累计，限额判定与 UI 进度事件直接读内存值，不依赖
@@ -299,6 +310,8 @@ pub struct SeedingEntry {
     /// Session-local counter baseline used to accumulate uploads across
     /// librqbit counter resets (pause/resume or session rebuild).
     pub last_session_uploaded: i64,
+    /// 已采样、尚未落库的上传字节。求值 tick 合并写库后扣减。
+    pub unpersisted_upload: i64,
     pub stop_reason: SeedingStopReason,
 }
 
@@ -320,6 +333,7 @@ impl std::fmt::Debug for SeedingEntry {
             .field("last_uploaded_bytes", &self.last_uploaded_bytes)
             .field("uploaded_at_completion", &self.uploaded_at_completion)
             .field("last_session_uploaded", &self.last_session_uploaded)
+            .field("unpersisted_upload", &self.unpersisted_upload)
             .field("stop_reason", &self.stop_reason)
             .finish_non_exhaustive()
     }
@@ -456,6 +470,7 @@ impl SeedingManager {
                     last_uploaded_bytes: uploaded_at_completion,
                     uploaded_at_completion,
                     last_session_uploaded,
+                    unpersisted_upload: 0,
                     stop_reason: SeedingStopReason::None,
                 },
             );
@@ -509,6 +524,7 @@ impl SeedingManager {
                     // Paused-then-unpaused torrents restart librqbit's upload
                     // counter from zero — so does the delta baseline.
                     last_session_uploaded: 0,
+                    unpersisted_upload: 0,
                     stop_reason: SeedingStopReason::None,
                 },
             );
@@ -556,12 +572,12 @@ impl SeedingManager {
         (activated, demoted)
     }
 
-    /// Apply a fresh live-upload snapshot and return the delta that should be
-    /// added to the persisted `uploaded_bytes` counter.
+    /// Apply a fresh live-upload snapshot and return the delta it adds to the
+    /// task's upload total. The delta is also added to the entry's
+    /// [`SeedingEntry::unpersisted_upload`] until [`Self::mark_uploads_persisted`].
     ///
     /// Returns `None` when `snapshot_uploaded` is negative (should not happen)
-    /// or the seeder is not actively seeding. The caller should skip DB writes
-    /// when this returns `None`.
+    /// or the seeder is not actively seeding.
     ///
     /// librqbit resets its internal upload counter when a torrent is paused
     /// or when the session is rebuilt, so this method detects counter
@@ -583,9 +599,8 @@ impl SeedingManager {
             entry.last_session_uploaded = 0;
         }
         let delta = snapshot_uploaded - entry.last_session_uploaded;
-        if delta >= 0 {
-            entry.last_session_uploaded = snapshot_uploaded;
-        }
+        entry.last_session_uploaded = snapshot_uploaded;
+        entry.unpersisted_upload = entry.unpersisted_upload.saturating_add(delta);
 
         // `last_uploaded_bytes` 只保存 DB 累计尺度，由 `evaluate_limits`
         // 独占写入；这里的入参是会话计数器（尺度更小），据它检测到的上传
@@ -595,6 +610,28 @@ impl SeedingManager {
         }
 
         Some(delta)
+    }
+
+    /// 活动做种者已采样、尚未落库的上传字节（只含非零项）。
+    pub async fn unpersisted_uploads(&self) -> Vec<(String, i64)> {
+        let guard = self.state.lock().await;
+        guard
+            .active
+            .iter()
+            .filter(|(_, entry)| entry.unpersisted_upload != 0)
+            .map(|(id, entry)| (id.clone(), entry.unpersisted_upload))
+            .collect()
+    }
+
+    /// 登记 [`Self::unpersisted_uploads`] 取走的字节已落库：逐项扣减，期间
+    /// 新采样的增量保留到下一次落库。
+    pub async fn mark_uploads_persisted(&self, persisted: &[(String, i64)]) {
+        let mut guard = self.state.lock().await;
+        for (task_id, bytes) in persisted {
+            if let Some(entry) = guard.active.get_mut(task_id) {
+                entry.unpersisted_upload = entry.unpersisted_upload.saturating_sub(*bytes);
+            }
+        }
     }
 
     /// Remove a seeding entry (active or queued) and report its final

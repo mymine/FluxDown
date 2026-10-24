@@ -5,11 +5,15 @@
 //! 向 UI 的出口是一个有界 `mpsc`：UI 消费慢时驱动在 `send` 上等待（背压），远端传输层的
 //! 事件缓冲溢出后会按「事件缺口」重连重拉，保证不会无界堆积。
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxdown_protocol::method::SYSTEM_SNAPSHOT;
-use fluxdown_protocol::{PROTOCOL_VERSION, RpcRequest, ServiceRole, Snapshot};
+use fluxdown_protocol::method::{SYSTEM_SNAPSHOT, SYSTEM_TASK_PAGE};
+use fluxdown_protocol::{
+    CategoryRouteDto, EventFrame, PROTOCOL_VERSION, RpcRequest, ServiceRole, Snapshot, TablePage,
+    TableSync,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
@@ -44,6 +48,10 @@ pub(crate) struct Timing {
     /// 连接存活超过该时长才算「健康」，重置退避。
     pub healthy_after: Duration,
     pub snapshot_timeout: Duration,
+    /// 任务表分页载入：单页 `system.taskPage` 的超时。
+    pub page_timeout: Duration,
+    /// 任务表分页载入：一轮（任务 + 队列位置全部页）的总时限；超时重连。
+    pub load_timeout: Duration,
     /// 连续「立即重连」的上限，防止对端反复 4009 造成空转。
     pub max_fast_reconnects: u32,
 }
@@ -54,10 +62,12 @@ impl Default for Timing {
             stale_grace: Duration::from_millis(800),
             backoff_min: Duration::from_millis(500),
             backoff_max: Duration::from_secs(15),
-            buffer_cap: 20_000,
+            buffer_cap: 65_536,
             max_resyncs: 5,
             healthy_after: Duration::from_secs(10),
             snapshot_timeout: Duration::from_secs(30),
+            page_timeout: Duration::from_secs(30),
+            load_timeout: Duration::from_secs(600),
             max_fast_reconnects: 5,
         }
     }
@@ -134,6 +144,8 @@ pub(crate) struct Driver {
     /// 首次同步结果；`open_*` 等待它以便把鉴权 / 网络错误同步返回给调用方。
     pub first: Option<oneshot::Sender<Result<(), FluxError>>>,
     pub timing: Timing,
+    /// 主机当前偏好 `custom_categories` 构建的分类路由，供 `HostSession::create_task` 读取。
+    pub routes: watch::Sender<Option<CategoryRouteDto>>,
 }
 
 /// 驱动的可变运行状态。
@@ -334,6 +346,7 @@ impl Driver {
                 }
                 continue;
             };
+            self.publish_route(&projection);
 
             let snapshot_signal = HostSignalDto::Snapshot {
                 snapshot: projection.snapshot_dto(),
@@ -343,33 +356,16 @@ impl Driver {
             }
             self.recovered(state);
 
-            // 握手期间缓冲的帧：epoch 不同的帧早于快照，丢弃；其余按游标规则重放。
-            let mut need_resync = false;
-            for frame in buffered {
-                if frame.epoch != projection.epoch() {
-                    continue;
-                }
-                match projection.accept(frame) {
-                    FrameOutcome::Skip => {}
-                    FrameOutcome::Resync(reason) => {
-                        tracing::debug!(?reason, "buffered frame requires resync");
-                        need_resync = true;
-                        break;
-                    }
-                    FrameOutcome::Applied(signals) => {
-                        for signal in signals {
-                            if let Err(stop) = self.emit(signal).await {
-                                return SessionEnd::Stop(stop);
-                            }
-                        }
-                    }
-                }
-            }
-            if !need_resync {
-                match self.live(&mut projection, events.as_mut()).await {
-                    LiveEnd::End(end) => return end,
-                    LiveEnd::Resync => {}
-                }
+            let loaded = self
+                .bootstrap(&caller, &mut projection, events.as_mut(), buffered)
+                .await;
+            let live = match loaded {
+                Ok(()) => self.live(&caller, &mut projection, events.as_mut()).await,
+                Err(end) => end,
+            };
+            match live {
+                LiveEnd::End(end) => return end,
+                LiveEnd::Resync => {}
             }
             resyncs += 1;
             if resyncs > self.timing.max_resyncs {
@@ -447,8 +443,13 @@ impl Driver {
         }
     }
 
-    /// 稳态：逐帧过游标并下发。
-    async fn live(&self, projection: &mut Projection, events: &mut dyn EventSource) -> LiveEnd {
+    /// 稳态：逐帧过游标并下发；帧使投影进入加载态（整表替换）时就地分页重载。
+    async fn live(
+        &self,
+        caller: &Arc<dyn Caller>,
+        projection: &mut Projection,
+        events: &mut dyn EventSource,
+    ) -> LiveEnd {
         loop {
             let event = tokio::select! {
                 biased;
@@ -458,20 +459,17 @@ impl Driver {
                 event = events.next() => event,
             };
             match event {
-                LinkEvent::Frame(frame) => match projection.accept(*frame) {
-                    FrameOutcome::Skip => {}
-                    FrameOutcome::Resync(reason) => {
-                        tracing::debug!(?reason, "cursor requires resync");
-                        return LiveEnd::Resync;
+                LinkEvent::Frame(frame) => {
+                    let reloaded = match self.apply(projection, *frame).await {
+                        Ok(sync) => sync,
+                        Err(end) => return end,
+                    };
+                    if let Some(sync) = reloaded
+                        && let Err(end) = self.reload(caller, projection, events, sync).await
+                    {
+                        return end;
                     }
-                    FrameOutcome::Applied(signals) => {
-                        for signal in signals {
-                            if let Err(stop) = self.emit(signal).await {
-                                return LiveEnd::End(SessionEnd::Stop(stop));
-                            }
-                        }
-                    }
-                },
+                }
                 LinkEvent::Lagged => {
                     return LiveEnd::End(SessionEnd::Reconnect {
                         immediate: true,
@@ -482,6 +480,194 @@ impl Driver {
             }
         }
     }
+
+    /// 握手后的首轮收尾：快照头带 `taskTotal` / `queueTotal` 时分页载入表，再回放握手期间的帧。
+    /// 快照（加载态或完整）已发给 UI，本函数只补「载入完成」的完整快照与缓冲帧产生的信号。
+    async fn bootstrap(
+        &self,
+        caller: &Arc<dyn Caller>,
+        projection: &mut Projection,
+        events: &mut dyn EventSource,
+        buffered: Vec<EventFrame>,
+    ) -> Result<(), LiveEnd> {
+        // epoch 不同的帧早于快照，丢弃。
+        let epoch = projection.epoch().to_owned();
+        let buffered = buffered.into_iter().filter(|frame| frame.epoch == epoch);
+        match projection.table_sync() {
+            Some(mut sync) => {
+                for frame in buffered {
+                    push_backlog(&mut sync, frame)?;
+                }
+                self.reload(caller, projection, events, sync).await
+            }
+            None => {
+                self.replay(caller, projection, events, buffered.collect())
+                    .await
+            }
+        }
+    }
+
+    /// 载入一轮表并回放期间缓冲的帧。
+    async fn reload(
+        &self,
+        caller: &Arc<dyn Caller>,
+        projection: &mut Projection,
+        events: &mut dyn EventSource,
+        sync: TableSync,
+    ) -> Result<(), LiveEnd> {
+        let backlog = self.load_tables(caller, projection, events, sync).await?;
+        self.replay(caller, projection, events, backlog).await
+    }
+
+    /// 按游标规则逐帧回放；回放中遇到又一个整表替换帧则应用它、把余下的帧并入新一轮载入的
+    /// 缓冲，载入完成后继续回放。
+    async fn replay(
+        &self,
+        caller: &Arc<dyn Caller>,
+        projection: &mut Projection,
+        events: &mut dyn EventSource,
+        frames: Vec<EventFrame>,
+    ) -> Result<(), LiveEnd> {
+        let mut queue = VecDeque::from(frames);
+        while let Some(frame) = queue.pop_front() {
+            let Some(mut sync) = self.apply(projection, frame).await? else {
+                continue;
+            };
+            for pending in queue.drain(..) {
+                push_backlog(&mut sync, pending)?;
+            }
+            queue = VecDeque::from(self.load_tables(caller, projection, events, sync).await?);
+        }
+        Ok(())
+    }
+
+    /// 应用一帧并下发信号；该帧使投影进入加载态时返回新一轮载入。
+    async fn apply(
+        &self,
+        projection: &mut Projection,
+        frame: EventFrame,
+    ) -> Result<Option<TableSync>, LiveEnd> {
+        match projection.accept(frame) {
+            FrameOutcome::Skip => Ok(None),
+            FrameOutcome::Resync(reason) => {
+                tracing::debug!(?reason, "frame requires resync");
+                Err(LiveEnd::Resync)
+            }
+            FrameOutcome::Applied(signals) => {
+                self.publish_route(projection);
+                for signal in signals {
+                    self.emit(signal)
+                        .await
+                        .map_err(|stop| LiveEnd::End(SessionEnd::Stop(stop)))?;
+                }
+                Ok(projection.table_sync())
+            }
+        }
+    }
+
+    /// 把投影里当前的分类路由发布给会话（建任务时据此路由）；未变化不通知。
+    fn publish_route(&self, projection: &Projection) {
+        let route = projection.category_route();
+        self.routes.send_if_modified(|current| {
+            let changed = *current != route;
+            if changed {
+                *current = route;
+            }
+            changed
+        });
+    }
+
+    /// 经 `system.taskPage` 翻完所有待载入的表，装入投影并下发完整快照，返回期间缓冲的帧。
+    ///
+    /// 载入期间到达的帧只缓冲不应用；每页有独立超时，整轮有总时限（大表不会被单次快照超时
+    /// 误杀）。epoch 变化 / 游标不前进 / 缓冲溢出走重同步，传输层错误走重连。
+    async fn load_tables(
+        &self,
+        caller: &Arc<dyn Caller>,
+        projection: &mut Projection,
+        events: &mut dyn EventSource,
+        mut sync: TableSync,
+    ) -> Result<Vec<EventFrame>, LiveEnd> {
+        let deadline = Instant::now() + self.timing.load_timeout;
+        while let Some(request) = sync.next_request() {
+            let params = serde_json::to_value(&request).map_err(|error| {
+                reconnect_end(false, format!("encode system.taskPage params: {error}"))
+            })?;
+            let call = timeout(
+                self.timing.page_timeout,
+                caller.call(SYSTEM_TASK_PAGE, Some(params)),
+            );
+            tokio::pin!(call);
+            let result = loop {
+                tokio::select! {
+                    biased;
+                    () = self.cancel.cancelled() => {
+                        return Err(LiveEnd::End(SessionEnd::Stop(Stop::Cancelled)));
+                    }
+                    () = sleep_until(deadline) => {
+                        return Err(reconnect_end(false, "task table load timed out".to_owned()));
+                    }
+                    result = &mut call => break result,
+                    event = events.next() => match event {
+                        LinkEvent::Frame(frame) => {
+                            if frame.epoch != sync.epoch() {
+                                tracing::debug!("epoch changed during table load; resyncing");
+                                return Err(LiveEnd::Resync);
+                            }
+                            push_backlog(&mut sync, *frame)?;
+                        }
+                        LinkEvent::Lagged => {
+                            return Err(reconnect_end(true, "event stream lagged".to_owned()));
+                        }
+                        LinkEvent::Closed(info) => return Err(LiveEnd::End(end_for_close(info))),
+                    },
+                }
+            };
+            let value = match result {
+                Err(_elapsed) => {
+                    return Err(reconnect_end(false, "system.taskPage timed out".to_owned()));
+                }
+                Ok(Err(
+                    error @ FluxError::Rpc {
+                        code: ErrorCodeDto::Unauthorized | ErrorCodeDto::ProtocolIncompatible,
+                        ..
+                    },
+                )) => {
+                    return Err(LiveEnd::End(SessionEnd::Stop(Stop::Fatal(error.into()))));
+                }
+                Ok(Err(error)) => {
+                    return Err(reconnect_end(
+                        false,
+                        format!("system.taskPage failed: {error}"),
+                    ));
+                }
+                Ok(Ok(value)) => value,
+            };
+            let page = serde_json::from_value::<TablePage>(value)
+                .map_err(|error| reconnect_end(false, format!("undecodable task page: {error}")))?;
+            if let Err(error) = sync.accept(page) {
+                tracing::warn!(?error, "task table load failed; resyncing");
+                return Err(LiveEnd::Resync);
+            }
+        }
+        let (signal, backlog) = projection.finish_load(sync);
+        self.emit(signal)
+            .await
+            .map_err(|stop| LiveEnd::End(SessionEnd::Stop(stop)))?;
+        Ok(backlog)
+    }
+}
+
+fn reconnect_end(immediate: bool, reason: String) -> LiveEnd {
+    LiveEnd::End(SessionEnd::Reconnect { immediate, reason })
+}
+
+/// 载入期间缓冲一帧；超限放弃本轮、整体重同步。
+fn push_backlog(sync: &mut TableSync, frame: EventFrame) -> Result<(), LiveEnd> {
+    sync.push_frame(frame).map_err(|error| {
+        tracing::warn!(?error, "table load backlog overflowed; resyncing");
+        LiveEnd::Resync
+    })
 }
 
 fn resync_loop() -> SessionEnd {

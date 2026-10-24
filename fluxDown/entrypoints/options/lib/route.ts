@@ -6,6 +6,7 @@ export const PANELS = [
   "sniff",
   "sites",
   "rules",
+  "pageScripts",
   "remote",
   "shortcuts",
   "backup",

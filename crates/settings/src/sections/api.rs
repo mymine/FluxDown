@@ -3,6 +3,7 @@
 use fluxdown_protocol::GatewayPatchParams;
 use fluxdown_ui_components::{
     ButtonVariant, ControlExt as _, FluxIcon, button, icon_button, loading_icon_button,
+    tooltip_view,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -13,7 +14,6 @@ use gpui_component::{
     Icon, WindowExt as _, h_flex,
     input::{Input, InputEvent, InputState},
     notification::Notification,
-    tooltip::Tooltip,
 };
 
 use super::SectionContext;
@@ -412,7 +412,7 @@ fn token_field(ctx: &SectionContext) -> Control {
                     cx,
                 )
                 .disabled(token.is_empty())
-                .tooltip(move |window, cx| Tooltip::new(copy_tooltip.clone()).build(window, cx))
+                .tooltip(move |window, cx| tooltip_view(copy_tooltip.clone(), window, cx))
                 .on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(copy_token.to_string()));
                     copy_store.update(cx, |store, cx| {
@@ -444,7 +444,7 @@ fn token_field(ctx: &SectionContext) -> Control {
                     cx,
                 )
                 .disabled(disabled || busy)
-                .tooltip(move |window, cx| Tooltip::new(generate_tooltip.clone()).build(window, cx))
+                .tooltip(move |window, cx| tooltip_view(generate_tooltip.clone(), window, cx))
                 .on_click(move |_, _, cx| {
                     generate_store.update(cx, |store, cx| {
                         store.patch_gateway(
@@ -470,7 +470,7 @@ fn token_field(ctx: &SectionContext) -> Control {
                     cx,
                 )
                 .disabled(disabled || busy || token.is_empty())
-                .tooltip(move |window, cx| Tooltip::new(clear_tooltip.clone()).build(window, cx))
+                .tooltip(move |window, cx| tooltip_view(clear_tooltip.clone(), window, cx))
                 .on_click(move |_, _, cx| {
                     clear_store.update(cx, |store, cx| {
                         store.patch_gateway(

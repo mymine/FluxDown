@@ -97,6 +97,7 @@ defineInterceptors({
 | `originHeaders` | `[{origin, headers}]`——只对站点（`scheme://host[:port]`）等于 `origin` 的请求附加的额外请求头，例如分片所在主机。至多 32 条，按 origin 合并。 |
 | `segments` | `0..=512`；**覆盖本次运行的用户线程数**（0 = 自动）。 |
 | `maxConnections` | `1..=512`；始终生效的硬上限。 |
+| `maxRangeBytes` | 仅 HTTP 任务；整数，单位字节，`>= 65536`（64 KiB）。限制该任务**每一个**数据请求的 `Range` 跨度，适用于拒绝大区间的直链（例如网盘 CDN 单次请求超过约 5 MiB 就返回 403——请设为不超过该上限的值，如 `4 * 1024 * 1024`）。分段 worker 在各自区间内按不超过该值的窗口逐个请求并复用连接；单流与回退单流只发不超过该值的有界 `Range` 请求（绝不发无 Range 的 GET 或开放式 `bytes=N-`）；与 `ephemeral` 同用时，首个连接也带 `Range`。需要已知大小（`totalBytes` 或探测结果）且服务器支持 `Range`，否则无法生效。元数据探测（`HEAD`、`Range: bytes=0-0`）不受影响。FTP / HLS / DASH 任务会拒绝该字段。 |
 | `ephemeral` | 仅 HTTP 任务。与 resolver 返回值同义：本次运行跳过元数据探测，避免一次性凭据被探测消耗。 |
 | `totalBytes` / `rangeSupported` | 仅 HTTP，且必须与 `ephemeral: true` 同用。`totalBytes`（> 0）是代替探测使用的大小；`rangeSupported` 表示服务器已知支持 Range（首次运行默认 `false`）。 |
 | `fileName` | 不含路径分隔符、`..` 与控制字符。**仅在首次运行（下载开始前）生效**；之后的运行会忽略并记一条说明。 |
@@ -125,7 +126,7 @@ defineInterceptors({
 - **连续 5 次**换发后都没换来任何成功响应（凭据始终无效）即停止刷新。被拒的凭据此前成功用过至少一次属于正常消耗，会让计数归零——因此「每请求一个令牌」的方案可以按需反复刷新。
 - 并发被拒会**单飞合并**：一次插件调用服务所有请求；用旧身份发出的请求直接用当前身份重发。插件未做任何改动时，该身份代际被标记为已拒绝，不再重复询问。
 - 刷新得到的凭据**不落库**；下次运行从 `prepare` 重新开始。
-- 非 HTTP 任务不能刷新 `url`（其他凭据字段可以）。`refresh` 不能改写 `method`、`body`、`segments`、`maxConnections`、`fileName`、`ephemeral`。
+- 非 HTTP 任务不能刷新 `url`（其他凭据字段可以）。`refresh` 不能改写 `method`、`body`、`segments`、`maxConnections`、`maxRangeBytes`、`fileName`、`ephemeral`。
 - `failed` 重试有独立的 5 次额度，**不受**自动重试开关影响。
 - 锁定 User-Agent / Referer 之后，探测的自适应不再重发相同的请求。
 

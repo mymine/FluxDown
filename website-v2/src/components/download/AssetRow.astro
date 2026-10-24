@@ -12,15 +12,18 @@ interface Props {
   label: string;
   detail?: string;
   ext: string;
+  /** 行级版本号在 release JSON 中的路径(同组资产版本可能不同时使用)。 */
+  versionPath?: string;
   fallback: string;
 }
-const { path, label, detail, ext, fallback } = Astro.props;
+const { path, label, detail, ext, versionPath, fallback } = Astro.props;
 ---
 
 <a class="asset" href={fallback} data-asset={path} data-fallback={fallback} rel="nofollow">
   <span class="asset-main">
     <span class="asset-label">{label}</span>
     {detail && <span class="asset-detail">{detail}</span>}
+    {versionPath && <span class="asset-detail asset-version" data-version={versionPath} hidden></span>}
   </span>
   <span class="asset-ext">{ext}</span>
   <span class="asset-size" data-size></span>
@@ -63,6 +66,10 @@ const { path, label, detail, ext, fallback } = Astro.props;
   .asset-detail {
     font-size: 12.5px;
     color: var(--fg-subtle);
+  }
+  .asset-version {
+    font-family: var(--font-mono);
+    font-size: 12px;
   }
   .asset-ext {
     font-family: var(--font-mono);

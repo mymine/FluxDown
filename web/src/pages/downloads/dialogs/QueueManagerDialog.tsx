@@ -4,7 +4,7 @@
 import { ArrowDown, ArrowLeft, ArrowUp, ChevronRight, Plus } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useT } from '../../../i18n'
-import { LATER_QUEUE_ID, MAIN_QUEUE_ID, TASK_STATUS, rpc, useAgent, useDaemon, useTasks } from '../../../lib/rpc'
+import { LATER_QUEUE_ID, MAIN_QUEUE_ID, TASK_STATUS, rpc, useAgent, useDaemon, useTasks, useTasksLoading } from '../../../lib/rpc'
 import type { QueueDto, TaskDto } from '../../../lib/rpc'
 import { Button, Checkbox, Dialog, DialogFooter, FieldError, FieldHint, Form, FormField, FormRow, Icon, Input, InputWithAction, OptionGroup, OptionRow, SectionHeader, Select, Switch, confirmDialog, useIsMobile } from '../../../ui'
 import { toastRpcError } from '../../../lib/rpcToast'
@@ -441,6 +441,7 @@ function pendingIn(tasks: readonly TaskDto[], queueId: string): TaskDto[] {
 function PendingOrder({ queue }: { queue: QueueDto }) {
   const t = useT()
   const tasks = useTasks()
+  const loading = useTasksLoading()
   const pending = useMemo(() => pendingIn(tasks, queue.queueId), [tasks, queue.queueId])
   const move = async (index: number, delta: -1 | 1) => {
     const order = pending.map((task) => task.taskId)
@@ -457,7 +458,9 @@ function PendingOrder({ queue }: { queue: QueueDto }) {
     <div className="flex flex-col gap-1.5">
       <SectionHeader>{t('queueTabTasks')}</SectionHeader>
       <FieldHint>{t('queueTasksOrderHint')}</FieldHint>
-      {pending.length === 0 ? (
+      {loading ? (
+        <FieldHint>{t('tasksLoadingTitle')}</FieldHint>
+      ) : pending.length === 0 ? (
         <FieldHint>{t('queueNoPendingTasks')}</FieldHint>
       ) : (
         <ul className="rounded-md border border-hairline">

@@ -29,19 +29,20 @@ use fluxdown_api::routes::{API_LINK_INFO, API_LINK_TASKS, API_LINK_UNPAIR};
 use fluxdown_api::service::{ApiError, LinkAuthReason, link_unsupported};
 use fluxdown_link::pairing::{CODE_TTL_SECS, DECISION_WINDOW_SECS};
 use fluxdown_link::{
-    DiscoveredPeer, DiscoveryKind, LINK_PROTOCOL_VERSION, LinkEngineEvent, LinkError, LinkManager,
-    LinkOptions, LinkResult, PairConfirmOutcome, PeerAddress, PeerInfo, SelfInfo, WireHello,
-    WireReveal,
+    DiscoveredPeer, DiscoveryKind, LINK_CONTROL_VERSION, LINK_PROTOCOL_VERSION, LinkEngineEvent,
+    LinkError, LinkManager, LinkOptions, LinkResult, PairConfirmOutcome, PeerAddress, PeerInfo,
+    SelfInfo, WireHello, WireReveal,
 };
 use fluxdown_protocol::{
     AgentEvent, ApplicationErrorCode, CreateTaskRequest, DaemonCreateTaskParams, ErrorReason,
-    EventFrame, LinkAddressParams, LinkApproveParams, LinkAuth, LinkCodeResponse, LinkDeviceInfo,
-    LinkDeviceParams, LinkDiscoveredPeer, LinkDiscoveryParams, LinkDispatchParams,
-    LinkDispatchResult, LinkPairBeginParams, LinkPairBeginResponse, LinkPairConfirmOutcome,
-    LinkPairConfirmRequest, LinkPairFinishParams, LinkPairFinishResponse, LinkPairHelloRequest,
-    LinkPairHelloResponse, LinkPairRevealRequest, LinkPairRevealResponse, LinkPairingCodeDto,
-    LinkPairingRequestDto, LinkPingInfo, LinkRenameParams, LinkTaskRequest, PathStyle,
-    RpcErrorData, ServiceEvent, method,
+    EventFrame, LinkAddressParams, LinkApproveParams, LinkAuth, LinkCodeResponse,
+    LinkControlCredentialDto, LinkDeviceInfo, LinkDeviceParams, LinkDiscoveredPeer,
+    LinkDiscoveryParams, LinkDispatchParams, LinkDispatchResult, LinkPairBeginParams,
+    LinkPairBeginResponse, LinkPairConfirmOutcome, LinkPairConfirmRequest, LinkPairFinishParams,
+    LinkPairFinishResponse, LinkPairHelloRequest, LinkPairHelloResponse, LinkPairRevealRequest,
+    LinkPairRevealResponse, LinkPairingCodeDto, LinkPairingRequestDto, LinkPingInfo,
+    LinkRenameParams, LinkStopPairingParams, LinkTaskRequest, PathStyle, RpcErrorData,
+    ServiceEvent, method,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -69,6 +70,21 @@ fn now_unix_ms() -> i64 {
         .ok()
         .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
         .unwrap_or(0)
+}
+
+/// 距 `expires_at_unix_ms` 的剩余毫秒（已过期 = 0）。
+fn remaining_ms(expires_at_unix_ms: i64, now_ms: i64) -> u64 {
+    u64::try_from(expires_at_unix_ms.saturating_sub(now_ms)).unwrap_or(0)
+}
+
+/// 按当前时刻重算入站配对请求的相对剩余时间 `ttl_ms`：客户端以「收到 DTO 的本机时刻 + `ttl_ms`」
+/// 计算过期，不依赖与主机的时钟对齐。事件发布与取快照时都要重算——存着的副本只有
+/// `expires_at_unix_ms` 是恒定的。
+pub(crate) fn refresh_request_ttls(requests: &mut [LinkPairingRequestDto]) {
+    let now = now_unix_ms();
+    for request in requests {
+        request.ttl_ms = remaining_ms(request.expires_at_unix_ms, now);
+    }
 }
 
 /// 本机建下载任务的入口（生产实现走 daemon；测试注入记录型实现）。
@@ -104,6 +120,7 @@ impl LinkTaskCreator for DaemonTaskCreator {
                     unattended: true,
                     hint_file_size: None,
                     name_hint: None,
+                    category_route: None,
                 }),
             )
             .await
@@ -215,11 +232,7 @@ pub fn rpc_error(error: &LinkOpError, context: ErrorContext) -> RpcErrorData {
                 false,
                 Some(ErrorReason::PairingSessionExpired),
             ),
-            LinkError::PairingTimeout => (
-                Code::Timeout,
-                false,
-                Some(ErrorReason::PairingSessionExpired),
-            ),
+            LinkError::PairingTimeout => (Code::Timeout, false, Some(ErrorReason::PairingTimeout)),
             LinkError::BadSignature => (
                 Code::InvalidArgument,
                 false,
@@ -259,9 +272,11 @@ pub fn rpc_error(error: &LinkOpError, context: ErrorContext) -> RpcErrorData {
             ),
             // 对端数据面协议过旧：两端都要升级，重试无用。
             LinkError::PeerOutdated => (Code::Conflict, false, Some(ErrorReason::PeerOutdated)),
-            LinkError::Unauthorized | LinkError::ClockSkew => {
+            LinkError::Unauthorized => {
                 (Code::Unauthorized, false, Some(ErrorReason::PeerNotPaired))
             }
+            // 两台设备的系统时钟偏差过大：临时、可由用户修正，与「未配对」区分提示。
+            LinkError::ClockSkew => (Code::Unauthorized, false, Some(ErrorReason::PeerClockSkew)),
             LinkError::NotPaired => (Code::NotFound, false, Some(ErrorReason::PeerNotPaired)),
             LinkError::Unreachable | LinkError::Io(_) => {
                 (Code::Unavailable, true, unreachable_reason)
@@ -561,6 +576,11 @@ pub struct LinkService {
     online: StdMutex<HashMap<String, bool>>,
     requests: StdMutex<Vec<LinkPairingRequestDto>>,
     code_generation: AtomicU64,
+    /// 当前展示的配对码（`agent.link.stopPairing {code}` 只在它仍是当前码时才作废）。
+    current_code: StdMutex<Option<String>>,
+    /// 名册里设备凭据相关的记录发生变化（配对 / 解除 / 被对端撤销）时递增：已建立的 `/rpc` 设备
+    /// 会话据此重新校验自己的凭据，失效即断开（见 [`Self::subscribe_roster`]）。
+    roster_epoch: tokio::sync::watch::Sender<u64>,
     /// 每台设备最近一次成功交换设备信息的时刻：决定「设备刚上线 / 久未交换」时是否要再交换。
     last_info_exchange: StdMutex<HashMap<String, Instant>>,
     /// 最近一次自动 mDNS 浏览的启动时刻（限频）。
@@ -592,6 +612,8 @@ impl LinkService {
             online: StdMutex::new(HashMap::new()),
             requests: StdMutex::new(Vec::new()),
             code_generation: AtomicU64::new(0),
+            current_code: StdMutex::new(None),
+            roster_epoch: tokio::sync::watch::Sender::new(0),
             last_info_exchange: StdMutex::new(HashMap::new()),
             last_heal: StdMutex::new(None),
             weak: weak.clone(),
@@ -675,7 +697,8 @@ impl LinkService {
     /// 配置了自报地址覆盖则取覆盖值，否则按监听地址自动探测。
     fn advertised_base_urls(&self) -> Vec<String> {
         let bound = *lock(&self.bound);
-        if bound.ip().is_loopback() {
+        // 配置了自报地址覆盖（反代 / 端口映射 / 容器）时，即使监听回环也对外可达。
+        if bound.ip().is_loopback() && self.network.advertise.is_empty() {
             return Vec::new();
         }
         let overridden: Vec<String> = resolved_advertise_entries(&self.network.advertise, bound)
@@ -708,7 +731,8 @@ impl LinkService {
             cloud_device_id,
         };
         let bound = *lock(&self.bound);
-        let reachable = !bound.ip().is_loopback();
+        // 只监听回环但配置了自报地址覆盖：外部经反代 / 端口映射到达本机，视为可达。
+        let reachable = !bound.ip().is_loopback() || !self.network.advertise.is_empty();
         let options = LinkOptions {
             api_port: bound.port(),
             reachable,
@@ -737,7 +761,7 @@ impl LinkService {
                 return Ok(());
             }
         }
-        tokio::spawn(self.clone().pump(rx));
+        tokio::spawn(Self::pump(Arc::downgrade(self), rx));
         self.started.notify_one();
         self.publish_devices().await;
         Ok(())
@@ -788,18 +812,36 @@ impl LinkService {
         self.manager.get().ok_or_else(link_unsupported)
     }
 
-    /// 转发 [`LinkManager`] 事件到快照 / 事件流。
-    async fn pump(self: Arc<Self>, mut rx: mpsc::Receiver<LinkEngineEvent>) {
+    /// 转发 [`LinkManager`] 事件到快照 / 事件流。只持 `Weak`：转发任务自己不能成为服务存活的理由——
+    /// 服务拥有 `LinkManager`（持有事件发送端），任务若再攥一份 `Arc<Self>`，两者互相拽住，宿主
+    /// 关停后状态目录的锁永远不释放（嵌入式移动宿主要在同一进程里重启）。
+    async fn pump(weak: Weak<Self>, mut rx: mpsc::Receiver<LinkEngineEvent>) {
         while let Some(event) = rx.recv().await {
+            let Some(service) = weak.upgrade() else {
+                break;
+            };
+            service.handle_event(event).await;
+        }
+    }
+
+    async fn handle_event(self: &Arc<Self>, event: LinkEngineEvent) {
+        {
             match event {
-                LinkEngineEvent::Discovered(_) => self.publish_discovered(),
+                LinkEngineEvent::Discovered(_) | LinkEngineEvent::DiscoveredLost => {
+                    self.publish_discovered();
+                }
                 LinkEngineEvent::Paired(record) => {
                     tracing::info!(
                         name = %record.name,
                         fingerprint = %record.short_fingerprint(),
+                        grants_control = record.grants_control,
+                        controllable = record.controllable,
                         "device paired"
                     );
                     self.drop_requests(|request| request.peer_fingerprint == record.fingerprint);
+                    // 刚配对完成：对端此刻必然在线（响应方这一侧没有走 `pair_finish` 的在线探测）。
+                    lock(&self.online).insert(record.fingerprint.clone(), true);
+                    self.bump_roster();
                     self.publish_devices().await;
                     // 双方都拿到对端的名称 / 地址 / 云设备 ID / 默认目录 / 路径风格；失败（旧版
                     // 对端、暂时不可达）静默。
@@ -814,6 +856,7 @@ impl LinkService {
                 LinkEngineEvent::Unpaired(fingerprint) => {
                     lock(&self.online).remove(&fingerprint);
                     lock(&self.last_info_exchange).remove(&fingerprint);
+                    self.bump_roster();
                     self.publish_devices().await;
                 }
                 LinkEngineEvent::Revoked(fingerprint) => {
@@ -822,6 +865,7 @@ impl LinkService {
                         "linked device revoked the pairing"
                     );
                     lock(&self.online).insert(fingerprint, false);
+                    self.bump_roster();
                     self.publish_devices().await;
                 }
                 LinkEngineEvent::IncomingCancelled { session_id } => {
@@ -833,6 +877,7 @@ impl LinkService {
                     peer_name,
                     peer_platform,
                     peer_fingerprint,
+                    requests_control,
                 } => self.add_request(LinkPairingRequestDto {
                     session_id,
                     peer_name,
@@ -842,6 +887,8 @@ impl LinkService {
                     expires_at_unix_ms: now_unix_ms().saturating_add(
                         i64::try_from(DECISION_WINDOW_SECS * 1000).unwrap_or(60_000),
                     ),
+                    ttl_ms: DECISION_WINDOW_SECS * 1000,
+                    requests_control,
                 }),
                 LinkEngineEvent::Error(message) => {
                     tracing::warn!(error = %message, "device link subsystem error");
@@ -856,6 +903,32 @@ impl LinkService {
         let online = lock(&self.online).clone();
         let state = self.state.lock().await;
         devices_with_online(&state, &online)
+    }
+
+    /// 订阅名册变化：每当配对完成、解除配对或被对端撤销时值递增。`/rpc` 设备会话借此重新校验
+    /// 凭据（设备记录被删除 / revoked / 重新配对导致 `link_secret` 变化 / `grants_control`
+    /// 变化都会让旧凭据失效）。
+    #[must_use]
+    pub fn subscribe_roster(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.roster_epoch.subscribe()
+    }
+
+    fn bump_roster(&self) {
+        self.roster_epoch.send_modify(|epoch| *epoch += 1);
+    }
+
+    /// 校验 `/rpc` 设备控制凭据（被控主机侧）：通过返回设备指纹。互联服务未启动 → `None`。
+    pub async fn verify_control_credential(&self, token: &str) -> Option<String> {
+        self.manager.get()?.verify_control_credential(token).await
+    }
+
+    /// `agent.link.controlCredential`：为「本机可控制」的已配对主机签发 `/rpc` 设备控制凭据。
+    pub async fn control_credential(
+        &self,
+        fingerprint: &str,
+    ) -> Result<LinkControlCredentialDto, LinkOpError> {
+        let token = self.manager()?.control_credential(fingerprint).await?;
+        Ok(LinkControlCredentialDto { token })
     }
 
     async fn publish_devices(&self) {
@@ -881,7 +954,9 @@ impl LinkService {
     }
 
     fn publish_requests(&self) {
-        let requests = lock(&self.requests).clone();
+        let mut requests = lock(&self.requests).clone();
+        // 事件里的 `ttl_ms` 是发布这一刻的剩余时间（存着的副本只保证 `expires_at_unix_ms` 准确）。
+        refresh_request_ttls(&mut requests);
         self.events
             .publish(AgentEvent::LinkPairingRequestsChanged(requests));
     }
@@ -898,11 +973,14 @@ impl LinkService {
             }
         }
         self.publish_requests();
-        // 核验窗口过后请求自然作废：从快照里移除，UI 不再显示一个已无法批准的弹窗。
-        let service = self.clone();
+        // 核验窗口过后请求自然作废：从快照里移除，UI 不再显示一个已无法批准的弹窗。定时任务只持
+        // `Weak`：服务释放后不必等窗口走完。
+        let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             tokio::time::sleep(expires_in).await;
-            service.drop_requests(|request| request.session_id == session_id);
+            if let Some(service) = weak.upgrade() {
+                service.drop_requests(|request| request.session_id == session_id);
+            }
         });
     }
 
@@ -1049,12 +1127,12 @@ impl LinkService {
     // ── agent.link.* ───────────────────────────────────────────────────────
 
     /// 配对码过期后收起 mDNS 广播（除非之后又生成了更新的码 / 用户已主动停止）。
-    fn arm_advertising_timeout(self: &Arc<Self>) {
-        let generation = self.code_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let service = self.clone();
+    fn arm_advertising_timeout(self: &Arc<Self>, generation: u64) {
+        let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(CODE_TTL_SECS)).await;
-            if service.code_generation.load(Ordering::Acquire) == generation
+            if let Some(service) = weak.upgrade()
+                && service.code_generation.load(Ordering::Acquire) == generation
                 && let Ok(manager) = service.manager()
             {
                 manager.stop_advertising();
@@ -1062,25 +1140,47 @@ impl LinkService {
         });
     }
 
+    /// 生成新配对码并安排过期后收起广播。**先**递增广播代数再生成码：代数在码存在之前就已前进，
+    /// 之前码的过期任务不可能在新码刚生成的间隙里误关新码的广播。
+    fn issue_code(self: &Arc<Self>, manager: &LinkManager) -> String {
+        let generation = self.code_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let code = manager.generate_code();
+        *lock(&self.current_code) = Some(code.clone());
+        self.arm_advertising_timeout(generation);
+        code
+    }
+
     /// `agent.link.pairingCode`：生成配对码并（局域网可达时）开始 mDNS 广播。
     pub async fn pairing_code(self: &Arc<Self>) -> Result<LinkPairingCodeDto, LinkOpError> {
         let manager = self.manager()?;
-        let code = manager.generate_code();
-        self.arm_advertising_timeout();
+        let code = self.issue_code(manager);
         Ok(LinkPairingCodeDto {
             code,
             expires_at_unix_ms: now_unix_ms()
                 .saturating_add(i64::try_from(CODE_TTL_SECS * 1000).unwrap_or(120_000)),
+            ttl_ms: CODE_TTL_SECS * 1000,
             addresses: self.advertised_base_urls(),
             fingerprint: manager.fingerprint().to_owned(),
             device_name: manager.self_name().to_owned(),
         })
     }
 
-    /// `agent.link.stopPairing`：作废配对码并停止广播。
-    pub fn stop_pairing(&self) -> Result<(), LinkOpError> {
+    /// `agent.link.stopPairing`：作废配对码并停止广播。带 `code` 时只有它仍是当前展示的码才作废
+    /// （多个客户端互不干扰：一个客户端关闭自己的面板，不会作废另一个客户端刚刷新出来的新码）；
+    /// 不带则无条件作废。
+    pub fn stop_pairing(&self, code: Option<&str>) -> Result<(), LinkOpError> {
+        let manager = self.manager()?;
+        {
+            let mut current = lock(&self.current_code);
+            if let Some(code) = code
+                && current.as_deref() != Some(code)
+            {
+                return Ok(());
+            }
+            *current = None;
+        }
         self.code_generation.fetch_add(1, Ordering::AcqRel);
-        self.manager()?.stop_pairing();
+        manager.stop_pairing();
         Ok(())
     }
 
@@ -1108,13 +1208,17 @@ impl LinkService {
         &self,
         address: &str,
         code: &str,
+        request_control: bool,
     ) -> Result<LinkPairBeginResponse, LinkOpError> {
         let address = PeerAddress::parse(address).map_err(|_| LinkOpError::Invalid("address"))?;
         let code = code.trim();
         if code.is_empty() {
             return Err(LinkOpError::Invalid("code"));
         }
-        let result = self.manager()?.begin_pairing(&address, code).await?;
+        let result = self
+            .manager()?
+            .begin_pairing(&address, code, request_control)
+            .await?;
         Ok(LinkPairBeginResponse {
             token: result.token,
             sas: result.sas,
@@ -1313,7 +1417,13 @@ impl LinkService {
             method::AGENT_LINK_PAIRING_CODE => {
                 rpc_value(self.pairing_code().await, ErrorContext::Local)
             }
-            method::AGENT_LINK_STOP_PAIRING => ok(self.stop_pairing(), ErrorContext::Local),
+            method::AGENT_LINK_STOP_PAIRING => {
+                let params: LinkStopPairingParams = parse(params)?;
+                ok(
+                    self.stop_pairing(params.code.as_deref()),
+                    ErrorContext::Local,
+                )
+            }
             method::AGENT_LINK_DISCOVERY_SET => {
                 let params: LinkDiscoveryParams = parse(params)?;
                 ok(self.set_discovery(params.enabled), ErrorContext::Local)
@@ -1325,7 +1435,8 @@ impl LinkService {
             method::AGENT_LINK_PAIR_BEGIN => {
                 let params: LinkPairBeginParams = parse(params)?;
                 rpc_value(
-                    self.pair_begin(&params.address, &params.code).await,
+                    self.pair_begin(&params.address, &params.code, params.request_control)
+                        .await,
                     ErrorContext::Pairing,
                 )
             }
@@ -1361,6 +1472,13 @@ impl LinkService {
                 )
             }
             method::AGENT_LINK_REFRESH => rpc_value(self.refresh().await, ErrorContext::Local),
+            method::AGENT_LINK_CONTROL_CREDENTIAL => {
+                let params: LinkDeviceParams = parse(params)?;
+                rpc_value(
+                    self.control_credential(&params.fingerprint).await,
+                    ErrorContext::Peer,
+                )
+            }
             method::AGENT_LINK_DISPATCH => {
                 let params: LinkDispatchParams = parse(params)?;
                 rpc_value(
@@ -1389,6 +1507,7 @@ impl LinkService {
             name: manager.self_name(),
             platform: manager.self_platform().unwrap_or_default(),
             link_protocol: LINK_PROTOCOL_VERSION,
+            link_control: LINK_CONTROL_VERSION,
         })
     }
 
@@ -1408,6 +1527,7 @@ impl LinkService {
             platform: non_empty(req.platform),
             app_version: non_empty(req.app_version),
             initiator_addrs: req.initiator_addrs,
+            request_control: req.request_control,
         };
         let resp = manager.pair_hello_wire(wire, source).map_err(api_error)?;
         Ok(LinkPairHelloResponse {
@@ -1561,8 +1681,7 @@ impl LinkService {
 
     pub fn api_generate_code(self: &Arc<Self>) -> Result<LinkCodeResponse, ApiError> {
         let manager = self.api_manager()?;
-        let code = manager.generate_code();
-        self.arm_advertising_timeout();
+        let code = self.issue_code(manager);
         Ok(LinkCodeResponse {
             code,
             ttl_seconds: i64::try_from(CODE_TTL_SECS).unwrap_or(120),
@@ -1605,7 +1724,8 @@ impl LinkService {
     ) -> Result<LinkPairBeginResponse, ApiError> {
         let address = PeerAddress::from_host_port(host, port).map_err(api_error)?;
         self.api_manager()?;
-        self.pair_begin(&address.to_candidate(), code)
+        // 管理面 REST 的配对不请求设备控制：控制授权只经 `agent.link.pairBegin` 显式发起。
+        self.pair_begin(&address.to_candidate(), code, false)
             .await
             .map_err(op_api_error)
     }
@@ -1681,6 +1801,7 @@ mod tests {
         let frame = |event: AgentEvent| EventFrame {
             epoch: "e".to_owned(),
             sequence: 1,
+            previous: None,
             event: ServiceEvent::Agent(event),
         };
         assert!(affects_link_identity(&frame(AgentEvent::SessionChanged(

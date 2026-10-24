@@ -1,6 +1,7 @@
 import FluxDomain
 import FluxUI
 import SwiftUI
+#if FULL_FLAVOR
 
 /// S11.4 · 插件设置表单：按 manifest `SettingFieldDto` 动态生成控件，提交前做
 /// required / number / min-max / select 前置校验，全部通过才发起 `daemon.plugin.updateSettings`
@@ -270,3 +271,4 @@ struct PluginSettingsSheet: View {
         }
     }
 }
+#endif

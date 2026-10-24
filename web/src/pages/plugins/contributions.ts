@@ -49,9 +49,23 @@ export interface PluginActivityEntry {
   id: string
   /** 原文标签（非 i18n 键）。 */
   label: string
+  /** 插件未声明图标时的默认图标。 */
   icon: LucideIcon
+  /** 插件声明的图标：可直接用于 CSS `mask-image` 的 `url(...)`；未声明为 null。 */
+  iconMask: string | null
   identity: string
   viewId: string
+}
+
+const SVG_NAMESPACE = 'http://www.w3.org/2000/svg'
+
+/**
+ * 插件 SVG 图标 → CSS `mask-image` 值。浏览器以图片解析 data URL 时要求根元素带 SVG 命名空间
+ * （GPUI 渲染器不要求），缺失时补上；图片上下文不执行脚本、不加载外部资源。
+ */
+export function svgMaskUrl(svg: string): string {
+  const normalized = svg.replace(/<svg\b[^>]*>/i, (tag) => (/\sxmlns\s*=/i.test(tag) ? tag : `${tag.slice(0, 4)} xmlns="${SVG_NAMESPACE}"${tag.slice(4)}`))
+  return `url("data:image/svg+xml;charset=utf-8,${encodeURIComponent(normalized)}")`
 }
 
 export function deriveActivityEntries(plugins: readonly PluginDto[]): PluginActivityEntry[] {
@@ -59,6 +73,7 @@ export function deriveActivityEntries(plugins: readonly PluginDto[]): PluginActi
     id: pluginRouteId(identity, view.id),
     label: view.title,
     icon: Sparkles,
+    iconMask: view.iconSvg === undefined ? null : svgMaskUrl(view.iconSvg),
     identity,
     viewId: view.id,
   }))

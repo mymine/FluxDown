@@ -27,14 +27,11 @@ import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import com.fluxdown.app.R
 import com.fluxdown.app.i18n.str
-import com.fluxdown.app.nav.AppNavigator
 import com.fluxdown.fluxui.chrome.FluxPageHead
 import com.fluxdown.fluxui.controls.FluxPickList
 import com.fluxdown.fluxui.controls.IconButtonSize
@@ -153,38 +150,6 @@ internal fun LazyListScope.flowItem(
 ) {
     item(key = key) {
         Box(Modifier.fluxFlowIn(index, gate, key)) { content() }
-    }
-}
-
-/**
- * 下滑列表 >5dp 时坞收为迷你态，上滑 / 回到顶部展开（Tab 根页使用）。
- * 以 (首项序号, 偏移) 的变化方向判定，不触发重组。
- */
-@Composable
-internal fun DockMiniOnScroll(state: LazyListState, nav: AppNavigator) {
-    val density = LocalDensity.current
-    LaunchedEffect(state, nav) {
-        val threshold = with(density) { 5.dp.toPx() }
-        var lastIndex = 0
-        var lastOffset = 0
-        var acc = 0f
-        snapshotFlow { state.firstVisibleItemIndex to state.firstVisibleItemScrollOffset }
-            .collect { (index, offset) ->
-                val delta = when {
-                    index == lastIndex -> (offset - lastOffset).toFloat()
-                    index > lastIndex -> 1000f
-                    else -> -1000f
-                }
-                lastIndex = index
-                lastOffset = offset
-                if (index == 0 && offset < threshold) {
-                    acc = 0f
-                    nav.dockMini = false
-                } else if (delta != 0f) {
-                    acc = if ((delta > 0f) == (acc > 0f)) acc + delta else delta
-                    if (acc > threshold) nav.dockMini = true else if (acc < -threshold) nav.dockMini = false
-                }
-            }
     }
 }
 

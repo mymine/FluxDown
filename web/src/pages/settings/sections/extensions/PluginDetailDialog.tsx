@@ -95,6 +95,17 @@ export function PluginDetailDialog({
               })}
             </>
           ) : null}
+          {shown.pageScripts.length > 0 ? (
+            <>
+              <SectionTitle>{t('pluginConsentPageScripts')}</SectionTitle>
+              {shown.pageScripts.map((script) => (
+                <div key={script.id} className="flex w-full flex-col gap-0.5">
+                  <div className="text-sm font-medium text-foreground">{script.title}</div>
+                  <div className="break-all text-xs text-muted-foreground">{script.matches.join(', ')}</div>
+                </div>
+              ))}
+            </>
+          ) : null}
           <SectionTitle>{t('pluginDetailUsage')}</SectionTitle>
           <div className="text-xs text-muted-foreground">{t('pluginDetailUsageBody')}</div>
         </div>

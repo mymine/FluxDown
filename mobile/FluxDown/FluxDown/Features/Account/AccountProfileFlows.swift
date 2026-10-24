@@ -359,3 +359,88 @@ final class PasswordChangeFlow {
         }
     }
 }
+
+// MARK: - 注销账户
+
+@MainActor
+@Observable
+final class DeleteAccountFlow {
+    nonisolated enum Mode: Sendable, Hashable { case password, code }
+
+    let userId: String
+    let email: String
+    /// `nil`（旧云端未知）按已设置处理。
+    let hasPassword: Bool?
+
+    var mode: Mode
+    var current = ""
+    var code = ""
+
+    private(set) var clock: CodeClock?
+    private(set) var sending = false
+    private(set) var submitting = false
+    private(set) var errorText: String?
+    private var restored = false
+
+    init(userId: String, email: String, hasPassword: Bool?) {
+        self.userId = userId
+        self.email = email
+        self.hasPassword = hasPassword
+        mode = hasPassword == false ? .code : .password
+    }
+
+    private var key: String { SentCodeStore.deleteKey(userId: userId) }
+    var canUsePassword: Bool { hasPassword != false }
+    var byCode: Bool { mode == .code }
+
+    var canConfirm: Bool {
+        guard !sending, !submitting else { return false }
+        return byCode ? (clock != nil && !trimmed(code).isEmpty) : !current.isEmpty
+    }
+
+    func setMode(_ next: Mode) {
+        guard !submitting else { return }
+        mode = next
+        errorText = nil
+    }
+
+    func restoreIfNeeded() {
+        guard !restored else { return }
+        restored = true
+        clock = SentCodeStore.recall(key)
+    }
+
+    func sendCode(_ api: AgentAPI) async {
+        guard !sending, !submitting else { return }
+        sending = true
+        errorText = nil
+        defer { sending = false }
+        do throws(HostError) {
+            let ttl = try await api.sendDeleteCode()
+            SentCodeStore.remember(key, ttlSeconds: ttl.ttlSeconds)
+            clock = CodeClock(ttlSeconds: ttl.ttlSeconds)
+            code = ""
+        } catch {
+            errorText = AccountText.error(error, context: .code)
+        }
+    }
+
+    /// - Returns: 账户已注销（本机会话随之清除）。
+    func submit(_ api: AgentAPI) async -> Bool {
+        guard canConfirm else { return false }
+        submitting = true
+        errorText = nil
+        defer { submitting = false }
+        let params = byCode
+            ? DeleteAccountParams(code: trimmed(code))
+            : DeleteAccountParams(currentPassword: current)
+        do throws(HostError) {
+            try await api.deleteAccount(params)
+            SentCodeStore.forget(key)
+            return true
+        } catch {
+            errorText = AccountText.error(error, context: .code)
+            return false
+        }
+    }
+}

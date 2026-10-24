@@ -2,7 +2,7 @@
 //! 不遮挡任何任务行，紧挨刚点过的复选框，鼠标移动距离最短。
 
 use fluxdown_ui_components::{
-    FluxIcon, IconControlExt as _, tabular_numbers, toolbar_action_button,
+    FluxIcon, IconControlExt as _, tabular_numbers, toolbar_action_button, tooltip_view,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -14,11 +14,10 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
-    tooltip::Tooltip,
 };
 
 use crate::{
-    components::task_table::{SELECTION_COLUMN_WIDTH, ToolbarCommand, table_header_height},
+    components::task_table::{ToolbarCommand, table_header_height},
     model::{RowKey, TaskState, TaskStore},
     pages::downloads::DownloadView,
 };
@@ -113,7 +112,7 @@ impl DownloadView {
         div()
             .id(SharedString::from(format!("{id}-tooltip")))
             .flex_none()
-            .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
+            .tooltip(move |window, cx| tooltip_view(tooltip_label.clone(), window, cx))
             .child(
                 toolbar_action_button(id, label, icon, destructive, disabled, cx)
                     .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx))),
@@ -151,34 +150,40 @@ impl DownloadView {
                             this.controller.is_stale() || this.selected_stale_keys(cx).is_empty()
                         });
                         menu.item(
-                            PopupMenuItem::new(delete_task.clone())
-                                .icon(FluxIcon::Trash2)
-                                .on_click({
-                                    let view = view.clone();
-                                    move |_, _, cx| {
-                                        let Ok(()) = view.update(cx, |this, cx| {
-                                            this.execute_toolbar(ToolbarCommand::Delete, cx);
-                                        }) else {
-                                            // 视图已释放，结束这次回调而不再更新状态。
-                                            return;
-                                        };
-                                    }
-                                }),
+                            PopupMenuItem::element({
+                                let label = delete_task.clone();
+                                move |_, _| div().text_color(destructive).child(label.clone())
+                            })
+                            .icon(Icon::new(FluxIcon::Trash2).text_color(destructive))
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    let Ok(()) = view.update(cx, |this, cx| {
+                                        this.execute_toolbar(ToolbarCommand::Delete, cx);
+                                    }) else {
+                                        // 视图已释放，结束这次回调而不再更新状态。
+                                        return;
+                                    };
+                                }
+                            }),
                         )
                         .item(
-                            PopupMenuItem::new(delete_with_files.clone())
-                                .icon(FluxIcon::Trash2)
-                                .on_click({
-                                    let view = view.clone();
-                                    move |_, window, cx| {
-                                        let Ok(()) = view.update(cx, |this, cx| {
-                                            this.delete_selected_with_files(window, cx);
-                                        }) else {
-                                            // 视图已释放，结束这次回调而不再更新状态。
-                                            return;
-                                        };
-                                    }
-                                }),
+                            PopupMenuItem::element({
+                                let label = delete_with_files.clone();
+                                move |_, _| div().text_color(destructive).child(label.clone())
+                            })
+                            .icon(Icon::new(FluxIcon::Trash2).text_color(destructive))
+                            .on_click({
+                                let view = view.clone();
+                                move |_, window, cx| {
+                                    let Ok(()) = view.update(cx, |this, cx| {
+                                        this.delete_selected_with_files(window, cx);
+                                    }) else {
+                                        // 视图已释放，结束这次回调而不再更新状态。
+                                        return;
+                                    };
+                                }
+                            }),
                         )
                         .separator()
                         .item(
@@ -208,6 +213,7 @@ impl DownloadView {
         let delegate = self.table_state.read(cx).delegate();
         let selection = delegate.selection_summary();
         let multi_select = delegate.in_multi_select();
+        let selection_column_width = delegate.selection_column_width();
         self.selection_summary.set(selection);
         if selection.count == 0 || !multi_select {
             return None;
@@ -297,7 +303,7 @@ impl DownloadView {
                 .occlude()
                 .absolute()
                 .top_0()
-                .left(px(SELECTION_COLUMN_WIDTH))
+                .left(px(selection_column_width))
                 .right_0()
                 // 留出表头底部分隔线。
                 .h(table_header_height(cx) - stroke)
