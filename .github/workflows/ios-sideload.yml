@@ -4,39 +4,41 @@
 #   build-core.sh --release --flavor full → xcodebuild archive（CODE_SIGNING_ALLOWED=NO、FLUX_FLAVOR_CONDITIONS=FULL_FLAVOR）
 #   → 打包 Payload/FluxDown.app 为 .ipa。不需要任何签名密钥。
 # 触发：
-#   - 推送 v* tag：版本号取 tag（vX.Y.Z-rc.N → X.Y.Z）；IPA 作为 artifact，并挂到同名 GitHub Release
-#     （release.yml 先建草稿；release 尚不存在则只留 artifact，可手动重跑本 workflow 补挂）。
-#   - 手动：gh workflow run ios-sideload.yml --ref main -f version=X.Y.Z [-f release_tag=vX.Y.Z]
-#     release_tag 留空 = 只出 artifact，不挂 Release。
-# 构建号 = UTC 时间 YYYYMMDD.HHMMSS（只用于 CFBundleVersion，侧载不需要唯一性之外的约束）。
+#   - release.yml 的 build-ios 以 workflow_call 复用（统一 release 的 ios 组件）：产物 artifact `ios-ipa`，
+#     由 upload-ios 连同完成哨兵 SHA256SUMS-ios.txt 上传到 vX.Y.Z release 并同步 OSS；
+#     演练、产物晋升、补发（-f component=ios）与其他组件同一套规则。本文件不直接写 Release。
+#   - 手动出测试包（只留 artifact，不碰 Release）：gh workflow run ios-sideload.yml --ref main -f version=X.Y.Z
+# 资产名 FluxDown-<版本>-ios-sideload-unsigned.ipa：版本保留 -rc.N（与其他发布资产一致），官网 /api/release
+# 的 ios.assets.sideload_ipa 按这个后缀匹配，改名须同步 website-v2/src/lib/release-assets.ts。
+# CFBundleShortVersionString 只能是 X.Y.Z（去掉预发布后缀）；核心编译期版本 FLUXDOWN_APP_VERSION 保留完整版本
+# （协议握手 / 云端 / UA，与 Android、桌面一致）。构建号 = UTC 时间 YYYYMMDD.HHMMSS（CFBundleVersion）。
+# 缓存：tag 推送触发的调用不保存——GitHub 缓存按 ref 隔离，tag 作用域的缓存之后任何运行都恢复不了。
 # Secrets：FLUXCLOUD_BASE_URL（可选，编译期写入核心）。
 name: iOS Sideload (unsigned IPA)
-run-name: >-
-  ${{ inputs.version != ''
-  && format('iOS Sideload {0}', inputs.version)
-  || format('iOS Sideload {0}', github.ref_name) }}
+run-name: iOS Sideload ${{ inputs.version }}
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_call:
+    inputs:
+      ref:
+        description: "构建的 git ref（release.yml 传 changes.outputs.source）"
+        required: true
+        type: string
+      version:
+        description: "发布版本（X.Y.Z 或 X.Y.Z-rc.N，不带 v）"
+        required: true
+        type: string
+    secrets:
+      FLUXCLOUD_BASE_URL:
+        required: false
   workflow_dispatch:
     inputs:
       version:
-        description: "CFBundleShortVersionString（X.Y.Z）"
+        description: "版本（X.Y.Z 或 X.Y.Z-rc.N，不带 v）"
         required: true
-        type: string
-      release_tag:
-        description: "挂载到的 GitHub Release tag（如 v1.2.3；留空 = 只出 artifact）"
-        required: false
-        default: ""
         type: string
 
 permissions:
-  contents: write
-
-concurrency:
-  group: ios-sideload-${{ github.ref }}
-  cancel-in-progress: false
+  contents: read
 
 jobs:
   sideload:
@@ -51,29 +53,22 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
-      - name: Resolve version, build number and release tag
+      - name: Resolve version and build number
         id: meta
         env:
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "$INPUT_VERSION" ]; then
-            VERSION="$INPUT_VERSION"
-            RELEASE_TAG="$INPUT_RELEASE_TAG"
-          else
-            VERSION="${GITHUB_REF_NAME#v}"
-            VERSION="${VERSION%%-*}"
-            RELEASE_TAG="$GITHUB_REF_NAME"
-          fi
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::版本号须为 X.Y.Z（得到 '$VERSION'）"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::版本号须为 X.Y.Z 或 X.Y.Z-rc.N（得到 '$VERSION'）"
             exit 1
           fi
           {
             echo "version=$VERSION"
+            echo "marketing=${VERSION%%-*}"
             echo "build=$(date -u +%Y%m%d.%H%M%S)"
-            echo "release_tag=$RELEASE_TAG"
           } >> "$GITHUB_OUTPUT"
 
       - name: Select newest non-beta Xcode
@@ -111,37 +106,27 @@ jobs:
         with:
           key: ios-sideload
           cache-on-failure: true
+          save-if: ${{ github.ref_type != 'tag' }}
 
       - name: Build unsigned IPA
         env:
           FLUXCLOUD_BASE_URL_SECRET: ${{ secrets.FLUXCLOUD_BASE_URL }}
           VERSION: ${{ steps.meta.outputs.version }}
+          MARKETING: ${{ steps.meta.outputs.marketing }}
           BUILD: ${{ steps.meta.outputs.build }}
         run: |
           if [ -n "$FLUXCLOUD_BASE_URL_SECRET" ]; then export FLUXCLOUD_BASE_URL="$FLUXCLOUD_BASE_URL_SECRET"; fi
-          mobile/FluxDown/scripts/sideload.sh --version "$VERSION" --build "$BUILD"
-          echo "### iOS sideload ${VERSION} (${BUILD}) — 未签名 IPA（full flavor），见 artifact" >> "$GITHUB_STEP_SUMMARY"
+          FLUXDOWN_APP_VERSION="$VERSION" mobile/FluxDown/scripts/sideload.sh --version "$MARKETING" --build "$BUILD"
+          mkdir -p build/ios
+          cp "mobile/FluxDown/build/sideload/FluxDown-${MARKETING}-${BUILD}-unsigned.ipa" \
+            "build/ios/FluxDown-${VERSION}-ios-sideload-unsigned.ipa"
+          echo "### iOS sideload ${VERSION} (${BUILD}) — 未签名 IPA（full flavor）" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload unsigned IPA
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ios-sideload-${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.build }}
-          path: mobile/FluxDown/build/sideload/FluxDown-*-unsigned.ipa
+          overwrite: true
+          retention-days: 14
+          name: ios-ipa
+          path: build/ios/FluxDown-*-ios-sideload-unsigned.ipa
           if-no-files-found: error
-          retention-days: 30
-
-      - name: Attach to GitHub Release
-        if: steps.meta.outputs.release_tag != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.meta.outputs.release_tag }}
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: |
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            echo "::warning::release $TAG 尚不存在，未挂载侧载 IPA（artifact 已保留；release 建好后重跑本 workflow 补挂）"
-            exit 0
-          fi
-          ASSET="$RUNNER_TEMP/FluxDown-${VERSION}-ios-sideload-unsigned.ipa"
-          cp mobile/FluxDown/build/sideload/FluxDown-*-unsigned.ipa "$ASSET"
-          gh release upload "$TAG" "$ASSET" --clobber

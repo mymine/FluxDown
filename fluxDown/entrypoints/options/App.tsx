@@ -5,6 +5,7 @@ import { HostAccessNotice } from "@/ui/components/HostAccessNotice";
 import { Icon, type UiIconName } from "@/ui/components/Icon";
 import { ToastHost } from "@/ui/components/Toast";
 import { useSidePanelOpener } from "@/ui/hooks/useSidePanelOpener";
+import { usePlatform } from "@/ui/hooks/usePlatform";
 import { useT } from "@/ui/i18n";
 import { useThemeAttr } from "@/ui/theme";
 import type { MessageKey } from "@/utils/i18n";
@@ -38,7 +39,16 @@ export function App(): JSX.Element {
   const t = useT();
   useThemeAttr(document.documentElement);
   const sidePanel = useSidePanelOpener(false);
+  const platform = usePlatform();
   const [route, setRoute] = useState(() => parseHash(location.hash));
+
+  // 当前平台可见的面板：页面脚本依赖桌面 App，快捷键依赖 commands API；hash 指向隐藏面板时回落 general。
+  const visiblePanels = PANELS.filter((id) => {
+    if (id === "pageScripts") return platform.desktopApp;
+    if (id === "shortcuts") return platform.shortcuts;
+    return true;
+  });
+  const activePanel: PanelId = visiblePanels.includes(route.panel) ? route.panel : "general";
 
   useEffect(() => {
     const stopSync = startSettingsSync();
@@ -61,10 +71,10 @@ export function App(): JSX.Element {
 
   const manifest = browser.runtime.getManifest();
   const version = manifest.version_name ?? `v${manifest.version}`;
-  const prefillHost = route.panel === "sites" ? route.params.get("host") : null;
+  const prefillHost = activePanel === "sites" ? route.params.get("host") : null;
 
   let content: JSX.Element;
-  switch (route.panel) {
+  switch (activePanel) {
     case "intercept":
       content = <InterceptPanel />;
       break;
@@ -106,11 +116,11 @@ export function App(): JSX.Element {
 
         <div class="opt-nav-group">{t("options.navSettings")}</div>
         <nav class="opt-nav">
-          {PANELS.map((id) => (
+          {visiblePanels.map((id) => (
             <button
               key={id}
               type="button"
-              class={`opt-nav-item${route.panel === id ? " active" : ""}`}
+              class={`opt-nav-item${activePanel === id ? " active" : ""}`}
               onClick={() => go(id)}
             >
               <Icon name={NAV[id].icon} size={15} />

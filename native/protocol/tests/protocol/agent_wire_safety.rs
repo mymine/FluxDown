@@ -1,8 +1,40 @@
 use fluxdown_protocol::{
-    AgentLoginResult, AgentSessionDto, CloudDevice, CloudUser, CloudUserStatus, Entitlements,
-    GatewayPatchParams,
+    AgentLoginResult, AgentSessionDto, CloudDevice, CloudPlan, CloudProfile, CloudUser,
+    CloudUserStatus, Entitlements, ErrorReason, GatewayPatchParams,
 };
 use serde_json::json;
+
+#[test]
+fn subscription_fields_default_and_round_trip() -> Result<(), serde_json::Error> {
+    let lifetime: CloudPlan = serde_json::from_value(json!({ "code": "pro" }))?;
+    assert_eq!(lifetime.billing_period_days, None);
+    let card: CloudPlan =
+        serde_json::from_value(json!({ "code": "m30", "billingPeriodDays": 30 }))?;
+    assert_eq!(card.billing_period_days, Some(30));
+
+    let legacy: CloudProfile =
+        serde_json::from_value(json!({ "id": "u", "email": "a@b.c", "currentPlan": null }))?;
+    assert_eq!(legacy.active_subscription, None);
+    let profile: CloudProfile = serde_json::from_value(json!({
+        "id": "u", "email": "a@b.c", "currentPlan": null,
+        "activeSubscription": {
+            "planCode": "m30", "planName": "月卡",
+            "startsAt": "2026-10-01T00:00:00Z", "endsAt": "2026-10-31T00:00:00Z"
+        }
+    }))?;
+    let sub = profile.active_subscription.as_ref();
+    assert_eq!(sub.map(|s| s.plan_code.as_str()), Some("m30"));
+    assert_eq!(
+        sub.map(|s| s.ends_at.as_str()),
+        Some("2026-10-31T00:00:00Z")
+    );
+
+    assert_eq!(
+        serde_json::to_value(ErrorReason::SubscriptionConflict)?,
+        json!("subscriptionConflict")
+    );
+    Ok(())
+}
 
 fn session() -> AgentSessionDto {
     AgentSessionDto {
@@ -35,6 +67,7 @@ fn session() -> AgentSessionDto {
             default_save_dir: None,
             path_style: None,
         },
+        active_subscription: None,
     }
 }
 

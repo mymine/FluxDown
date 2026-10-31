@@ -310,13 +310,17 @@ impl UpdateService {
         }
     }
 
-    /// 启动后台任务：清理上次替换残留、对账 `pending.json`，`auto_check` 时进入周期检查。
-    /// 只用于 agent 宿主；委托宿主由 App 自行调度并调用 [`Self::reconcile`]。
+    /// 启动后台任务：清理上次替换残留、修复 macOS 已安装 bundle 的隔离标记、对账 `pending.json`，
+    /// `auto_check` 时进入周期检查。只用于 agent 宿主；委托宿主由 App 自行调度并调用 [`Self::reconcile`]。
     pub fn start(self: &Arc<Self>, cancel: CancellationToken, auto_check: bool) {
         let service = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(error) = tokio::task::spawn_blocking(install::cleanup_leftovers).await {
                 tracing::debug!(error = %error, "update leftover cleanup task failed");
+            }
+            #[cfg(target_os = "macos")]
+            if service.target.kind == fluxdown_protocol::UpdateInstallKind::MacosApp {
+                install::heal_installed_quarantine().await;
             }
             service.reconcile().await;
             if auto_check {

@@ -72,9 +72,14 @@ export function normalizeLayout(stored: unknown, catalog: readonly ChromeItemSpe
     }
     if (Array.isArray(stored.hidden)) hiddenStored = stored.hidden
   }
-  for (const spec of catalog) {
-    if (!placed.has(spec.id)) zones[spec.defaultZone].push(spec.id)
-  }
+  // 未摆放条目插到默认区域第一个目录位置靠后的条目之前（没有则追加），新增内置入口不会落到插件入口之后。
+  const order = new Map(catalog.map((spec, index) => [spec.id, index]))
+  catalog.forEach((spec, index) => {
+    if (placed.has(spec.id)) return
+    const zone = zones[spec.defaultZone]
+    const at = zone.findIndex((id) => (order.get(id) ?? -1) > index)
+    zone.splice(at === -1 ? zone.length : at, 0, spec.id)
+  })
   const hiddenSet = new Set(hiddenStored)
   const hidden = catalog.filter((spec) => !spec.fixed && hiddenSet.has(spec.id)).map((spec) => spec.id)
   return { ...zones, hidden }

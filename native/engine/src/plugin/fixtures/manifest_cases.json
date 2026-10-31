@@ -4201,5 +4201,51 @@
   },
   "files": ["main.js"],
   "ok": false
+ },
+ {
+  "name": "auth view ok",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+    "permissions": ["auth"],
+   "auth": { "entry": "auth.js" },
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [{ "id": "login", "title": "T", "location": "auth" }]
+   }
+  },
+  "files": ["main.js", "auth.js"],
+  "ok": true
+ },
+ {
+  "name": "two auth views",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+    "permissions": ["auth"],
+   "auth": { "entry": "auth.js" },
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [{ "id": "a", "title": "T", "location": "auth" }, { "id": "b", "title": "T", "location": "auth" }]
+   }
+  },
+  "files": ["main.js", "auth.js"],
+  "ok": false
+ },
+ {
+  "name": "auth view without auth decl",
+  "manifest": {
+   "identity": "a@b",
+   "name": "N",
+   "version": "1.0.0",
+   "main": { "entry": "main.js" },
+   "contributes": {
+    "views": [{ "id": "login", "title": "T", "location": "auth" }]
+   }
+  },
+  "files": ["main.js", "auth.js"],
+  "ok": false
  }
 ]

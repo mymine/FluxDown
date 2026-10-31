@@ -72,6 +72,11 @@ export interface ReleaseInfo {
     tag: string;
     assets: Assets<"android_arm64" | "android_armv7" | "android_x64" | "android_universal">;
   } | null;
+  ios: {
+    version: string;
+    tag: string;
+    assets: Assets<"sideload_ipa">;
+  } | null;
 }
 
 export interface ChangelogRelease {

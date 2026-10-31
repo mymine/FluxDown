@@ -140,10 +140,10 @@ const MAX_DOWNLOAD_REDIRECTS: usize = 5;
 pub struct MarketClient {
     manager: std::sync::Arc<PluginManager>,
     db: Db,
-    client: reqwest::Client,
+    clients: crate::egress::RoutedClients,
     /// 包下载专用：重定向逐跳复查 https 与字面量 IP 守卫（初始 URL 的
     /// `mirror_url_allowed` 只管第一跳）。
-    download_client: reqwest::Client,
+    download_clients: crate::egress::RoutedClients,
     /// 宿主自身下载的统一出口：包（content_hash 钉住）可经插件改写来源（如 GitHub 加速）。
     egress: crate::egress::Egress,
     sources: Vec<String>,
@@ -165,35 +165,34 @@ impl MarketClient {
         } else {
             sources
         };
-        let client = crate::egress::client_builder(proxy, "")
-            .map_err(client_build_error)?
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .map_err(network_error)?;
-        let download_client = crate::egress::client_builder(proxy, "")
-            .map_err(client_build_error)?
-            .timeout(std::time::Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= MAX_DOWNLOAD_REDIRECTS {
-                    return attempt.error("too many redirects");
-                }
-                if !parsed_url_allowed(attempt.url()) {
-                    let message = format!(
-                        "redirect target rejected by mirror guard: {}",
-                        safe_url(attempt.url().as_str())
-                    );
-                    return attempt.error(message);
-                }
-                attempt.follow()
-            }))
-            .build()
-            .map_err(network_error)?;
+        let clients = crate::egress::RoutedClients::new(proxy, "", |b| {
+            b.timeout(std::time::Duration::from_secs(20))
+        })
+        .map_err(client_build_error)?;
+        let download_clients = crate::egress::RoutedClients::new(proxy, "", |b| {
+            b.timeout(std::time::Duration::from_secs(20)).redirect(
+                reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() >= MAX_DOWNLOAD_REDIRECTS {
+                        return attempt.error("too many redirects");
+                    }
+                    if !parsed_url_allowed(attempt.url()) {
+                        let message = format!(
+                            "redirect target rejected by mirror guard: {}",
+                            safe_url(attempt.url().as_str())
+                        );
+                        return attempt.error(message);
+                    }
+                    attempt.follow()
+                }),
+            )
+        })
+        .map_err(client_build_error)?;
         let egress = crate::egress::Egress::new(db.clone()).with_plugins(manager.clone());
         Ok(Self {
             manager,
             db,
-            client,
-            download_client,
+            clients,
+            download_clients,
             egress,
             sources,
         })
@@ -227,7 +226,8 @@ impl MarketClient {
     }
 
     async fn fetch_index_from(&self, url: &str) -> Result<MarketIndex, MarketError> {
-        let mut resp = self.client.get(url).send().await.map_err(network_error)?;
+        let client = self.clients.client(url).await.map_err(client_build_error)?;
+        let mut resp = client.get(url).send().await.map_err(network_error)?;
         if !resp.status().is_success() {
             return Err(MarketError::Network(format!(
                 "HTTP {} at {}",
@@ -390,7 +390,12 @@ impl MarketClient {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<Vec<u8>, MarketError> {
-        let mut request = self.download_client.get(url);
+        let client = self
+            .download_clients
+            .client(url)
+            .await
+            .map_err(client_build_error)?;
+        let mut request = client.get(url);
         for (name, value) in headers {
             request = request.header(name.as_str(), value.as_str());
         }

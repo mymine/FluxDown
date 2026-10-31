@@ -8,9 +8,14 @@
 //! 3. 逐跳重定向 `Policy::custom`（手动重建 30 跳上限 + 每跳字面量 IP 校验）。
 //!
 //! ## 代理
-//! - 出口代理与宿主自身下载同一来源（[`crate::egress::proxy_endpoint`]）；全局代理变更时
-//!   [`EngineBridge::set_proxy_config`] 整体替换 client 与 yt-dlp `--proxy`（#401），已在途的
-//!   请求 / 子进程沿用发起时的配置。
+//! - 每个请求的出口：命中站点规则（`flux.fetch` 按请求 URL，yt-dlp 按首个位置参数）→ 规则
+//!   出口；否则调用级出口（[`super::call_egress::CallEgress`]，任务 / 订阅自带代理、源链接
+//!   命中的规则、全局模式或 Auto 计划的一步）；没有调用级出口（常驻宿主、通知钩子）按全局
+//!   规则 + 全局模式现场解析（System 每次检测，Auto 折算直连）。全局代理 / 规则变更由
+//!   [`EngineBridge::set_proxy_config`] 替换，已在途的请求 / 子进程沿用发起时的出口（#401）。
+//! - 走调用级 fallback 出口的请求记入 [`NetObserver`]（断在传输层 / 未完成），manager 据此
+//!   在 Auto 下换路重跑、并豁免网络等待导致的超时熔断。
+//! - 开发模式插件同样遵循规则与代理，但私网 / 本地域恒直连（[`DEV_PRIVATE_NO_PROXY`]）。
 //! - 单次调用严格 per-call fetch 上限退化为**全局并发 fetch 上限**（对宿主保护更强）。
 //! - 配置代理时 DNS 由代理侧解析，[`GuardResolver`] 不参与（hostname 级过滤失效；
 //!   字面量 IP 前置校验与逐跳重定向校验仍然生效）。代理由用户显式配置，视为可信出口。
@@ -29,6 +34,7 @@ use crate::db::Db;
 use crate::logger::{log_error, log_info, log_warn};
 use crate::proxy_config::ProxyConfig;
 
+use super::call_egress::{CallEgress, NetObserver};
 use super::runtime::{
     BridgeHttpRequest, BridgeHttpResponse, FfmpegAvailability, FfmpegOutcome, FfmpegSpec,
     PluginBridge, PluginError, PluginLogLevel, YtdlpAvailability, YtdlpOutcome, YtdlpSpec,
@@ -237,20 +243,42 @@ fn is_v6_routable(ip: Ipv6Addr) -> bool {
     true
 }
 
-/// 守卫用自定义 DNS 解析器：解析后仅保留可全局路由的地址。
+/// 守卫用自定义 DNS 解析器：解析后仅保留可全局路由的地址。解析出地址却全被过滤（内网
+/// 主机名）时报 [`GuardError::BlockedHost`]——这是守卫拦截而不是网络故障，Auto 不得据此
+/// 换代理重跑（代理侧解析会绕开守卫）。例外：全落在 198.18.0.0/15 的是 TUN 代理的 fake-ip
+/// 应答，直连本就走不通，按网络故障交给换路。
 struct GuardResolver;
 
 impl reqwest::dns::Resolve for GuardResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
-            let filtered: Vec<SocketAddr> = addrs
+            let resolved: Vec<SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let filtered: Vec<SocketAddr> = resolved
+                .iter()
+                .copied()
                 .filter(|sa| is_globally_routable_unicast(sa.ip()))
                 .collect();
+            if filtered.is_empty() && !resolved.iter().all(|sa| is_fake_ip(sa.ip())) {
+                return Err(
+                    Box::new(GuardError::BlockedHost) as Box<dyn std::error::Error + Send + Sync>
+                );
+            }
             let iter: reqwest::dns::Addrs = Box::new(filtered.into_iter());
             Ok(iter)
         })
+    }
+}
+
+/// TUN 代理 fake-ip 段（198.18.0.0/15，RFC 2544 基准测试段）。
+fn is_fake_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 198 && (o[1] & 0xfe) == 18
+        }
+        IpAddr::V6(_) => false,
     }
 }
 
@@ -260,36 +288,154 @@ enum GuardError {
     TooManyRedirects,
     #[error("blocked: non-routable redirect target")]
     BlockedRedirect,
+    #[error("blocked: host resolves only to non-routable addresses")]
+    BlockedHost,
 }
+
+/// 错误链里是否有守卫拦截（不是网络故障，不归因出口）。
+fn is_guard_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if e.downcast_ref::<GuardError>().is_some() {
+            return true;
+        }
+        current = e.source();
+    }
+    false
+}
+
+/// 守卫 client 缓存容量上限；超出后整体清空（键空间 = 出口 × 认证 × 开发模式，通常个位数）。
+const GUARDED_CLIENT_CACHE_CAP: usize = 32;
+
+/// 开发模式插件额外直连的私网 / 本地域：联调目标多在本机或局域网，不能被转发给代理出口。
+/// 环回由 [`crate::proxy_config::proxy_bypass_list`] 恒直连。
+const DEV_PRIVATE_NO_PROXY: &str = "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,\
+100.64.0.0/10,fc00::/7,fe80::/10,local,lan,home.arpa,internal";
 
 /// 随全局代理整体替换的出口配置。
 struct BridgeNet {
-    client: reqwest::Client,
-    /// 认证请求专用 client：认证档案里的自定义 headers 不能跨 origin 跟随重定向。
-    auth_client: reqwest::Client,
-    /// 开发模式插件专用：无 SSRF 守卫、直连（见 [`build_dev_client`]）。
-    dev_client: reqwest::Client,
-    dev_auth_client: reqwest::Client,
-    /// yt-dlp 子进程用 `--proxy` URL。`None` = 直连，不注入 `--proxy`。#401
-    ytdlp_proxy_url: Option<String>,
+    /// 全局代理配置（带站点规则）。没有调用级出口的请求按它现场解析（System 每次检测）。
+    global: ProxyConfig,
+}
+
+/// 请求选定的出口。
+struct RequestRoute {
+    /// 具体出口（`None` / `Manual` 模式）。
+    proxy: ProxyConfig,
+    /// 走的是调用的 fallback 出口（未命中站点规则）——换路判据只看这类请求。
+    via_fallback: bool,
 }
 
 impl BridgeNet {
-    fn build(proxy: &ProxyConfig) -> Result<Self, PluginError> {
-        let endpoint = crate::egress::proxy_endpoint(proxy);
-        Ok(Self {
-            client: build_guarded_client(endpoint.as_ref(), false, "守卫")?,
-            auth_client: build_guarded_client(endpoint.as_ref(), true, "认证守卫")?,
-            dev_client: build_dev_client(false, "开发模式")?,
-            dev_auth_client: build_dev_client(true, "开发模式认证")?,
-            ytdlp_proxy_url: endpoint.map(|endpoint| endpoint.url),
+    /// 生效的站点规则：调用级出口自带（自带代理时为空），否则取全局。
+    fn rules<'a>(
+        &'a self,
+        egress: Option<&'a CallEgress>,
+    ) -> Option<&'a Arc<crate::proxy_rules::ProxyRuleSet>> {
+        match egress {
+            Some(egress) => egress.rules(),
+            None => self.global.rules.as_ref(),
+        }
+    }
+
+    /// 请求出口：命中站点规则 → 规则出口；否则调用级 fallback（无调用级出口时为全局模式
+    /// 现场解析，Auto 即直连）。System 检测会阻塞，放进 `spawn_blocking`。`dev` = 开发模式
+    /// 插件（私网 / 本地域另走直连）。
+    async fn route(
+        &self,
+        egress: Option<&CallEgress>,
+        url: &url::Url,
+        dev: bool,
+    ) -> Result<RequestRoute, PluginError> {
+        if let Some(rule) = self
+            .rules(egress)
+            .and_then(|rules| rules.first_match_url(url))
+        {
+            let rule_egress = rule.egress().clone();
+            let proxy = if rule_egress.needs_detection() {
+                tokio::task::spawn_blocking(move || rule_egress.resolve())
+                    .await
+                    .map_err(|e| PluginError::Runtime(format!("解析站点规则出口失败: {e}")))?
+            } else {
+                rule_egress.resolve()
+            };
+            return Ok(RequestRoute {
+                proxy,
+                via_fallback: false,
+            });
+        }
+        let proxy = match egress {
+            Some(egress) => egress.fallback().clone(),
+            None => resolve_global(&self.global).await?,
+        };
+        // 走代理的 fallback 下，命中直连名单（环回 / 用户排除 / 开发模式私网）的请求实际
+        // 直连：它的失败不能记到这一步的代理头上。
+        let bypassed = proxy.mode != crate::proxy_config::ProxyMode::None
+            && url.host_str().is_some_and(|host| {
+                let mut list = crate::proxy_config::proxy_bypass_list(&proxy.no_proxy_list);
+                if dev {
+                    list.push(',');
+                    list.push_str(DEV_PRIVATE_NO_PROXY);
+                }
+                crate::proxy_config::host_matches_no_proxy(host, &list)
+            });
+        Ok(RequestRoute {
+            proxy,
+            via_fallback: !bypassed,
         })
     }
+
+    /// yt-dlp 的 `--proxy` 值与是否走 fallback。第一个位置参数命中站点规则时取规则出口
+    /// （直连为 `Some("")`）；否则取调用级 fallback：显式设定恒注入（直连注入空值强制
+    /// 直连），非显式（全局 None / Auto 直连路径）直连时不注入，插件自带的 `--proxy` 仍可用。
+    async fn ytdlp_proxy(
+        &self,
+        egress: Option<&CallEgress>,
+        args: &[String],
+    ) -> Result<(Option<String>, bool), PluginError> {
+        if let Some(url) = ytdlp_first_positional_url(args)
+            && self
+                .rules(egress)
+                .is_some_and(|rules| rules.first_match_url(&url).is_some())
+        {
+            let route = self.route(egress, &url, false).await?;
+            let proxy_url = crate::egress::proxy_endpoint(&route.proxy)
+                .map(|endpoint| endpoint.url)
+                .unwrap_or_default();
+            return Ok((Some(proxy_url), false));
+        }
+        let (proxy, explicit) = match egress {
+            Some(egress) => (egress.fallback().clone(), egress.explicit()),
+            None => (resolve_global(&self.global).await?, false),
+        };
+        let proxy_url = crate::egress::proxy_endpoint(&proxy).map(|endpoint| endpoint.url);
+        let injected = match proxy_url {
+            Some(url) => Some(url),
+            None if explicit => Some(String::new()),
+            None => None,
+        };
+        Ok((injected, true))
+    }
 }
+
+/// 全局模式现场解析（System 检测可能起子进程，放进 `spawn_blocking`；Auto 折算直连）。
+async fn resolve_global(global: &ProxyConfig) -> Result<ProxyConfig, PluginError> {
+    if global.mode != crate::proxy_config::ProxyMode::System {
+        return Ok(global.resolve());
+    }
+    let global = global.clone();
+    tokio::task::spawn_blocking(move || global.resolve())
+        .await
+        .map_err(|e| PluginError::Runtime(format!("检测系统代理失败: {e}")))
+}
+
+type GuardedClientKey = (String, bool, bool);
 
 /// 引擎侧 `PluginBridge` 实现。
 pub struct EngineBridge {
     net: std::sync::RwLock<Arc<BridgeNet>>,
+    /// 守卫 client 缓存：键 =（出口指纹, 认证同源跳转, 开发模式）。
+    clients: std::sync::Mutex<HashMap<GuardedClientKey, reqwest::Client>>,
     db: Db,
     plugin_retry_tx: mpsc::UnboundedSender<(String, u64)>,
     fetch_sema: Arc<Semaphore>,
@@ -302,32 +448,47 @@ pub struct EngineBridge {
 }
 
 impl EngineBridge {
-    /// 构造带守卫的 bridge，出口按 `proxy` 装配。
+    /// 构造带守卫的 bridge，出口按 `proxy`（带站点规则的全局配置）装配。坏代理配置在此失败。
     pub fn new(
         db: Db,
         proxy: &ProxyConfig,
         plugin_retry_tx: mpsc::UnboundedSender<(String, u64)>,
         data_dir: PathBuf,
     ) -> Result<Self, PluginError> {
-        Ok(Self {
-            net: std::sync::RwLock::new(Arc::new(BridgeNet::build(proxy)?)),
+        let bridge = Self {
+            net: std::sync::RwLock::new(Arc::new(BridgeNet {
+                global: proxy.clone(),
+            })),
+            clients: std::sync::Mutex::new(HashMap::new()),
             db,
             plugin_retry_tx,
             fetch_sema: Arc::new(Semaphore::new(MAX_CONCURRENT_FETCH)),
             data_dir,
             ffmpeg_sema: Arc::new(Semaphore::new(MAX_CONCURRENT_FFMPEG)),
             ytdlp_sema: Arc::new(Semaphore::new(MAX_CONCURRENT_YTDLP)),
-        })
+        };
+        bridge.guarded_client(&proxy.resolve(), false, false)?;
+        Ok(bridge)
     }
 
-    /// 全局代理变更：重建插件出口；构建失败时保留原出口并返回错误。
+    /// 全局代理或站点规则变更：之后发起的请求按新配置选出口；在途请求 / 子进程沿用
+    /// 发起时的出口。全局出口 client 构建失败（坏代理地址）时保留原配置并返回错误。
+    /// 会阻塞（System 模式检测系统代理），与下载侧全局 client 重建同在 actor 上调用。
     pub fn set_proxy_config(&self, proxy: &ProxyConfig) -> Result<(), PluginError> {
-        let next = Arc::new(BridgeNet::build(proxy)?);
+        self.guarded_client(&proxy.resolve(), false, false)?;
         *self
             .net
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(BridgeNet {
+            global: proxy.clone(),
+        });
         Ok(())
+    }
+
+    /// 当前全局代理配置（带站点规则），供插件调用制定出口计划。
+    #[must_use]
+    pub fn proxy_config(&self) -> ProxyConfig {
+        self.net().global.clone()
     }
 
     fn net(&self) -> Arc<BridgeNet> {
@@ -338,32 +499,95 @@ impl EngineBridge {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
     }
+
+    fn cached_client(&self, key: &GuardedClientKey) -> Option<reqwest::Client> {
+        self.clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
+    }
+
+    fn cache_client(&self, key: GuardedClientKey, client: &reqwest::Client) {
+        let mut clients = self
+            .clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if clients.len() >= GUARDED_CLIENT_CACHE_CAP {
+            clients.clear();
+        }
+        clients.insert(key, client.clone());
+    }
+
+    /// 同步取（或构建并缓存）守卫 client：只用于装配期 / 设置变更时的快速失败校验。
+    fn guarded_client(
+        &self,
+        proxy: &ProxyConfig,
+        same_origin_redirects_only: bool,
+        dev: bool,
+    ) -> Result<reqwest::Client, PluginError> {
+        let key = client_key(proxy, same_origin_redirects_only, dev);
+        if let Some(client) = self.cached_client(&key) {
+            return Ok(client);
+        }
+        let client = build_client(
+            crate::egress::proxy_endpoint(proxy).as_ref(),
+            same_origin_redirects_only,
+            dev,
+        )?;
+        self.cache_client(key, &client);
+        Ok(client)
+    }
+
+    /// 请求路径上取守卫 client：未命中缓存时在阻塞池构建（加载根证书等开销不占插件
+    /// runtime 工作线程）。
+    async fn request_client(
+        &self,
+        proxy: &ProxyConfig,
+        same_origin_redirects_only: bool,
+        dev: bool,
+    ) -> Result<reqwest::Client, PluginError> {
+        let key = client_key(proxy, same_origin_redirects_only, dev);
+        if let Some(client) = self.cached_client(&key) {
+            return Ok(client);
+        }
+        let endpoint = crate::egress::proxy_endpoint(proxy);
+        let client = tokio::task::spawn_blocking(move || {
+            build_client(endpoint.as_ref(), same_origin_redirects_only, dev)
+        })
+        .await
+        .map_err(|e| PluginError::Runtime(format!("构建 fetch Client 任务失败: {e}")))??;
+        self.cache_client(key, &client);
+        Ok(client)
+    }
 }
 
-fn build_guarded_client(
-    proxy: Option<&crate::egress::ProxyEndpoint>,
+fn client_key(
+    proxy: &ProxyConfig,
     same_origin_redirects_only: bool,
-    label: &str,
-) -> Result<reqwest::Client, PluginError> {
-    build_client(proxy, same_origin_redirects_only, false, label)
+    dev: bool,
+) -> GuardedClientKey {
+    (
+        crate::client_cache::proxy_fingerprint(proxy),
+        same_origin_redirects_only,
+        dev,
+    )
 }
 
-/// 开发模式插件用 client：不挂 `GuardResolver`、重定向不拦截非公网 IP，
-/// 且一律直连不走代理（取舍：代理会把 localhost / 私网地址发给代理出口，
-/// 开发联调目标几乎都是本机或局域网服务）。超时、最大跳数、认证同源跳转规则保留。
-fn build_dev_client(
-    same_origin_redirects_only: bool,
-    label: &str,
-) -> Result<reqwest::Client, PluginError> {
-    build_client(None, same_origin_redirects_only, true, label)
-}
-
+/// 插件 `flux.fetch` 用 client。非开发模式挂 [`GuardResolver`]、逐跳拦截非公网 IP（防 SSRF）；
+/// 开发模式（「从目录安装」）放开私网 / 环回以便联调，同样遵循代理设定，但私网与本地域
+/// 恒直连（[`DEV_PRIVATE_NO_PROXY`]）。超时、最大跳数、认证同源跳转规则一致。
 fn build_client(
     proxy: Option<&crate::egress::ProxyEndpoint>,
     same_origin_redirects_only: bool,
     allow_private: bool,
-    label: &str,
 ) -> Result<reqwest::Client, PluginError> {
+    let label = match (allow_private, same_origin_redirects_only) {
+        (false, false) => "守卫",
+        (false, true) => "认证守卫",
+        (true, false) => "开发模式",
+        (true, true) => "开发模式认证",
+    };
     let mut builder = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(move |attempt| {
@@ -393,19 +617,21 @@ fn build_client(
     }
 
     // 无显式代理时必须 no_proxy：否则 reqwest 会静默继承环境/系统代理，请求改由
-    // 代理解析主机名，GuardResolver 的 DNS 级内网过滤随之失效。
-    match proxy.map(|endpoint| reqwest::Proxy::all(&endpoint.url).map(|p| (p, endpoint))) {
-        Some(Ok((p, endpoint))) => {
-            builder = builder.proxy(p.no_proxy(reqwest::NoProxy::from_string(&endpoint.no_proxy)));
+    // 代理解析主机名，GuardResolver 的 DNS 级内网过滤随之失效。坏代理地址报错，
+    // 绝不静默直连（会把本该走代理的流量放到明网上）。
+    builder = match proxy {
+        Some(endpoint) => {
+            let no_proxy = if allow_private {
+                format!("{},{DEV_PRIVATE_NO_PROXY}", endpoint.no_proxy)
+            } else {
+                endpoint.no_proxy.clone()
+            };
+            let proxy = reqwest::Proxy::all(&endpoint.url)
+                .map_err(|e| PluginError::Runtime(format!("{label} Client 代理地址无效: {e}")))?;
+            builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string(&no_proxy)))
         }
-        Some(Err(error)) => {
-            log_warn!(
-                "[plugin-bridge] invalid proxy address, {label} client connects directly: {error}"
-            );
-            builder = builder.no_proxy();
-        }
-        None => builder = builder.no_proxy(),
-    }
+        None => builder.no_proxy(),
+    };
 
     builder
         .build()
@@ -528,12 +754,12 @@ impl PluginBridge for EngineBridge {
         let method = reqwest::Method::from_bytes(req.method.as_bytes())
             .map_err(|_| PluginError::InvalidOutput(format!("HTTP method 非法: {}", req.method)))?;
         let net = self.net();
-        let (client, auth_client) = if req.private_network_allowed {
-            (&net.dev_client, &net.dev_auth_client)
-        } else {
-            (&net.client, &net.auth_client)
-        };
-        let client = if auth_applied { auth_client } else { client };
+        let route = net
+            .route(req.egress.as_deref(), &parsed, req.private_network_allowed)
+            .await?;
+        let client = self
+            .request_client(&route.proxy, auth_applied, req.private_network_allowed)
+            .await?;
         let mut rb = client.request(method, parsed);
         for (k, v) in &req.headers {
             if let (Ok(name), Ok(value)) = (
@@ -547,9 +773,26 @@ impl PluginBridge for EngineBridge {
             rb = rb.body(body);
         }
 
-        let mut resp = rb.send().await.map_err(|e| {
-            PluginError::Runtime(format!("fetch 失败: {}", reqwest_error_detail(&e)))
-        })?;
+        // 观测：调用结束时仍未完成（墙钟超时丢弃）或断在传输层的请求，是换路与熔断豁免的判据。
+        let op = req
+            .egress
+            .as_ref()
+            .map(|egress| NetObserver::begin(egress, route.via_fallback));
+        let mut resp = match rb.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let failure = (!is_guard_error(&e))
+                    .then(|| crate::net_failure::classify(&e))
+                    .flatten();
+                if let Some(op) = op {
+                    op.finish(failure.is_some());
+                }
+                return Err(PluginError::Runtime(crate::net_failure::append_tag(
+                    format!("fetch 失败: {}", reqwest_error_detail(&e)),
+                    failure,
+                )));
+            }
+        };
         let status = resp.status().as_u16();
         // HeaderMap 允许同名响应头（尤其是多个 Set-Cookie）；wire 层以换行
         // 拼接，避免登录插件丢掉除最后一个之外的 Cookie。
@@ -569,8 +812,20 @@ impl PluginBridge for EngineBridge {
                     body.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
-                Err(e) => return Err(PluginError::Runtime(format!("读取响应体失败: {e:#}"))),
+                Err(e) => {
+                    let failure = crate::net_failure::classify(&e);
+                    if let Some(op) = op {
+                        op.finish(failure.is_some());
+                    }
+                    return Err(PluginError::Runtime(crate::net_failure::append_tag(
+                        format!("读取响应体失败: {e:#}"),
+                        failure,
+                    )));
+                }
             }
+        }
+        if let Some(op) = op {
+            op.finish(false);
         }
 
         Ok(BridgeHttpResponse {
@@ -1052,22 +1307,26 @@ impl PluginBridge for EngineBridge {
         // subdir，使同插件多次调用共享 nsig/player JS 等缓存；插件自带的
         // `--cache-dir`（只能是牢笼内相对路径）会覆盖此默认，仍在牢笼内。
         cmd.arg("--cache-dir").arg(jail.join(".cache"));
-        let ytdlp_proxy_url = self.net().ytdlp_proxy_url.clone();
+        let (ytdlp_proxy_url, via_fallback) = self
+            .net()
+            .ytdlp_proxy(spec.egress.as_deref(), &spec.args)
+            .await?;
         log_info!(
             "[ytdlp-exec] plugin={} 执行: {} --ignore-config --cache-dir <jail> {}{}",
             plugin_id,
             bin.display(),
             spec.args.join(" "),
-            if ytdlp_proxy_url.is_some() {
-                " --proxy <redacted>"
-            } else {
-                ""
+            match ytdlp_proxy_url.as_deref() {
+                Some("") => " --proxy \"\"",
+                Some(_) => " --proxy <redacted>",
+                None => "",
             },
         );
         cmd.args(&spec.args);
         // 宿主注入代理（#401）：放在 spec.args 之后——yt-dlp 同名开关后者生效，
-        // 用户在 App 里配置的代理对子进程权威；未配置代理时不注入，插件自带的
-        // `--proxy`（既有插件的自救路径）仍然可用。
+        // 用户在 App 里配置的代理对子进程权威；未配置代理（全局 None / Auto 直连路径）
+        // 时不注入，插件自带的 `--proxy`（既有插件的自救路径）仍然可用。站点规则 / 任务
+        // 显式直连时注入空值，yt-dlp 的 `--proxy ""` 表示强制直连。
         if let Some(proxy_url) = &ytdlp_proxy_url {
             cmd.arg("--proxy").arg(proxy_url);
         }
@@ -1078,11 +1337,24 @@ impl PluginBridge for EngineBridge {
         let child = cmd
             .spawn()
             .map_err(|e| PluginError::Runtime(format!("启动 yt-dlp 失败: {e}")))?;
+        // 观测：yt-dlp 自身的网络失败只在 stderr；未完成（墙钟超时丢弃）同样记入。
+        let op = spec
+            .egress
+            .as_ref()
+            .map(|egress| NetObserver::begin(egress, via_fallback));
         let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
             Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err(PluginError::Runtime(format!("yt-dlp 执行失败: {e}"))),
+            Ok(Err(e)) => {
+                if let Some(op) = op {
+                    op.finish(false);
+                }
+                return Err(PluginError::Runtime(format!("yt-dlp 执行失败: {e}")));
+            }
             Err(_) => {
                 // 超时：future 被 drop → kill_on_drop 杀子进程。
+                if let Some(op) = op {
+                    op.finish(true);
+                }
                 return Ok(YtdlpOutcome {
                     code: -1,
                     stdout: String::new(),
@@ -1114,6 +1386,9 @@ impl PluginBridge for EngineBridge {
                 stdout.len(),
                 trunc_mark
             );
+        }
+        if let Some(op) = op {
+            op.finish(code != 0 && super::call_egress::ytdlp_transport_failure(&stderr));
         }
         Ok(YtdlpOutcome {
             code: output.status.code().unwrap_or(-1),
@@ -1693,6 +1968,43 @@ fn ytdlp_args_reject_reason(args: &[String]) -> Option<String> {
     None
 }
 
+/// yt-dlp 参数里的第一个位置参数（待匹配站点规则的 URL）。遍历方式同
+/// [`ytdlp_args_reject_reason`]：带值选项的值不算，`--` 之后一律是位置参数。
+/// 必须能解析为 http(s) URL，否则 `None`。
+fn ytdlp_first_positional_url(args: &[String]) -> Option<url::Url> {
+    let mut it = args.iter();
+    let mut positional_only = false;
+    while let Some(a) = it.next() {
+        if positional_only || !a.starts_with('-') {
+            let parsed = url::Url::parse(a).ok()?;
+            return matches!(parsed.scheme(), "http" | "https").then_some(parsed);
+        }
+        if a == "--" {
+            positional_only = true;
+            continue;
+        }
+        let (name, inline) = if a.starts_with("--") {
+            match a.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (a.as_str(), None),
+            }
+        } else {
+            (a.as_str(), None)
+        };
+        let kind = ytdlp_option_kind(name)?;
+        if kind == YtdlpOpt::Flag {
+            continue;
+        }
+        if inline.is_none() {
+            it.next();
+        }
+        if kind == YtdlpOpt::PrintToFile {
+            it.next();
+        }
+    }
+    None
+}
+
 fn ytdlp_url_reject_reason(a: &str) -> Option<&'static str> {
     let lower = a.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") {
@@ -1880,6 +2192,35 @@ mod tests {
         let resp = bridge.http_request("acme@dev", req).await?;
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, "ok");
+        Ok(())
+    }
+
+    /// 回归（Auto 换路绕开 SSRF 守卫）：主机名只解析到内网地址被守卫拦下，不能记成断网——
+    /// 否则 Auto 会改经代理重跑，由代理侧解析把请求送进内网。
+    #[tokio::test]
+    async fn guard_blocked_hostname_is_not_a_transport_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::PluginBridge;
+        let bridge = test_bridge().await?;
+        let egress = std::sync::Arc::new(super::CallEgress::new(
+            crate::proxy_config::ProxyConfig::default(),
+            false,
+            None,
+        ));
+        let req = crate::plugin::runtime::BridgeHttpRequest {
+            url: "http://localhost:9/".to_string(),
+            egress: Some(std::sync::Arc::clone(&egress)),
+            ..Default::default()
+        };
+        let err = bridge
+            .http_request("acme@regular", req)
+            .await
+            .expect_err("localhost must be blocked for regular plugins");
+        assert!(err.to_string().contains("non-routable"), "{err}");
+        assert!(
+            !egress.observer().transport_suspect(&err, true),
+            "guard block must not trigger an Auto proxy retry"
+        );
         Ok(())
     }
 
@@ -2291,5 +2632,146 @@ mod tests {
         for s in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
             assert!(is_globally_routable_unicast(ip(s)), "{s} should be allowed");
         }
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use std::sync::Arc;
+
+    use super::{BridgeNet, ytdlp_first_positional_url};
+    use crate::plugin::call_egress::CallEgress;
+    use crate::proxy_config::{ProxyConfig, ProxyMode, ProxyType};
+    use crate::proxy_rules::ProxyRuleSet;
+
+    const RULES: &str = r#"[
+        {"id":"a","match":"domain","pattern":"example.com","action":"custom","proxy":"http://127.0.0.1:9"},
+        {"id":"b","match":"domain","pattern":"direct.test","action":"direct"}
+    ]"#;
+
+    fn rules() -> Arc<ProxyRuleSet> {
+        Arc::new(ProxyRuleSet::compile(RULES, &ProxyConfig::default()))
+    }
+
+    fn net() -> BridgeNet {
+        BridgeNet {
+            global: ProxyConfig {
+                rules: Some(rules()),
+                ..ProxyConfig::default()
+            },
+        }
+    }
+
+    fn manual(port: u16) -> ProxyConfig {
+        ProxyConfig {
+            mode: ProxyMode::Manual,
+            proxy_type: ProxyType::Http,
+            host: "127.0.0.1".to_string(),
+            port,
+            ..ProxyConfig::default()
+        }
+    }
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn first_positional_skips_option_values() {
+        let url = ytdlp_first_positional_url(&args(&[
+            "--referer",
+            "https://referer.test/",
+            "https://example.com/v",
+        ]));
+        assert_eq!(
+            url.map(|u| u.host_str().map(str::to_owned)),
+            Some(Some("example.com".to_string()))
+        );
+        let inline = ytdlp_first_positional_url(&args(&[
+            "--referer=https://referer.test/",
+            "-J",
+            "https://example.com/v",
+        ]));
+        assert!(inline.is_some_and(|u| u.host_str() == Some("example.com")));
+    }
+
+    #[test]
+    fn first_positional_after_double_dash_and_invalid() {
+        let url = ytdlp_first_positional_url(&args(&["--", "https://example.com/x"]));
+        assert!(url.is_some());
+        assert!(ytdlp_first_positional_url(&args(&["-J"])).is_none());
+        assert!(ytdlp_first_positional_url(&args(&["ftp://example.com/x"])).is_none());
+        assert!(ytdlp_first_positional_url(&args(&["not a url"])).is_none());
+    }
+
+    #[tokio::test]
+    async fn ytdlp_proxy_follows_first_positional_rule() -> Result<(), Box<dyn std::error::Error>> {
+        let net = net();
+        let (hit, via_fallback) = net
+            .ytdlp_proxy(
+                None,
+                &args(&["--referer", "https://direct.test/", "https://example.com/v"]),
+            )
+            .await?;
+        assert!(hit.is_some_and(|p| p.starts_with("http://127.0.0.1:9")));
+        assert!(!via_fallback);
+        let (direct, _) = net
+            .ytdlp_proxy(None, &args(&["https://x.direct.test/v"]))
+            .await?;
+        assert_eq!(direct, Some(String::new()));
+        let (miss, via_fallback) = net
+            .ytdlp_proxy(
+                None,
+                &args(&["--referer", "https://example.com/", "https://other.test/v"]),
+            )
+            .await?;
+        assert_eq!(
+            miss, None,
+            "全局未配置代理：不注入，插件自带 --proxy 仍可用"
+        );
+        assert!(via_fallback);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn call_egress_replaces_global_fallback_but_rules_still_win()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let net = net();
+        let auto_proxy = CallEgress::new(manual(7890), true, Some(rules()));
+        let (miss, via_fallback) = net
+            .ytdlp_proxy(Some(&auto_proxy), &args(&["https://other.test/v"]))
+            .await?;
+        assert_eq!(miss.as_deref(), Some("http://127.0.0.1:7890"));
+        assert!(via_fallback);
+        let (hit, via_fallback) = net
+            .ytdlp_proxy(Some(&auto_proxy), &args(&["https://example.com/v"]))
+            .await?;
+        assert!(hit.is_some_and(|p| p.starts_with("http://127.0.0.1:9")));
+        assert!(!via_fallback, "规则命中的请求不归因到调用出口");
+
+        let auto_direct = CallEgress::new(ProxyConfig::default(), false, Some(rules()));
+        let (none, _) = net
+            .ytdlp_proxy(Some(&auto_direct), &args(&["https://other.test/v"]))
+            .await?;
+        assert_eq!(none, None);
+        let explicit_direct = CallEgress::new(ProxyConfig::default(), true, None);
+        let (forced, _) = net
+            .ytdlp_proxy(Some(&explicit_direct), &args(&["https://example.com/v"]))
+            .await?;
+        assert_eq!(
+            forced,
+            Some(String::new()),
+            "任务自带直连：不看规则且强制直连"
+        );
+
+        let url = url::Url::parse("https://other.test/a")?;
+        let route = net.route(Some(&auto_proxy), &url, false).await?;
+        assert_eq!(route.proxy.port, 7890);
+        assert!(route.via_fallback);
+        let url = url::Url::parse("https://www.example.com/a")?;
+        let route = net.route(Some(&auto_proxy), &url, false).await?;
+        assert_eq!(route.proxy.port, 9);
+        assert!(!route.via_fallback);
+        Ok(())
     }
 }

@@ -47,7 +47,7 @@ class Cycle {}
 
 const baseCache = new Map<string, Map<string, TokenValue>>();
 
-/** `extends` 基底在某模式下的 Base 值（来自 registry 的 builtins 快照）。 */
+/** `extends` 基底在某模式下的预设值（Base token 及预设固定的非 Base token；来自 registry 的 builtins 快照）。 */
 function baseValues(extendsValue: string, mode: ThemeMode): Map<string, TokenValue> {
   const cacheKey = `${extendsValue}:${mode}`;
   const cached = baseCache.get(cacheKey);
@@ -185,9 +185,12 @@ class Resolver {
   }
 
   evalDefault(spec: TokenSpec, expr: DefaultExpr): TokenValue {
+    // 预设基底的值优先于默认表达式（Base token 与预设固定的非 Base token），同 Rust `eval_default`。
+    const preset = this.base.get(spec.path);
+    if (preset) return preset;
     switch (expr.kind) {
       case "base":
-        return this.base.get(spec.path) ?? this.fallback(spec);
+        return this.fallback(spec);
       case "ref":
         return this.evalPath(expr.path);
       case "refAlpha": {

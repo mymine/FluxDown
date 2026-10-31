@@ -21,6 +21,8 @@ const CHROME_STORE: &str = "https://chromewebstore.google.com/search/FluxDown";
 const FIREFOX_STORE: &str = "https://addons.mozilla.org/firefox/addon/fluxdown/";
 const EDGE_STORE: &str = "https://microsoftedge.microsoft.com/addons/search/FluxDown";
 const DONATE: &str = "https://fluxdown.com/sponsor";
+const DB_IP: &str = "https://db-ip.com";
+const FLAG_ICONS: &str = "https://github.com/lipis/flag-icons";
 /// 更新说明正文的行高（字号倍数）：多行列表项与中文长句比控件文字需要更宽松的行距。
 const RELEASE_NOTES_LINE_HEIGHT: f32 = 1.6;
 
@@ -36,6 +38,7 @@ pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingsPage {
         update_section(ctx),
         logs_section(ctx),
         links_section(ctx),
+        open_source_section(ctx),
     ])
 }
 
@@ -437,6 +440,23 @@ fn links_section(ctx: &SectionContext) -> SettingsSection {
             ctx,
             "donateTitle",
             &[("donateButton", DONATE), ("officialWebsite", WEBSITE)],
+        ))
+}
+
+/// 第三方数据 / 素材署名：对端国家来自 DB-IP lite（CC BY 4.0，要求署名并链接），旗帜为 flag-icons（MIT）。
+/// 两者都是专有名词署名行，按原文显示，不走翻译（`link_item` 对非目录键回落为键名本身）。
+fn open_source_section(ctx: &SectionContext) -> SettingsSection {
+    SettingsSection::new()
+        .title(ctx.t("mobileOpenSource"))
+        .row(link_item(
+            ctx,
+            "IP Geolocation by DB-IP",
+            &[("db-ip.com", DB_IP)],
+        ))
+        .row(link_item(
+            ctx,
+            "flag-icons (MIT)",
+            &[("GitHub", FLAG_ICONS)],
         ))
 }
 

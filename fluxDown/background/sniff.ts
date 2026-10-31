@@ -15,6 +15,7 @@ import { getEngine } from "./rules-store";
 import { peekCachedProfiles, peekCachedSettings } from "./settings-cache";
 import { getTabPageUrl, ingestResources } from "./tab-state";
 import { profileFor } from "@/utils/site-profiles";
+import { logWarn } from "@/utils/error-log";
 
 interface ParsedHeaders {
   contentType: string;
@@ -211,6 +212,6 @@ export function installSniff(): void {
       ["responseHeaders"],
     );
   } catch (e) {
-    console.warn("[FluxDown] Failed to register resource sniffer:", e);
+    logWarn("[FluxDown] Failed to register resource sniffer:", e);
   }
 }

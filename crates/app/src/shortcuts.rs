@@ -69,6 +69,7 @@ const ACTIONS: &[ActionBinding] = &[
     }),
     download_list("open_torrent_file", || Box::new(dl::OpenTorrentFile)),
     download_list("toggle_detail", || Box::new(dl::ToggleDetailPanel)),
+    download_list("share_selected", || Box::new(dl::ShareSelected)),
     download_list("cycle_density", || Box::new(dl::CycleDensity)),
     download_list("cycle_group", || Box::new(dl::CycleGroupBy)),
     download_list("cycle_sort", || Box::new(dl::CycleSort)),
@@ -122,15 +123,8 @@ fn build_binding(binding: &ActionBinding, keystroke: &str, cx: &App) -> Result<K
                 .map_err(|error| format!("{error:#}"))
         })
         .transpose()?;
-    KeyBinding::load(
-        keystroke,
-        (binding.make)(),
-        predicate,
-        false,
-        None,
-        cx.keyboard_mapper().as_ref(),
-    )
-    .map_err(|error| format!("{error:#}"))
+    KeyBinding::load(keystroke, (binding.make)(), predicate, false, None, cx)
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// 装配应用内快捷键：固定绑定 + 用户可编辑绑定 + 双击修饰键监听，并随偏好变化重建。
@@ -363,7 +357,7 @@ mod tests {
         for key in SHORTCUT_KEYS {
             let chord = ShortcutChord::new(true, true, true, true, key).expect("catalog key");
             let text = chord_keystroke(&chord);
-            let parsed = Keystroke::parse(&text)
+            let parsed = Keystroke::parse_with_os(&text, gpui::OperatingSystem::Mac)
                 .unwrap_or_else(|error| panic!("`{text}` must parse: {error}"));
             assert!(
                 parsed.modifiers.control

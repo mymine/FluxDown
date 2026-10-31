@@ -14,7 +14,7 @@ FluxDown 用 **SemVer 预发布后缀**区分双渠道：**稳定版 `vX.Y.Z`**�
 `vX.Y.Z` release。本 skill 覆盖三件事：**发布前校验版本可用** + **快速查看已有版本** + **失败组件补发**。
 
 > 红线（`.omp/RULES.md`）：**未经用户明确要求，禁止 `git commit` / `push` / tag**。
-> 本 skill 的推送命令仅在用户明确要求发布时执行。
+> 用户要求发版（「发版」「发布 vX.Y.Z」等）即授权本次发布全程：跑 CI + 演练 → 全绿后**直接打 tag 并推送，不再回头确认** → 盯到 release 转正。
 
 ## 1. 快速查看已有版本
 
@@ -40,10 +40,10 @@ gh release list --limit 20
 
 | 渠道 | tag | 打自分支 | GitHub prerelease | make_latest | 打包范围 |
 |---|---|---|---|---|---|
-| 稳定版 | `vX.Y.Z` | `stable` | false | true | 客户端 / web / 移动 / NAS / 扩展 全部 |
-| 预览版 | `vX.Y.Z-rc.N` | `main` | true | false | 客户端 / web / 移动 / NAS，**不含浏览器扩展** |
+| 稳定版 | `vX.Y.Z` | `stable` | false | true | 客户端 / web / 移动（Android + iOS 侧载 IPA）/ NAS / 扩展 全部 |
+| 预览版 | `vX.Y.Z-rc.N` | `main` | true | false | 客户端 / web / 移动（Android + iOS 侧载 IPA）/ NAS，**不含浏览器扩展** |
 
-- 同一次 `v*` push 按目录 diff 决定本次打包哪些组件（app / server / cli / mobile / extension），产物全部上传到这一个 `vX.Y.Z` release；未改动的组件不重建，官网自动沿用它上一个完整版本。历史上的 `server-v*` / `cli-v*` / `mobile-v*` / `extension-v*` 组件 release 不再新建，官网仍兼容读取。
+- 同一次 `v*` push 按目录 diff 决定本次打包哪些组件（app / server / cli / mobile / ios / extension），产物全部上传到这一个 `vX.Y.Z` release；未改动的组件不重建，官网自动沿用它上一个完整版本。历史上的 `server-v*` / `cli-v*` / `mobile-v*` / `extension-v*` 组件 release 不再新建，官网仍兼容读取。
 - **扩展发布后无法改版本号**，故 `-rc` tag 跳过 `build-extension`（`changes` 判定 extension=false）。
 - latest：`publish-release` 只在「稳定版 + 桌面端完整 + 最高稳定版本」时标记；Rust `FLUXDOWN_APP_VERSION` 与原生 Android `versionName` 保留完整 tag 版本。
 - **分支模型**：`main` = 开发分支（超集 / 最新），`stable` = 稳定分支（子集）；`stable` 只经合并/cherry-pick `main` 前进。稳定发布前 `git log stable --not main` 必须为空。
@@ -71,24 +71,35 @@ command -v git-cliff >/dev/null && git cliff --latest --strip header | head -40
 版本"可用"的硬条件：格式合法 · tag 不重复 · 高于同渠道最新 · 停在正确分支且工作树干净 · 稳定版 `stable --not main` 为空 · **目标提交 CI 全绿**（tag 推送的 `changes` 会再卡一次：CI 红即在建草稿前失败，仍在跑则等待）。
 预览版额外确认：后缀是 `-rc.N` 且 N 递增（预览用户按 SemVer 收 `rc.1 < rc.2 < … < 转正 X.Y.Z`）。
 
-## 4. 发布（不可逆，仅用户明确要求时）
+## 4. 发布（不可逆，用户要求发版后全自动）
 
-**只构建一次**：稳定版先在目标提交上跑全量 CI + 演练（演练就是正式构建：签名、公证、Docker digest 全做，只是不发布），两者都绿再推 tag；tag 推送复用演练产物（`changes` 自动查找同提交同 tag 的演练），推 tag 后约 5–10 分钟完成上传 / 镜像打 tag / 转正。没有演练时 tag 推送照常全量构建（预览版可直接推 tag）。
+**只构建一次**：先在目标提交上跑全量 CI + 演练（演练就是正式构建：签名、公证、Docker digest 全做，只是不发布），两者都绿再推 tag；tag 推送复用演练产物（`changes` 自动查找同提交同 tag 的演练），推 tag 后约 5–10 分钟完成上传 / 镜像打 tag / 转正。稳定版与预览版同一流程（预览版 `--ref main`）。
+
+**自动放行**：`.omp/hooks/pre/guard.ts` 推送前按 tag 指向的提交查 GitHub Actions——最近一次 `ci.yml` 与最近一次「Release 演练 `$V`（不发布）」都 `completed + success` 即直接放行，不弹确认；任一不满足（缺演练、仍在跑、失败、本地无 tag）、`--tags` / `--follow-tags` / 变量 refspec 时才回退为弹确认（无 UI 拒绝）。所以推送命令**必须写字面 tag 名**（`git push origin v0.6.4`，不能 `"$V"`）。
 
 ```bash
-# 1) 全量 CI + 演练（无副作用；演练里偶发失败在其运行页 Re-run 即可）
+# 0) 第 3 节校验全部通过
 git checkout stable      # 预览版改为 main（CI 守卫会拒绝打错分支的 tag）
+SHA=$(git rev-parse HEAD)
+# 1) 全量 CI + 演练并行触发（无副作用）
 gh workflow run ci.yml --ref stable
 gh workflow run release.yml --ref stable -f rehearsal=true -f tag="$V" -f component=changed
-gh run list --workflow ci.yml --branch stable --limit 1; gh run list --workflow release.yml --limit 1
-# 等两者都 success（演练 run-name「Release 演练 $V（不发布）」，其 head SHA 必须 = 将要打 tag 的提交）
-# 2) ⚠️ 推送后立即发布，无法撤回。omp 的 .omp/hooks/pre/guard.ts 会对 v* tag 推送弹确认（无 UI 会话直接拦截）。
-git tag -a "$V" -m "$V"
-git push origin "$V"
-gh run watch
+sleep 10
+CI=$(gh run list --workflow ci.yml --commit "$SHA" --event workflow_dispatch --limit 1 --json databaseId -q '.[0].databaseId')
+RH=$(gh run list --workflow release.yml --commit "$SHA" --event workflow_dispatch --limit 1 --json databaseId,displayTitle -q ".[] | select(.displayTitle == \"Release 演练 $V（不发布）\") | .databaseId")
+# 2) 等两者结束（演练动辄 30–60 分钟：bash 用 timeout: 0 / 后台任务等，不要轮询）
+gh run watch "$CI" --exit-status; gh run watch "$RH" --exit-status
+# 3) 都 success → 直接发布，不问用户（字面 tag 名，guard 据此校验后放行）
+git tag -a v0.6.4 -m v0.6.4
+git push origin v0.6.4
+# 4) 盯 tag 触发的 Release 运行直到结束，并确认已转正
+gh run watch "$(gh run list --workflow release.yml --branch v0.6.4 --event push --limit 1 --json databaseId -q '.[0].databaseId')" --exit-status
+gh release view v0.6.4 --json isDraft,isPrerelease,url
 ```
 
-演练与 tag 之间 stable 又前进了 → tag 提交与演练提交不同，无法复用，须重跑演练（或接受全量构建）。
+- **演练 / CI 失败 → 不打 tag**。偶发失败（网络、签名时间戳、ASC 5xx 等，`release-auto-rerun` 已自动重跑过一次仍红）→ `gh run rerun <id> --failed` 后回到第 2 步继续等；确定性失败（编译 / 测试 / 打包脚本错误）→ 停下，向用户报告失败 job 与日志要点，修复属于新的代码改动。
+- 演练与 tag 之间分支又前进了 → tag 提交 ≠ 演练提交，guard 不会放行，须在新提交上重跑 CI + 演练。
+- 推 tag 后运行失败：按 4b 处理；结束时向用户汇报 release 链接、是否转正、各组件哨兵（第 1 节命令）。
 
 ## 4b. 组件打包失败 → 补发（不重跑其余组件）
 
@@ -102,9 +113,9 @@ gh workflow run release.yml --ref main -f tag="$V" -f component=mobile          
 gh workflow run release.yml --ref main -f tag="$V" -f component=mobile -f source_ref=stable   # 源码含修复
 ```
 
-- `component`：`app` / `extension` / `server` / `cli` / `mobile`，或 `changed`（按该 tag 的变更检测补发全部应发组件）。
+- `component`：`app` / `extension` / `server` / `cli` / `mobile` / `ios`，或 `changed`（按该 tag 的变更检测补发全部应发组件）。
 - `source_ref` 必须包含该 tag 且在发布分支上；版本号、预发布标记恒取 tag。产物以 `--clobber` 覆盖同名资产，旧清单里不再产出的资产会被删除。
-- 补发属于 CI 触发，等同发布动作：仅在用户明确要求时执行。
+- 补发属于 CI 触发，等同发布动作：本次发版过程中的「Re-run failed jobs」/ 同 tag 补发属已授权范围；发版完成后的补发、或需要改代码的补发，仅在用户明确要求时执行。
 
 ## 5. 各渠道发布后可见性（自检预期）
 

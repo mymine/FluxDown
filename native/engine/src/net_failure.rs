@@ -96,21 +96,6 @@ impl NetFailure {
     pub const fn retriable_same_path(self) -> bool {
         !matches!(self, Self::Tls)
     }
-
-    /// 是否发生在建连阶段（尚未收到任何响应字节）。探测竞速据此判定
-    /// 「这条路径根本走不通」，而不是「慢」。
-    #[must_use]
-    pub const fn before_response(self) -> bool {
-        matches!(
-            self,
-            Self::Dns
-                | Self::Refused
-                | Self::ConnectTimeout
-                | Self::Unreachable
-                | Self::Tls
-                | Self::Connect
-        )
-    }
 }
 
 impl fmt::Display for NetFailure {

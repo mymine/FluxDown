@@ -20,6 +20,9 @@
  * "off"。需要远程且凭据齐全时先自动补验；失败后 30 秒内不重复等待网络超时，
  * 仅本次退回桌面通道，保留所选远程模式以便连接恢复后自动继续投递。
  *
+ * 「本机」通道在桌面是 NMH；Android 版浏览器没有 Native Messaging，本机通道改为 Intent 唤起
+ * FluxDown Android App（background/android-handoff.ts），可用性探测恒为可达。
+ *
  * === 设置读取策略：缓存 + storage.onChanged 失效 ===
  *
  * 与 background.ts 自身的设置缓存策略一致：缓存永不主动过期，只在
@@ -53,6 +56,40 @@ import {
 import type { RemoteServerConfig } from "./remote-server";
 import { ensureRemoteSettingsVerified } from "./settings";
 import type { FluxDownSettings, RemoteMode } from "./settings";
+import { isAndroidPlatform, peekAndroidPlatform } from "./platform";
+import {
+  ANDROID_UNSUPPORTED_MESSAGES,
+  androidSendBatchDownloadRequest,
+  androidSendDownloadRequest,
+} from "@/background/android-handoff";
+
+// ──────────────────────────────────────────────────────────────
+// 本机通道：桌面 = NMH；Android（浏览器没有 Native Messaging）= Intent 唤起 FluxDown App。
+// ──────────────────────────────────────────────────────────────
+
+async function localSend(request: DownloadRequest): Promise<ApiResponse> {
+  return (await isAndroidPlatform()) ? androidSendDownloadRequest(request) : nmh.nmhSendDownloadRequest(request);
+}
+
+async function localSendBatch(items: BatchDownloadItem[]): Promise<ApiResponse> {
+  return (await isAndroidPlatform())
+    ? androidSendBatchDownloadRequest(items)
+    : nmh.nmhSendBatchDownloadRequest(items);
+}
+
+/** Android 的 Intent 通道无法探测 App 是否安装，视为始终可投递。 */
+async function localAvailable(withRetry: boolean): Promise<boolean> {
+  if (await isAndroidPlatform()) return true;
+  return withRetry ? nmh.nmhCheckFluxDownAvailableWithRetry() : nmh.nmhCheckFluxDownAvailable();
+}
+
+/** fallback 模式下本机结果是否应改投远程：本机不可达，或 Android Intent 承载不了该请求。 */
+function shouldTryRemote(response: ApiResponse): boolean {
+  return (
+    isNmhUnreachable(response) ||
+    (!response.success && response.message !== undefined && ANDROID_UNSUPPORTED_MESSAGES.has(response.message))
+  );
+}
 
 // NMH 侧代表"不可达"（连接层/瞬态失败）而非 App 业务拒绝的 message 集合，
 // 与 nmh-shared.ts 的连接层失败（SharedFailure）及中继应答的 app_not_running 一一对应。
@@ -140,7 +177,7 @@ export async function sendDownloadRequest(
   channel?: DispatchChannel,
 ): Promise<ApiResponse> {
   if (channel === "local") {
-    return stamp(await nmh.nmhSendDownloadRequest(request), "local");
+    return stamp(await localSend(request), "local");
   }
   if (channel === "remote") {
     const remote = remoteConfigOf(await getRoutingSettings());
@@ -151,16 +188,16 @@ export async function sendDownloadRequest(
   const mode = effectiveMode(cfg);
 
   if (mode === "off") {
-    return stamp(await nmh.nmhSendDownloadRequest(request), "local");
+    return stamp(await localSend(request), "local");
   }
   if (mode === "always") {
     return stamp(await remoteSendDownloadRequest(request, cfg.remote), "remote");
   }
 
-  // fallback：先 NMH，仅"不可达"或抛异常时改投远程。
+  // fallback：先本机，仅"不可达"/Android 承载不了或抛异常时改投远程。
   try {
-    const result = await nmh.nmhSendDownloadRequest(request);
-    if (result.success || !isNmhUnreachable(result)) {
+    const result = await localSend(request);
+    if (!shouldTryRemote(result)) {
       return stamp(result, "local");
     }
     return stamp(await remoteSendDownloadRequest(request, cfg.remote), "remote");
@@ -290,7 +327,7 @@ export async function sendBatchDownloadRequest(
   channel?: DispatchChannel,
 ): Promise<ApiResponse> {
   if (channel === "local") {
-    return stamp(await nmh.nmhSendBatchDownloadRequest(items), "local");
+    return stamp(await localSendBatch(items), "local");
   }
   if (channel === "remote") {
     const remote = remoteConfigOf(await getRoutingSettings());
@@ -301,7 +338,7 @@ export async function sendBatchDownloadRequest(
   const mode = effectiveMode(cfg);
 
   if (mode === "off") {
-    return stamp(await nmh.nmhSendBatchDownloadRequest(items), "local");
+    return stamp(await localSendBatch(items), "local");
   }
   if (mode === "always") {
     return stamp(
@@ -311,8 +348,8 @@ export async function sendBatchDownloadRequest(
   }
 
   try {
-    const result = await nmh.nmhSendBatchDownloadRequest(items);
-    if (result.success || !isNmhUnreachable(result)) {
+    const result = await localSendBatch(items);
+    if (!shouldTryRemote(result)) {
       return stamp(result, "local");
     }
     return stamp(
@@ -336,6 +373,8 @@ export function warmupNativeHost(): void {
   const cached = peekCachedSettings();
   const cfg = cached ? toRoutingConfig(cached) : null;
   if (cfg && effectiveMode(cfg) === "always") return;
+  // Android 没有 Native Messaging，本机通道是 Intent，无需预热。
+  if (peekAndroidPlatform() === true) return;
 
   nmh.nmhWarmupNativeHost();
 
@@ -349,16 +388,16 @@ export async function checkFluxDownAvailable(): Promise<boolean> {
   const mode = effectiveMode(cfg);
 
   if (mode === "off") {
-    return nmh.nmhCheckFluxDownAvailable();
+    return localAvailable(false);
   }
   if (mode === "always") {
     const result = await remotePing(cfg.remote);
     return result.success === true;
   }
 
-  // fallback：NMH 或 remote 任一可达即视为可用。
+  // fallback：本机或 remote 任一可达即视为可用。
   const [nmhUp, remoteUp] = await Promise.all([
-    nmh.nmhCheckFluxDownAvailable().catch(() => false),
+    localAvailable(false).catch(() => false),
     remotePing(cfg.remote)
       .then((r) => r.success === true)
       .catch(() => false),
@@ -383,7 +422,7 @@ export async function checkFluxDownAvailableWithRetry(): Promise<boolean> {
   const mode = effectiveMode(cfg);
 
   if (mode === "off") {
-    return nmh.nmhCheckFluxDownAvailableWithRetry();
+    return localAvailable(true);
   }
   if (mode === "always") {
     const result = await remotePing(cfg.remote);
@@ -391,7 +430,7 @@ export async function checkFluxDownAvailableWithRetry(): Promise<boolean> {
   }
 
   const [nmhUp, remoteUp] = await Promise.all([
-    nmh.nmhCheckFluxDownAvailableWithRetry().catch(() => false),
+    localAvailable(true).catch(() => false),
     remotePing(cfg.remote)
       .then((r) => r.success === true)
       .catch(() => false),

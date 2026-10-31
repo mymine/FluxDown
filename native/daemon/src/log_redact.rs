@@ -13,6 +13,9 @@ pub fn redact_snapshot(snapshot: &mut DaemonSnapshot) {
             *value = REDACTED.to_owned();
         }
     }
+    if let Some(value) = snapshot.config.values.get_mut("proxy_rules") {
+        *value = redact_proxy_rules(value);
+    }
     if let Some(value) = snapshot.config.values.get_mut("webhook.endpoints") {
         *value = redact_webhook_endpoints(value);
     }
@@ -39,6 +42,36 @@ pub fn redact_snapshot(snapshot: &mut DaemonSnapshot) {
         delivery.request_body.clear();
         delivery.response_body.clear();
     }
+}
+
+/// 站点代理规则：名称与匹配式可能暴露访问习惯，自定义代理地址只保留 `scheme://host:port`。
+fn redact_proxy_rules(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return REDACTED.to_owned();
+    };
+    if let Some(items) = value.as_array_mut() {
+        for item in items {
+            let Some(map) = item.as_object_mut() else {
+                continue;
+            };
+            for key in ["name", "pattern"] {
+                if let Some(entry) = map.get_mut(key)
+                    && entry.as_str().is_some_and(|text| !text.is_empty())
+                {
+                    *entry = serde_json::Value::String(REDACTED.to_owned());
+                }
+            }
+            if let Some(entry) = map.get_mut("proxy")
+                && let Some(text) = entry.as_str()
+            {
+                *entry = serde_json::Value::String(strip_url(text, false));
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| REDACTED.to_owned())
 }
 
 /// 去掉 userinfo、query 与 fragment；`keep_path` 为假时路径也一并丢弃（仅留 scheme://host[:port]）。
@@ -130,7 +163,25 @@ fn redact_header_values(value: &mut serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_webhook_endpoints, strip_url};
+    use super::{redact_proxy_rules, redact_webhook_endpoints, strip_url};
+
+    #[test]
+    fn proxy_rules_are_redacted_but_keep_structure() {
+        assert_eq!(redact_proxy_rules(""), "");
+        assert_eq!(redact_proxy_rules("not json"), "<redacted>");
+        let out = redact_proxy_rules(
+            r#"[{"id":"a","enabled":true,"name":"GH","match":"domain","pattern":"github.com","action":"custom","proxy":"socks5://u:p@127.0.0.1:7891"},{"id":"b","name":"","pattern":"","action":"direct","proxy":""},3]"#,
+        );
+        let value: serde_json::Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(value[0]["name"], "<redacted>");
+        assert_eq!(value[0]["pattern"], "<redacted>");
+        assert_eq!(value[0]["proxy"], "socks5://127.0.0.1:7891");
+        assert_eq!(value[0]["id"], "a");
+        assert_eq!(value[0]["action"], "custom");
+        assert_eq!(value[1]["name"], "");
+        assert_eq!(value[1]["proxy"], "");
+        assert!(!out.contains("u:p"));
+    }
 
     #[test]
     fn strip_url_removes_userinfo_and_query() {

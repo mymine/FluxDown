@@ -35,7 +35,8 @@
  *               fnos_x64, fnos_arm64 }
  *   } | null,  // FluxDown Server（headless Web 版），无对应 release 时为 null
  *   cli: { version, tag, assets:{ windows_x64, windows_arm64, linux_x64, linux_arm64, macos_x64, macos_arm64 } } | null,
- *   mobile: { version, tag, assets:{ android_arm64, android_armv7, android_x64, android_universal } } | null
+ *   mobile: { version, tag, assets:{ android_arm64, android_armv7, android_x64, android_universal } } | null,
+ *   ios: { version, tag, assets:{ sideload_ipa } } | null  // 未签名侧载 IPA（full flavor）；商店版走 TestFlight，不在此列
  * }
  */
 
@@ -44,9 +45,10 @@ import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
 import { getCached, setCached } from "../../lib/api-cache";
 import { withBase } from "@/lib/base";
 import { getClientIp } from "@/lib/client-ip";
-import { markReleaseViewer } from "@/lib/download-gate";
+import { markReleaseViewer, recordUpdateAssets } from "@/lib/download-gate";
 import {
   desktopAssets,
+  IOS_SIDELOAD_SUFFIX,
   pickComponentRelease,
   releaseVersion,
   type GitHubAsset,
@@ -162,6 +164,7 @@ export const GET: APIRoute = async ({ url, request, clientAddress }) => {
     const serverRelease = pickComponentRelease(appPool, "server", includePrerelease);
     const cliRelease = pickComponentRelease(appPool, "cli", includePrerelease);
     const mobileRelease = pickComponentRelease(appPool, "mobile", includePrerelease);
+    const iosRelease = pickComponentRelease(appPool, "ios", includePrerelease);
 
     // 统一 release 同时含服务器/CLI 的同后缀压缩包，桌面资产只在过滤后的集合里匹配
     const appAssets = desktopAssets(latest);
@@ -282,6 +285,10 @@ export const GET: APIRoute = async ({ url, request, clientAddress }) => {
     const mobileArmv7Asset = findMobileAsset("-android-armeabi-v7a.apk");
     const mobileX64Asset = findMobileAsset("-android-x86_64.apk");
     const mobileUniversalAsset = findMobileAsset("-android-universal.apk");
+    // iOS 侧载 IPA（命名：FluxDown-<ver>-ios-sideload-unsigned.ipa）
+    const iosSideloadAsset = iosRelease?.assets.find((a) =>
+      a.name.endsWith(IOS_SIDELOAD_SUFFIX),
+    );
 
     const formatAsset = (asset: GitHubAsset | undefined, tag?: string) => {
       if (!asset) return null;
@@ -456,7 +463,26 @@ export const GET: APIRoute = async ({ url, request, clientAddress }) => {
             },
           }
         : null,
+      ios: iosRelease
+        ? {
+            version: releaseVersion(iosRelease.tag_name),
+            tag: iosRelease.tag_name,
+            assets: {
+              sideload_ipa: formatAsset(iosSideloadAsset, iosRelease.tag_name),
+            },
+          }
+        : null,
     };
+
+    // 应用内更新只取桌面 / 服务器 / Android 资产（native/agent/src/update/install）：只有当前清单里的
+    // 这些资产能拿 123 直链，历史版本、扩展、CLI 与 iOS 侧载包不给。
+    const updateEntries = (tag: string, assets: Record<string, { name: string } | null>, skip: string[] = []) =>
+      Object.entries(assets).flatMap(([kind, asset]) => asset && !skip.includes(kind) ? [{ tag, name: asset.name }] : []);
+    recordUpdateAssets(channel, [
+      ...updateEntries(latest.tag_name, data.assets, ["extension", "firefox_extension", "chrome_crx"]),
+      ...(serverRelease && data.server ? updateEntries(serverRelease.tag_name, data.server.assets) : []),
+      ...(mobileRelease && data.mobile ? updateEntries(mobileRelease.tag_name, data.mobile.assets) : []),
+    ]);
 
     // 更新缓存
     setCached(cacheKey, data);

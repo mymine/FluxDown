@@ -16,8 +16,11 @@ use fluxdown_ui_downloads::{
     DownloadView, PluginCommandRunner, PluginTabViewFactory, PluginTaskCommand, PluginTaskTab,
     TaskDetailView,
 };
-use fluxdown_ui_extensions::PluginViewFactory;
-use fluxdown_ui_plugin_ui::contrib::{CommandRef, Contributions, ViewRef, view_for};
+use fluxdown_ui_extensions::{PluginViewFactory, PluginViewSlot};
+use fluxdown_ui_plugin_ui::{
+    ViewContainer,
+    contrib::{CommandRef, Contributions, ViewRef, view_for},
+};
 use fluxdown_ui_shell::{RouteId, ShellRoute};
 use gpui::{
     AnyView, App, AppContext as _, Context, Entity, Global, IntoElement, ParentElement as _,
@@ -27,6 +30,7 @@ use gpui_component::{Icon, WindowExt as _, notification::Notification};
 use serde_json::{Value, json};
 
 use crate::{
+    activity::{DOWNLOADS_ROUTE, RSS_ROUTE, SHARE_ROUTE, WEBHOOKS_ROUTE},
     app::Desktop,
     capability_ports::AgentPluginUiPort,
     session::{SessionSignal, agent_body},
@@ -89,6 +93,8 @@ fn task_tabs(contributions: &Contributions) -> Vec<PluginTaskTab> {
         .task_tabs
         .iter()
         .map(|view| PluginTaskTab {
+            identity: view.identity.clone(),
+            view: view.view.id.clone(),
             title: SharedString::from(view.view.title.clone()),
             revision: view.package_revision,
         })
@@ -148,7 +154,13 @@ struct PluginRouteView {
 impl PluginRouteView {
     fn ensure_inner(&mut self, window: &mut Window, cx: &mut App) {
         if self.inner.is_none() {
-            self.inner = Some(view_for(&self.view, None, window, cx));
+            self.inner = Some(view_for(
+                &self.view,
+                None,
+                ViewContainer::default(),
+                window,
+                cx,
+            ));
         }
     }
 }
@@ -191,7 +203,7 @@ pub(crate) fn install(cx: &mut App) {
         state.current = Contributions::from_plugins(&body.daemon.plugins);
     }
     cx.set_global(state);
-
+    fluxdown_ui_plugin_ui::set_navigator(cx, Rc::new(navigate_for_plugin));
     cx.subscribe(&session, |_, signal, cx| match signal {
         SessionSignal::Snapshot(snapshot) => {
             if let Some(body) = agent_body(snapshot) {
@@ -342,6 +354,44 @@ fn build_routes(cx: &mut App) -> Vec<ShellRoute> {
     routes
 }
 
+// ---------------------------------------------------------------- 插件跳转
+
+/// 插件请求的路由 id → 主窗口路由。内置页恒可用；`plugin:` 路由须是发起方插件当前的活动栏视图。
+fn resolve_route(
+    identity: &str,
+    route: &str,
+    contributions: &Contributions,
+) -> Result<RouteId, String> {
+    match route {
+        "downloads" => return Ok(DOWNLOADS_ROUTE),
+        "rss" => return Ok(RSS_ROUTE),
+        "webhooks" => return Ok(WEBHOOKS_ROUTE),
+        "share" => return Ok(SHARE_ROUTE),
+        _ => {}
+    }
+    let Some(view) = route.strip_prefix(&format!("plugin:{identity}:")) else {
+        return Err(format!("unknown navigation target '{route}'"));
+    };
+    contributions
+        .activity
+        .iter()
+        .any(|candidate| candidate.identity == identity && candidate.view.id == view)
+        .then(|| RouteId::plugin(identity, view))
+        .ok_or_else(|| format!("view '{view}' is not an activity view of this plugin"))
+}
+
+/// 安装给 plugin_ui 的跳转器：同步校验目标存在，随后 defer 到安全时机把主窗口带到前台并切页
+/// （调用方可能正处于任意窗口的 update 栈内）。
+fn navigate_for_plugin(identity: &str, route: &str, cx: &mut App) -> Result<(), String> {
+    let target = resolve_route(
+        identity,
+        route,
+        &cx.global::<PluginContributionState>().current,
+    )?;
+    cx.defer(move |cx| crate::command_palette::navigate_now(cx, target));
+    Ok(())
+}
+
 // ---------------------------------------------------------------- 下载页 / 设置 / 面板
 
 /// 下载页任务右键命令的执行回调。
@@ -351,22 +401,30 @@ pub(crate) fn command_runner() -> PluginCommandRunner {
     })
 }
 
-/// 下载页 / 任务详情窗口的插件 tab 视图工厂：按下标取当前贡献。
+/// 下载页 / 任务详情窗口的插件 tab 视图工厂：按 tab 的 `(identity, 视图 id)` 取当前贡献，
+/// 贡献已消失时给占位空视图。
 pub(crate) fn tab_view_factory() -> PluginTabViewFactory {
-    Rc::new(|index, task_id, window, cx| {
+    Rc::new(|tab, task_id, window, cx| {
         let view = cx
             .try_global::<PluginContributionState>()
-            .and_then(|state| state.current.task_tabs.get(usize::from(index)).cloned());
+            .and_then(|state| {
+                state
+                    .current
+                    .task_tabs
+                    .iter()
+                    .find(|view| view.identity == tab.identity && view.view.id == tab.view)
+                    .cloned()
+            });
         match view {
-            Some(view) => view_for(&view, Some(task_id), window, cx),
+            Some(view) => view_for(&view, Some(task_id), ViewContainer::default(), window, cx),
             None => cx.new(|_| Blank).into(),
         }
     })
 }
 
-/// 设置窗口扩展页的插件设置视图工厂。
-pub(crate) fn settings_view_factory() -> PluginViewFactory {
-    Rc::new(|plugin, view, task_id, window, cx| {
+/// 扩展页对话框（插件设置 / 登录）里的插件视图工厂：承载位置决定视图的容器能力。
+pub(crate) fn dialog_view_factory() -> PluginViewFactory {
+    Rc::new(|plugin, view, task_id, slot, window, cx| {
         let view = ViewRef {
             identity: plugin.identity.clone(),
             plugin_name: plugin.name.clone(),
@@ -374,7 +432,10 @@ pub(crate) fn settings_view_factory() -> PluginViewFactory {
             package_dir: plugin.package_dir.clone(),
             package_revision: plugin.package_revision,
         };
-        view_for(&view, task_id, window, cx)
+        let container = match slot {
+            PluginViewSlot::Dialog => ViewContainer::dialog(window),
+        };
+        view_for(&view, task_id, container, window, cx)
     })
 }
 
@@ -557,6 +618,48 @@ mod tests {
         assert!(same("plugin:e@x:a"));
         // 详情 tab 列表随之不等，详情面板据此丢弃旧视图缓存。
         assert_ne!(task_tabs(&current), task_tabs(&next));
+    }
+
+    #[test]
+    fn task_tabs_from_different_plugins_never_compare_equal() {
+        // 同标题、同修订号的 tab 换了插件：详情面板必须作废缓存，不能把旧插件的视图当新的用。
+        let first = task_tabs(&Contributions::from_plugins(&[plugin("d@x", json!({}))]));
+        let second = task_tabs(&Contributions::from_plugins(&[plugin("e@x", json!({}))]));
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].title, second[0].title);
+        assert_eq!(first[0].revision, second[0].revision);
+        assert_ne!(first, second);
+        assert_eq!(
+            (first[0].identity.as_str(), first[0].view.as_str()),
+            ("d@x", "t")
+        );
+    }
+
+    #[test]
+    fn resolves_navigation_targets_against_the_current_contributions() {
+        let contributions = Contributions::from_plugins(&[plugin("d@x", json!({}))]);
+        for (id, expected) in [
+            ("downloads", DOWNLOADS_ROUTE),
+            ("rss", RSS_ROUTE),
+            ("webhooks", WEBHOOKS_ROUTE),
+            ("share", SHARE_ROUTE),
+        ] {
+            assert_eq!(resolve_route("d@x", id, &contributions), Ok(expected));
+        }
+        assert_eq!(
+            resolve_route("d@x", "plugin:d@x:a", &contributions),
+            Ok(RouteId::plugin("d@x", "a"))
+        );
+        // 只有活动栏视图可跳转：任务详情 tab、不存在的视图、别的插件的页面、乱写的 id 都拒绝。
+        assert_eq!(
+            resolve_route("d@x", "plugin:d@x:t", &contributions),
+            Err("view 't' is not an activity view of this plugin".to_owned())
+        );
+        assert!(resolve_route("d@x", "plugin:d@x:nope", &contributions).is_err());
+        assert!(resolve_route("other@x", "plugin:d@x:a", &contributions).is_err());
+        assert!(resolve_route("other@x", "plugin:other@x:a", &contributions).is_err());
+        assert!(resolve_route("d@x", "settings", &contributions).is_err());
     }
 
     #[test]

@@ -1,20 +1,13 @@
 // 翻译目录：与 GPUI（crates/i18n）同一份 assets/i18n/*.json，语义逐条镜像：
 // locale 精确匹配 → 主语言匹配 → 英文键级回退（空值同缺键）→ 键名；`{name}` 占位插值。
+// 语言表构建期自动发现（virtual:i18n-tables），新增语言只需新增 JSON 文件。
 
-import en from '@i18n-assets/en.json'
-import zh from '@i18n-assets/zh.json'
-import zhTW from '@i18n-assets/zh-TW.json'
+import TABLES from 'virtual:i18n-tables'
 
 export type Params = Readonly<Record<string, string | number>>
 
 /** 最终回退语言（与 Rust `FALLBACK_LOCALE` 一致）。 */
 export const FALLBACK_LOCALE = 'en'
-
-const TABLES: Readonly<Record<string, Readonly<Record<string, string>>>> = {
-  en: en as Record<string, string>,
-  zh: zh as Record<string, string>,
-  'zh-tw': zhTW as Record<string, string>,
-}
 
 function normalizeLocale(locale: string): string {
   return locale.trim().toLowerCase().replaceAll('_', '-')

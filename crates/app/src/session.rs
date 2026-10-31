@@ -352,6 +352,7 @@ forward_consumer!(
     fluxdown_ui_settings::SettingsStore,
     fluxdown_ui_account::AccountHost,
     fluxdown_ui_rss::RssView,
+    fluxdown_ui_share::ShareHub,
     fluxdown_ui_extensions::ExtensionsView,
 );
 

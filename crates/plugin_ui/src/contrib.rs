@@ -10,7 +10,7 @@ use gpui::{
 };
 
 use crate::{
-    PluginUiError, PluginWindowSpec, desktop_view, load_failure_view,
+    PluginUiError, PluginWindowSpec, ViewContainer, desktop_view, load_failure_view,
     portable::{PluginViewHost, PortableEnv},
 };
 
@@ -42,6 +42,8 @@ pub struct Contributions {
     pub task_tabs: Vec<ViewRef>,
     /// 插件设置视图（`settings`，每插件至多一个），键为 identity。
     pub settings: HashMap<String, ViewRef>,
+    /// 登录弹窗视图（`auth`，每插件至多一个），键为 identity。
+    pub auth: HashMap<String, ViewRef>,
     /// 独立窗口（`window`）。
     pub windows: Vec<ViewRef>,
     /// 命令面板命令（`palette`）。
@@ -77,6 +79,9 @@ impl Contributions {
                         out.settings
                             .entry(plugin.identity.clone())
                             .or_insert(view_ref);
+                    }
+                    "auth" => {
+                        out.auth.entry(plugin.identity.clone()).or_insert(view_ref);
                     }
                     "window" => out.windows.push(view_ref),
                     other => log::debug!(
@@ -118,20 +123,21 @@ impl ViewRef {
     }
 }
 
-/// 为一个 view 创建内容视图。
+/// 为一个 view 创建内容视图。`container` 是承载它的容器（嵌入页传 `ViewContainer::default()`）。
 ///
 /// 优先桌面实现（脚本在本机包目录可读时）；否则回退到可移植视图；两者都不可用时给出
 /// 「仅桌面可用」提示。可移植视图创建后立即 `activate`。
 pub fn view_for(
     r: &ViewRef,
     task_id: Option<String>,
+    container: ViewContainer,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyView {
     if let Some(spec) = r.desktop_spec()
         && crate::package_available(&spec)
     {
-        return desktop_view(spec, task_id, window, cx);
+        return desktop_view(spec, task_id, container, window, cx);
     }
     if !r.view.portable {
         return notice_view("pluginViewDesktopOnly", cx);
@@ -147,7 +153,8 @@ pub fn view_for(
     };
     let identity = r.identity.clone();
     let view = r.view.id.clone();
-    let host = cx.new(|cx| PluginViewHost::new(identity, view, task_id, port, translator, cx));
+    let host =
+        cx.new(|cx| PluginViewHost::new(identity, view, task_id, container, port, translator, cx));
     host.update(cx, |host, cx| host.activate(cx));
     host.into()
 }
@@ -204,6 +211,7 @@ mod tests {
                     {"id": "a", "title": "A", "location": "activity", "portable": true},
                     {"id": "t", "title": "T", "location": "taskDetail", "portable": true},
                     {"id": "s", "title": "S", "location": "settings", "portable": true},
+                    {"id": "l", "title": "L", "location": "auth", "portable": true},
                     {"id": "w", "title": "W", "location": "window", "portable": false,
                      "desktop": {"entry": "ui/w.js"}}
                 ],
@@ -236,6 +244,8 @@ mod tests {
         assert_eq!(contributions.windows.len(), 1);
         assert_eq!(contributions.settings.len(), 1);
         assert_eq!(contributions.settings["a@ok"].view.id, "s");
+        assert_eq!(contributions.auth.len(), 1);
+        assert_eq!(contributions.auth["a@ok"].view.id, "l");
         let palette: Vec<_> = contributions
             .palette
             .iter()

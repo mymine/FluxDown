@@ -24,7 +24,7 @@ repeatGap: 3
 | 扩展（`fluxDown/`） | `t('section.key')`，或 HTML 上挂 `data-i18n="section.key"` |
 
 
-同一动作里把键补进**基线双语**：`en.json` + `zh.json`（官网 `defineMessages` 的 `en`/`zh`，扩展 `zh-CN.ts` + `en.ts`）；原生移动端与 GPUI / Web 消费共享基线。**ja 等社区语言不要动**（Weblate 维护，运行时按键级回退英文）——细则见规则 `i18n-baseline-zh-en`。
+同一动作里把键补进**基线双语**：`en.json` + `zh.json`（官网 `defineMessages` 的 `en`/`zh`，扩展 `zh-CN.ts` + `en.ts` + `zh-TW.ts`）；原生移动端与 GPUI / Web 消费共享基线。**`assets/i18n/` 的其余语言（zh-TW 等）不用补**（ZerxLabBot 翻译自动化每日补齐，运行时按键级回退英文）——细则见规则 `i18n-baseline-zh-en`。
 
 **可以硬编码的例外**（命中本规则时若属于以下情形，说明一句继续即可）：
 

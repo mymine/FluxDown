@@ -38,6 +38,8 @@ import { sawNetworkRequest } from "./request-cache";
 import { fallbackAfterSendFailure, sendToFluxDown } from "./sender";
 import { getCachedProfiles, getCachedSettings, peekCachedProfiles, peekCachedSettings } from "./settings-cache";
 import { loadServiceWorkerScopes, peekServiceWorkerScopes } from "./sw-scopes";
+import { logError, logWarn } from "@/utils/error-log";
+import { hasDownloadsApi } from "@/utils/platform";
 
 // 响应头缓存 —— 当 HTTP 响应指示"这是一个下载"时，缓存其元数据
 // 这是第三层兜底拦截的关键数据来源
@@ -166,8 +168,10 @@ function isBrowserOnly(urls: readonly (string | undefined)[], scopes: ServiceWor
 }
 
 // Firefox 不支持 onDeterminingFilename，兜底层是唯一拦截路径，
-// 需要更长等待让浏览器填充 downloadItem 元数据
-const hasDeterminingFilename = !!browser.downloads.onDeterminingFilename;
+// 需要更长等待让浏览器填充 downloadItem 元数据。
+// Firefox for Android 连 downloads 命名空间都没有：只剩 webRequest blocking 一条拦截路径。
+const downloadsApi = hasDownloadsApi() ? browser.downloads : undefined;
+const hasDeterminingFilename = !!downloadsApi?.onDeterminingFilename;
 
 // ──────────────────────────────────────────────────────────────
 // 弱网可靠性：统一等待元数据就绪
@@ -487,7 +491,7 @@ async function executeFallbackIntercept(
   try {
     await browser.downloads.cancel(downloadId);
   } catch (e) {
-    console.warn("[FluxDown] executeFallbackIntercept: cancel failed:", e);
+    logWarn("[FluxDown] executeFallbackIntercept: cancel failed:", e);
   }
   void eraseWhenSettled(downloadId);
 
@@ -506,7 +510,7 @@ async function executeFallbackIntercept(
       })
     ).success;
   } catch (e) {
-    console.error(
+    logError(
       "[FluxDown] executeFallbackIntercept: sendToFluxDown threw:",
       e,
     );
@@ -514,7 +518,7 @@ async function executeFallbackIntercept(
 
   if (!sendOk) {
     // 发送失败，先 ping 确认 App 是否在线再决定是否回退
-    console.warn(
+    logWarn(
       "[FluxDown] executeFallbackIntercept: send failed, checking app status before fallback:",
       url,
     );
@@ -569,6 +573,7 @@ const handleDeterminingFilename: DeterminingFilenameListener = (
       (id) => browser.downloads.cancel(id),
       (query) => browser.downloads.erase(query),
       resolveFilename,
+      async (id) => (await browser.downloads.search({ id }))[0]?.state,
     );
   const collectItemInfo = (): {
     itemInfo: DownloadItemInfo;
@@ -644,14 +649,14 @@ const handleDeterminingFilename: DeterminingFilenameListener = (
         handledDownloads.delete(downloadItem.id);
         await fallbackAfterSendFailure(downloadUrl, cleanFilename, false, manual?.channel).catch(
           (error) =>
-            console.error(
+            logError(
               "[FluxDown] failed to restore browser download after send failure:",
               error,
             ),
         );
       }
     } catch (error) {
-      console.error(
+      logError(
         "[FluxDown] onDeterminingFilename interception failed:",
         error,
       );
@@ -659,7 +664,7 @@ const handleDeterminingFilename: DeterminingFilenameListener = (
         handledDownloads.delete(downloadItem.id);
         await fallbackAfterSendFailure(downloadUrl, cleanFilename, false, manual?.channel).catch(
           (fallbackError) =>
-            console.error(
+            logError(
               "[FluxDown] failed to restore browser download after interception error:",
               fallbackError,
             ),
@@ -701,7 +706,7 @@ const handleDeterminingFilename: DeterminingFilenameListener = (
       });
       await interceptAfterCancellation(itemInfo, referrer);
     } catch (error) {
-      console.error(
+      logError(
         "[FluxDown] failed while resolving interception settings:",
         error,
       );
@@ -861,7 +866,7 @@ async function eraseWhenSettled(downloadId: number): Promise<void> {
     try {
       await browser.downloads.erase({ id: downloadId });
     } catch (e) {
-      console.warn("[FluxDown] eraseWhenSettled: erase failed:", e);
+      logWarn("[FluxDown] eraseWhenSettled: erase failed:", e);
     }
     try {
       const remain = await browser.downloads.search({ id: downloadId });
@@ -871,7 +876,7 @@ async function eraseWhenSettled(downloadId: number): Promise<void> {
     }
     await sleep(100);
   }
-  console.warn(
+  logWarn(
     "[FluxDown] eraseWhenSettled: record still present after retries:",
     downloadId,
   );
@@ -1058,14 +1063,14 @@ const onDownloadHeadersBlocking = (
         })
       ).success;
       if (!ok) {
-        console.warn(
+        logWarn(
           "[FluxDown] Firefox blocking: send failed, falling back to browser download:",
           details.url,
         );
         await fallbackAfterSendFailure(details.url, cleanFilename);
       }
     } catch (e) {
-      console.error(
+      logError(
         "[FluxDown] Firefox blocking: sendToFluxDown threw:",
         e,
       );
@@ -1111,7 +1116,7 @@ const handleDownloadCreated = (downloadItem: Browser.downloads.DownloadItem): vo
     if (downloadItem.state === "interrupted") linkCapture.interrupted(downloadItem);
   } else {
     startFallbackInterception(downloadId, downloadItem).catch((e) => {
-      console.error(
+      logError(
         "[FluxDown] Unexpected error in startFallbackInterception:",
         e,
       );
@@ -1143,12 +1148,12 @@ const blockingHeadersEvent = browser.webRequest.onHeadersReceived as unknown as 
 export function setInterceptListenersActive(active: boolean): void {
   if (active === interceptListenersActive) return;
   interceptListenersActive = active;
-  if (browser.downloads.onDeterminingFilename) {
-    if (active) browser.downloads.onDeterminingFilename.addListener(handleDeterminingFilename);
-    else browser.downloads.onDeterminingFilename.removeListener(handleDeterminingFilename);
+  if (downloadsApi?.onDeterminingFilename) {
+    if (active) downloadsApi.onDeterminingFilename.addListener(handleDeterminingFilename);
+    else downloadsApi.onDeterminingFilename.removeListener(handleDeterminingFilename);
   }
-  if (active) browser.downloads.onCreated.addListener(handleDownloadCreated);
-  else browser.downloads.onCreated.removeListener(handleDownloadCreated);
+  if (active) downloadsApi?.onCreated.addListener(handleDownloadCreated);
+  else downloadsApi?.onCreated.removeListener(handleDownloadCreated);
   if (!hasDeterminingFilename) {
     try {
       if (active) {
@@ -1160,7 +1165,7 @@ export function setInterceptListenersActive(active: boolean): void {
         blockingHeadersEvent.removeListener(onDownloadHeadersBlocking);
       }
     } catch (e) {
-      console.warn("[FluxDown] Firefox blocking interceptor toggle failed:", e);
+      logWarn("[FluxDown] Firefox blocking interceptor toggle failed:", e);
     }
   }
 }
@@ -1168,6 +1173,11 @@ export function setInterceptListenersActive(active: boolean): void {
 /** 同步注册拦截监听；由 startBackground 调用一次。 */
 export function installIntercept(): void {
   setInterceptListenersActive(true);
+}
+
+/** 拦截监听当前是否挂着（总开关关闭时已整体摘除）。 */
+export function isInterceptActive(): boolean {
+  return interceptListenersActive;
 }
 
 /**

@@ -55,6 +55,11 @@ impl DaemonService {
                     }
                 };
                 self.events.plugin_views().open(&session, tree.clone());
+                // 插件可能在 init 里就 `ctx.close()` 了：引擎已结束会话、关闭事件先于登记发出，
+                // 这里补清存储，避免留下永不关闭的条目（客户端缓存了关闭动作，登记后自行收尾）。
+                if !manager.has_view_session(&session) {
+                    self.events.plugin_views().close(&session);
+                }
                 to_value(PluginViewOpenedDto {
                     session,
                     seq: 0,
@@ -617,6 +622,81 @@ flux.rpc.handle("optsErrors", async () => optsErrors);
             .await
             .unwrap(),
             json!(["TypeError", "TypeError", "TypeError", "TypeError"])
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actions_from_init_reach_clients_and_closed_session_is_not_stored() {
+        let mut f = fixture_with(
+            json!({
+                "identity": ID, "name": "Views", "version": "1.0.0",
+                "main": { "entry": "main.js" },
+                "contributes": {
+                    "views": [{ "id": "gate", "title": "Gate", "location": "activity" }],
+                },
+            }),
+            r#"
+flux.ui.view("gate", {
+  init: async (ctx) => { await ctx.navigate("downloads"); ctx.close(); return {}; },
+  render: () => flux.ui.h("text", { text: "bye" }),
+});
+"#,
+            &[],
+        )
+        .await;
+        let opened = call(
+            &f,
+            "daemon.plugin.view.open",
+            json!({ "identity": ID, "view": "gate" }),
+        )
+        .await
+        .unwrap();
+        let session = opened["session"].as_str().unwrap().to_owned();
+        // 存储没有留下已在 init 里关闭的会话。
+        let error = call(
+            &f,
+            "daemon.plugin.view.snapshot",
+            json!({ "session": session }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.data.as_ref().map(|data| data.code),
+            Some(ApplicationErrorCode::InvalidArgument)
+        );
+        // 动作照样广播（跳转在前、关闭在后），客户端缓存后在登记会话时执行。
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            let frame = tokio::time::timeout(Duration::from_secs(10), f.frames.recv())
+                .await
+                .expect("plugin view events arrive")
+                .expect("event channel open");
+            match frame.event {
+                ServiceEvent::Daemon(DaemonEvent::PluginViewFrame(frame))
+                    if frame.session == session =>
+                {
+                    assert_eq!(frame.seq, 0);
+                    seen.push(format!("{:?}", frame.effects));
+                }
+                ServiceEvent::Daemon(DaemonEvent::PluginViewClosed { session: s, reason })
+                    if s == session =>
+                {
+                    seen.push(reason);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                format!(
+                    "{:?}",
+                    vec![fluxdown_protocol::ViewEffect::Navigate {
+                        target: "downloads".to_owned()
+                    }]
+                ),
+                "requested".to_owned(),
+            ]
         );
     }
 }

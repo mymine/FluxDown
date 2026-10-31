@@ -29,6 +29,8 @@ interface Props {
   canonicalUrl?: string;
   alternates?: { lang: string; href: string }[];
   noindex?: boolean;
+  /** 与 noindex 同用:追加 nofollow(分享落地页等不应被爬取的动态页)。 */
+  nofollow?: boolean;
   /** 页面级追加的 JSON-LD 节点(如 FAQPage / BreadcrumbList),并入全站 @graph。 */
   jsonLdNodes?: Record<string, unknown>[];
   ogImage?: string;
@@ -41,6 +43,7 @@ const {
   description = HOME_META[lang].description,
   canonicalUrl,
   noindex: pageNoindex = false,
+  nofollow = false,
   jsonLdNodes = [],
   ogImage = OG_IMAGE_URL,
   chrome = true,
@@ -87,7 +90,7 @@ const autoZhHref = lang === "en" && Astro.props.alternates === undefined ? switc
     <title>{title}</title>
     <meta name="description" content={description} />
     <link rel="canonical" href={canonical} />
-    {noindex && <meta name="robots" content="noindex" />}
+    {noindex && <meta name="robots" content={nofollow ? "noindex,nofollow" : "noindex"} />}
     {alternates.map((a) => <link rel="alternate" hreflang={a.lang} href={a.href} />)}
 
     <!-- 主题预绘制:在首帧前确定 data-theme,避免闪烁。默认跟随系统。 -->

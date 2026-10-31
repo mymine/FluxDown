@@ -13,6 +13,8 @@ data class Category(
     val extensions: List<String>,
     /** 非空 = 正则模式（`matchMode = regex`）。 */
     val regexPattern: String = "",
+    /** 非空 = 网址模式（`matchMode = url`）的通配符模式（桥接层只在 url 模式下下发）。 */
+    val urlPattern: String = "",
     val position: Int,
     val visible: Boolean = true,
     /** all / video / audio / document / image / program / archive / other；自定义为 null。 */
@@ -35,36 +37,79 @@ data class Category(
         )
 
         private fun builtin(type: String, icon: String, exts: List<String>, position: Int) =
-            Category("builtin_$type", "", icon, exts, "", position, true, type)
+            Category("builtin_$type", "", icon, exts, position = position, builtinType = type)
     }
 }
 
-/** 按 position 排序的匹配索引（语义同 GPUI `CategoryIndex`）：首个命中的具体分类；无 → other。 */
+/**
+ * 网址通配符（`*` 任意串、`?` 单字符，其余字面；不分大小写；须完整匹配整个网址）：
+ * 与 agent `category_dir.rs` / 引擎 `wildcard_matches` 同语义。空白 / 非法模式编译为 null（不命中）。
+ */
+object UrlWildcard {
+    fun compile(pattern: String): Regex? {
+        val trimmed = pattern.trim()
+        if (trimmed.isEmpty()) return null
+        val source = buildString(trimmed.length + 8) {
+            for (ch in trimmed) {
+                when (ch) {
+                    '*' -> append(".*")
+                    '?' -> append('.')
+                    else -> append(Regex.escape(ch.toString()))
+                }
+            }
+        }
+        return runCatching { Regex(source, RegexOption.IGNORE_CASE) }.getOrNull()
+    }
+}
+
+/**
+ * 按 position 排序的匹配索引（语义同 GPUI `CategoryIndex`）：网址规则固定优先（规则间按列表顺序），
+ * 其后是扩展名 / 正则规则（列表顺序）；都不命中 → other。网址规则匹配「来源地址」（调用方传
+ * `Task.shareUrl`：`originUrl` 非空取它，否则取 `url`）；文件名未知（空串）时只有网址规则参与。
+ * 规则（含正则 / 通配符编译）在构造时一次编译。
+ */
 class CategoryIndex(categories: List<Category>) {
     val ordered: List<Category> = categories.sortedBy { it.position }
     private val other: Category? = ordered.firstOrNull { it.isOther }
-    private val rules: List<Pair<Category, (String) -> Boolean>> = ordered
-        .filter { !it.isAll && !it.isOther }
-        .map { c ->
-            val m: (String) -> Boolean = if (c.regexPattern.isNotEmpty()) {
-                val re = runCatching { Regex(c.regexPattern, RegexOption.IGNORE_CASE) }.getOrNull()
-                val match: (String) -> Boolean = { name -> re?.containsMatchIn(name) == true }
-                match
-            } else {
-                val exts = c.extensions.map { it.lowercase().removePrefix(".") }.toSet()
-                val match: (String) -> Boolean = { name -> name.substringAfterLast('.', "").lowercase() in exts }
-                match
-            }
-            c to m
-        }
 
-    /** 任务命中的首个具体分类；都不命中 → other（无 other 时 null）。 */
-    fun categoryOf(fileName: String): Category? = rules.firstOrNull { it.second(fileName) }?.first ?: other
+    private class Rule(val category: Category, val isUrl: Boolean, val test: (name: String, url: String) -> Boolean)
+
+    private val urlRules: List<Rule>
+    private val nameRules: List<Rule>
+    private val ruleById: Map<String, Rule>
+
+    init {
+        val all = ordered
+            .filter { !it.isAll && !it.isOther }
+            .map { c -> Rule(c, c.urlPattern.isNotEmpty(), compile(c)) }
+        urlRules = all.filter { it.isUrl }
+        nameRules = all.filter { !it.isUrl }
+        ruleById = HashMap<String, Rule>(all.size * 2).also { map -> all.forEach { map.putIfAbsent(it.category.id, it) } }
+    }
+
+    private fun compile(c: Category): (String, String) -> Boolean {
+        if (c.urlPattern.isNotEmpty()) {
+            val re = UrlWildcard.compile(c.urlPattern)
+            return { _, url -> re != null && re.matches(url) }
+        }
+        if (c.regexPattern.isNotEmpty()) {
+            val re = runCatching { Regex(c.regexPattern, RegexOption.IGNORE_CASE) }.getOrNull()
+            return { name, _ -> name.isNotEmpty() && re?.containsMatchIn(name) == true }
+        }
+        val exts = c.extensions.map { it.lowercase().removePrefix(".") }.toSet()
+        return { name, _ -> name.substringAfterLast('.', "").lowercase() in exts }
+    }
+
+    /** 任务命中的首个具体分类：网址规则优先，其后扩展名 / 正则；都不命中 → other（无 other 时 null）。 */
+    fun categoryOf(fileName: String, url: String = ""): Category? =
+        urlRules.firstOrNull { it.test(fileName, url) }?.category
+            ?: nameRules.firstOrNull { it.test(fileName, url) }?.category
+            ?: other
 
     /** 任务是否属于分类（all 恒真；other = 未命中任何具体分类）。 */
-    fun matches(category: Category, fileName: String): Boolean = when {
+    fun matches(category: Category, fileName: String, url: String = ""): Boolean = when {
         category.isAll -> true
-        category.isOther -> rules.none { it.second(fileName) }
-        else -> rules.firstOrNull { it.first.id == category.id }?.second?.invoke(fileName) == true
+        category.isOther -> urlRules.none { it.test(fileName, url) } && nameRules.none { it.test(fileName, url) }
+        else -> ruleById[category.id]?.test?.invoke(fileName, url) == true
     }
 }

@@ -1,6 +1,7 @@
 import { browser } from "wxt/browser";
 import { redactConnectionError } from "./connection-diagnostics-store";
 import type { ConnectionDiagnostic } from "./connection-diagnostics-store";
+import { logWarn } from "./error-log";
 
 let backgroundRecorder: ((event: ConnectionDiagnostic) => Promise<void>) | undefined;
 
@@ -19,10 +20,10 @@ export function recordConnectionDiagnostic(event: ConnectionDiagnostic): void {
           if (!reply?.ok) throw new Error("Diagnostic event was not saved");
         });
     void write.catch((error) => {
-      console.warn("[FluxDown Diagnostics] Could not save connection event:", error);
+      logWarn("[FluxDown Diagnostics] Could not save connection event:", error);
     });
   } catch (error) {
-    console.warn("[FluxDown Diagnostics] Could not record connection event:", error);
+    logWarn("[FluxDown Diagnostics] Could not record connection event:", error);
   }
 }
 

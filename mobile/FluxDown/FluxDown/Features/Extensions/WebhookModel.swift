@@ -3,30 +3,6 @@ import FluxUI
 import Foundation
 import Observation
 
-/// `WebhookEndpointWriter` 的生产端口：读 `HostStore` 快照，写 `daemon.config.*`。
-@MainActor
-final class ContainerWebhookPort: WebhookConfigPort {
-    private let container: AppContainer
-
-    init(_ container: AppContainer) {
-        self.container = container
-    }
-
-    var cachedConfig: WebhookConfigSnapshot? {
-        let state = container.store.state
-        guard !state.isReadOnly else { return nil }
-        return WebhookConfigSnapshot(revision: state.configRevision, values: state.config)
-    }
-
-    func fetchConfig() async throws(HostError) -> WebhookConfigSnapshot {
-        try await container.session.call(HostMethod.daemonConfigGet)
-    }
-
-    func patchConfig(expectedRevision: UInt64, values: [String: String]) async throws(HostError) {
-        try await container.session.patchConfig(expectedRevision: expectedRevision, values: values)
-    }
-}
-
 /// 写回失败 → 反馈文案（`web/src/pages/webhooks/write.ts::writeErrorText` ↔ GPUI `SettingsErrorKind::i18n_key`；
 /// 校验失败附带具体原因）。
 enum WebhookErrorText {
@@ -91,7 +67,7 @@ final class WebhookModel {
 
     init(container: AppContainer) {
         self.container = container
-        writer = WebhookEndpointWriter(port: ContainerWebhookPort(container))
+        writer = WebhookEndpointWriter(port: ContainerDaemonConfigPort(container))
     }
 
     private var session: any HostSession { container.session }

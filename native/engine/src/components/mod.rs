@@ -212,9 +212,10 @@ pub async fn exec_probe(
 /// 安装流程共用。
 #[cfg(feature = "components")]
 pub(crate) async fn fetch_github_json(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     url: &str,
 ) -> Result<serde_json::Value, ComponentError> {
+    let client = client_for(clients, url).await?;
     let resp = client
         .get(url)
         .header("User-Agent", "FluxDown")
@@ -238,16 +239,16 @@ pub(crate) async fn fetch_github_json(
 /// 不是 https）都回退直连原始 `url`，不让一次镜像故障拖垮整个安装流程。
 #[cfg(feature = "components")]
 pub(crate) async fn fetch_github_json_with_mirror(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     url: &str,
     mirror_base: &str,
 ) -> Result<serde_json::Value, ComponentError> {
     if let Some(mirrored) = https_mirror_url(url, mirror_base)
-        && let Ok(v) = fetch_github_json(client, &mirrored).await
+        && let Ok(v) = fetch_github_json(clients, &mirrored).await
     {
         return Ok(v);
     }
-    fetch_github_json(client, url).await
+    fetch_github_json(clients, url).await
 }
 
 /// 镜像改写后的 URL：仅当确实改写且镜像为 https 才返回；http 镜像一律忽略
@@ -300,7 +301,7 @@ const MAX_CHECKSUM_FILE_BYTES: usize = 1024 * 1024;
 /// 不参与——它只转发版本 JSON，不在校验文件的信任路径上。
 #[cfg(feature = "components")]
 pub(crate) async fn fetch_expected_sha256(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     checksum_url: &str,
     mirror_base: &str,
     asset_name: &str,
@@ -309,7 +310,7 @@ pub(crate) async fn fetch_expected_sha256(
     urls.extend(https_mirror_url(checksum_url, mirror_base));
     let mut last = ComponentError::NotFound(format!("checksum for {asset_name}"));
     for url in urls {
-        match fetch_text(client, &url).await {
+        match fetch_text(clients, &url).await {
             Ok(text) => match parse_checksum_file(&text, asset_name) {
                 Some(hash) => return Ok(hash),
                 None => {
@@ -323,7 +324,11 @@ pub(crate) async fn fetch_expected_sha256(
 }
 
 #[cfg(feature = "components")]
-async fn fetch_text(client: &reqwest::Client, url: &str) -> Result<String, ComponentError> {
+async fn fetch_text(
+    clients: &crate::egress::RoutedClients,
+    url: &str,
+) -> Result<String, ComponentError> {
+    let client = client_for(clients, url).await?;
     let resp = client
         .get(url)
         .header("User-Agent", "FluxDown")
@@ -357,16 +362,16 @@ const MIRROR_BASE: &str = "https://fluxdown.com/api/components";
 /// 配置的镜像与直连 `github_url`。二进制下载不走此路径。
 #[cfg(feature = "components")]
 pub(crate) async fn fetch_versions_json(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     component: &str,
     github_url: &str,
     mirror_base: &str,
 ) -> Result<serde_json::Value, ComponentError> {
     let official_mirror = format!("{MIRROR_BASE}/{component}");
-    if let Ok(v) = fetch_github_json(client, &official_mirror).await {
+    if let Ok(v) = fetch_github_json(clients, &official_mirror).await {
         return Ok(v);
     }
-    fetch_github_json_with_mirror(client, github_url, mirror_base).await
+    fetch_github_json_with_mirror(clients, github_url, mirror_base).await
 }
 
 /// 流式下载载荷到 `dest` 并校验 SHA-256（`expected_sha256`，小写 hex），
@@ -379,7 +384,7 @@ pub(crate) async fn fetch_versions_json(
 /// 并报错——调用方在校验通过前不得执行或落位该文件。
 #[cfg(feature = "components")]
 pub(crate) async fn download_to_file(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     route: &crate::egress::EgressRoute,
     mirror_base: &str,
     dest: &std::path::Path,
@@ -397,7 +402,7 @@ pub(crate) async fn download_to_file(
     attempts.extend(route.attempts());
     let mut last_error = ComponentError::NotFound("download source".to_string());
     for attempt in &attempts {
-        match download_to_file_from(client, attempt, dest, progress).await {
+        match download_to_file_from(clients, attempt, dest, progress).await {
             Ok(actual) if actual.eq_ignore_ascii_case(expected_sha256) => return Ok(()),
             Ok(actual) => {
                 crate::log_info!(
@@ -428,7 +433,7 @@ pub(crate) async fn download_to_file(
 /// 下载到 `dest`，返回内容的 SHA-256（小写 hex）。
 #[cfg(feature = "components")]
 async fn download_to_file_from(
-    client: &reqwest::Client,
+    clients: &crate::egress::RoutedClients,
     attempt: &crate::egress::EgressAttempt,
     dest: &std::path::Path,
     progress: &(dyn Fn(u64, u64) + Send + Sync),
@@ -437,6 +442,7 @@ async fn download_to_file_from(
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
 
+    let client = client_for(clients, &attempt.url).await?;
     let mut request = client.get(&attempt.url).header("User-Agent", "FluxDown");
     for (name, value) in &attempt.headers {
         request = request.header(name.as_str(), value.as_str());
@@ -478,17 +484,27 @@ async fn download_to_file_from(
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// 组件安装的 HTTP 客户端：统一出口按当前全局代理装配。
+/// 组件安装的 HTTP 客户端集合：统一出口按当前全局代理与站点规则装配。
 #[cfg(feature = "components")]
-pub(crate) async fn egress_client(
+pub(crate) async fn egress_clients(
     egress: &crate::egress::Egress,
-) -> Result<reqwest::Client, ComponentError> {
+) -> Result<crate::egress::RoutedClients, ComponentError> {
     egress
-        .client_builder()
+        .routed(|builder| builder)
         .await
-        .map_err(|e| ComponentError::Http(format!("{e:#}")))?
-        .build()
-        .map_err(|e| ComponentError::Http(e.to_string()))
+        .map_err(|e| ComponentError::Http(format!("{e:#}")))
+}
+
+/// `url` 命中站点规则时用规则出口的客户端，否则用全局出口的客户端。
+#[cfg(feature = "components")]
+async fn client_for(
+    clients: &crate::egress::RoutedClients,
+    url: &str,
+) -> Result<reqwest::Client, ComponentError> {
+    clients
+        .client(url)
+        .await
+        .map_err(|e| ComponentError::Http(format!("{e:#}")))
 }
 
 #[cfg(test)]

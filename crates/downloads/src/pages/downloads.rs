@@ -13,13 +13,13 @@ use crate::{
         DeleteSelected, DeleteSelectedWithFiles, EnterMultiSelect, FocusSearch, KEY_CONTEXT,
         NewDownload, OpenQueueManager, OpenSelected, OpenSelectedInWindow, OpenTorrentFile,
         PauseAll, PauseSelected, RedownloadSelected, RenameSelected, ResumeAll, ResumeSelected,
-        RevealSelected, SelectAllTasks, ShowSelectedDetail, ToggleBoostSelected, ToggleDetailPanel,
-        TogglePauseSelected,
+        RevealSelected, SeedLocal, SelectAllTasks, ShowSelectedDetail, ToggleBoostSelected,
+        ToggleDetailPanel, TogglePauseSelected,
     },
     components::{
         task_table::{
-            DownloadTableDelegate, SelectionSummary, TableFilter, ToolbarCommand,
-            spawn_midnight_refresh,
+            DownloadTableDelegate, SelectModifiers, SelectionSummary, TableFilter, ToolbarCommand,
+            spawn_midnight_refresh, task_menu_facts_for,
         },
         title_bar::{DownloadSearchBox, DownloadTitleBar, DownloadViewMenu},
     },
@@ -33,9 +33,11 @@ use crate::{
         file_rescan::{RescanDecision, RescanThrottle},
         group_tree::{GroupMeta, member_dir},
         refresh_gate::{RefreshGate, RefreshPlan, RefreshTrigger},
+        share::ShareHostCaps,
         view_prefs::{DetailPlacement, VIEW_PREFS_KEY, ViewPrefs},
     },
     pages::new_download::{NewDownloadContext, build_new_download_context},
+    pages::seed_local::open_seed_local_dialog,
     pages::task_detail::TaskDetailView,
     strings::{DownloadStrings, error_text},
     submission::{
@@ -76,6 +78,7 @@ pub const MAX_TASK_WINDOWS_PER_ACTION: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageCommand {
     OpenTorrentFile,
+    SeedLocal,
     PauseAll,
     ResumeAll,
     ClearFinished,
@@ -85,6 +88,7 @@ pub enum PageCommand {
     CycleGroupBy,
     CycleSort,
     ToggleDetailPanel,
+    ShareSelected,
 }
 
 /// 宿主注入的「新建下载」入口：由 app 打开独立对话框窗口。
@@ -101,8 +105,14 @@ pub type CategoryEditorOpener = Rc<dyn Fn(Option<String>, &mut Window, &mut App)
 pub type UserStartHook = Rc<dyn Fn(UserStartIntent, &mut App)>;
 /// 执行插件命令：`(identity, command, task_ids)`。
 pub type PluginCommandRunner = Rc<dyn Fn(String, String, Vec<String>, &mut Window, &mut App)>;
-/// 构造插件详情 tab 视图：`(tab 下标, task_id)`。
-pub type PluginTabViewFactory = Rc<dyn Fn(u16, String, &mut Window, &mut App) -> AnyView>;
+/// 构造插件详情 tab 视图：`(tab, task_id)`；宿主按 tab 的 `(identity, view)` 定位贡献，
+/// 不依赖下标。
+pub type PluginTabViewFactory =
+    Rc<dyn Fn(&PluginTaskTab, String, &mut Window, &mut App) -> AnyView>;
+/// 分享任务：参数为任务 id 列表，由宿主打开分享面板。
+pub type ShareTasksOpener = Rc<dyn Fn(Vec<String>, &mut Window, &mut App)>;
+/// 构造某任务的FluxMesh「传输诊断」页签内容（宿主按任务缓存视图由详情面板负责）。
+pub type ShareDiagnosticsViewFactory = Rc<dyn Fn(String, &mut Window, &mut App) -> AnyView>;
 
 /// 插件贡献的任务右键命令。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,9 +122,13 @@ pub struct PluginTaskCommand {
     pub title: SharedString,
 }
 
-/// 插件贡献的任务详情 tab。
+/// 插件贡献的任务详情 tab。相等性包含插件 identity 与视图 id：换了插件的同标题 tab 也必须
+/// 判为不同，详情面板才会作废旧视图缓存。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginTaskTab {
+    pub identity: String,
+    /// 贡献该 tab 的视图 id（插件内唯一）。
+    pub view: String,
     pub title: SharedString,
     /// 内容修订号：变化即旧视图作废、须按工厂重建（插件包代码被替换时由 app 递增）。
     pub revision: u64,
@@ -145,8 +159,24 @@ pub struct DownloadHostActions {
     pub on_user_started: Option<UserStartHook>,
     /// 点击插件任务右键命令：`(插件 identity, 命令 id, 任务 id 列表)`。
     pub run_plugin_command: Option<PluginCommandRunner>,
-    /// 取插件详情 tab 内容：`(tab 下标, 任务 id)`；同一 `(下标, 任务)` 的视图由详情面板缓存。
+    /// 取插件详情 tab 内容：`(tab, 任务 id)`；同一 `(tab 下标, 任务)` 的视图由详情面板缓存，
+    /// tab 列表变化（含插件 identity / 视图 id 变化）时缓存整体作废。
     pub plugin_tab_view: Option<PluginTabViewFactory>,
+    /// 分享入口（右键菜单 / 选择条 / 详情面板 / `PageCommand::ShareSelected`）：参数为任务
+    /// id 列表。`None` 时全部分享入口隐藏。
+    pub share_tasks: Option<ShareTasksOpener>,
+    /// FluxMesh接收任务角标上的「切换桥接」：参数为任务 id。`None` 时不显示该动作。
+    pub share_switch_to_bridge: Option<IdOpener>,
+    /// FluxMesh接收任务角标上的「共享加速额度已用完 / 登录后可共享加速」chip：打开设置 › 账户的额度，
+    /// 参数为任务 id。`None` 时 chip 不可点击。
+    pub share_open_usage: Option<IdOpener>,
+    /// 任务右键「停止共享」：停止该任务所属接收记录的共享，参数为接收记录 ID。`None` 时不显示该菜单项。
+    pub share_stop_providing: Option<IdOpener>,
+    /// FluxMesh接收任务详情「传输诊断」页签内容；`None` 时不显示该页签。
+    pub share_diagnostics_view: Option<ShareDiagnosticsViewFactory>,
+    /// 新建下载对话框识别出分享链接后打开接收确认：参数为链接原文。
+    /// 对话框是独立窗口，由 app 经 [`crate::NewDownloadView::set_open_share_receive`] 注入。
+    pub open_share_receive: Option<IdOpener>,
 }
 
 /// 一个进行中的大批量导入：进度只在分块边界更新，取消不回滚已创建的任务。
@@ -385,6 +415,12 @@ impl DownloadView {
 
     /// 注入宿主入口（新建下载 / 任务窗口 / 队列管理…）。
     pub fn set_host_actions(&mut self, host: DownloadHostActions) {
+        self.controller.store().set_share_host(ShareHostCaps {
+            send: host.share_tasks.is_some(),
+            switch_bridge: host.share_switch_to_bridge.is_some(),
+            open_usage: host.share_open_usage.is_some(),
+            stop_providing: host.share_stop_providing.is_some(),
+        });
         self.host = host;
     }
 
@@ -424,23 +460,29 @@ impl DownloadView {
             .collect()
     }
 
-    /// 右键菜单点击插件命令：把选中任务 id 交给宿主回调。
+    /// 右键菜单点击插件命令：按菜单构建时捕获的 `(identity, 命令 id)` 定位，把选中任务 id
+    /// 交给宿主回调。命令已不在当前贡献里（插件被禁用 / 卸载 / 熔断）时不执行。
     pub(crate) fn run_plugin_command(
         &self,
-        index: u16,
+        identity: &str,
+        command: &str,
         task_ids: Vec<String>,
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (Some(run), Some(command)) = (
-            self.host.run_plugin_command.clone(),
-            self.plugin_commands.get(usize::from(index)),
-        ) else {
+        let Some(run) = self.host.run_plugin_command.clone() else {
             return;
         };
+        if !self
+            .plugin_commands
+            .iter()
+            .any(|entry| entry.identity == identity && entry.command == command)
+        {
+            return;
+        }
         run(
-            command.identity.clone(),
-            command.command.clone(),
+            identity.to_owned(),
+            command.to_owned(),
             task_ids,
             window,
             cx,
@@ -522,6 +564,7 @@ impl DownloadView {
             controller.queues(),
             selected_queue,
             controller.other_devices(),
+            controller.store().share().pickup_code_length(),
         )
     }
 
@@ -1217,7 +1260,7 @@ impl DownloadView {
         self.table_state.update(cx, |table, cx| {
             table
                 .delegate_mut()
-                .select_task(key.clone(), gpui::Modifiers::default());
+                .select_task(key.clone(), SelectModifiers::default());
             cx.notify();
         });
         self.open_detail_for(key, window, cx);
@@ -1357,7 +1400,7 @@ impl DownloadView {
         self.table_state.update(cx, |table, cx| {
             table
                 .delegate_mut()
-                .select_group(&group_id, gpui::Modifiers::default());
+                .select_group(&group_id, SelectModifiers::default());
             cx.notify();
         });
         self.bind_group_detail(group_id, cx);
@@ -1556,7 +1599,10 @@ impl DownloadView {
         self.search_revealed || !self.search_input.read(cx).value().is_empty()
     }
 
-    /// 内联重命名对话框（单选本地任务）；确认后写 `DownloadsCommand::Rename`。
+    /// 内联重命名对话框（单选、满足 [`TaskMenuFacts::can_rename`] 的任务；应用菜单不置灰，
+    /// 入口须按同一事实源再判）；确认后写 `DownloadsCommand::Rename`。
+    ///
+    /// [`TaskMenuFacts::can_rename`]: crate::components::task_table::TaskMenuFacts::can_rename
     fn on_rename_selected(
         &mut self,
         _: &RenameSelected,
@@ -1567,7 +1613,9 @@ impl DownloadView {
         let [key] = selected.as_slice() else {
             return;
         };
-        if !key.is_local() {
+        if !task_menu_facts_for(self.controller.store(), key)
+            .is_some_and(|facts| facts.can_rename())
+        {
             return;
         }
         let task_id = key.task_id().to_owned();
@@ -2169,6 +2217,10 @@ impl DownloadView {
         self.run_page_command(PageCommand::OpenTorrentFile, window, cx);
     }
 
+    fn on_seed_local(&mut self, _: &SeedLocal, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_page_command(PageCommand::SeedLocal, window, cx);
+    }
+
     fn open_torrent_file(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -2228,6 +2280,13 @@ impl DownloadView {
     ) {
         match command {
             PageCommand::OpenTorrentFile => self.open_torrent_file(cx),
+            PageCommand::SeedLocal => open_seed_local_dialog(
+                Arc::clone(&self.port),
+                self.strings.clone(),
+                self.translator.clone(),
+                window,
+                cx,
+            ),
             PageCommand::PauseAll => self.execute_toolbar(ToolbarCommand::PauseAll, cx),
             PageCommand::ResumeAll => self.execute_toolbar(ToolbarCommand::ResumeAll, cx),
             PageCommand::ClearFinished => {
@@ -2264,6 +2323,7 @@ impl DownloadView {
             PageCommand::ToggleDetailPanel => {
                 self.mutate_prefs(|prefs| prefs.detail_open = !prefs.detail_open, cx);
             }
+            PageCommand::ShareSelected => self.share_selected(window, cx),
         }
     }
 
@@ -2428,6 +2488,28 @@ impl DownloadView {
             |this, window, cx| this.on_pop_out_detail(window, cx),
             cx,
         );
+        let detail_task_id = (!showing_group)
+            .then(|| {
+                self.detail
+                    .as_ref()
+                    .map(|detail| detail.read(cx).task_id().to_owned())
+            })
+            .flatten();
+        let share = detail_task_id.and_then(|task_id| {
+            let control = self
+                .controller
+                .store()
+                .share_control(&[RowKey::Local(task_id.clone())]);
+            self.share_button(
+                "detail-panel-share",
+                control,
+                icon_size,
+                move |this, window, cx| {
+                    this.share_keys(&[RowKey::Local(task_id.clone())], window, cx);
+                },
+                cx,
+            )
+        });
         let close = self.icon_action(
             "detail-panel-close",
             close_label,
@@ -2464,6 +2546,7 @@ impl DownloadView {
                         h_flex()
                             .gap(tokens.spacing.xxs)
                             .child(toggle_position)
+                            .children(share)
                             .child(pop_out)
                             .child(close),
                     ),
@@ -2499,6 +2582,13 @@ impl DownloadView {
     }
 }
 
+/// 下载页根焦点：宿主据此把动作派发进下载页（如标题栏菜单在下载页外发起的动作）。
+impl gpui::Focusable for DownloadView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for DownloadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 语言切换后同步搜索框 placeholder（InputState 只在构造时取一次）。
@@ -2527,9 +2617,12 @@ impl Render for DownloadView {
             .on_action(cx.listener(Self::on_resume_all))
             .on_action(cx.listener(Self::on_open_selected))
             .on_action(cx.listener(Self::on_reveal_selected))
+            .on_action(cx.listener(Self::on_copy_selected_files))
             .on_action(cx.listener(Self::on_open_selected_in_window))
             .on_action(cx.listener(Self::on_show_selected_detail))
             .on_action(cx.listener(Self::on_copy_selected_url))
+            .on_action(cx.listener(Self::on_copy_magnet_selected))
+            .on_action(cx.listener(Self::on_export_torrent_selected))
             .on_action(cx.listener(Self::on_redownload_selected))
             .on_action(cx.listener(Self::on_toggle_boost_selected))
             .on_action(cx.listener(Self::on_cycle_density))
@@ -2537,6 +2630,7 @@ impl Render for DownloadView {
             .on_action(cx.listener(Self::on_cycle_sort))
             .on_action(cx.listener(Self::on_new_download))
             .on_action(cx.listener(Self::on_open_torrent_file))
+            .on_action(cx.listener(Self::on_seed_local))
             .on_action(cx.listener(Self::on_open_queue_manager))
             .on_action(cx.listener(Self::on_clear_finished))
             .on_action(cx.listener(Self::on_focus_search))
@@ -2544,6 +2638,7 @@ impl Render for DownloadView {
             .on_action(cx.listener(Self::on_change_selected_url))
             .on_action(cx.listener(Self::on_change_selected_segments))
             .on_action(cx.listener(Self::on_verify_selected))
+            .on_action(cx.listener(Self::on_share_selected))
             .on_action(cx.listener(Self::on_toggle_detail_panel))
             .on_drop(cx.listener(Self::on_paths_dropped))
             .drag_over::<ExternalPaths>(|style, _, _, cx| {

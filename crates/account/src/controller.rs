@@ -321,6 +321,7 @@ mod tests {
             },
             entitlements: Entitlements::default(),
             current_plan: None,
+            active_subscription: None,
             device: device("me", true),
         }
     }

@@ -1,11 +1,19 @@
 // 下载页命令：对应 GPUI 的 DownloadsCommand（downloads_port.rs），全部走 agent /rpc。
 // 本地任务 → `daemon.*`；远程任务 → `agent.remote.command`。失败统一 toast。
 // 「打开文件 / 在文件夹中显示」只在连接带 `agent.openTaskFiles` 能力（agent 与浏览器同机）时提供，
-// 其余情况由浏览器下载已完成文件替代。
+// 其余情况由浏览器下载已完成文件替代；「复制文件」另需 `agent.copyTaskFiles`（同机桌面会话），
+// 远程 / NAS 连接不提供（浏览器 Clipboard API 不能写入文件），同样以浏览器下载替代。
 
 import { copyText } from '../../../lib/copy'
 import { t } from '../../../i18n'
-import { CAPABILITY_AGENT_OPEN_TASK_FILES, RpcError, downloadTaskFile, rpc, rpcStore } from '../../../lib/rpc'
+import {
+  CAPABILITY_AGENT_COPY_TASK_FILES,
+  CAPABILITY_AGENT_OPEN_TASK_FILES,
+  RpcError,
+  downloadTaskFile,
+  rpc,
+  rpcStore,
+} from '../../../lib/rpc'
 import type { CreateTaskRequest, RemoteCommandParams } from '../../../lib/rpc'
 import { confirmDialog, toast } from '../../../ui'
 import { toastRpcError } from '../../../lib/rpcToast'
@@ -120,7 +128,11 @@ export async function resumeIfFailed(taskId: string, wasFailed: boolean): Promis
 }
 
 export function isPluginRetryError(view: DownloadTaskView): boolean {
-  return view.state === 'failed' && view.errorMessage.startsWith(PLUGIN_ERROR_PREFIX)
+  return (
+    view.state === 'failed' &&
+    view.groupId === '' &&
+    view.errorMessage.startsWith(PLUGIN_ERROR_PREFIX)
+  )
 }
 
 export async function confirmIgnorePluginRetry(taskId: string): Promise<boolean> {
@@ -174,6 +186,57 @@ export function copyUrls(views: readonly DownloadTaskView[]): void {
   toast.key('urlCopied', 'success')
 }
 
+/** 「复制磁力链接 / 导出 .torrent」：单选的本地 BT 任务（任意状态）。 */
+export const canShareTorrent = (views: readonly DownloadTaskView[]): boolean =>
+  views.length === 1 && views.every((view) => view.source === 'local' && view.protocol === 'bt')
+
+export async function copyMagnet(view: DownloadTaskView): Promise<void> {
+  try {
+    const share = await rpc.daemon.task.torrentShare({ taskId: view.taskId, includeTorrent: false })
+    copyText(share.magnet)
+    toast.key('btMagnetCopied', 'success')
+  } catch (error) {
+    toastRpcError(error)
+  }
+}
+
+/** 文件名去掉路径分隔符与保留字符，空名回退 `torrent`。 */
+export function torrentFileName(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  const clean = name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim().replace(/^\.+/, '')
+  const base = clean === '' ? 'torrent' : clean
+  return base.toLowerCase().endsWith('.torrent') ? base : `${base}.torrent`
+}
+
+function decodeBase64(b64: string): Uint8Array<ArrayBuffer> {
+  const binary = atob(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+export async function exportTorrent(view: DownloadTaskView): Promise<void> {
+  try {
+    const share = await rpc.daemon.task.torrentShare({ taskId: view.taskId, includeTorrent: true })
+    if (!share.torrentB64) {
+      toast.key('btNoTorrentFile', 'error')
+      return
+    }
+    const url = URL.createObjectURL(new Blob([decodeBase64(share.torrentB64)], { type: 'application/x-bittorrent' }))
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = torrentFileName(share.name)
+    anchor.setAttribute('data-fluxdown-skip', '1')
+    document.body.append(anchor)
+    anchor.click()
+    anchor.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 10_000)
+    toast.key('btTorrentExported', 'success')
+  } catch (error) {
+    toastRpcError(error)
+  }
+}
+
 /** 只有本地已完成且文件仍在磁盘上的任务有可下载的最终文件。 */
 export const isDownloadable = (view: DownloadTaskView): boolean =>
   view.source === 'local' && view.state === 'completed' && !view.fileMissing
@@ -210,6 +273,32 @@ export async function openTaskFile(taskId: string): Promise<void> {
 }
 
 export const revealTaskFile = (taskId: string) => guarded(() => rpc.agent.platform.revealTask({ taskId }))
+
+/**
+ * 「复制文件」：可多选，全部本地已完成且文件仍在（对齐 GPUI `TaskMenuFacts::has_product_on_disk`），
+ * 且本连接带 `agent.copyTaskFiles`——agent 所在主机就是浏览器所在机器、有桌面剪贴板。
+ */
+export const canCopyTaskFiles = (views: readonly DownloadTaskView[]): boolean =>
+  views.length > 0 &&
+  (rpcStore.peek().hello?.capabilities.includes(CAPABILITY_AGENT_COPY_TASK_FILES) ?? false) &&
+  views.every(isDownloadable)
+
+/** 产物以文件写入主机剪贴板；文件已不在时立即重扫（同 `openTaskFile`），失败文案对齐 GPUI `task_copy.rs`。 */
+export async function copyTaskFiles(views: readonly DownloadTaskView[]): Promise<void> {
+  try {
+    await rpc.agent.platform.copyTaskFiles({ taskIds: views.map((view) => view.taskId) })
+    toast.success(t('fileCopiedToClipboard'))
+  } catch (error) {
+    if (error instanceof RpcError && error.is('notFound')) {
+      rpc.daemon.task.rescan().catch(() => {})
+      toast.error(t('copyFileErrNotFound'))
+    } else if (error instanceof RpcError && error.is('unsupported')) {
+      toast.error(t('copyFileErrUnsupported'))
+    } else {
+      toast.error(`${t('copyFileFailed')} ${rpcErrorText(error, t)}`)
+    }
+  }
+}
 
 /** 已损坏文件名文案：前 3 个，超出部分折叠为「等 N 个」（与 GPUI 同规则）。 */
 function damagedFilesText(files: readonly string[]): string {

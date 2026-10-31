@@ -3,7 +3,10 @@
 //! 版本选择与引擎 `MarketClient::latest_entry` 同一规则（`yanked == "none"` 中 sequence
 //! 最大者），保证列表展示的版本就是 `daemon.plugin.marketInstall` 实际装上的版本。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use fluxdown_protocol::{MarketEntryDto, PluginDto};
 
@@ -309,6 +312,24 @@ pub fn hosts_to_confirm(entry: &MarketEntryDto, installed: Option<&PluginDto>) -
         .collect()
 }
 
+/// 目录最长可信时长：超过后再次进入插件页会重新拉取，保证「更新」徽标不陈旧。
+pub const MARKET_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// 目录是否需要（重新）加载：从未请求、断连失败待重试、或上次成功加载已过期。
+/// 失败（`failed`）且非断连类时不自动重试，避免重绘循环——由手动刷新恢复。
+pub fn market_needs_load(
+    requested: bool,
+    retry_on_reconnect: bool,
+    failed: bool,
+    loaded_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !requested || retry_on_reconnect {
+        return true;
+    }
+    !failed && loaded_at.is_some_and(|at| now.saturating_duration_since(at) >= MARKET_MAX_AGE)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -316,9 +337,25 @@ mod tests {
     use fluxdown_protocol::{MarketEntryDto, PluginDto};
 
     use super::{
-        MarketAction, confirmation_holds, filter_market, installed_version_yanked,
-        latest_per_plugin, market_action, permissions_to_confirm, version_newer,
+        MARKET_MAX_AGE, MarketAction, confirmation_holds, filter_market, installed_version_yanked,
+        latest_per_plugin, market_action, market_needs_load, permissions_to_confirm, version_newer,
     };
+
+    #[test]
+    fn market_reloads_when_never_requested_retrying_or_expired() {
+        use std::time::{Duration, Instant};
+
+        let loaded = Instant::now();
+        let fresh = loaded + MARKET_MAX_AGE - Duration::from_secs(1);
+        let expired = loaded + MARKET_MAX_AGE;
+        assert!(market_needs_load(false, false, false, None, loaded));
+        assert!(market_needs_load(true, true, true, Some(loaded), loaded));
+        assert!(!market_needs_load(true, false, false, Some(loaded), fresh));
+        assert!(market_needs_load(true, false, false, Some(loaded), expired));
+        // 失败后不自动重试（防重绘循环）；从未成功加载过也不按时间重试。
+        assert!(!market_needs_load(true, false, true, Some(loaded), expired));
+        assert!(!market_needs_load(true, false, false, None, expired));
+    }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| (*v).to_owned()).collect()

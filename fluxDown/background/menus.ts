@@ -18,9 +18,12 @@ import { notify } from "./notify";
 import type { SendChannel } from "./protocol";
 import { fallbackAfterSendFailure, sendToFluxDown } from "./sender";
 import { getCachedSettings, onSettingsChanged } from "./settings-cache";
+import type { FluxDownSettings } from "@/utils/settings";
+import { rebuildMenus, type MenuApi, type MenuItemSpec } from "./menu-build";
 import { getContextTarget } from "./tab-state";
 import { buildTabView } from "./tab-view";
 import { allRows, rowsForElement } from "./view-model";
+import { logWarn } from "@/utils/error-log";
 
 type MenuBase =
   | "fluxdown-send-link"
@@ -74,37 +77,48 @@ export function createContextMenus(): Promise<void> {
   return menuChain;
 }
 
+/**
+ * 浏览器菜单 API 适配：create 的失败只经回调里的 runtime.lastError 给出（不抛错、不 reject），
+ * 不在回调里读取就会被记为「Unchecked runtime.lastError」。
+ */
+const browserMenus: MenuApi = {
+  removeAll: () => browser.contextMenus.removeAll(),
+  create(item, done) {
+    browser.contextMenus.create(item, () => {
+      const error = browser.runtime.lastError;
+      done(error ? (error.message ?? String(error)) : null);
+    });
+  },
+};
+
 /** 重建的实际实现；内部吞掉所有错误，保证 menuChain 不会 reject。 */
 async function rebuildContextMenus(): Promise<void> {
   if (!browser.contextMenus) {
-    console.warn("[FluxDown] contextMenus API not available");
+    logWarn("[FluxDown] contextMenus API not available");
     return;
   }
   try {
-    await browser.contextMenus.removeAll();
+    // 先读设置：removeAll 与 create 之间不再隔着存储读取，缩小与菜单恢复交错的窗口。
     const settings = await getCachedSettings();
-    if (!settings.contextMenuEnabled) return;
-    const withChannels = !!settings.remoteVerified;
-    for (const def of MENUS) {
-      browser.contextMenus.create({ id: def.id, title: t(def.titleKey), contexts: def.contexts });
-      if (withChannels) {
-        browser.contextMenus.create({
-          id: `${def.id}-local`,
-          parentId: def.id,
-          title: t("menu.sendLocal"),
-          contexts: def.contexts,
-        });
-        browser.contextMenus.create({
-          id: `${def.id}-remote`,
-          parentId: def.id,
-          title: t("menu.sendRemote"),
-          contexts: def.contexts,
-        });
-      }
-    }
+    const errors = await rebuildMenus(browserMenus, menuItems(settings));
+    if (errors.length > 0) logWarn("[FluxDown] Failed to create context menus:", errors.join("; "));
   } catch (e) {
-    console.warn("[FluxDown] Failed to create context menus:", e);
+    logWarn("[FluxDown] Failed to create context menus:", e);
   }
+}
+
+/** 按设置列出全部菜单项：关闭右键菜单时为空；已验证远程服务器时每项下挂「本机 / 远程」子项。 */
+function menuItems(settings: FluxDownSettings): MenuItemSpec[] {
+  if (!settings.contextMenuEnabled) return [];
+  const items: MenuItemSpec[] = [];
+  for (const def of MENUS) {
+    items.push({ id: def.id, title: t(def.titleKey), contexts: def.contexts });
+    if (settings.remoteVerified) {
+      items.push({ id: `${def.id}-local`, parentId: def.id, title: t("menu.sendLocal"), contexts: def.contexts });
+      items.push({ id: `${def.id}-remote`, parentId: def.id, title: t("menu.sendRemote"), contexts: def.contexts });
+    }
+  }
+  return items;
 }
 
 function parseMenuId(menuItemId: string | number): { base: MenuBase; channel?: SendChannel } | null {
@@ -218,7 +232,7 @@ async function handleMenuClick(info: Browser.contextMenus.OnClickData, tab?: Bro
 /** 同步注册菜单点击监听（MV3 要求监听器在 SW 首次执行时注册）。 */
 export function installMenus(): void {
   browser.contextMenus?.onClicked?.addListener((info, tab) => {
-    handleMenuClick(info, tab).catch((e) => console.warn("[FluxDown] context menu failed:", e));
+    handleMenuClick(info, tab).catch((e) => logWarn("[FluxDown] context menu failed:", e));
   });
   // contextMenuEnabled / remoteVerified 变化后重建。
   onSettingsChanged(() => {

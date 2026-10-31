@@ -121,18 +121,18 @@ class WebhooksTest {
     // ── 读-改-写 ──
 
     /** 模拟主机：真实的 revision 校验；`cache` 可被固定成过期值（store 发布滞后）。 */
-    private class FakePort : WebhookConfigPort {
-        var server = WebhookConfigSnapshot(5, emptyMap())
-        var cache: WebhookConfigSnapshot? = null
+    private class FakePort : DaemonConfigPort {
+        var server = DaemonConfigSnapshot(5, emptyMap())
+        var cache: DaemonConfigSnapshot? = null
         var forcedConflicts = 0
         var concurrent: List<WebhookEndpoint> = emptyList()
         val patches = mutableListOf<Pair<Long, List<WebhookEndpoint>>>()
         var fetches = 0
         var failure: HostException? = null
 
-        override val cachedConfig: WebhookConfigSnapshot? get() = cache
+        override val cachedConfig: DaemonConfigSnapshot? get() = cache
 
-        override suspend fun fetchConfig(): WebhookConfigSnapshot {
+        override suspend fun fetchConfig(): DaemonConfigSnapshot {
             fetches += 1
             return server
         }
@@ -146,15 +146,15 @@ class WebhooksTest {
                 forcedConflicts -= 1
                 val current = WebhookEndpoint.parseList(server.values[WebhookEndpoint.CONFIG_KEY]) + concurrent
                 concurrent = emptyList()
-                server = WebhookConfigSnapshot(server.revision + 1, mapOf(WebhookEndpoint.CONFIG_KEY to WebhookEndpoint.encodeList(current)))
+                server = DaemonConfigSnapshot(server.revision + 1, mapOf(WebhookEndpoint.CONFIG_KEY to WebhookEndpoint.encodeList(current)))
                 throw HostException(HostErrorCode.Conflict)
             }
             if (expectedRevision != server.revision) throw HostException(HostErrorCode.Conflict)
-            server = WebhookConfigSnapshot(server.revision + 1, values)
+            server = DaemonConfigSnapshot(server.revision + 1, values)
         }
 
         fun seed(list: List<WebhookEndpoint>) {
-            server = WebhookConfigSnapshot(server.revision, mapOf(WebhookEndpoint.CONFIG_KEY to WebhookEndpoint.encodeList(list)))
+            server = DaemonConfigSnapshot(server.revision, mapOf(WebhookEndpoint.CONFIG_KEY to WebhookEndpoint.encodeList(list)))
             cache = server
         }
 

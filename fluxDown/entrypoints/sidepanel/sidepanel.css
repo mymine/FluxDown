@@ -70,6 +70,12 @@ body {
 .sp-diag-none { font-size: 12px; color: var(--fd-text-muted); }
 .sp-error { color: var(--fd-danger); }
 .sp-diag-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.sp-errlog-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; max-height: 360px; overflow-y: auto; }
+.sp-errlog-item { padding: 6px 0; font-size: 12px; }
+.sp-errlog-item + .sp-errlog-item { border-top: 1px solid var(--fd-border); }
+.sp-errlog-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--fd-text-muted); font-size: 11px; }
+.sp-errlog-msg { margin-top: 3px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.sp-errlog-actions { display: flex; align-items: center; gap: 6px; }
 
 .sp-rule + .sp-rule { border-top: 1px solid var(--fd-border); }
 .sp-rule-head { display: flex; align-items: center; gap: 6px; width: 100%; padding: 6px 0; border: none; background: transparent; cursor: pointer; text-align: left; font-size: 12px; }

@@ -29,3 +29,18 @@ describe('buildTaskMenu plugin commands', () => {
     expect(keys.includes('sep-delete')).toBe(true)
   })
 })
+
+describe('buildTaskMenu ignore plugin retry', () => {
+  const failed = { ...view, state: 'failed', errorMessage: '[插件] yt: boom', groupId: '' } as unknown as DownloadTaskView
+  const build = (v: DownloadTaskView) =>
+    buildTaskMenu({ t, views: [v], queues: [], queueName: (id: string) => id, showDetail: () => undefined }).map((entry) => entry.key)
+
+  test('standalone failed plugin task offers ignore-retry', () => {
+    expect(build(failed).includes('ignore-plugin-retry')).toBe(true)
+  })
+
+  test('task group member with plugin error does not', () => {
+    const member = { ...failed, groupId: 'g1' } as unknown as DownloadTaskView
+    expect(build(member).includes('ignore-plugin-retry')).toBe(false)
+  })
+})

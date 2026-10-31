@@ -185,7 +185,7 @@ struct DownloadsListScreen: View {
             if !editing {
                 TaskMenuItems(task: item.task, boosted: item.boosted, onSelect: { model.beginSelecting(with: item.id) })
                 #if FULL_FLAVOR
-                if PluginFailure.isIgnorable(status: item.task.status, errorMessage: item.task.errorMessage) {
+                if PluginFailure.isIgnorable(status: item.task.status, errorMessage: item.task.errorMessage, groupId: item.task.groupId) {
                     Section {
                         Button(L("taskIgnorePluginRetry"), systemImage: "puzzlepiece.extension") {
                             if actions.guardWritable() { ignoreRetryTaskId = item.id }

@@ -196,6 +196,7 @@ mod tests {
             match_mode: mode.to_owned(),
             extensions: extensions.iter().map(|ext| (*ext).to_owned()).collect(),
             regex_pattern: pattern.to_owned(),
+            url_pattern: String::new(),
             position: 0,
             visible: true,
             is_builtin: false,

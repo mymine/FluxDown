@@ -90,8 +90,12 @@ async fn download_baseline(
 ) -> Result<(i64, String), String> {
     use tokio::io::AsyncWriteExt;
 
-    let proxy = ProxyConfig::default();
-    let client = build_client(&proxy, ua).map_err(|e| format!("baseline build_client: {e}"))?;
+    // 下载 client 不自动跟随重定向（引擎逐跳跟随），基线请求用 reqwest 默认 client。
+    let client = reqwest::Client::builder()
+        .user_agent(ua)
+        .no_proxy()
+        .build()
+        .map_err(|e| format!("baseline client: {e}"))?;
 
     let resp = client
         .get(url)

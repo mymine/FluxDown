@@ -7,6 +7,32 @@ body {
   overflow: hidden;
 }
 
+/* 移动端浏览器（Firefox for Android 等）把 popup 显示为整屏页面：铺满视口。 */
+@media (hover: none) and (pointer: coarse) {
+  html,
+  body {
+    width: 100%;
+    height: 100%;
+  }
+
+  /* 触屏点击热区 ≥ 36–40px（桌面规则不受影响） */
+  .pp-status { min-height: 36px; padding: 6px 12px; font-size: 12px; }
+  .pp-header-right { gap: 14px; }
+  .pp-root .fd-toggle { width: 44px; height: 26px; }
+  .pp-root .fd-toggle-track { border-radius: 13px; }
+  .pp-root .fd-toggle-track::after { top: 3px; left: 3px; width: 20px; height: 20px; }
+  .pp-root .fd-toggle input:checked + .fd-toggle-track::after { transform: translateX(18px); }
+  .pp-root .fd-tab { min-height: 40px; padding-left: 14px; padding-right: 14px; }
+  .pp-root .fd-icon-btn { width: 40px; height: 40px; }
+  .pp-root .fd-row { min-height: 48px; }
+  .pp-root .fd-check { width: 20px; height: 20px; }
+  .pp-root .fd-menu button { min-height: 40px; }
+  .pp-root .fd-quick input { min-height: 40px; }
+  .pp-root .fd-quick .fd-btn { min-height: 40px; padding-left: 14px; padding-right: 14px; }
+  .pp-footer { padding: 4px 12px; }
+  .pp-link { min-height: 36px; padding: 6px 8px; font-size: 12px; }
+}
+
 #app {
   height: 100%;
 }
@@ -82,6 +108,8 @@ body {
 .pp-pane { display: flex; flex-direction: column; gap: 6px; }
 .pp-empty { padding: 14px 0; text-align: center; font-size: 12px; color: var(--fd-text-muted); }
 .pp-view-all { align-self: stretch; }
+/* Android：无任务列表，快速下载输入框置于资源列表上方 */
+.pp-quick { margin-bottom: 8px; }
 
 /* ===== 页脚 ===== */
 .pp-footer {
@@ -108,6 +136,7 @@ body {
 }
 .pp-link:hover:not(:disabled) { color: var(--fd-accent); }
 .pp-link:disabled { opacity: 0.5; cursor: wait; }
+.pp-bypass-hint { font-size: 11px; color: var(--fd-text-secondary); cursor: help; white-space: nowrap; }
 .pp-stats { display: inline-flex; align-items: center; gap: 4px; }
 .pp-stat-ok { color: var(--fd-success); }
 .pp-stat-fail { color: var(--fd-danger); }

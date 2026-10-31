@@ -12,6 +12,7 @@ import type { ViewDensity } from '../model/viewPrefs'
 import { SegmentProgress } from './SegmentProgress'
 import { kindLabel, relaxedMeta, statusDetail, statusLabel, taskStatusClass } from './text'
 import type { Translate } from './text'
+import { SourceBadge } from '../../share'
 
 /** 文件图标边长：常规与 GPUI 选择列紧凑档同为 `icon.lg`，宽松密度放进 32px 底块。 */
 const GLYPH_SIZE = 'var(--fx-icon-lg)'
@@ -91,7 +92,10 @@ export function StatusCell({ t, view, density }: { t: Translate; view: DownloadT
   const tooltip = failedError ? localizeTaskError(t, view.errorMessage) : twoLine ? undefined : (detail ?? undefined)
   return (
     <div className="tabular flex min-w-0 flex-col justify-center text-xs" title={tooltip}>
-      <div className={cn('truncate', taskStatusClass(view))}>{statusLabel(t, view)}</div>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className={cn('truncate', taskStatusClass(view))}>{statusLabel(t, view)}</span>
+        {view.source === 'local' ? <SourceBadge taskId={view.taskId} taskState={view.state} /> : null}
+      </div>
       {twoLine && detail ? <div className="truncate text-xs text-text-tertiary">{detail}</div> : null}
     </div>
   )

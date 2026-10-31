@@ -10,7 +10,8 @@ import { browser } from "wxt/browser";
 import type { Browser } from "wxt/browser";
 import { hostOf } from "@/rules/url";
 import { installConnectionDiagnostics } from "@/utils/connection-diagnostics-background";
-import { checkRemoteAvailable, effectiveRemoteMode } from "@/utils/download-dispatch";
+import { ERROR_LOG_TYPES, handleErrorLogMessage } from "@/utils/error-log-background";
+import { checkRemoteAvailable, effectiveRemoteMode, warmupNativeHost } from "@/utils/download-dispatch";
 import {
   nmhOpenFile,
   nmhRevealFile,
@@ -23,7 +24,7 @@ import { normalizeHlsPlaylist } from "@/utils/hls-playlist";
 import { buildMediaCandidates } from "@/utils/media-candidates";
 import { buildResourceDebugLog } from "@/utils/resource-debug-log";
 import { profileFor } from "@/utils/site-profiles";
-import { markAppUp } from "./breaker";
+import { armBypassClick, hasActiveBypass, isAppKnownDown, markAppUp, setBypassKeyHeld } from "./breaker";
 import {
   downloadCandidate,
   downloadResources,
@@ -32,9 +33,10 @@ import {
 } from "./downloads";
 import { showBrowserDownload } from "./browser-downloads";
 import { getCapabilities } from "./host";
-import { markPreempted } from "./intercept";
+import { isInterceptActive, markPreempted } from "./intercept";
 import { rememberServiceWorkerScope } from "./sw-scopes";
-import { scopeBelongsTo } from "@/utils/download-source";
+import { isReplayableUrl, scopeBelongsTo } from "@/utils/download-source";
+import { isLikelyDownloadClick } from "@/utils/settings";
 import type { PageConfig } from "@/page/bridge";
 import type {
   HostStatus,
@@ -218,7 +220,10 @@ const handlers: { [A in MessageAction]: Handler<A> } = {
       pageDot: settings.showPageDot && profile.pageDot,
       frameIsTop: frameId === 0,
       interceptMagnet: settings.enabled && settings.interceptMagnet && profile.intercept !== "never",
+      bypassKey: settings.enabled ? settings.bypassKey : "off",
+      warmOnLinkPress: settings.enabled && profile.intercept !== "never",
       sniffImages: settings.sniffImages,
+      sniffMaxResources: settings.sniffMaxResources,
       classify: engine.classifyRules(),
     };
     return config;
@@ -340,6 +345,31 @@ const handlers: { [A in MessageAction]: Handler<A> } = {
     if (tabId === undefined || typeof req.sid !== "string" || !req.sid) return { ok: false };
     await whenRestored();
     setSessionHooks(tabId, sender.frameId ?? 0, req.sid, req.hooks ?? null);
+    return { ok: true };
+  },
+
+  async bypassKey(req) {
+    setBypassKeyHeld(req.held === true);
+    return { ok: true };
+  },
+
+  async bypassClick(req, sender) {
+    armBypassClick(senderTabId(sender), typeof req.href === "string" && req.href ? req.href : undefined);
+    return { ok: true };
+  },
+
+  async linkPress(req, sender) {
+    // 浏览器要等对方响应头才把点击变成下载；像下载的点击先预热 NMH，App 冷启动与该等待并行。
+    // 只预热不接管：是否接管仍由拦截层按响应头决定。
+    const href = typeof req.href === "string" ? req.href : "";
+    if (!isReplayableUrl(href) || !isInterceptActive() || isAppKnownDown() || hasActiveBypass(href)) {
+      return { ok: true };
+    }
+    const [settings, profiles] = await Promise.all([getCachedSettings(), getCachedProfiles()]);
+    const pageUrl = sender.tab?.url || sender.url;
+    if (isLikelyDownloadClick(href, req.download === true, pageUrl, settings, profiles)) {
+      warmupNativeHost();
+    }
     return { ok: true };
   },
 
@@ -608,6 +638,9 @@ export function installMessages(): void {
   async function handleMessage(message: TypedMessage, sender: Sender): Promise<unknown> {
     if (message.type === "diagnostics-record" || message.type === "diagnostics-export") {
       return handleDiagnostics({ type: message.type, event: message.event }, sender);
+    }
+    if (typeof message.type === "string" && ERROR_LOG_TYPES.includes(message.type)) {
+      return handleErrorLogMessage(message, sender);
     }
     const typed = await handleTypeMessage(message);
     if (typed !== undefined) return typed;

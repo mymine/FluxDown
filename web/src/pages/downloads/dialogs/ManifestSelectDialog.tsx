@@ -113,6 +113,7 @@ export function ManifestSelectDialog({
         extraHeaders: Object.keys(base.headers).length > 0 ? base.headers : undefined,
         ignoreTlsErrors: base.ignoreTlsErrors,
         startPaused,
+        resolverPluginId: preview.pluginId || undefined,
         items: buildManifestGroupItems(items, selected),
       })
       onCreated()

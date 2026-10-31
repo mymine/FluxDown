@@ -3,8 +3,21 @@
     "name": "first matching rule with a directory wins in order",
     "route": {
       "rules": [
-        { "matchMode": "extension", "extensions": ["mp4", "mkv"], "saveDir": "/videos" },
-        { "matchMode": "extension", "extensions": ["mp4"], "saveDir": "/second" }
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "mp4",
+            "mkv"
+          ],
+          "saveDir": "/videos"
+        },
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "mp4"
+          ],
+          "saveDir": "/second"
+        }
       ]
     },
     "fileName": "Movie.MP4",
@@ -15,8 +28,19 @@
     "name": "matched rule without a directory skips to the next matching rule",
     "route": {
       "rules": [
-        { "matchMode": "extension", "extensions": ["pdf"] },
-        { "matchMode": "extension", "extensions": ["pdf"], "saveDir": "/books" }
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "pdf"
+          ]
+        },
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "pdf"
+          ],
+          "saveDir": "/books"
+        }
       ]
     },
     "fileName": "a.pdf",
@@ -26,7 +50,14 @@
   {
     "name": "matched rule without a directory blocks the other fallback",
     "route": {
-      "rules": [{ "matchMode": "extension", "extensions": ["pdf"] }],
+      "rules": [
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "pdf"
+          ]
+        }
+      ],
       "otherDir": "/other"
     },
     "fileName": "a.pdf",
@@ -36,7 +67,14 @@
   {
     "name": "other directory applies when no rule matches",
     "route": {
-      "rules": [{ "matchMode": "extension", "extensions": ["mp4"] }],
+      "rules": [
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "mp4"
+          ]
+        }
+      ],
       "otherDir": "/other"
     },
     "fileName": "setup.exe",
@@ -46,7 +84,15 @@
   {
     "name": "extensions may be written with a leading dot",
     "route": {
-      "rules": [{ "matchMode": "extension", "extensions": [".jpg"], "saveDir": "/pictures" }]
+      "rules": [
+        {
+          "matchMode": "extension",
+          "extensions": [
+            ".jpg"
+          ],
+          "saveDir": "/pictures"
+        }
+      ]
     },
     "fileName": "photo.JPG",
     "url": "",
@@ -55,7 +101,15 @@
   {
     "name": "url segment fills a name without extension",
     "route": {
-      "rules": [{ "matchMode": "extension", "extensions": ["flac"], "saveDir": "/music" }]
+      "rules": [
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "flac"
+          ],
+          "saveDir": "/music"
+        }
+      ]
     },
     "fileName": "",
     "url": "https://x.test/a/My%20Song.flac?x=1",
@@ -64,7 +118,15 @@
   {
     "name": "query parameters are not a file name",
     "route": {
-      "rules": [{ "matchMode": "extension", "extensions": ["jpg"], "saveDir": "/pictures" }]
+      "rules": [
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "jpg"
+          ],
+          "saveDir": "/pictures"
+        }
+      ]
     },
     "fileName": "",
     "url": "https://pbs.twimg.com/media/abc?format=jpg&name=orig",
@@ -74,8 +136,21 @@
     "name": "final name decides even when the url looked like a playlist",
     "route": {
       "rules": [
-        { "matchMode": "extension", "extensions": ["m3u8", "ts"], "saveDir": "/streams" },
-        { "matchMode": "extension", "extensions": ["mp4"], "saveDir": "/videos" }
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "m3u8",
+            "ts"
+          ],
+          "saveDir": "/streams"
+        },
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "mp4"
+          ],
+          "saveDir": "/videos"
+        }
       ]
     },
     "fileName": "clip.mp4",
@@ -86,8 +161,16 @@
     "name": "regex matches case-insensitively and invalid regex never matches",
     "route": {
       "rules": [
-        { "matchMode": "regex", "regexPattern": "(", "saveDir": "/bad" },
-        { "matchMode": "regex", "regexPattern": "^ubuntu-.*\\.iso$", "saveDir": "/iso" }
+        {
+          "matchMode": "regex",
+          "regexPattern": "(",
+          "saveDir": "/bad"
+        },
+        {
+          "matchMode": "regex",
+          "regexPattern": "^ubuntu-.*\\.iso$",
+          "saveDir": "/iso"
+        }
       ]
     },
     "fileName": "Ubuntu-24.04.ISO",
@@ -97,7 +180,13 @@
   {
     "name": "empty regex never matches",
     "route": {
-      "rules": [{ "matchMode": "regex", "regexPattern": "", "saveDir": "/all" }],
+      "rules": [
+        {
+          "matchMode": "regex",
+          "regexPattern": "",
+          "saveDir": "/all"
+        }
+      ],
       "otherDir": "/other"
     },
     "fileName": "a.bin",
@@ -106,9 +195,191 @@
   },
   {
     "name": "nothing to match without any name",
-    "route": { "otherDir": "/other" },
+    "route": {
+      "otherDir": "/other"
+    },
     "fileName": "",
     "url": "https://x.test/download",
     "expected": null
+  },
+  {
+    "name": "url wildcard matches the whole url",
+    "route": {
+      "rules": [
+        {
+          "matchMode": "url",
+          "urlPattern": "https://example.com/*",
+          "saveDir": "/site"
+        }
+      ]
+    },
+    "fileName": "a.zip",
+    "url": "https://example.com/downloads/a.zip?token=1",
+    "expected": "/site"
+  },
+  {
+    "name": "url wildcard matches case-insensitively and single chars with ?",
+    "route": {
+      "rules": [
+        {
+          "matchMode": "url",
+          "urlPattern": "HTTPS://X.TEST/file?.zip",
+          "saveDir": "/site"
+        }
+      ]
+    },
+    "fileName": "",
+    "url": "https://x.test/file1.zip",
+    "expected": "/site"
+  },
+  {
+    "name": "url wildcard is anchored and ? matches exactly one char",
+    "route": {
+      "rules": [
+        {
+          "matchMode": "url",
+          "urlPattern": "https://x.test/file?.zip",
+          "saveDir": "/site"
+        }
+      ],
+      "otherDir": "/other"
+    },
+    "fileName": "",
+    "url": "https://evil.test/https://x.test/file12.zip",
+    "expected": "/other"
+  },
+  {
+    "name": "url rule wins when it comes first regardless of extension match",
+    "route": {
+      "rules": [
+        {
+          "matchMode": "url",
+          "urlPattern": "https://mirror.test/*",
+          "saveDir": "/mirror"
+        },
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "zip"
+          ],
+          "saveDir": "/archives"
+        }
+      ]
+    },
+    "fileName": "a.zip",
+    "url": "https://mirror.test/a.zip",
+    "expected": "/mirror"
+  },
+  {
+    "name": "url rule wins regardless of its position in the list",
+    "route": {
+      "rules": [
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "zip"
+          ],
+          "saveDir": "/archives"
+        },
+        {
+          "matchMode": "url",
+          "urlPattern": "https://mirror.test/*",
+          "saveDir": "/mirror"
+        }
+      ]
+    },
+    "fileName": "a.zip",
+    "url": "https://mirror.test/a.zip",
+    "expected": "/mirror"
+  },
+  {
+    "name": "url rule with an empty directory only blocks the other fallback",
+    "route": {
+      "rules": [
+        {
+          "matchMode": "url",
+          "urlPattern": "https://nokeep.test/*"
+        },
+        {
+          "matchMode": "extension",
+          "extensions": [
+            "zip"
+          ],
+          "saveDir": "/archives"
+        }
+      ],
+      "otherDir": "/other"
+    },
+    "fileName": "setup.exe",
+    "url": "https://nokeep.test/setup.exe",
+    "expected": null
+  },
+  {
+    "name": "empty or invalid url patterns never match",
+    "route": {
+      "rules": [
+        {
+          "matchMode": "url",
+          "urlPattern": "",
+          "saveDir": "/empty"
+        },
+        {
+          "matchMode": "url",
+          "urlPattern": "   ",
+          "saveDir": "/blank"
+        }
+      ],
+      "otherDir": "/other"
+    },
+    "fileName": "",
+    "url": "https://x.test/a.bin",
+    "expected": "/other"
+  },
+  {
+    "name": "url rule still matches when the file name is unknown",
+    "route": {
+      "rules": [
+        {
+          "matchMode": "url",
+          "urlPattern": "https://x.test/download/*",
+          "saveDir": "/site"
+        }
+      ]
+    },
+    "fileName": "",
+    "url": "https://x.test/download/blob",
+    "expected": "/site"
+  },
+  {
+    "name": "unknown file name with unmatched url rules stays unrouted",
+    "route": {
+      "rules": [
+        {
+          "matchMode": "url",
+          "urlPattern": "https://other.test/*",
+          "saveDir": "/site"
+        }
+      ],
+      "otherDir": "/other"
+    },
+    "fileName": "",
+    "url": "https://x.test/download/blob",
+    "expected": null
+  },
+  {
+    "name": "url rule does not match a different host",
+    "route": {
+      "rules": [
+        {
+          "matchMode": "url",
+          "urlPattern": "https://*.example.com/*",
+          "saveDir": "/site"
+        }
+      ],
+      "otherDir": "/other"
+    },
+    "fileName": "a.zip",
+    "url": "https://example.com/a.zip",
+    "expected": "/other"
   }
 ]

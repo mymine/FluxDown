@@ -18,6 +18,8 @@ import type { CaptureState } from "./capture-logic";
 import { parsePageScriptSource, parsePageScriptsIndex } from "./page-scripts/model";
 import type { PageScriptSource, PageScriptsIndex } from "./page-scripts/model";
 import type { HostCapabilities, HostSyncStatus, ResolverInfo } from "./protocol";
+import { logWarn } from "@/utils/error-log";
+import { isAndroidPlatform } from "@/utils/platform";
 
 const CAPABILITIES_TTL_MS = 60_000;
 /** 未连接时的结果只缓存很短时间，App 一启动就能被感知。 */
@@ -88,6 +90,8 @@ async function probeCapabilities(): Promise<HostCapabilities> {
     const connected = await checkFluxDownAvailable().catch(() => false);
     return { ...PROTOCOL_ONE_OFFLINE, connected };
   }
+  // Android：本机通道是 Intent 唤起 App（单向投递，没有能力协议），视为可投递。
+  if (await isAndroidPlatform()) return { ...PROTOCOL_ONE_OFFLINE, connected: true };
 
   const reply = await nmhCall<CapabilitiesData>("capabilities", {});
   if (reply.success) {
@@ -154,7 +158,7 @@ export function getCapabilities(force = false): Promise<HostCapabilities> {
         try {
           listener(value);
         } catch (e) {
-          console.warn("[FluxDown] capabilities listener failed:", e);
+          logWarn("[FluxDown] capabilities listener failed:", e);
         }
       }
       return value;
@@ -239,7 +243,12 @@ const PLUGIN_INVOKE_TIMEOUT_MS = 90_000;
  * 同插件的调用在其专用端口内排队，空闲 30 s 自动断开。
  */
 const invokePool: DedicatedPool = createDedicatedPool({
-  connect: () => browser.runtime.connectNative(NMH_NAME) as NmhPortLike,
+  connect: () => {
+    const port = browser.runtime.connectNative(NMH_NAME);
+    // 主机退出等被动断开的原因在 runtime.lastError；不读会被记为 Unchecked 错误（池只关心断开本身）。
+    port.onDisconnect.addListener(() => void browser.runtime.lastError);
+    return port as NmhPortLike;
+  },
 });
 
 export type InvokeReply = { ok: true; value: unknown } | { ok: false; message: string };

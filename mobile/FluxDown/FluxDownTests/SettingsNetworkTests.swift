@@ -83,7 +83,7 @@ struct SettingsNetworkTests {
         #expect(unloaded == [.siteAuth, .siteAuthAdd, .siteAuthClear])
 
         let none = NetworkRow.visible(mode: .none, isLoaded: true)
-        #expect(none == [.mode, .siteAuth, .siteAuthAdd, .siteAuthClear])
+        #expect(none == [.mode, .rules, .rulesAdd, .rulesTest, .siteAuth, .siteAuthAdd, .siteAuthClear])
         #expect(NetworkRow.visible(mode: .system, isLoaded: true) == none)
         #expect(NetworkRow.visible(mode: .auto, isLoaded: true) == none)
 

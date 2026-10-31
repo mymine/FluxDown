@@ -17,30 +17,30 @@ const t = pricing[lang].compare;
     <span>{figTag ?? t.figTag}</span>
     <span>{t.figCaption}</span>
   </figcaption>
-  <table class="w-full min-w-[520px] border-collapse text-left text-sm">
+  <table class="w-full border-collapse text-left text-sm sm:min-w-[520px]">
     <thead>
       <tr class="border-b border-line font-mono text-[11px] uppercase tracking-[0.12em] text-subtle">
-        <th scope="col" class="w-[46%] px-5 py-3 font-medium">{t.feature}</th>
-        <th scope="col" class="px-5 py-3 font-medium">{t.free}</th>
-        <th scope="col" class="px-5 py-3 font-medium text-accent-ink">{t.paid}</th>
+        <th scope="col" class="w-[36%] py-3 pl-3 pr-2 font-medium sm:w-[46%] sm:px-5">{t.feature}</th>
+        <th scope="col" class="px-2 py-3 font-medium sm:px-5">{t.free}</th>
+        <th scope="col" class="px-2 py-3 font-medium text-accent-ink sm:px-5">{t.paid}</th>
       </tr>
     </thead>
     <tbody>
       {
         t.rows.map((row) => (
           <tr class="border-b border-line last:border-b-0 transition-colors hover:bg-sunken">
-            <th scope="row" class="px-5 py-3.5 font-medium">
+            <th scope="row" class="py-3.5 pl-3 pr-2 font-medium sm:px-5">
               {row.label}
             </th>
             {[row.free, row.paid].map((value, i) =>
               value === "—" ? (
-                <td class="px-5 py-3.5 text-subtle">
+                <td class="px-2 py-3.5 text-subtle sm:px-5">
                   <Minus size={14} aria-hidden="true" />
                   <span class="sr-only">{t.none}</span>
                 </td>
               ) : (
-                <td class:list={["px-5 py-3.5", i === 0 ? "text-muted" : "text-fg"]}>
-                  <span class="inline-flex items-center gap-2">
+                <td class:list={["px-2 py-3.5 sm:px-5", i === 0 ? "text-muted" : "text-fg"]}>
+                  <span class="inline-flex items-center gap-1.5 sm:gap-2">
                     <Check size={14} className="shrink-0 text-accent" aria-hidden="true" />
                     {value}
                   </span>

@@ -12,13 +12,17 @@
 //! - gpui 的 `hover` 每个元素只能设置一次：本 crate 返回的按钮 / 行已设置悬停，调用方不得再 `.hover()`。
 //!   本 crate 按钮的底色悬停 / 按下 / 选中由 [`crate::StateLayer`] 过渡绘制，调用方也不得再 `.active()` 改底色。
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     AnyElement, App, Bounds, BoxShadow, Div, ElementId, FontWeight, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement as _,
-    Styled, Window, div, point, prelude::FluentBuilder as _, px, size,
+    IntoElement, ParentElement, Pixels, RenderOnce, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, div, linear_color_stop, linear_gradient,
+    point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{
     ActiveTheme as _, Sizable as _, Size,
@@ -115,6 +119,9 @@ type TabSelect = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 ///
 /// 选中白底是一块随选中项滑动的底块（弹簧驱动，宽度同步过渡），标签文字色同步淡变。
 /// 底块按上一帧量得的标签位置定位；首帧尚无测量时由选中项自己画底，下一帧交给底块。
+///
+/// 容器放不下全部标签时（如窄侧栏里的 BT 详情）轨道收缩到可用宽度，标签行横向滚动：
+/// 纵向滚轮同样横滚，被裁一侧显示渐隐提示，选中项变化时自动滚入视野。
 pub fn segmented_tabs(
     id: impl Into<ElementId>,
     labels: impl IntoIterator<Item = SharedString>,
@@ -127,15 +134,18 @@ pub fn segmented_tabs(
     let colors = tokens.colors;
     let control = theme.density().control;
     let tab_radius = theme.components().tab_radius;
+    let track = theme.extended().colors.nav_hover;
 
     div()
         .flex()
-        .flex_none()
+        .flex_shrink(1.)
+        .min_w_0()
+        .max_w_full()
         .items_center()
         .h(control)
         .p(px(2.))
         .rounded(tab_radius + px(1.))
-        .bg(theme.extended().colors.nav_hover)
+        .bg(track)
         .child(SegmentedTabs {
             id: id.into(),
             labels: labels.into_iter().collect(),
@@ -151,6 +161,8 @@ pub fn segmented_tabs(
                 foreground: colors.foreground,
                 muted_foreground: colors.muted_foreground,
                 ring: colors.ring,
+                track,
+                fade_width: tokens.spacing.xl,
                 shadow: tokens.shadow.sm.clone(),
             },
         })
@@ -166,15 +178,33 @@ struct SegmentedStyle {
     foreground: Hsla,
     muted_foreground: Hsla,
     ring: Hsla,
+    /// 轨道底色：横向溢出时两端渐隐从它过渡到透明。
+    track: Hsla,
+    fade_width: Pixels,
     shadow: Vec<BoxShadow>,
 }
 
-/// 上一帧量得的各标签相对首个标签的 `(左缘, 宽度)`，由标签行的 `on_children_prepainted`
-/// 写入。放在元素状态而非实体里（不被依赖追踪），所以测量值变化时由写入方自己请求一帧，
-/// 让所在视图按新几何重建（首帧、标签增减、改字号 / 语言）；只存相对值，窗口缩放与滚动
-/// 不会触发重建。
+/// 分段标签的跨帧元素状态（放在元素状态而非实体里，不被依赖追踪，变化时由写入方自己请求一帧）。
+///
+/// - `tabs`：上一帧量得的各标签相对首个标签的 `(左缘, 宽度)`，由标签行的
+///   `on_children_prepainted` 写入（首帧、标签增减、改字号 / 语言时变化）；只存相对值，
+///   窗口缩放与滚动不会触发重建。
+/// - `scroll`：标签行横向滚动句柄；`revealed`：已滚入视野的选中项，选中变化时重新滚动。
+/// - `fades`：本帧渲染的左右渐隐，prepaint 按实际滚动位置复核，不符时请求下一帧。
 #[derive(Clone, Default)]
-struct SegmentGeometry(Rc<RefCell<Vec<(Pixels, Pixels)>>>);
+struct SegmentGeometry {
+    tabs: Rc<RefCell<Vec<(Pixels, Pixels)>>>,
+    scroll: ScrollHandle,
+    revealed: Rc<Cell<Option<usize>>>,
+    fades: Rc<Cell<(bool, bool)>>,
+}
+
+/// 按滚动位置判定两端是否有被裁的标签（半像素容差，避免亚像素抖动反复切换）。
+fn scroll_fades(scroll: &ScrollHandle) -> (bool, bool) {
+    let scrolled = -scroll.offset().x;
+    let max = scroll.max_offset().x;
+    (scrolled > px(0.5), scrolled < max - px(0.5))
+}
 
 #[derive(IntoElement)]
 struct SegmentedTabs {
@@ -207,7 +237,7 @@ impl RenderOnce for SegmentedTabs {
             // 选中项的底块外框；尚无测量（首帧）或与标签数不符时本帧由选中项自己画底，
             // 测量写入后会请求下一帧交给底块。
             let highlight = {
-                let tabs = geometry.0.borrow();
+                let tabs = geometry.tabs.borrow();
                 tabs.get(selected)
                     .filter(|_| tabs.len() == count)
                     .map(|&(left, width)| {
@@ -228,8 +258,49 @@ impl RenderOnce for SegmentedTabs {
         });
 
         let has_highlight = highlight.is_some();
-        div()
+        let scroll = geometry.scroll.clone();
+        // 选中项变化（含首次渲染）时把它最小幅度滚入视野；需要上一帧的测量与视口宽度。
+        if geometry.revealed.get() != Some(selected)
+            && let Some(bounds) = highlight
+        {
+            let viewport = scroll.bounds().size.width;
+            let max = scroll.max_offset().x;
+            if viewport > px(0.) {
+                let current = -scroll.offset().x;
+                let (left, right) = (bounds.left(), bounds.right());
+                let target = if left < current {
+                    left
+                } else if right > current + viewport {
+                    right - viewport
+                } else {
+                    current
+                };
+                let target = target.clamp(px(0.), max.max(px(0.)));
+                if target != current {
+                    scroll.set_offset(point(-target, px(0.)));
+                }
+                geometry.revealed.set(Some(selected));
+            }
+        }
+        let (fade_left, fade_right) = scroll_fades(&scroll);
+        geometry.fades.set((fade_left, fade_right));
+        let fade = |left: bool| {
+            let (from, to) = (style.track, style.track.opacity(0.));
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .w(style.fade_width)
+                .map(|this| if left { this.left_0() } else { this.right_0() })
+                .bg(linear_gradient(
+                    if left { 90. } else { 270. },
+                    linear_color_stop(from, 0.),
+                    linear_color_stop(to, 1.),
+                ))
+        };
+        let content = div()
             .relative()
+            .flex_none()
             .h_full()
             .when_some(highlight, |this, bounds| {
                 this.child(
@@ -250,8 +321,9 @@ impl RenderOnce for SegmentedTabs {
                             .iter()
                             .map(|tab| (tab.origin.x - origin, tab.size.width))
                             .collect();
-                        let mut tabs = geometry.0.borrow_mut();
-                        if *tabs != measured {
+                        let mut tabs = geometry.tabs.borrow_mut();
+                        let fades = scroll_fades(&geometry.scroll);
+                        if *tabs != measured || geometry.fades.get() != fades {
                             *tabs = measured;
                             window.request_animation_frame();
                         }
@@ -266,6 +338,7 @@ impl RenderOnce for SegmentedTabs {
                                     SharedString::from(format!("{id}-tab")),
                                     index as u64,
                                 ))
+                                .flex_none()
                                 .h(style.height)
                                 .px(style.padding_x)
                                 .flex()
@@ -295,7 +368,23 @@ impl RenderOnce for SegmentedTabs {
                                 .child(label)
                         },
                     )),
+            );
+        div()
+            .relative()
+            .flex_shrink(1.)
+            .min_w_0()
+            .h_full()
+            .child(
+                div()
+                    .id(ElementId::from(SharedString::from(format!("{id}-scroll"))))
+                    .flex()
+                    .size_full()
+                    .overflow_x_scroll()
+                    .track_scroll(&scroll)
+                    .child(content),
             )
+            .when(fade_left, |this| this.child(fade(true)))
+            .when(fade_right, |this| this.child(fade(false)))
     }
 }
 

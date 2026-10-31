@@ -1,20 +1,24 @@
 /**
  * Release 下载入口（仅 302，不代理文件流量）。
- * 镜像 = dl-cn（Cloudflare Worker / 备案后阿里云 CDN，私有 OSS 回源，不能回退 GitHub），302 前必须确认 OSS 有该资产且大小一致。
- * 只有中国大陆访客（ip2region 按 X-Client-IP 判定）且像正常客户端（24 小时内读过发布清单、
- * 非脚本 User-Agent，见 download-gate.ts）才走镜像；其余访客、脚本与镜像缺资产时走 GitHub。
- * source=github：仅 GitHub；source=oss：可走镜像的访客在镜像不可用时返回 503，其余同 auto。
+ * 下载源优先级：123 云盘直链（仅应用内更新）→ dl-cn 镜像（中国大陆访客）→ GitHub。
+ * 两个镜像都不能回退 GitHub，302 前必须确认镜像有该资产且大小与 GitHub 资产一致。
+ * 镜像只发给像正常客户端的请求（24 小时内读过发布清单、非脚本 User-Agent，见 download-gate.ts）；
+ * 浏览器等非更新器请求还须带验证码通行证 Cookie（ESA AI 验证码换取，见 download-pass.ts / pass.ts）。
+ * 大陆按边缘（阿里云 ESA）判定的访客国家（X-Client-Country = CN，见 client-ip.ts）判定。
+ * 123 另外要求（不分地区）：≥ 0.6.0 更新器 User-Agent（isPan123Updater）、资产在当前更新清单里
+ * （isUpdateAsset）、该 IP 未超签发配额（hasPan123Quota）；官网浏览器下载不走 123。
+ * source=github：仅 GitHub；source=oss：大陆准入访客在镜像都不可用时返回 503，其余同 auto。
  */
 import type { APIRoute } from "astro";
-import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
+import { DOWNLOAD_PASS_SECRET, GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
 import { getCached, setCached } from "@/lib/api-cache";
-import { getClientIp } from "@/lib/client-ip";
-import { recordDownload } from "@/lib/download-ban";
-import { mayUseMirror } from "@/lib/download-gate";
-import { isMainlandChinaIp } from "@/lib/geoip";
+import { getClientCountry, getClientIp } from "@/lib/client-ip";
+import { readDownloadPass, verifyDownloadPass } from "@/lib/download-pass";
+import { hasPan123Quota, isPan123Updater, isUpdateAsset, mayUseMirror, recordPan123Link } from "@/lib/download-gate";
 import { cdnConfigured, cdnDownloadUrl, ossConfigured, presignOssHeadUrl, releaseObjectKey } from "@/lib/oss";
 import { DownloadLookupCache } from "@/lib/download-cache";
 import { createOssProbe } from "@/lib/download-probe";
+import { pan123Configured, pan123DownloadUrl } from "@/lib/pan123";
 import {
   DownloadLookupError,
   downloadRedirect,
@@ -107,19 +111,11 @@ export const GET: APIRoute = async ({ params, url, request, clientAddress }) => 
   const tag = url.searchParams.get("tag")?.trim() || "";
   const source = downloadSource(url.searchParams.get("source"));
   const ip = getClientIp(request, clientAddress);
-  const banned = recordDownload(ip, `${tag}/${filename}`);
-  if (banned > 0) {
-    return new Response(JSON.stringify({ error: "Too many downloads from this IP; try again later." }), {
-      status: 429,
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "no-store",
-        "Retry-After": String(Math.ceil(banned / 1000)),
-      },
-    });
-  }
-  const wantsMirror = source !== "github" && isMainlandChinaIp(ip) &&
-    mayUseMirror(ip, request.headers.get("user-agent"));
+  const userAgent = request.headers.get("user-agent");
+  const hasPass = !DOWNLOAD_PASS_SECRET || verifyDownloadPass(DOWNLOAD_PASS_SECRET, readDownloadPass(request), ip);
+  const admitted = source !== "github" && mayUseMirror(ip, userAgent, hasPass);
+  const wantsMirror = admitted && getClientCountry(request) === "CN";
+  const wantsPan123 = admitted && isPan123Updater(userAgent);
 
   try {
     const { value: releases, stale } = await releaseCache().lookup(
@@ -137,11 +133,20 @@ export const GET: APIRoute = async ({ params, url, request, clientAddress }) => 
       return jsonError(404, `Asset "${filename}" not found in release "${release.tag_name}"`);
     }
 
-    // 只有 GitHub 新鲜元数据确认的 tag + asset 才有资格获得 CDN 签名；HEAD 结果缓存 1h。
+    // 只有 GitHub 新鲜元数据确认的 tag + asset 才有资格获得镜像链接；探测结果按资产缓存。
     // 过期缓存只允许 GitHub 公共 URL：撤回/转草稿后由 GitHub 自身拒绝访问。
-    if (wantsMirror && cdnConfigured && ossConfigured && !stale) {
+    if (!stale && (wantsPan123 || wantsMirror)) {
       const key = releaseObjectKey(release.tag_name, asset.name);
-      if (await ossHasAsset(key, asset.size)) return downloadRedirect(cdnDownloadUrl(key), "cdn");
+      if (wantsPan123 && pan123Configured && isUpdateAsset(release.tag_name, asset.name) && hasPan123Quota(ip)) {
+        const link = await pan123DownloadUrl(key, asset.size);
+        if (link) {
+          recordPan123Link(ip);
+          return downloadRedirect(link, "pan123");
+        }
+      }
+      if (wantsMirror && cdnConfigured && ossConfigured && await ossHasAsset(key, asset.size)) {
+        return downloadRedirect(cdnDownloadUrl(key), "cdn");
+      }
     }
     if (source === "oss" && wantsMirror) return ossUnavailable();
     return downloadRedirect(asset.browser_download_url, "github", stale);

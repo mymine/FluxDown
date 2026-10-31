@@ -46,6 +46,17 @@ struct SnapshotMappingTests {
         #expect(snapshot.taskTotal == 0)
     }
 
+    @Test func categoryMappingCarriesUrlPattern() {
+        let dto = CategoryDto(
+            id: "site", name: "Site", icon: "globe", extensions: [], regexPattern: "",
+            urlPattern: "https://*.example.com/*", position: 2, visible: true, builtinType: nil
+        )
+        let category = dto.domain
+        #expect(category.urlPattern == "https://*.example.com/*")
+        #expect(category.regexPattern.isEmpty)
+        #expect(category.id == "site")
+    }
+
     @MainActor
     @Test func loadingFlagReachesTheStoreAndClearsOnTheCompleteSnapshot() {
         let store = HostStore()

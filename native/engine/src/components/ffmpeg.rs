@@ -284,10 +284,11 @@ mod install {
         egress: &crate::egress::Egress,
     ) -> Result<FfmpegVersions, ComponentError> {
         let plat = platform_tag().ok_or(ComponentError::Unsupported)?;
-        let client = super::super::egress_client(egress).await?;
+        let clients = super::super::egress_clients(egress).await?;
         let mirror_base = super::super::component_mirror_base(db).await;
         let release =
-            super::super::fetch_versions_json(&client, "ffmpeg", RELEASE_API, &mirror_base).await?;
+            super::super::fetch_versions_json(&clients, "ffmpeg", RELEASE_API, &mirror_base)
+                .await?;
         let empty = Vec::new();
         let assets = release["assets"].as_array().unwrap_or(&empty);
         let mut versions: Vec<String> = assets
@@ -316,12 +317,13 @@ mod install {
         progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<FfmpegStatus, ComponentError> {
         let plat = platform_tag().ok_or(ComponentError::Unsupported)?;
-        let client = super::super::egress_client(egress).await?;
+        let clients = super::super::egress_clients(egress).await?;
         let mirror_base = super::super::component_mirror_base(db).await;
         // latest release 端点与 list_versions 相同，复用同一条镜像优先链路
         // （官网镜像 → 用户配置镜像 → 直连 GitHub），675#1 无需额外维护第二套回退。
         let release =
-            super::super::fetch_versions_json(&client, "ffmpeg", RELEASE_API, &mirror_base).await?;
+            super::super::fetch_versions_json(&clients, "ffmpeg", RELEASE_API, &mirror_base)
+                .await?;
         let empty = Vec::new();
         let assets = release["assets"].as_array().unwrap_or(&empty);
 
@@ -359,7 +361,7 @@ mod install {
         super::super::require_upstream_asset_url(&sums_url, UPSTREAM_DOWNLOAD_PREFIX)?;
         // 校验和是完整性锚：只走代理，不交给插件改写。
         let expected_sha256 =
-            super::super::fetch_expected_sha256(&client, &sums_url, &mirror_base, &asset_name)
+            super::super::fetch_expected_sha256(&clients, &sums_url, &mirror_base, &asset_name)
                 .await?;
 
         // 流式下载到 bin/ 下的临时文件。
@@ -375,7 +377,7 @@ mod install {
         let archive_path = bin_dir.join(format!("ffmpeg.download.{archive_ext}"));
         let route = egress.route_verified(&url).await;
         super::super::download_to_file(
-            &client,
+            &clients,
             &route,
             &mirror_base,
             &archive_path,

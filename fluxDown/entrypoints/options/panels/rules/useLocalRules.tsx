@@ -25,6 +25,7 @@ import { issueText } from "../../lib/rule-issue";
 import { ConfirmModal } from "../../parts";
 import { RuleEditorModal } from "./RuleEditorModal";
 import type { TesterBinding } from "./RuleTester";
+import { logError } from "@/utils/error-log";
 
 interface UseLocalRulesOptions {
   rules: SniffRuleV1[];
@@ -150,7 +151,7 @@ export function useLocalRules(opts: UseLocalRulesOptions): LocalRulesApi {
       }
       commitImport(parsed.accepted, parsed.rejected);
     } catch (e) {
-      console.error("[FluxDown Options] import local rules failed:", e);
+      logError("[FluxDown Options] import local rules failed:", e);
       showToast(t("rules.local.importInvalid", { message: e instanceof Error ? e.message : String(e) }), "error");
     }
   };

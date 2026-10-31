@@ -6,7 +6,7 @@
 use std::{collections::HashMap, ops::Range, rc::Rc, sync::Arc};
 
 use fluxdown_protocol::{ViewEventDto, ViewNode};
-use fluxdown_ui_components::ControlExt as _;
+use fluxdown_ui_components::{BusyExt as _, ControlExt as _};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Div, ElementId, Entity, Focusable as _,
@@ -685,7 +685,7 @@ fn button_node(node: &ViewNode, env: &RenderEnv<'_>) -> AnyElement {
     let node_id = node.id.clone();
     let button = Button::new(element_id(env, node))
         .label(str_prop(node, "text").to_owned())
-        .loading(bool_prop(node, "loading"))
+        .busy(bool_prop(node, "loading"))
         .disabled(bool_prop(node, "disabled"))
         .on_click(move |_: &ClickEvent, _, cx| emit(&host, &node_id, event("press"), cx));
     match enum_prop(node, "variant", "outline") {

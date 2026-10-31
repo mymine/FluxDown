@@ -23,16 +23,19 @@ export function SettingsPage({
   title,
   description,
   tabs,
+  initialTabId,
   children,
 }: {
   title: string
   description: string
   tabs?: readonly SettingsTabDef[]
+  /** 首次显示的子 Tab（深链接进入时指定）；缺省为第一个。 */
+  initialTabId?: string
   children?: ReactNode
 }) {
   const t = useT()
   const mobile = useIsMobile()
-  const [tabId, setTabId] = useState<string>(tabs?.[0]?.id ?? '')
+  const [tabId, setTabId] = useState<string>(initialTabId ?? tabs?.[0]?.id ?? '')
   const activeTab = tabs?.find((tab) => tab.id === tabId) ?? tabs?.[0]
   const error = useSettingsError()
   const readOnly = useSettingsReadOnly()

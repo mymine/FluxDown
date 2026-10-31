@@ -45,6 +45,8 @@ struct FileStamp {
 }
 
 struct CachedScript {
+    /// 缓存对应的插件包修订号；与当前不同即视为过期（更新后绝不返回旧内容）。
+    revision: u64,
     stamps: Vec<FileStamp>,
     /// 内容非法（超限 / 非 UTF-8）时为 `None`：缓存「无效」避免每次重读。
     built: Option<Built>,
@@ -164,7 +166,7 @@ pub async fn source(
     };
     let key = (info.identity.clone(), dir.to_string(), decl.id.clone());
     let mut cache = SCRIPT_CACHE.lock().await;
-    refresh_cached(&mut cache, &key, decl).await;
+    refresh_cached(&mut cache, &key, decl, info.package_revision).await;
     match cache.get(&key).and_then(|c| c.built.clone()) {
         Some(built) => Ok(PageScriptSource {
             sha256: built.sha256,
@@ -208,7 +210,7 @@ async fn collect(plugins: &[PluginInfo]) -> Vec<PageScriptEntry> {
         }
         for decl in &info.contributions.page_scripts {
             let key = (info.identity.clone(), dir.to_string(), decl.id.clone());
-            refresh_cached(&mut cache, &key, decl).await;
+            refresh_cached(&mut cache, &key, decl, info.package_revision).await;
             let Some(built) = cache.get(&key).and_then(|c| c.built.as_ref()) else {
                 continue;
             };
@@ -262,13 +264,17 @@ async fn refresh_cached(
     cache: &mut BTreeMap<(String, String, String), CachedScript>,
     key: &(String, String, String),
     decl: &PageScriptDecl,
+    revision: u64,
 ) {
     let (identity, dir, _) = key;
     let Some(stamps) = current_stamps(dir, decl).await else {
-        drop_if_files_differ(cache, key, decl);
+        drop_if_files_differ(cache, key, decl, revision);
         return;
     };
-    if cache.get(key).is_some_and(|c| c.stamps == stamps) {
+    if cache
+        .get(key)
+        .is_some_and(|c| c.stamps == stamps && c.revision == revision)
+    {
         return;
     }
     let mut contents: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
@@ -279,7 +285,7 @@ async fn refresh_cached(
             }
             Err(error) => {
                 crate::log_warn!("[plugin-page-scripts] {identity} 读取 {file} 失败: {error}");
-                drop_if_files_differ(cache, key, decl);
+                drop_if_files_differ(cache, key, decl, revision);
                 return;
             }
         }
@@ -294,20 +300,39 @@ async fn refresh_cached(
             None
         }
     };
-    cache.insert(key.clone(), CachedScript { stamps, built });
+    cache.insert(
+        key.clone(),
+        CachedScript {
+            revision,
+            stamps,
+            built,
+        },
+    );
 }
 
+/// IO 失败时沿用旧缓存只限同一包修订且文件列表一致；否则丢弃，不得回放旧版本内容。
 fn drop_if_files_differ(
     cache: &mut BTreeMap<(String, String, String), CachedScript>,
     key: &(String, String, String),
     decl: &PageScriptDecl,
+    revision: u64,
 ) {
     let differs = cache.get(key).is_some_and(|c| {
-        c.stamps.len() != decl.js.len() || c.stamps.iter().zip(&decl.js).any(|(s, f)| &s.file != f)
+        c.revision != revision
+            || c.stamps.len() != decl.js.len()
+            || c.stamps.iter().zip(&decl.js).any(|(s, f)| &s.file != f)
     });
     if differs {
         cache.remove(key);
     }
+}
+
+/// 卸载插件时清除其全部脚本缓存条目。
+pub(crate) async fn purge_identity(identity: &str) {
+    SCRIPT_CACHE
+        .lock()
+        .await
+        .retain(|(cached_identity, _, _), _| cached_identity != identity);
 }
 
 #[cfg(test)]

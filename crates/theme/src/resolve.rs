@@ -326,12 +326,12 @@ impl Resolver<'_> {
         spec: &'static TokenSpec,
         expr: &DefaultExpr,
     ) -> Result<TokenValue, Cycle> {
+        // 预设基底的值优先于默认表达式（Base token 与预设固定的非 Base token）。
+        if let Some(value) = self.base.get(spec.path) {
+            return Ok(value.clone());
+        }
         Ok(match expr {
-            DefaultExpr::Base => self
-                .base
-                .get(spec.path)
-                .cloned()
-                .unwrap_or_else(|| self.fallback(spec)),
+            DefaultExpr::Base => self.fallback(spec),
             DefaultExpr::Ref(path) => self.eval_path(path)?,
             DefaultExpr::RefAlpha(path, alpha) => match self.eval_path(path)? {
                 TokenValue::Color(color) => TokenValue::Color(color.opacity(*alpha)),

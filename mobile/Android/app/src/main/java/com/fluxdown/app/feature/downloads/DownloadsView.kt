@@ -26,6 +26,7 @@ import com.fluxdown.core.protocol.preferences
 import com.fluxdown.core.format.Format
 import com.fluxdown.core.format.Measure
 import com.fluxdown.core.model.FileConflicts
+import com.fluxdown.core.model.HostRef
 import com.fluxdown.core.model.QueueOrder
 import com.fluxdown.core.model.allTasksPaused
 import com.fluxdown.core.model.TaskStatus
@@ -118,6 +119,10 @@ class DownloadsView internal constructor(private val container: AppContainer) {
     internal var queueOrder by mutableStateOf(QueueOrder.Empty)
         private set
 
+    /** 当前主机是本机：远端主机的已完成文件在主机磁盘上，行环钮改为「任务详情」（iOS `ringAction` 同规则）。 */
+    var localHost by mutableStateOf(true)
+        private set
+
     /** 远程任务命令与行内过渡态。 */
     internal val remoteCommands = RemoteCommands(container)
 
@@ -205,6 +210,9 @@ class DownloadsView internal constructor(private val container: AppContainer) {
         launch {
             // 名次只在渲染可见排队行时按键二分取：顺序变化（队首出队等）只重组读它的可见行，不重建任务行模型。
             container.store.state.map { it.queueOrder }.distinctUntilChanged().collect { queueOrder = it }
+        }
+        launch {
+            container.host.map { it is HostRef.Local }.distinctUntilChanged().collect { localHost = it }
         }
         launch {
             val cache = DeriveCache()

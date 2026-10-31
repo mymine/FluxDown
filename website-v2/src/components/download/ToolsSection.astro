@@ -1,5 +1,5 @@
 ---
-/** 命令行、Android 与 iOS(TestFlight 公测)构建。 */
+/** 命令行、Android 与 iOS(未签名侧载 IPA + TestFlight 公测)构建。 */
 import { SquareTerminal } from "lucide-react";
 import AssetGroup, { type RowSpec } from "./AssetGroup.astro";
 import { BrandIcon } from "@/components/icons/brand";
@@ -31,6 +31,15 @@ const android: RowSpec[] = [
   { path: `${m}.android_x64`, label: "x86_64", ext: ".apk" },
   { path: `${m}.android_universal`, label: t.android.universal, ext: ".apk" },
 ];
+const ios: RowSpec[] = [
+  {
+    path: "ios.assets.sideload_ipa",
+    label: t.ios.sideload,
+    detail: t.ios.sideloadDetail,
+    ext: ".ipa",
+    versionPath: "ios.version",
+  },
+];
 ---
 
 <section class="frame" aria-label={`${t.cli.title} · ${t.android.title} · ${t.ios.title}`}>
@@ -42,7 +51,7 @@ const android: RowSpec[] = [
     <AssetGroup lang={lang} id="android" os="android" title={t.android.title} desc={t.android.desc} versionPath="mobile.version" fallback={fallback} rows={android}>
       <Fragment slot="icon"><BrandIcon name="android" size={16} /></Fragment>
     </AssetGroup>
-    <AssetGroup lang={lang} id="ios" os="ios" title={t.ios.title} desc={t.ios.desc} fallback={fallback} rows={[]}>
+    <AssetGroup lang={lang} id="ios" os="ios" title={t.ios.title} desc={t.ios.desc} fallback={fallback} rows={ios}>
       <Fragment slot="icon"><BrandIcon name="apple" size={16} /></Fragment>
       <a class="link mt-auto self-start text-[13px]" href={TESTFLIGHT_URL} target="_blank" rel="noopener">{t.ios.join}</a>
     </AssetGroup>

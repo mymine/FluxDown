@@ -14,6 +14,8 @@ export const METHOD = {
   DAEMON_TASK_GET: 'daemon.task.get',
   DAEMON_TASK_ACTIVITY: 'daemon.task.activity',
   DAEMON_TASK_SPEED_HISTORY: 'daemon.task.speedHistory',
+  /** BT 任务实况（`TaskIdParams` → `BtStatusDto`）：详情页 Tracker / 连接标签轮询；非 BT 任务 `invalidArgument`。 */
+  DAEMON_TASK_BT_STATUS: 'daemon.task.btStatus',
   DAEMON_TASK_CREATE: 'daemon.task.create',
   /** 批量建任务（`DaemonCreateTasksParams`）：整块一个事务、一次 `tasksChanged` 事件，按 `batchId` 幂等。 */
   DAEMON_TASK_CREATE_MANY: 'daemon.task.createMany',
@@ -29,6 +31,8 @@ export const METHOD = {
   DAEMON_TASK_RESCAN: 'daemon.task.rescan',
   DAEMON_TASK_SET_SEED_LIMITS: 'daemon.task.setSeedLimits',
   DAEMON_TASK_VERIFY: 'daemon.task.verify',
+  DAEMON_TASK_SEED_LOCAL: 'daemon.task.seedLocal',
+  DAEMON_TASK_TORRENT_SHARE: 'daemon.task.torrentShare',
   DAEMON_TASK_PAUSE_MANY: 'daemon.task.pauseMany',
   DAEMON_TASK_RESUME_MANY: 'daemon.task.resumeMany',
   DAEMON_TASK_DELETE_MANY: 'daemon.task.deleteMany',
@@ -54,6 +58,7 @@ export const METHOD = {
   DAEMON_CONFIG_GET: 'daemon.config.get',
   DAEMON_CONFIG_PATCH: 'daemon.config.patch',
   DAEMON_CONFIG_PROXY_TEST: 'daemon.config.proxyTest',
+  DAEMON_CONFIG_PROXY_ROUTE: 'daemon.config.proxyRoute',
   DAEMON_CONFIG_CONN_POLICY: 'daemon.config.connPolicy',
   DAEMON_CONFIG_CLEAR_CONN_POLICY: 'daemon.config.clearConnPolicy',
   DAEMON_CONFIG_SYSTEM_PROXY: 'daemon.config.systemProxy',
@@ -126,6 +131,16 @@ export const METHOD = {
   DAEMON_EGRESS_PLAN: 'daemon.egress.plan',
 
   DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH: 'daemon.bt.trackerSubscription.refresh',
+  DAEMON_BT_GUARD_STATE: 'daemon.bt.guard.state',
+  DAEMON_BT_GUARD_ENTRIES_LIST: 'daemon.bt.guard.entries.list',
+  DAEMON_BT_GUARD_ENTRIES_ADD: 'daemon.bt.guard.entries.add',
+  DAEMON_BT_GUARD_ENTRIES_REMOVE: 'daemon.bt.guard.entries.remove',
+  DAEMON_BT_GUARD_EVENTS_LIST: 'daemon.bt.guard.events.list',
+  DAEMON_BT_GUARD_EXPORT: 'daemon.bt.guard.export',
+  DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH: 'daemon.bt.guard.filterSources.refresh',
+  // 以下 agent 内部方法，Web 不得调用。
+  DAEMON_BT_GUARD_CLOUD_APPLY: 'daemon.bt.guard.cloud.apply',
+  DAEMON_BT_GUARD_EVIDENCE_DRAIN: 'daemon.bt.guard.evidence.drain',
   DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH: 'daemon.ed2k.serverSubscription.refresh',
   DAEMON_DIAGNOSTICS_DESCRIBE: 'daemon.diagnostics.describe',
   DAEMON_DIAGNOSTICS_PREPARE_LOG_EXPORT: 'daemon.diagnostics.prepareLogExport',
@@ -206,15 +221,21 @@ export const METHOD = {
   AGENT_PLUGIN_FAVORITE_LIST: 'agent.pluginFavorite.list',
   AGENT_PLUGIN_FAVORITE_SET: 'agent.pluginFavorite.set',
 
-  // 以下方法读写宿主机路径 / 桌面集成，Web 不使用。
+  // 以下方法读写宿主机路径 / 桌面集成，按连接能力门控（多数 Web 不使用）。
   AGENT_PLATFORM_OPEN_TASK: 'agent.platform.openTask',
   AGENT_PLATFORM_REVEAL_TASK: 'agent.platform.revealTask',
+  /** 把任务产物以文件写入 agent 所在主机的系统剪贴板；仅当 hello 带 `agent.copyTaskFiles` 能力时可用。 */
+  AGENT_PLATFORM_COPY_TASK_FILES: 'agent.platform.copyTaskFiles',
   AGENT_PLATFORM_OPEN_PATH: 'agent.platform.openPath',
   AGENT_PLATFORM_INTEGRATION_GET: 'agent.platform.integrationGet',
   AGENT_PLATFORM_SET_AUTOSTART: 'agent.platform.setAutostart',
   AGENT_PLATFORM_SET_FILE_ASSOCIATION: 'agent.platform.setFileAssociation',
   AGENT_PLATFORM_SET_URL_PROTOCOL: 'agent.platform.setUrlProtocol',
   AGENT_PLATFORM_FILE_ICON: 'agent.platform.fileIcon',
+  /** 桌面应用图标（仅 GPUI 使用）：切换 / 导入、读取自定义图标、为现有窗口补设图标。 */
+  AGENT_PLATFORM_SET_APP_ICON: 'agent.platform.setAppIcon',
+  AGENT_PLATFORM_APP_ICON_IMAGE: 'agent.platform.appIconImage',
+  AGENT_PLATFORM_SYNC_WINDOW_ICONS: 'agent.platform.syncWindowIcons',
   AGENT_SOUND_PREVIEW: 'agent.sound.preview',
   AGENT_CAPTURE_SUBMIT: 'agent.capture.submit',
   AGENT_CAPTURE_SUBMIT_TORRENT_FILE: 'agent.capture.submitTorrentFile',
@@ -247,6 +268,36 @@ export const METHOD = {
   AGENT_CLOUD_NOTIFY_DELIVERIES: 'agent.cloudNotify.deliveries',
   AGENT_CLOUD_NOTIFY_SEND_EMAIL_CODE: 'agent.cloudNotify.sendEmailCode',
   AGENT_CLOUD_NOTIFY_VERIFY_EMAIL: 'agent.cloudNotify.verifyEmail',
+  /** FluxMesh（临时文件分享）：仅当 hello 带 `agent.share` 能力时可用。 */
+  AGENT_SHARE_CONFIG: 'agent.share.config',
+  AGENT_SHARE_SET_LOCAL_CONFIG: 'agent.share.setLocalConfig',
+  AGENT_SHARE_CREATE: 'agent.share.create',
+  AGENT_SHARE_LIST: 'agent.share.list',
+  AGENT_SHARE_UPDATE: 'agent.share.update',
+  AGENT_SHARE_STOP: 'agent.share.stop',
+  /** 重新开始已停止 / 已过期的分享（同 id、同链接，重新分配取件码）。 */
+  AGENT_SHARE_RESUME: 'agent.share.resume',
+  /** 删除分享记录（分享中的先停止）。 */
+  AGENT_SHARE_DELETE: 'agent.share.delete',
+  AGENT_SHARE_RESOLVE: 'agent.share.resolve',
+  AGENT_SHARE_RECEIVE: 'agent.share.receive',
+  AGENT_SHARE_DISMISS_PENDING: 'agent.share.dismissPending',
+  AGENT_SHARE_RECEIVE_RECORDS: 'agent.share.receiveRecords',
+  /** 把接收任务切到实时桥接；任务继续运行，其 `pathKind` 在分块经桥接 / CDN 流动后变为 `bridge` / `cdn`。 */
+  AGENT_SHARE_SWITCH_TO_BRIDGE: 'agent.share.switchToBridge',
+  AGENT_SHARE_DIAGNOSTICS: 'agent.share.diagnostics',
+  AGENT_SHARE_USAGE_REFRESH: 'agent.share.usageRefresh',
+  AGENT_SHARE_LOGS: 'agent.share.logs',
+  AGENT_SHARE_SESSION_KILL: 'agent.share.sessionKill',
+  /** 把实时分享转为云端暂存（需登录）；预检通过后立即返回 `cloudState = uploading`，上传在 agent 后台进行。 */
+  AGENT_SHARE_CONVERT_TO_CLOUD: 'agent.share.convertToCloud',
+  /** 删除云端副本（上传中则先取消）；分享回到实时模式。 */
+  AGENT_SHARE_DELETE_CLOUD_COPY: 'agent.share.deleteCloudCopy',
+  AGENT_SHARE_STOP_PROVIDING: 'agent.share.stopProviding',
+  /** 举报分享（按原因枚举，agent 用本机 endpoint 私钥签名）。 */
+  AGENT_SHARE_REPORT: 'agent.share.report',
+  /** 申诉已下架的分享，返回更新后的分享。 */
+  AGENT_SHARE_APPEAL: 'agent.share.appeal',
 
   /** 服务端推送通知，params 为 EventFrame。 */
   SERVICE_EVENT: 'service.event',
@@ -274,5 +325,12 @@ export const CAPABILITY_AGENT_DEVICE_LINK = 'agent.deviceLink';
 export const CAPABILITY_AGENT_EXTERNAL_CAPTURE = 'agent.externalCapture';
 /** 按连接下发：本连接可在 agent 所在主机上打开 / 定位任务产物（`agent.platform.openTask` / `revealTask`）。 */
 export const CAPABILITY_AGENT_OPEN_TASK_FILES = 'agent.openTaskFiles';
+/**
+ * 按连接下发：本连接可把任务产物写入 agent 所在主机的系统剪贴板（`agent.platform.copyTaskFiles`）。
+ * 只在本机来源 + 桌面构建 + 有图形会话时下发；远程 / NAS 连接没有（浏览器无法把文件写进系统剪贴板）。
+ */
+export const CAPABILITY_AGENT_COPY_TASK_FILES = 'agent.copyTaskFiles';
+/** 本 agent 编入了FluxMesh服务（`agent.share.*`）；条件能力，未编入FluxMesh的构建不下发。 */
+export const CAPABILITY_AGENT_SHARE = 'agent.share';
 /** 客户端能力：可处理交互选择（HLS/BT/变体），放入握手 capabilities。 */
 export const CAPABILITY_CLIENT_SELECTIONS = 'client.selections';

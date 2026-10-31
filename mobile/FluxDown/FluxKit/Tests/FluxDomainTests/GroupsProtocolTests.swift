@@ -18,6 +18,9 @@ struct GroupsProtocolTests {
         #expect(!empty.hasManifest && empty.items.isEmpty && empty.error.isEmpty)
         let failed = try ProtocolJSON.decode(ResolvePreviewResponse.self, from: Data(#"{"name":"","sourceUrl":"u","error":"login expired","items":[{"id":"1","name":"n","path":"","size":1,"variants":[]}]}"#.utf8), what: "preview")
         #expect(!failed.hasManifest)
+        #expect(empty.pluginId.isEmpty)
+        let withPlugin = try ProtocolJSON.decode(ResolvePreviewResponse.self, from: Data(#"{"name":"A","sourceUrl":"u","pluginId":"com.x.p","items":[]}"#.utf8), what: "preview")
+        #expect(withPlugin.pluginId == "com.x.p")
     }
 
     @Test func createGroupRequestEncodesWireNames() throws {
@@ -32,6 +35,11 @@ struct GroupsProtocolTests {
         #expect(json["extraHeaders"]?["A"]?.stringValue == "B")
         #expect(json["items"]?.arrayValue?.first?["resolverItem"]?.stringValue == "v@hd")
         #expect(json["items"]?.arrayValue?.first?["relPath"]?.stringValue == "p")
+        #expect(json["resolverPluginId"]?.stringValue == "")
+        var bound = request
+        bound.resolverPluginId = "p1"
+        let boundJson = try ProtocolJSON.decode(JSONValue.self, from: ProtocolJSON.encode(bound, what: "g"), what: "g")
+        #expect(boundJson["resolverPluginId"]?.stringValue == "p1")
 
         let capture = try ProtocolJSON.decode(JSONValue.self, from: ProtocolJSON.encode(CaptureCreateGroupParams(transactionId: "tx", request: request), what: "c"), what: "c")
         #expect(capture["transactionId"]?.stringValue == "tx")

@@ -12,6 +12,7 @@ import { captureStatus } from "./host";
 import { notify } from "./notify";
 import { addSendObserver, fallbackToBrowserDownload } from "./sender";
 import { getCachedProfiles, getCachedSettings } from "./settings-cache";
+import { logWarn } from "@/utils/error-log";
 
 const PENDING_KEY = "fluxdown_capture_pending";
 const CANCEL_STATS_KEY = "fluxdown_cancel_stats";
@@ -122,10 +123,10 @@ async function poll(): Promise<void> {
     pending = reconcilePending(pending, snapshotIds, keep);
     persistPending();
     for (const action of actions) {
-      await applyAction(action).catch((e) => console.warn("[FluxDown] capture action failed:", e));
+      await applyAction(action).catch((e) => logWarn("[FluxDown] capture action failed:", e));
     }
   } catch (e) {
-    console.warn("[FluxDown] capture poll failed:", e);
+    logWarn("[FluxDown] capture poll failed:", e);
   } finally {
     polling = false;
     schedulePoll();

@@ -13,6 +13,7 @@ import { sendAction } from "@/utils/messaging";
 import { type RuleTestCase, buildTestCase } from "../../lib/local-rules";
 import { REQUEST_TYPE_OPTIONS } from "../../lib/rule-form";
 import { issueText } from "../../lib/rule-issue";
+import { logError } from "@/utils/error-log";
 
 const MB = 1024 * 1024;
 
@@ -80,7 +81,7 @@ export function RuleTester(props: RuleTesterProps): JSX.Element {
       setRun({ input, result });
       props.binding.onTested(input.pageUrl);
     } catch (e) {
-      console.error("[FluxDown Options] rulesTest failed:", e);
+      logError("[FluxDown Options] rulesTest failed:", e);
       showToast(t("rules.test.failed"), "error");
     } finally {
       setRunning(false);

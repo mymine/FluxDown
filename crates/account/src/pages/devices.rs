@@ -3,7 +3,8 @@
 
 use fluxdown_protocol::{CloudConnectionState, CloudDevice, LinkDeviceInfo};
 use fluxdown_ui_components::{
-    Button as BaseButton, ButtonVariant, FluxIcon, IconControlExt as _, button, card,
+    BusyExt as _, Button as BaseButton, ButtonVariant, FluxIcon, IconControlExt as _, button, card,
+    loading_button,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::{SemanticThemeTokens, active_theme};
@@ -12,11 +13,8 @@ use gpui::{
     div, prelude::FluentBuilder as _,
 };
 use gpui_component::{
-    Sizable as _,
     button::{Button, ButtonVariants as _},
-    h_flex,
-    spinner::Spinner,
-    v_flex,
+    h_flex, v_flex,
 };
 
 use crate::device_list::{platform_label_key, summarize};
@@ -107,7 +105,6 @@ fn render_cloud(
             .unwrap_or("accountErrorNetwork")
     });
     let empty_label = t(translator, "accountDevicesEmpty");
-    let extended = active_theme(cx).extended().clone();
     let (visible, hidden) = summarize(
         state.devices,
         !controller.is_stale() && controller.cloud_connected(),
@@ -150,21 +147,14 @@ fn render_cloud(
                         .gap(tokens.spacing.sm)
                         .child(add_device_button(translator, &host, disabled, cx))
                         .child(
-                            button(
+                            loading_button(
                                 "account-devices-refresh",
                                 retry_label,
                                 ButtonVariant::Secondary,
+                                refreshing,
                                 cx,
                             )
-                            .gap(tokens.spacing.xs)
                             .disabled(disabled || refreshing)
-                            .when(refreshing, |this| {
-                                this.child(
-                                    Spinner::new()
-                                        .with_size(extended.icon.sm)
-                                        .color(tokens.colors.muted_foreground),
-                                )
-                            })
                             .on_click(cx.listener(
                                 move |view, _: &ClickEvent, window: &mut gpui::Window, cx| {
                                     view.refresh_devices(window, cx);
@@ -249,6 +239,7 @@ fn online_limit_notice(
         .filter(|device| device.is_online && !device.is_current)
         .map(|device| {
             let host = state.host.clone();
+            let disconnecting = host.read(cx).is_disconnecting(&device.id);
             let target = device.clone();
             h_flex()
                 .w_full()
@@ -266,13 +257,14 @@ fn online_limit_notice(
                         .child(device.name.clone()),
                 )
                 .child(
-                    button(
+                    loading_button(
                         SharedString::from(format!(
                             "account-online-limit-disconnect-{}",
                             device.id
                         )),
                         t(translator, "accountDeviceDisconnectAction"),
                         ButtonVariant::Secondary,
+                        disconnecting,
                         cx,
                     )
                     .on_click(move |_, window, cx| {
@@ -309,7 +301,6 @@ fn render_linked(
     let desc = t(translator, "linkedDevicesDesc");
     let empty_label = t(translator, "linkedDevicesEmpty");
     let refresh_label = t(translator, "linkedDeviceRefresh");
-    let extended = active_theme(cx).extended().clone();
     let host = state.host.clone();
     let disabled = state.disabled;
     let refreshing = state.linked_refreshing;
@@ -344,21 +335,14 @@ fn render_linked(
                             this.child(add_device_button(translator, &host, disabled, cx))
                         })
                         .child(
-                            button(
+                            loading_button(
                                 "account-linked-refresh",
                                 refresh_label,
                                 ButtonVariant::Secondary,
+                                refreshing,
                                 cx,
                             )
-                            .gap(tokens.spacing.xs)
                             .disabled(disabled || refreshing)
-                            .when(refreshing, |this| {
-                                this.child(
-                                    Spinner::new()
-                                        .with_size(extended.icon.sm)
-                                        .color(tokens.colors.muted_foreground),
-                                )
-                            })
                             .on_click(cx.listener(
                                 move |view, _: &ClickEvent, _: &mut gpui::Window, cx| {
                                     view.refresh_linked(cx);
@@ -435,6 +419,7 @@ pub(crate) fn device_row(
         device.clone(),
     );
     let can_disconnect = host.read(cx).controller.can_disconnect_device(device);
+    let disconnecting = host.read(cx).is_disconnecting(&device.id);
     let status = t(
         translator,
         host.read(cx).controller.device_presence_key(device),
@@ -516,6 +501,7 @@ pub(crate) fn device_row(
                                     .ghost()
                                     .control_icon(cx)
                                     .icon(FluxIcon::Power)
+                                    .busy(disconnecting)
                                     .tooltip(t(translator, "accountDeviceDisconnectAction"))
                                     .on_click(move |_, window, cx| {
                                         disconnect_device(

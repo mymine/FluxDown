@@ -85,7 +85,42 @@ pub enum ViewOp {
     Error { message: String },
 }
 
+/// 插件请求宿主执行的界面动作（随 [`PluginViewFrameDto::effects`] 下发）。
+///
+/// 只发给承载该会话的客户端；未知种类反序列化为 [`ViewEffect::Unknown`] 并忽略，
+/// 以后新增动作不需要升协议版本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum ViewEffect {
+    /// 切到主界面某个页面：`target` 为路由 id——内置页 [`NAV_BUILTIN_TARGETS`] 之一，
+    /// 或本插件活动栏视图 `plugin:<identity>:<viewId>`。
+    Navigate { target: String },
+    /// 本端不认识的动作。
+    #[serde(other)]
+    Unknown,
+}
+
+/// 插件可跳转的内置主界面页面（与 GPUI 活动栏路由 id、Web 活动栏条目 id 一致）。
+pub const NAV_BUILTIN_TARGETS: [&str; 4] = ["downloads", "rss", "webhooks", "share"];
+
+/// `PluginViewClosed.reason`：插件经 `ctx.close()` 请求关闭承载该会话的容器。
+pub const VIEW_CLOSE_REASON_REQUESTED: &str = "requested";
+
+/// 插件活动栏视图的路由 id：`plugin:<identity>:<viewId>`（GPUI 动态路由与 Web 外壳条目共用）。
+///
+/// ```
+/// assert_eq!(fluxdown_protocol::plugin_route_id("a@b", "home"), "plugin:a@b:home");
+/// ```
+#[must_use]
+pub fn plugin_route_id(identity: &str, view: &str) -> String {
+    format!("plugin:{identity}:{view}")
+}
+
 /// `DaemonEvent::PluginViewFrame` 的载荷。
+///
+/// `effects` 非空、`ops` 为空且 `seq` 等于会话当前序号的帧只携带动作：客户端先执行
+/// `effects`，再按序号规则处理 `ops`（旧客户端按「序号不大于当前」整帧忽略）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -93,6 +128,8 @@ pub struct PluginViewFrameDto {
     pub session: String,
     pub seq: u64,
     pub ops: Vec<ViewOp>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<ViewEffect>,
 }
 
 /// `daemon.plugin.view.open` 参数。
@@ -273,7 +310,7 @@ impl std::error::Error for ViewError {}
 mod tests {
     use serde_json::json;
 
-    use super::{PluginViewOpenParams, ViewEventDto, ViewOp};
+    use super::{PluginViewFrameDto, PluginViewOpenParams, ViewEffect, ViewEventDto, ViewOp};
 
     #[test]
     fn plugin_view_op_wire_shape_is_tagged_camel_case() {
@@ -319,6 +356,36 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&event).unwrap(),
             json!({"type": "change", "value": true})
+        );
+    }
+
+    #[test]
+    fn view_frame_effects_are_optional_and_tolerate_unknown_kinds() {
+        // 旧服务端的帧没有 effects；无动作的帧也不输出该字段（旧客户端看到的形状不变）。
+        let legacy: PluginViewFrameDto =
+            serde_json::from_value(json!({"session": "s", "seq": 3, "ops": []})).unwrap();
+        assert!(legacy.effects.is_empty());
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            json!({"session": "s", "seq": 3, "ops": []})
+        );
+
+        let frame: PluginViewFrameDto = serde_json::from_value(json!({
+            "session": "s", "seq": 3, "ops": [],
+            "effects": [
+                {"kind": "navigate", "target": "downloads"},
+                {"kind": "openSheet", "id": "x"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            frame.effects,
+            vec![
+                ViewEffect::Navigate {
+                    target: "downloads".into()
+                },
+                ViewEffect::Unknown
+            ]
         );
     }
 }

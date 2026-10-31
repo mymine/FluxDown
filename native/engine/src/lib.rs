@@ -15,6 +15,12 @@ pub mod bt_config;
 /// BitTorrent 会话与下载实现（librqbit）。仅 `bt` feature 下编译。
 #[cfg(feature = "bt")]
 pub mod bt_downloader;
+/// BT 防吸血（peer 行为检测 / 封禁账本 / 云名单应用）。与 `bt` feature 同门控。
+#[cfg(feature = "bt")]
+pub mod bt_guard;
+/// 本机文件做种：为磁盘上已有的文件 / 文件夹生成或匹配种子并登记为做种任务。
+#[cfg(feature = "bt")]
+pub mod bt_local_seed;
 /// BT 部分选择做种的 parts 边车（选中文件路径映射 + 跨文件边界字节）。
 #[cfg(feature = "bt")]
 pub mod bt_partfile;
@@ -23,13 +29,19 @@ pub mod bt_seeding;
 /// 存储包装仅 `bt` feature 下编译。
 #[cfg(target_os = "windows")]
 pub mod bt_sparse;
+/// BT 任务运行时状态：peer 列表与 tracker 状态（tracker 状态经 tracing 旁路采集）。
+#[cfg(feature = "bt")]
+pub mod bt_status;
 /// 已完成 BT 任务的完整性校验（按 piece 表重哈希落盘数据）。
 #[cfg(feature = "bt")]
 pub mod bt_verify;
 /// 外部捕获的分类保存目录路由：建任务时选初始目录，完成前按最终文件名复核落点。
 pub mod category_route;
 pub mod cdn;
+pub(crate) mod client_cache;
 pub mod components;
+/// 请求凭据（Cookie / Authorization / Referer）对锚点 URL 的作用域判定（公共后缀表）。
+pub(crate) mod credential_scope;
 pub mod dash_downloader;
 pub mod data_dir;
 pub mod db;
@@ -44,7 +56,12 @@ pub mod egress;
 pub mod events;
 pub mod file_exists;
 pub mod ftp_downloader;
+/// IP → 国家（peer 国旗）：最小 MaxMind DB 读取器 + DB-IP 国家库按月下载。
+#[cfg(feature = "bt")]
+pub mod geoip;
 pub mod hls_downloader;
+/// 下载请求发送：逐跳跟随重定向，每跳按凭据作用域重建请求头。
+pub(crate) mod http_request;
 pub mod intercept;
 pub mod logger;
 /// 下载来源标记（Windows Zone.Identifier / macOS quarantine）。
@@ -58,8 +75,13 @@ pub mod naming;
 /// 网络传输失败的类型化分类（换路 / 自动重试的唯一判据，平台与语言无关）。
 pub mod net_failure;
 pub(crate) mod output;
-/// 系统 PAC 脚本的代理端点提取（供 Auto 模式的系统代理候选使用）。
+/// 系统 PAC：脚本获取与缓存、按下载链接决策、失败代理记忆。
 pub(crate) mod pac;
+/// 系统 PAC 脚本的 `FindProxyForURL` JS 执行器（QuickJS，仅 `plugins` feature）。
+#[cfg(feature = "plugins")]
+pub(crate) mod pac_js;
+/// 任务起跑时按系统 PAC 修正出口（System / Auto 模式）。
+pub(crate) mod pac_route;
 /// 多路径分段调度的纯判据（稳态速率采样、竞争集、均衡拆分、完成时间抢占）。
 pub(crate) mod path_scheduler;
 /// 插件系统（可选、可失败的下载中间层）。仅 `plugins` feature 下编译。
@@ -67,12 +89,16 @@ pub(crate) mod path_scheduler;
 pub mod plugin;
 mod proc;
 pub mod proxy_config;
+/// 站点代理规则：规则模型、严格校验、逐请求匹配与「测试网址」解释。
+pub mod proxy_rules;
 /// 排队顺序的增量发布（稳定排序键 + 差异计算）。
 pub mod queue_order;
 /// `ProxyMode::Auto` 各路径单连接速率的跨重启折扣先验。
 pub mod route_health;
 /// RSS 订阅自动下载（feed 轮询 → 规则过滤 → 建任务）。
 pub mod rss;
+/// 站点代理规则的逐请求路由（`RequestSpec.egress`）。
+pub mod rule_route;
 pub mod segment_advisor;
 pub mod segment_coordinator;
 pub mod selection;
@@ -382,6 +408,11 @@ impl Engine {
         manager.load_webhook_endpoints().await;
         // 回灌投递日志：面板在重启后仍能看到「昨晚那批到底发出去没有」。
         manager.webhook().attach_db(db.clone()).await;
+        // 防吸血：恢复条目 / 账本 / strike。失败不阻断引擎启动（本次从空状态开始，错误已记日志）。
+        #[cfg(feature = "bt")]
+        if let Err(error) = manager.bt_guard().load().await {
+            logger::report_warning("bt-guard", "load persisted state", &error);
+        }
         Ok(Self {
             db,
             write_guard: Arc::new(write_guard),

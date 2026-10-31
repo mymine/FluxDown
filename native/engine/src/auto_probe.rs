@@ -368,6 +368,7 @@ async fn adopt_alternate(
         // 多 CDN 钉定节点是直连 IP：起飞改走代理后不得再旁路代理。
         params.cdn.enabled = false;
     }
+    crate::intercept::sync_egress(params);
     params.auto_proxy = Some(Arc::new(AutoProxyCtx {
         host: ctx.host.clone(),
         user_agent: ctx.user_agent.clone(),
@@ -483,6 +484,8 @@ mod tests {
         host: &str,
         alternates: Vec<PathCandidate>,
     ) -> Result<DownloadParams, Box<dyn std::error::Error>> {
+        // 假代理与假源站都在环回上，须关闭引擎的环回直连才能走代理路径。
+        crate::proxy_config::disable_loopback_bypass_for_tests();
         let mut params =
             crate::downloader::test_support::params_with_interceptor(url, crate::intercept::noop())
                 .await?;

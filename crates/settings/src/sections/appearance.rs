@@ -84,7 +84,8 @@ pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingsPage {
                 Some("fontFamilyDesktopHint"),
                 super::font_family::field(ctx),
             ))
-            .row(ctx.item("fontSize", Some("fontSizeDesc"), font_size_field(ctx))),
+            .row(ctx.item("fontSize", Some("fontSizeDesc"), font_size_field(ctx)))
+            .row(super::app_icon::item(ctx)),
     ])
 }
 

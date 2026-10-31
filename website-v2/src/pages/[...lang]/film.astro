@@ -69,6 +69,7 @@ const t = film[lang];
   </script>
   <script>
     import { mountAppDemo } from "../../components/home/app-demo";
+    import { fitApp } from "../../components/home/app-fit";
 
     type Caption = { k: string; v: string };
     const captions = (window as unknown as { __filmCaptions: Caption[] }).__filmCaptions;
@@ -134,6 +135,7 @@ const t = film[lang];
     ];
 
     if (stage && app && camera && win) {
+      fitApp(app);
       const demo = mountAppDemo(app, { external: true });
       let shownCaption = -1;
 

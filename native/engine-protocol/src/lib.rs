@@ -48,6 +48,7 @@ pub fn category_route_to_engine(
                 match_mode: rule.match_mode,
                 extensions: rule.extensions,
                 regex_pattern: rule.regex_pattern,
+                url_pattern: rule.url_pattern,
                 save_dir: rule.save_dir,
             })
             .collect(),
@@ -86,6 +87,44 @@ pub fn egress_plan_to_dto(
             headers: std::collections::BTreeMap::new(),
             plugin: None,
             proxy,
+        },
+    }
+}
+
+/// 将站点规则的校验结果与（可选的）路由解释转换为 wire DTO；`index` 从 0 起。
+#[must_use]
+pub fn proxy_route_to_dto(
+    issues: Vec<fluxdown_engine::proxy_rules::RuleIssue>,
+    explanation: Option<fluxdown_engine::proxy_rules::RouteExplanation>,
+) -> fluxdown_protocol::ProxyRouteResponse {
+    let to_index = |index: usize| u32::try_from(index).unwrap_or(u32::MAX);
+    let issues = issues
+        .into_iter()
+        .map(|issue| fluxdown_protocol::ProxyRuleIssueDto {
+            index: to_index(issue.index),
+            field: issue.field.to_owned(),
+            code: issue.code.to_owned(),
+            detail: issue.detail,
+        })
+        .collect();
+    match explanation {
+        Some(explanation) => fluxdown_protocol::ProxyRouteResponse {
+            issues,
+            matched: explanation
+                .matched
+                .map(|matched| fluxdown_protocol::ProxyRouteMatchDto {
+                    index: to_index(matched.index),
+                    id: matched.id,
+                    name: matched.name,
+                }),
+            reason: explanation.reason.as_str().to_owned(),
+            endpoint: explanation.endpoint,
+        },
+        None => fluxdown_protocol::ProxyRouteResponse {
+            issues,
+            matched: None,
+            reason: String::new(),
+            endpoint: String::new(),
         },
     }
 }

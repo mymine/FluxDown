@@ -1,10 +1,33 @@
 import { describe, expect, test } from 'bun:test'
-import { canChangeSegments, canChangeUrl, canVerifyIntegrity, isBtUrl, isReplaceableUrl, parseTaskSegments } from './taskEdit'
+import { canChangeSegments, canChangeUrl, canRename, canVerifyIntegrity, isBtUrl, isReplaceableUrl, parseTaskSegments } from './taskEdit'
 import type { TaskState, TaskSource } from './task'
 
 function facts(state: TaskState, over: { source?: TaskSource; url?: string } = {}) {
   return { source: over.source ?? 'local', state, url: over.url ?? 'https://example.com/a.bin' } as const
 }
+
+describe('重命名可用性', () => {
+  const named = (state: TaskState, over: { source?: TaskSource; url?: string; preparing?: boolean } = {}) => ({
+    ...facts(state, over),
+    preparing: over.preparing ?? false,
+  })
+
+  test('非活跃的本地 HTTP / eD2K 任务可用（含已完成）', () => {
+    for (const state of ['pending', 'paused', 'failed', 'completed'] as const) {
+      expect(canRename(named(state))).toBe(true)
+      expect(canRename(named(state, { url: 'ed2k://|file|a.iso|1|h|/' }))).toBe(true)
+    }
+  })
+
+  test('下载中 / 准备中 / 远程 / BT 不可（引擎 task-active / bt-unsupported）', () => {
+    expect(canRename(named('downloading'))).toBe(false)
+    expect(canRename(named('pending', { preparing: true }))).toBe(false)
+    expect(canRename(named('paused', { source: 'remote' }))).toBe(false)
+    for (const url of ['magnet:?xt=urn:btih:abc', 'MAGNET:?xt=urn:btih:abc', 'torrent-file://local']) {
+      for (const state of ['paused', 'completed'] as const) expect(canRename(named(state, { url }))).toBe(false)
+    }
+  })
+})
 
 describe('更换链接可用性', () => {
   test('仅暂停 / 失败 / 等待', () => {

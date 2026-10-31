@@ -22,7 +22,9 @@
 //! - Progress = written bytes (writer side, never double-counted); speed and
 //!   host traffic = body bytes as received (`SegmentMeter`), so the display
 //!   follows the network instead of segment-sized write bursts. The speed
-//!   limiter throttles those reads, not the writes.
+//!   limiter throttles those reads, not the writes. 点播总大小在全部落盘前由逐段
+//!   大小证据(在途响应头 / 已下载 / 已写盘)与码率标注估算(`size_estimate`),
+//!   只用于展示,收尾前收敛为实际字节。
 //! - Resume checkpoints are throttled to `CHECKPOINT_INTERVAL` and topped up on exit
 //! - Per-segment retry with exponential backoff
 //! - 变体 AUDIO 组带独立 URI(EXT-X-MEDIA)时并行下载音轨,收尾用 ffmpeg 流复制
@@ -31,7 +33,6 @@
 //!   按 media sequence 只追加新分片,播放列表出现 ENDLIST / 用户暂停或取消 / 播放列表
 //!   连续拉取失败时,以已录内容走与点播相同的收尾(remux / 音轨 mux)定稿为完成文件
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -66,6 +67,10 @@ use crate::naming::{extract_from_url, sanitize_filename};
 use crate::output;
 use crate::selection::SelectionOutcome;
 use crate::transfer_activity::{TaskRuntime, TransferTracker};
+
+mod size_estimate;
+
+use size_estimate::{TaskProgress, TrackProgress, VariantBitrate};
 
 fn hls_runtime(task_id: &str, tracker: &TransferTracker, limit: u32) -> TaskRuntime {
     TaskRuntime {
@@ -130,15 +135,33 @@ impl SegmentMeter {
 }
 
 /// 点播 / 直播共用的进度帧:落盘字节表示进度,接收字节用于测速,附活跃连接采样。
-fn hls_progress(task_id: &str, meter: &SegmentMeter, written: i64, limit: u32) -> ProgressUpdate {
+/// `total` 0 = 未知(直播,或点播首段落盘前且无码率先验)。
+fn hls_progress(
+    task_id: &str,
+    meter: &SegmentMeter,
+    written: i64,
+    total: i64,
+    limit: u32,
+) -> ProgressUpdate {
     ProgressUpdate {
         task_id: task_id.to_owned(),
         downloaded_bytes: written,
         transfer_bytes: Some(meter.received()),
-        total_bytes: 0,
+        total_bytes: total,
         status: 1,
         runtime: Some(hls_runtime(task_id, &meter.tracker, limit)),
         ..Default::default()
+    }
+}
+
+/// 下载中的总量(估值或收尾前的实际字节)落库,供暂停 / 出错帧与重启后的列表显示
+/// 进度。只是展示值:完成帧与 manager 的完成落库才是终值,故失败只告警。0 = 未知,不写。
+async fn persist_display_total(db: &crate::db::Db, task_id: &str, total: i64) {
+    if total <= 0 {
+        return;
+    }
+    if let Err(error) = db.update_task_total_bytes(task_id, total).await {
+        crate::logger::report_warning("hls-download", "persist_display_total", &error);
     }
 }
 
@@ -154,63 +177,6 @@ async fn save_checkpoint(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Same-origin check for cookie safety
-// ---------------------------------------------------------------------------
-
-fn is_same_origin(base_url: &str, target_url: &str) -> bool {
-    let base = match url::Url::parse(base_url) {
-        Ok(u) => u,
-        Err(_) => return false,
-    };
-    let target = match url::Url::parse(target_url) {
-        Ok(u) => u,
-        Err(_) => return false,
-    };
-    base.scheme() == target.scheme()
-        && base.host_str() == target.host_str()
-        && base.port_or_known_default() == target.port_or_known_default()
-}
-
-fn cookies_for_url<'a>(playlist_url: &str, target_url: &str, cookies: &'a str) -> &'a str {
-    if cookies.is_empty() {
-        return "";
-    }
-    if is_same_origin(playlist_url, target_url) {
-        cookies
-    } else {
-        ""
-    }
-}
-
-/// 清单主机之外的请求不得携带的凭据类头。Cookie 另有独立的同源过滤
-/// (`cookies_for_url`),扩展捕获的 Authorization/Cookie 与站点 Basic 凭据
-/// 同样只属于用户提供的清单源站,分片/密钥/子清单指向第三方主机时不能带过去。
-fn is_credential_header(name: &str) -> bool {
-    ["authorization", "cookie", "proxy-authorization"]
-        .iter()
-        .any(|h| name.eq_ignore_ascii_case(h))
-}
-
-/// 目标与清单不同源时剔除凭据类头,同源(或本就没有凭据头)时零拷贝借用。
-pub(crate) fn extra_headers_for_origin<'a>(
-    manifest_url: &str,
-    target_url: &str,
-    headers: &'a HashMap<String, String>,
-) -> Cow<'a, HashMap<String, String>> {
-    if !headers.keys().any(|k| is_credential_header(k)) || is_same_origin(manifest_url, target_url)
-    {
-        return Cow::Borrowed(headers);
-    }
-    Cow::Owned(
-        headers
-            .iter()
-            .filter(|(k, _)| !is_credential_header(k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
-    )
-}
-
 /// 小请求(playlist / 密钥 / MPD)的整体超时:响应体只有几 KB~几 MB,30s 足够;
 /// 段 body 不能用整体超时(单段可达 256MB),见 `SEGMENT_IDLE_TIMEOUT`。
 pub(crate) const SMALL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -222,7 +188,7 @@ pub(crate) const SEGMENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 拉取小响应体,并与取消、超时竞速;返回(重定向后的最终 URL, 响应体)。
 /// 不在共享 client 上设全局 timeout,否则会误伤普通 HTTP 长下载。
 pub(crate) async fn fetch_small(
-    req: reqwest::RequestBuilder,
+    req: crate::http_request::HttpRequest<'_>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(String, bytes::Bytes), DownloadError> {
     let work = async {
@@ -245,14 +211,14 @@ pub(crate) async fn fetch_small(
 
 /// 一次 HLS 请求的公共上下文。请求身份(Cookie / Referer / 请求头 / 按站点请求头)
 /// 一律取自运行级共享的 [`DownloadSpec`]:每次发请求前读 `current()`,凭据被插件
-/// 刷新后后续请求立即换用新身份。Cookie 按播放列表同源过滤,凭据类头按用户原始
-/// 清单源站过滤,Referer 对所有请求附加(防盗链 CDN 缺失即 403)。
+/// 刷新后后续请求立即换用新身份。播放列表 / 密钥 / 分片的每个请求(含其重定向的
+/// 每一跳)都以用户提交的清单 URL 为凭据锚点按 [`crate::credential_scope`] 判定:
+/// Cookie 只发往同站主机,Authorization 只发往同源,Referer 对所有请求附加
+/// (防盗链 CDN 缺失即 403;仅 https 来源发往 http 目标时不发)。
 #[derive(Clone, Copy)]
 struct HlsRequestCtx<'a> {
     spec: &'a DownloadSpec,
-    /// Cookie 同源判定基准(实际列出该资源的 playlist URL)。
-    cookie_base_url: &'a str,
-    /// 凭据类请求头的同源判定基准(用户提交的原始清单 URL)。
+    /// 凭据锚点:用户提交的原始清单 URL。
     header_origin_url: &'a str,
 }
 
@@ -325,20 +291,14 @@ fn confirm_resend<T>(
 
 impl HlsRequestCtx<'_> {
     /// 以请求身份 `identity` 构造 GET。
-    fn get(&self, client: &Client, url: &str, identity: &RequestSpec) -> reqwest::RequestBuilder {
-        let mut req = client.get(url);
-        let safe_cookies = cookies_for_url(self.cookie_base_url, url, &identity.cookies);
-        if !safe_cookies.is_empty() {
-            req = req.header("Cookie", safe_cookies);
-        }
-        // 放在 apply_extra_headers 之前:扩展捕获的真实 Referer 会覆盖默认值。
-        if crate::downloader::is_valid_referrer(&identity.referrer) {
-            req = req.header(reqwest::header::REFERER, identity.referrer.as_str());
-        }
-        let headers =
-            extra_headers_for_origin(self.header_origin_url, url, &identity.extra_headers);
-        let req = crate::downloader::apply_extra_headers(req, &headers);
-        crate::downloader::apply_origin_headers(req, url, &identity.origin_headers)
+    fn get<'s>(
+        &self,
+        client: &Client,
+        url: &str,
+        identity: &'s RequestSpec,
+    ) -> crate::http_request::HttpRequest<'s> {
+        crate::downloader::build_request(client, url, reqwest::Method::GET, identity)
+            .anchor(self.header_origin_url)
     }
 
     /// 拉取小体积资源(播放列表 / 密钥);被拒且凭据已刷新时用新身份重发一次。
@@ -475,6 +435,8 @@ pub enum M3u8Content {
 /// A variant stream from a master playlist.
 pub struct HlsVariant {
     pub bandwidth: u64,
+    /// EXT-X-STREAM-INF 的 AVERAGE-BANDWIDTH(可选);只用作首段落盘前的总大小先验。
+    pub average_bandwidth: Option<u64>,
     pub resolution: Option<(u64, u64)>,
     pub uri: String,
     /// 该变体的音频组(`AUDIO="group"`)指向独立 URI 的 EXT-X-MEDIA 音轨时
@@ -492,6 +454,8 @@ pub struct HlsSegment {
     /// `Range: bytes=offset-(offset+length-1)` 头并要求 206,否则多个段会各自
     /// 下载整文件、拼出 N 份完整副本(巨量损坏 + 撑爆磁盘)。
     pub byte_range: Option<(u64, u64)>,
+    /// 本段生效的 EXT-X-BITRATE(kbps,粘性;带 BYTERANGE 的段不适用)。只用于进度估算。
+    pub bitrate_kbps: Option<u64>,
     /// 本段是否紧跟 EXT-X-DISCONTINUITY(与前一段存在不连续点)。当前仅解析
     /// 并保留该标志;隐式 IV 仍按 RFC 8216 用绝对 Media Sequence Number 计算
     /// (见 `compute_default_iv` 注释),不连续点不重置该序号。
@@ -658,6 +622,7 @@ fn parse_m3u8_bytes(base_url: &str, bytes: &[u8]) -> Result<M3u8Content, Downloa
                     let resolution = v.resolution.as_ref().map(|r| (r.width, r.height));
                     HlsVariant {
                         bandwidth: v.bandwidth,
+                        average_bandwidth: v.average_bandwidth,
                         resolution,
                         uri: resolve_uri(base_url, &v.uri),
                         audio_uri: v
@@ -700,9 +665,15 @@ fn parse_m3u8_bytes(base_url: &str, bytes: &[u8]) -> Result<M3u8Content, Downloa
             // 位置+1(按出现顺序累计)。键为已解析的绝对段 URI,值为该 uri 上
             // "下一个隐式子区间的起始 offset"(即上一子区间的 offset+length)。
             let mut byterange_next_offset: HashMap<String, u64> = HashMap::new();
+            // EXT-X-BITRATE(RFC 8216bis §4.4.4.8)粘性生效到下一条同名标签,只作用于
+            // 不带 EXT-X-BYTERANGE 的段;仅用于进度估算。
+            let mut current_bitrate: Option<u64> = None;
 
             for seg in &media.segments {
                 total_duration += seg.duration;
+                if let Some(kbps) = ext_x_bitrate(seg) {
+                    current_bitrate = Some(kbps);
+                }
 
                 if let Some(m) = &seg.map {
                     let map_byte_range = m
@@ -803,6 +774,7 @@ fn parse_m3u8_bytes(base_url: &str, bytes: &[u8]) -> Result<M3u8Content, Downloa
                     duration: seg.duration,
                     key: seg_key,
                     byte_range,
+                    bitrate_kbps: current_bitrate.filter(|_| byte_range.is_none()),
                     discontinuity: seg.discontinuity,
                     map: current_map.clone(),
                     sequence: media_sequence.saturating_add(segments.len() as u64),
@@ -846,6 +818,16 @@ fn has_dropped_ext_x_key_method_none(seg: &m3u8_rs::MediaSegment) -> bool {
                 .as_deref()
                 .is_some_and(|rest| rest.split(',').any(|attr| attr == "METHOD=NONE"))
     })
+}
+
+/// 段上的 `#EXT-X-BITRATE:<kbps>`(m3u8-rs 不认识,落在 `unknown_tags`);非法值忽略。
+fn ext_x_bitrate(seg: &m3u8_rs::MediaSegment) -> Option<u64> {
+    seg.unknown_tags
+        .iter()
+        .rev()
+        .find(|tag| tag.tag == "X-BITRATE")
+        .and_then(|tag| tag.rest.as_deref())
+        .and_then(|kbps| kbps.trim().parse().ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,7 +1489,6 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     );
     let root_ctx = HlsRequestCtx {
         spec: &spec,
-        cookie_base_url: &p.url,
         header_origin_url: &p.url,
     };
     let FetchedPlaylist {
@@ -1536,6 +1517,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         audio_uri,
         media_raw,
         target_duration,
+        variant_bitrate,
     ) = match content {
         M3u8Content::Master { variants } => {
             let saved_match = saved_variant
@@ -1633,6 +1615,10 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             };
             let selected_uri = variant.uri.clone();
             let chosen = VariantId::of(variant);
+            let variant_bitrate = VariantBitrate {
+                average: variant.average_bandwidth,
+                peak: Some(variant.bandwidth),
+            };
 
             // 变体的 AUDIO 组带独立 URI 时需要 ffmpeg 把音轨 mux 进视频;
             // 不可用就只下载视频流并留下 warning 活动,避免静默产出无声文件。
@@ -1694,6 +1680,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                     audio_uri,
                     media_raw,
                     target_duration,
+                    variant_bitrate,
                 ),
                 M3u8Content::Master { .. } => {
                     return Err(DownloadError::Other(
@@ -1719,6 +1706,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             None,
             root_raw,
             target_duration,
+            VariantBitrate::default(),
         ),
     };
 
@@ -2127,20 +2115,27 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     let meter = SegmentMeter::new(p.speed_limiter.clone());
     // Segments can stay in the body for longer than a completed writer chunk.
     // Sample independently, including while no byte geometry is available.
-    let reported_bytes = Arc::new(AtomicI64::new(downloaded_bytes));
-    // 独立音轨已写入的字节数(含续传前缀),与视频字节一起汇总为任务进度。
-    let audio_written = Arc::new(AtomicI64::new(0));
+    // 视频与独立音轨的分段大小证据(在途响应头 / 已下载待写盘 / 已写盘 / 续传前缀)汇总为
+    // 任务进度,并据此估算总大小。
+    let video_progress = Arc::new(TrackProgress::new(&segments));
+    video_progress.resume(downloaded_bytes, skip_segments);
+    let audio_progress: Option<Arc<TrackProgress>> = audio_track
+        .as_ref()
+        .map(|track| Arc::new(TrackProgress::new(&track.segments)));
+    let progress = Arc::new(TaskProgress::new(
+        Arc::clone(&video_progress),
+        audio_progress.clone(),
+        variant_bitrate,
+    ));
     let mut sampler = spawn_progress_sampler(
         p.progress_tx.clone(),
         p.task_id.clone(),
         meter.clone(),
-        Arc::clone(&reported_bytes),
-        Arc::clone(&audio_written),
+        ProgressSource::Vod(Arc::clone(&progress)),
         concurrency as u32,
     );
     let seg_ctx = HlsRequestCtx {
         spec: &spec,
-        cookie_base_url: &media_playlist_url,
         header_origin_url: &p.url,
     };
     let map_bytes: HashMap<MapKey, Vec<u8>> = if is_fmp4 {
@@ -2169,8 +2164,8 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
 
     // 独立音轨与视频并行下载。音轨出现真实错误时取消整个任务(视频 writer 随之
     // 以取消退出,收尾处用音轨的错误替换);用户取消/暂停时两边都以取消结束。
-    let audio_handle: Option<tokio::task::JoinHandle<Result<i64, DownloadError>>> = audio_track
-        .map(|track| {
+    let audio_handle: Option<tokio::task::JoinHandle<Result<i64, DownloadError>>> =
+        audio_track.zip(audio_progress).map(|(track, written)| {
             let run = AudioRun {
                 track,
                 client: p.client.clone(),
@@ -2182,7 +2177,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                 sink: p.sink.clone(),
                 key_cache: key_cache.clone(),
                 meter: meter.clone(),
-                written: Arc::clone(&audio_written),
+                written,
                 segment_limit: p.segment_count,
                 connection_cap: p.connection_cap,
                 is_resume: p.is_resume,
@@ -2216,6 +2211,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         meter: meter.clone(),
         db: p.db.clone(),
         sink: p.sink.clone(),
+        progress: Some(Arc::clone(&video_progress)),
     });
     // dispatcher 持有唯一的发送端;它与其子任务全部结束后 channel 关闭,
     // writer 的 recv 循环才不会在末尾挂起。
@@ -2387,8 +2383,8 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                 last_written_map = current_map_key;
             }
             downloaded_bytes += written_len;
-            reported_bytes.store(downloaded_bytes, Ordering::Relaxed);
             next_to_write += 1;
+            video_progress.wrote(seg_idx, written_len, downloaded_bytes);
             window.written(next_to_write, output_data.len());
 
             // Save resume checkpoint for HLS resume support.
@@ -2418,15 +2414,18 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                 }
                 checkpointed = next_to_write;
                 last_checkpoint = std::time::Instant::now();
+                persist_display_total(&p.db, &p.task_id, progress.snapshot().1).await;
             }
 
             // Progress reporting (every 200ms)
             if last_report.elapsed().as_millis() >= 200 {
+                let (written, total) = progress.snapshot();
                 if p.progress_tx
                     .send(hls_progress(
                         &p.task_id,
                         &meter,
-                        downloaded_bytes + audio_written.load(Ordering::Relaxed),
+                        written,
+                        total,
                         concurrency as u32,
                     ))
                     .await
@@ -2560,15 +2559,11 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                 }
             }
         }
-        if let Err(error) =
-            p.db.update_task_progress(
-                &p.task_id,
-                downloaded_bytes + audio_written.load(Ordering::Relaxed),
-            )
-            .await
-        {
+        let (written, total) = progress.snapshot();
+        if let Err(error) = p.db.update_task_progress(&p.task_id, written).await {
             crate::logger::report_warning("hls-download", "persist_failed_progress", &error);
         }
+        persist_display_total(&p.db, &p.task_id, total).await;
         return Err(err);
     }
 
@@ -2578,6 +2573,28 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         p.db.set_config(&resume_seg_key, &checkpoint).await?;
     }
     drop(file);
+
+    // 全部分段已落盘:总量从估值收敛为实际字节(进度 = 100%),先落库再上报。manager
+    // 对下载中帧有 500ms 节流,最后一帧若被吞,转封装 / mux 期间会一直停在 9x%;
+    // 携带文件名的帧必定转发(名字不变,只用于越过节流)。
+    let total_written = downloaded_bytes + audio_bytes;
+    persist_display_total(&p.db, &p.task_id, total_written).await;
+    if p.progress_tx
+        .send(ProgressUpdate {
+            file_name: actual_name.clone(),
+            ..hls_progress(
+                &p.task_id,
+                &meter,
+                total_written,
+                total_written,
+                concurrency as u32,
+            )
+        })
+        .await
+        .is_err()
+    {
+        tracing::debug!("download progress receiver closed");
+    }
 
     finalize_recording(
         p,
@@ -2769,7 +2786,8 @@ async fn finalize_recording(
             .send(ProgressUpdate {
                 task_id: p.task_id.clone(),
                 downloaded_bytes,
-                total_bytes: 0,
+                // 录制已结束,改名帧上的字节就是待定稿产物的实际大小,不能退回「未知」。
+                total_bytes: downloaded_bytes,
                 status: 1,
                 error_message: String::new(),
                 file_name: chosen.clone(),
@@ -3100,6 +3118,7 @@ fn audio_resume_key(task_id: &str) -> String {
 fn audio_track_tag(playlist_url: &str) -> String {
     VariantId::of(&HlsVariant {
         bandwidth: 0,
+        average_bandwidth: None,
         resolution: None,
         uri: playlist_url.to_owned(),
         audio_uri: None,
@@ -3354,6 +3373,8 @@ async fn prefetch_init_segments(
             meter,
             db,
             sink,
+            // init 段不是媒体段,大小随写盘计入所属分段。
+            None,
         )
         .await
         .map_err(RequestFailure::into_error)?;
@@ -3400,8 +3421,8 @@ struct AudioRun {
     key_cache: KeyCache,
     /// 与视频共享的传输计量(测速与限速)。
     meter: SegmentMeter,
-    /// 音轨已落盘字节数(含续传前缀),调用方据此汇总任务进度。
-    written: Arc<AtomicI64>,
+    /// 音轨已落盘前缀(含续传前缀),调用方据此汇总任务进度与总大小估算。
+    written: Arc<TrackProgress>,
     segment_limit: i32,
     /// 插件给出的连接上限(0 = 不限);独立音轨与视频轨各自受它约束。
     connection_cap: i32,
@@ -3491,7 +3512,7 @@ async fn run_audio_track(run: AudioRun) -> Result<i64, DownloadError> {
     } else {
         (File::create(&track.temp_path).await?, 0usize, 0i64)
     };
-    written.store(written_bytes, Ordering::Relaxed);
+    written.resume(written_bytes, first_idx);
     if first_idx == 0 {
         db.set_config(
             &track.resume_key,
@@ -3518,7 +3539,6 @@ async fn run_audio_track(run: AudioRun) -> Result<i64, DownloadError> {
 
     let seg_ctx = HlsRequestCtx {
         spec: &spec,
-        cookie_base_url: &track.playlist_url,
         header_origin_url: &header_origin_url,
     };
     let map_bytes = prefetch_init_segments(
@@ -3548,6 +3568,7 @@ async fn run_audio_track(run: AudioRun) -> Result<i64, DownloadError> {
         meter,
         db: db.clone(),
         sink: sink.clone(),
+        progress: Some(Arc::clone(&written)),
     });
     let dispatcher = tokio::spawn(dispatch_segments(
         segment_jobs(&track.segments, first_idx),
@@ -3667,8 +3688,8 @@ async fn run_audio_track(run: AudioRun) -> Result<i64, DownloadError> {
                 last_written_map = current_map_key;
             }
             written_bytes += chunk_total;
-            written.store(written_bytes, Ordering::Relaxed);
             next_to_write += 1;
+            written.wrote(seg_idx, chunk_total, written_bytes);
             window.written(next_to_write, data.len());
             if last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
                 if let Err(error) = save_checkpoint(
@@ -4251,6 +4272,7 @@ async fn ensure_live_init(
         &shared.meter,
         &shared.db,
         shared.sink.as_ref(),
+        None,
     )
     .await?;
     *cache = Some((key, data));
@@ -4362,7 +4384,6 @@ async fn run_live_track(run: LiveRun) -> Result<LiveOutcome, DownloadError> {
     // 播放列表请求沿用首次解析时的上下文(以用户 URL 为源站基准)。
     let root_ctx = HlsRequestCtx {
         spec: &spec,
-        cookie_base_url: &header_origin_url,
         header_origin_url: &header_origin_url,
     };
     let shared = Arc::new(SegmentShared {
@@ -4376,6 +4397,8 @@ async fn run_live_track(run: LiveRun) -> Result<LiveOutcome, DownloadError> {
         meter,
         db: db.clone(),
         sink: Arc::clone(&sink),
+        // 直播没有总量可估。
+        progress: None,
     });
 
     let mut playlist = playlist;
@@ -4622,24 +4645,46 @@ async fn run_live_track(run: LiveRun) -> Result<LiveOutcome, DownloadError> {
     })
 }
 
-/// 视频(及可选独立音轨)进度采样器:每 200ms 上报一次两轨已落盘字节(进度)与本次
-/// 运行的接收字节(测速)。
-/// 直播总大小未知,`total_bytes` 恒为 0(与点播同一"未知"语义)。
+/// 进度采样器读取的进度来源。
+enum ProgressSource {
+    /// 点播:两轨已落盘前缀 + 总大小估算。
+    Vod(Arc<TaskProgress>),
+    /// 直播:两轨已落盘字节;总大小未知(恒 0,与点播首段前同一「未知」语义)。
+    Live {
+        video: Arc<AtomicI64>,
+        audio: Arc<AtomicI64>,
+    },
+}
+
+impl ProgressSource {
+    /// `(已落盘字节, 总字节)`;总字节 0 = 未知。
+    fn sample(&self) -> (i64, i64) {
+        match self {
+            Self::Vod(progress) => progress.snapshot(),
+            Self::Live { video, audio } => (
+                video.load(Ordering::Relaxed) + audio.load(Ordering::Relaxed),
+                0,
+            ),
+        }
+    }
+}
+
+/// 视频(及可选独立音轨)进度采样器:每 200ms 上报一次两轨已落盘字节(进度)、总大小
+/// 与本次运行的接收字节(测速)。
 fn spawn_progress_sampler(
     tx: mpsc::Sender<ProgressUpdate>,
     task_id: String,
     meter: SegmentMeter,
-    video_bytes: Arc<AtomicI64>,
-    audio_bytes: Arc<AtomicI64>,
+    source: ProgressSource,
     limit: u32,
 ) -> AbortOnDrop {
     AbortOnDrop(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(200));
         loop {
             ticker.tick().await;
-            let written = video_bytes.load(Ordering::Relaxed) + audio_bytes.load(Ordering::Relaxed);
+            let (written, total) = source.sample();
             if tx
-                .send(hls_progress(&task_id, &meter, written, limit))
+                .send(hls_progress(&task_id, &meter, written, total, limit))
                 .await
                 .is_err()
             {
@@ -4760,8 +4805,10 @@ async fn run_live_recording(p: &DownloadParams, rec: LiveRecording) -> Result<i6
         p.progress_tx.clone(),
         p.task_id.clone(),
         meter.clone(),
-        Arc::clone(&video_written),
-        Arc::clone(&audio_written),
+        ProgressSource::Live {
+            video: Arc::clone(&video_written),
+            audio: Arc::clone(&audio_written),
+        },
         concurrency as u32,
     );
 
@@ -5023,13 +5070,14 @@ struct SegmentShared {
     meter: SegmentMeter,
     db: crate::db::Db,
     sink: Arc<dyn EventSink>,
+    /// 点播轨的大小证据:段任务上报在途响应头与下载完成的字节;直播为 `None`。
+    progress: Option<Arc<TrackProgress>>,
 }
 
 impl SegmentShared {
     fn ctx(&self) -> HlsRequestCtx<'_> {
         HlsRequestCtx {
             spec: &self.spec,
-            cookie_base_url: &self.playlist_url,
             header_origin_url: &self.header_origin_url,
         }
     }
@@ -5166,6 +5214,9 @@ async fn dispatch_segments(
             drop(permit);
             if let Ok(data) = &outcome {
                 child_window.buffered(data.len());
+                if let Some(track) = &child_shared.progress {
+                    track.downloaded(job.idx, data.len());
+                }
             }
             // Always emit a result for this index so the in-order writer never
             // blocks forever waiting on a task that failed.
@@ -5240,6 +5291,7 @@ async fn download_and_decrypt_segment(
         &shared.meter,
         &shared.db,
         shared.sink.as_ref(),
+        shared.progress.as_deref(),
     )
     .await?;
 
@@ -5284,12 +5336,14 @@ async fn download_segment_with_retry(
     meter: &SegmentMeter,
     db: &crate::db::Db,
     sink: &dyn EventSink,
+    progress: Option<&TrackProgress>,
 ) -> Result<Vec<u8>, RequestFailure> {
     let transport = SegmentTransport {
         client,
         ctx,
         cancel_token,
         meter,
+        progress,
         header_timeout: SEGMENT_HEADER_TIMEOUT,
         idle_timeout: SEGMENT_IDLE_TIMEOUT,
     };
@@ -5349,6 +5403,8 @@ struct SegmentTransport<'a> {
     cancel_token: &'a tokio_util::sync::CancellationToken,
     /// 活跃读取计数、接收字节与限速。
     meter: &'a SegmentMeter,
+    /// 点播轨的大小证据:响应头到达即上报本段声明的 body 长度。
+    progress: Option<&'a TrackProgress>,
     /// 等待响应头的上限;超时按 stalled 报错,复用段重试与自动重试白名单。
     header_timeout: Duration,
     /// body 逐 chunk 空闲上限(不是整段超时:单段可达 256MB)。
@@ -5460,6 +5516,9 @@ async fn download_segment_as(
             }
         }
     };
+    if let (Some(track), Some(length)) = (transport.progress, declared_len) {
+        track.announce(seg_idx, length);
+    }
     let raw_stream = resp.bytes_stream();
     let mut stream = crate::downloader::maybe_decompress_stream(raw_stream, encoding);
 
@@ -5570,7 +5629,6 @@ mod tests {
                 );
                 let ctx = super::HlsRequestCtx {
                     spec: &spec,
-                    cookie_base_url: &url,
                     header_origin_url: &url,
                 };
                 let transport = super::SegmentTransport {
@@ -5578,6 +5636,7 @@ mod tests {
                     ctx: &ctx,
                     cancel_token: &cancel,
                     meter: &meter,
+                    progress: None,
                     header_timeout: std::time::Duration::from_secs(30),
                     idle_timeout: std::time::Duration::from_secs(30),
                 };
@@ -6046,13 +6105,14 @@ mod tests {
     }
 
     use super::{
-        HlsRequestCtx, HlsVariant, SegmentTransport, VariantId, extra_headers_for_origin,
-        format_resume_checkpoint, match_saved_variant, parse_checkpoint_variant, resume_is_usable,
+        HlsRequestCtx, HlsVariant, SegmentTransport, VariantId, format_resume_checkpoint,
+        match_saved_variant, parse_checkpoint_variant, resume_is_usable,
     };
 
     fn variant(bandwidth: u64, resolution: Option<(u64, u64)>, uri: &str) -> HlsVariant {
         HlsVariant {
             bandwidth,
+            average_bandwidth: None,
             resolution,
             uri: uri.to_string(),
             audio_uri: None,
@@ -6150,33 +6210,76 @@ mod tests {
         assert!(!resume_is_usable(3, 100, 120, 10, false, true));
     }
 
+    /// 清单引出的每个请求都以用户清单 URL 为凭据锚点：Cookie 发往同站主机（含子域与其他
+    /// 端口），Authorization 只发往同源；跨站与 https → http 降级两者都不带。
     #[test]
-    fn credential_headers_only_go_to_manifest_origin() {
-        let mut headers = std::collections::HashMap::new();
-        headers.insert("Authorization".to_string(), "Bearer t".to_string());
-        headers.insert("cookie".to_string(), "a=b".to_string());
-        headers.insert("Proxy-Authorization".to_string(), "Basic x".to_string());
-        headers.insert("X-Token".to_string(), "keep".to_string());
-        let manifest = "https://site.example/master.m3u8";
+    fn segment_credentials_follow_manifest_scope() {
+        let mut identity = crate::downloader::RequestSpec::empty_get();
+        identity.cookies = "sid=1".to_string();
+        identity
+            .extra_headers
+            .insert("Authorization".to_string(), "Bearer t".to_string());
+        identity
+            .extra_headers
+            .insert("Proxy-Authorization".to_string(), "Basic x".to_string());
+        identity
+            .extra_headers
+            .insert("X-Token".to_string(), "keep".to_string());
+        let spec = crate::downloader::DownloadSpec::new(identity.clone());
+        let ctx = HlsRequestCtx {
+            spec: &spec,
+            header_origin_url: "https://www.site.example/master.m3u8",
+        };
+        let client = reqwest::Client::new();
+        let sent = |url: &str| {
+            let request = ctx.get(&client, url, &identity).first_hop();
+            let has = |name: &str| request.headers().contains_key(name);
+            (
+                has("cookie"),
+                has("authorization") && has("proxy-authorization"),
+                has("x-token"),
+            )
+        };
 
-        let same = extra_headers_for_origin(manifest, "https://site.example/seg0.ts", &headers);
-        assert_eq!(same.len(), 4);
-
-        for other in [
-            "https://cdn.example/seg0.ts",
-            "http://site.example/seg0.ts",
-            "https://site.example:8443/seg0.ts",
-        ] {
-            let filtered = extra_headers_for_origin(manifest, other, &headers);
-            assert_eq!(filtered.len(), 1, "{other}");
-            assert_eq!(filtered.get("X-Token").map(String::as_str), Some("keep"));
-        }
+        assert_eq!(sent("https://www.site.example/seg0.ts"), (true, true, true));
+        assert_eq!(
+            sent("https://cdn.site.example/seg0.ts"),
+            (true, false, true)
+        );
+        assert_eq!(
+            sent("https://www.site.example:8443/seg0.ts"),
+            (true, false, true)
+        );
+        assert_eq!(
+            sent("https://cdn.other.example/seg0.ts"),
+            (false, false, true)
+        );
+        assert_eq!(
+            sent("http://www.site.example/seg0.ts"),
+            (false, false, true)
+        );
     }
 
     #[test]
     fn playlist_with_bom_and_leading_whitespace_parses() {
         let playlist = b"\xEF\xBB\xBF\n  #EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg0.ts\n#EXT-X-ENDLIST\n";
         assert!(parse_m3u8_bytes("https://example.com/a.m3u8", playlist).is_ok());
+    }
+
+    #[test]
+    fn ext_x_bitrate_is_sticky_and_skips_byte_range_segments() -> Result<(), DownloadError> {
+        let playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n\
+                        #EXT-X-BITRATE:1200\n#EXTINF:6,\ns0.ts\n#EXTINF:6,\ns1.ts\n\
+                        #EXT-X-BYTERANGE:100@0\n#EXTINF:6,\nall.ts\n\
+                        #EXT-X-BITRATE:800\n#EXTINF:6,\ns3.ts\n#EXT-X-ENDLIST\n";
+        let M3u8Content::Media { segments, .. } =
+            parse_m3u8_bytes("https://example.com/a.m3u8", playlist.as_bytes())?
+        else {
+            panic!("expected media playlist");
+        };
+        let rates: Vec<Option<u64>> = segments.iter().map(|s| s.bitrate_kbps).collect();
+        assert_eq!(rates, [Some(1200), Some(1200), None, Some(800)]);
+        Ok(())
     }
 
     #[test]
@@ -6260,7 +6363,6 @@ v360.m3u8\n\
             crate::downloader::DownloadSpec::new(crate::downloader::RequestSpec::empty_get());
         let ctx = HlsRequestCtx {
             spec: &spec,
-            cookie_base_url: &url,
             header_origin_url: &url,
         };
         let transport = SegmentTransport {
@@ -6268,6 +6370,7 @@ v360.m3u8\n\
             ctx: &ctx,
             cancel_token: &cancel,
             meter: &meter,
+            progress: None,
             header_timeout: std::time::Duration::from_millis(200),
             idle_timeout: std::time::Duration::from_millis(200),
         };
@@ -6407,18 +6510,19 @@ v360.m3u8\n\
         is_resume: bool,
     ) -> Result<(i64, i64), Box<dyn std::error::Error>> {
         let playlist_url = format!("http://{address}/audio/index.m3u8");
-        let segments = (0..AUDIO_SEGMENTS.len())
+        let segments: Vec<super::HlsSegment> = (0..AUDIO_SEGMENTS.len())
             .map(|i| super::HlsSegment {
                 uri: format!("http://{address}/audio/seg{i}.ts"),
                 duration: 1.0,
                 key: None,
                 byte_range: None,
+                bitrate_kbps: None,
                 discontinuity: false,
                 map: None,
                 sequence: i as u64,
             })
             .collect();
-        let written = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let written = std::sync::Arc::new(super::TrackProgress::new(&segments));
         let run = super::AudioRun {
             track: super::AudioTrack {
                 segments,
@@ -6450,7 +6554,7 @@ v360.m3u8\n\
             is_resume,
         };
         let total = super::run_audio_track(run).await?;
-        Ok((total, written.load(std::sync::atomic::Ordering::Relaxed)))
+        Ok((total, written.written()))
     }
 
     fn audio_routes() -> Vec<(&'static str, Vec<u8>)> {
@@ -6885,6 +6989,7 @@ v360.m3u8\n\
                 duration: 1.0,
                 key: None,
                 byte_range: None,
+                bitrate_kbps: None,
                 discontinuity: false,
                 map: None,
                 sequence: 1000 + i as u64,
@@ -7618,6 +7723,112 @@ v360.m3u8\n\
         Ok(())
     }
 
+    /// 点播进度:在途分段的响应头长度即计入总量估算(未落盘完永不满格),全部落盘后先发
+    /// 一帧收敛到实际字节的 100%(带文件名越过 manager 节流),库内总量终值 = 产物实际大小。
+    #[tokio::test]
+    async fn vod_progress_estimates_total_and_converges_to_actual_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let bodies: [Vec<u8>; 3] = [vec![b'A'; 65_536], vec![b'B'; 65_536], vec![b'C'; 65_536]];
+        let actual: i64 = bodies.iter().map(|b| b.len() as i64).sum();
+        let playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n\
+                        #EXTINF:4,\ns0.ts\n#EXTINF:4,\ns1.ts\n#EXTINF:4,\ns2.ts\n#EXT-X-ENDLIST\n";
+        let [s0, s1, s2] = bodies;
+        let (address, _hits) = static_server(vec![
+            ("/v.m3u8", playlist.as_bytes().to_vec()),
+            ("/s0.ts", s0),
+            ("/s1.ts", s1),
+            ("/s2.ts", s2),
+        ])
+        .await?;
+        let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(i64, i64, String)>::new()));
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(256);
+        let collector = {
+            let frames = std::sync::Arc::clone(&frames);
+            tokio::spawn(async move {
+                while let Some(update) = progress_rx.recv().await {
+                    let update: crate::downloader::ProgressUpdate = update;
+                    if update.status == 1
+                        && let Ok(mut seen) = frames.lock()
+                    {
+                        seen.push((
+                            update.downloaded_bytes,
+                            update.total_bytes,
+                            update.file_name,
+                        ));
+                    }
+                }
+            })
+        };
+        let dir = scratch_dir("vod_progress");
+        let db = crate::db::Db::connect("sqlite::memory:").await?;
+        let url = format!("http://{address}/v.m3u8");
+        let dir_text = dir.to_string_lossy().to_string();
+        db.insert_task("t-prog", &url, "v.ts", &dir_text, 0, 0, "", "", "", 0)
+            .await?;
+        let mut params = vod_params("t-prog", &url, &dir, &db, crate::intercept::noop())?;
+        // 单连接 + 64 KiB/s:每段 body 至少传 0.75s,采样器必然报出「段在途、尚未落盘」的帧。
+        params.segment_count = 1;
+        params.speed_limiter = crate::speed_limiter::SpeedLimiter::new(65_536);
+        params.speed_limiter.spawn_refill_task();
+        params.progress_tx = progress_tx;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            super::run_hls_download_inner(&params),
+        )
+        .await??;
+        drop(params);
+        tokio::time::timeout(std::time::Duration::from_secs(5), collector).await??;
+
+        let frames = frames.lock().map_err(|e| e.to_string())?.clone();
+        for (written, total, _) in &frames {
+            assert!(
+                *total == 0 || *written <= *total,
+                "progress past 100%: {written}/{total}"
+            );
+            if *written < actual {
+                assert!(
+                    *total == 0 || *total > *written,
+                    "100% shown before every segment is written: {written}/{total}"
+                );
+            }
+        }
+        assert!(
+            frames
+                .iter()
+                .any(|(written, total, _)| *written == 0 && *total == actual),
+            "the in-flight head segment's Content-Length must feed the estimate before any write: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(written, total, _)| *written == 65_536 && *total == actual),
+            "after the first write the estimate must stay on the real total: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(written, total, name)| *written == actual
+                    && *total == actual
+                    && !name.is_empty()),
+            "all segments written must report exactly 100% with a forwarded frame: {frames:?}"
+        );
+        let (last_written, last_total, _) = frames.last().ok_or("no downloading frame")?;
+        assert_eq!(last_written, last_total, "must not end below 100%");
+
+        let task = db
+            .load_task_by_id("t-prog")
+            .await?
+            .ok_or("task row missing")?;
+        let on_disk = std::fs::metadata(dir.join(&task.file_name))?.len() as i64;
+        assert_eq!(result, on_disk);
+        assert_eq!(
+            task.total_bytes, on_disk,
+            "stored total must be the real artifact size, never the estimate"
+        );
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn filter_fingerprint_change_abandons_resume() -> Result<(), Box<dyn std::error::Error>> {
         let db = crate::db::Db::connect("sqlite::memory:").await?;
@@ -7643,6 +7854,7 @@ v360.m3u8\n\
                 duration: 1.0,
                 key: None,
                 byte_range: None,
+                bitrate_kbps: None,
                 discontinuity: false,
                 map: None,
                 sequence: n,
@@ -7753,6 +7965,7 @@ v360.m3u8\n\
                     duration: 1.0,
                     key: None,
                     byte_range: None,
+                    bitrate_kbps: None,
                     discontinuity: false,
                     map: None,
                     sequence: n,

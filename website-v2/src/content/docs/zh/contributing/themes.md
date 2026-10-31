@@ -3,7 +3,7 @@ title: 提交主题
 description: 设计主题，连同截图打包，通过 Pull Request 提交到 FluxDown 主题市场。
 section: contributing
 order: 2
-sourceHash: "0c2206ccc738"
+sourceHash: "ca68c14cf4a6"
 ---
 
 主题市场就是公开仓库 [zerx-lab/fluxdown-themes](https://github.com/zerx-lab/fluxdown-themes)。每个主题占一个目录；Pull Request 合并后，CI 会重新生成仓库的 `index.json`，主题随即出现在[主题市场](/zh/themes/)和客户端里。仓库的 [CONTRIBUTING.md](https://github.com/zerx-lab/fluxdown-themes/blob/main/CONTRIBUTING.md) 是权威规范，本页带你走一遍流程。
@@ -28,7 +28,7 @@ sourceHash: "0c2206ccc738"
 `theme-id` 规则：
 
 - kebab-case：小写字母、数字、连字符（`^[a-z0-9]+(-[a-z0-9]+)*$`），3–40 个字符，全仓库唯一。
-- 以下为内置主题保留名，不可使用：`default`、`default-dark`、`default-light`、`midnight-blue`、`nord`、`warm-light`。
+- 以下为内置主题保留名，不可使用：`default`、`default-dark`、`default-light`、`midnight-blue`、`nord`、`warm-light`、`graphite`、`graphite-light`。
 
 `manifest.json`：
 

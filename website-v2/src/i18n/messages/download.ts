@@ -106,8 +106,11 @@ export const download = defineMessages({
     },
     ios: {
       title: "iOS",
-      desc: "Public beta on TestFlight. Install Apple's TestFlight app, then open the invite link to join. Beta builds expire after 90 days; TestFlight delivers updates automatically.",
+      desc: "Two ways to install. TestFlight public beta (the App Store build, without BitTorrent / eD2K or plugins): install Apple's TestFlight app, then open the invite link; beta builds expire after 90 days and update automatically. Unsigned IPA (the full build, with BitTorrent / eD2K): sign and install it yourself with AltStore, SideStore or Sideloadly; a free Apple ID signature expires after 7 days.",
       join: "Join the TestFlight beta",
+      sideload: "Unsigned IPA",
+      sideloadDetail: "Sideload · full build",
+      sideloadAlt: "the unsigned IPA",
     },
     ext: {
       eyebrow: "Browser",
@@ -267,8 +270,11 @@ export const download = defineMessages({
     },
     ios: {
       title: "iOS",
-      desc: "已开放 TestFlight 公开测试。先安装 Apple 的 TestFlight App,再打开邀请链接加入。测试版每个构建 90 天后过期,新版本由 TestFlight 自动推送。",
+      desc: "两种安装方式。TestFlight 公测(App Store 版,不含 BT / eD2K 与插件):先安装 Apple 的 TestFlight App,再打开邀请链接加入,测试版每个构建 90 天后过期,新版本自动推送。未签名 IPA(完整版,含 BT / eD2K):用 AltStore、SideStore 或 Sideloadly 以自己的 Apple ID 签名安装,免费 Apple ID 的签名 7 天后过期需重签。",
       join: "加入 TestFlight 公测",
+      sideload: "未签名 IPA",
+      sideloadDetail: "侧载 · 完整版",
+      sideloadAlt: "侧载 IPA",
     },
     ext: {
       eyebrow: "浏览器",

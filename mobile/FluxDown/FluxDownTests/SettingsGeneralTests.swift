@@ -100,6 +100,8 @@ struct GeneralCategoryTextTests {
         #expect(GeneralCategoryText.detail(ext) == ".epub, .mobi")
         let regex = CustomCategoryDto(id: "custom_2", name: "R", matchMode: "regex", regexPattern: ".*\\.pdf$")
         #expect(GeneralCategoryText.detail(regex)?.hasSuffix(": .*\\.pdf$") == true)
+        let url = CustomCategoryDto(id: "custom_3", name: "U", matchMode: "url", urlPattern: "https://*.example.com/*")
+        #expect(GeneralCategoryText.detail(url)?.hasSuffix(": https://*.example.com/*") == true)
         let all = CustomCategoryDto.builtinDefaults[0]
         #expect(GeneralCategoryText.detail(all) == nil)
     }

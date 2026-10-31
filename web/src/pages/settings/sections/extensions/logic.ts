@@ -58,6 +58,29 @@ export function rangeHint(field: SettingFieldDto): string | null {
 /** 市场列表每次展开的条数。 */
 export const MARKET_PAGE_SIZE = 50
 
+/** 目录最长可信时长：超过后再次进入插件页会重新拉取，保证「更新」徽标不陈旧（对齐 GPUI `MARKET_MAX_AGE`）。 */
+export const MARKET_MAX_AGE_MS = 10 * 60 * 1000
+
+export interface MarketLoadState {
+  /** 是否发起过加载。 */
+  requested: boolean
+  /** 上次失败是断连类：连接恢复后自动重试一次。 */
+  retryOnReconnect: boolean
+  /** 当前展示的是失败态。 */
+  failed: boolean
+  /** 上次成功加载完成的时刻（毫秒时间戳）；从未成功为 null。 */
+  loadedAt: number | null
+}
+
+/**
+ * 目录是否需要（重新）加载（对齐 GPUI `market_needs_load`）：从未请求、断连失败待重试、或上次成功加载已过期。
+ * 失败且非断连类时不自动重试——由手动刷新恢复。
+ */
+export function marketNeedsLoad(state: MarketLoadState, now: number): boolean {
+  if (!state.requested || state.retryOnReconnect) return true
+  return !state.failed && state.loadedAt !== null && now - state.loadedAt >= MARKET_MAX_AGE_MS
+}
+
 /** 市场条目关键字过滤：名称 / id / 描述 / 作者 / 标签任一命中（大小写不敏感）。 */
 export function filterMarket(entries: readonly MarketEntryDto[], query: string): MarketEntryDto[] {
   const needle = query.trim().toLowerCase()
@@ -244,6 +267,28 @@ export function postInstallConsent(plugin: PluginDto, confirmed: ConsentSet | nu
   if (pending.permissions.length === 0 && pending.networkHosts.length === 0) return 'none'
   if (confirmed !== null && consentMatches(confirmed, pending)) return 'grant'
   return 'dialog'
+}
+
+/** 各对话框当前指向的插件 identity（未打开为 null）。 */
+export interface DialogIdentities {
+  detail: string | null
+  settings: string | null
+  auth: string | null
+  consent: string | null
+}
+
+/** 对话框对应的最新插件快照；插件已卸载为 null。授权框另需仍有待授权项（别处已授权则为 null → 关闭）。 */
+export type LiveDialogPlugins = { [K in keyof DialogIdentities]: PluginDto | null }
+
+export function liveDialogPlugins(plugins: readonly PluginDto[], open: DialogIdentities): LiveDialogPlugins {
+  const find = (identity: string | null) => (identity === null ? null : (plugins.find((plugin) => plugin.identity === identity) ?? null))
+  const consent = find(open.consent)
+  return {
+    detail: find(open.detail),
+    settings: find(open.settings),
+    auth: find(open.auth),
+    consent: consent !== null && postInstallConsent(consent, null) === 'none' ? null : consent,
+  }
 }
 
 // ── 插件登录挑战 ────────────────────────────────────────────

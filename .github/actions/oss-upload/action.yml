@@ -7,9 +7,9 @@
 # extension-v0.4.8 → v0.4.8/extension/，server-v… / cli-v… / mobile-v… 同理。
 # 官网 auto 优先 CDN 缓存、未命中回源 OSS、失败回退 GitHub；无 CDN 时才先预签名 HEAD 探测。
 # bucket 私有（开了「阻止公共访问」，对象不可 public-read），不要在这里设 ACL。
-# 存储键契约（website-v2/src/lib/oss-storage.ts 的 ossStorageKey，改一处须同步另一处）：
+# 存储键契约（website-v2/src/lib/oss-storage.ts 的 ossStorageKey 与 website-v2/cdn/esa-dl-cn.js，改一处须同步另两处）：
 # OSS 禁止经默认域名分发 .apk / .ipa（400 ApkDownloadForbidden），这两类对象在桶内追加 .bin；
-# 对外 URL 与文件名不变，由 dl-cn 镜像（website-v2/cdn/oss-proxy.js）回源时换成 .bin 并覆盖下载响应头。
+# 对外 URL 与文件名不变，由 dl-cn 镜像（阿里云 ESA 边缘函数 website-v2/cdn/esa-dl-cn.js）回源时换成 .bin 并覆盖下载响应头。
 #
 # 凭据只走 secrets（OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET）；未配置时整步跳过，
 # 不阻断 GitHub Release（官网自动回退 GitHub 直连）。

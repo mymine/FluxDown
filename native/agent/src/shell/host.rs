@@ -23,6 +23,8 @@ use tokio::sync::mpsc;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
+#[cfg(not(target_os = "macos"))]
+use super::TrayIconSource;
 use super::{ShellHost, TrayAction, TrayAvailability, TrayModel, TrayPort};
 #[cfg(target_os = "macos")]
 use crate::hotkey::{HotkeyBinding, HotkeyPort, HotkeySink, MainThreadHost};
@@ -51,7 +53,7 @@ const LIGHT_TASKBAR_ICON_BYTES: &[u8] = include_bytes!("../../../../assets/logo/
 const THEME_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 enum HostEvent {
-    Apply(TrayModel),
+    Apply(Box<TrayModel>),
     RuntimeFinished,
     /// 在主线程创建全局热键后端（仅 macOS）。
     #[cfg(target_os = "macos")]
@@ -72,7 +74,10 @@ impl TrayPort for ProxyPort {
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if proxy.send_event(HostEvent::Apply(model.clone())).is_err() {
+        if proxy
+            .send_event(HostEvent::Apply(Box::new(model.clone())))
+            .is_err()
+        {
             tracing::trace!("tray event loop closed before model update");
         }
     }
@@ -389,6 +394,9 @@ struct TrayUi {
     applied: Option<TrayModel>,
     #[cfg(windows)]
     dark_taskbar: bool,
+    /// 托盘正在显示用户选择的应用图标：此时不再按任务栏明暗换图。
+    #[cfg(windows)]
+    custom_icon: bool,
 }
 
 impl TrayUi {
@@ -541,12 +549,21 @@ impl TrayUi {
             applied: None,
             #[cfg(windows)]
             dark_taskbar,
+            #[cfg(windows)]
+            custom_icon: false,
         })
     }
 
     fn apply(&mut self, model: &TrayModel) {
         if self.applied.as_ref() == Some(model) {
             return;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let previous = self.applied.as_ref().map(|applied| &applied.icon);
+            if previous.unwrap_or(&TrayIconSource::Default) != &model.icon {
+                self.apply_icon(&model.icon);
+            }
         }
         self.show.set_text(&model.show_window);
         self.settings.set_text(&model.settings);
@@ -583,8 +600,44 @@ impl TrayUi {
         self.applied = Some(model.clone());
     }
 
+    /// 切换托盘图标：自选图标直接换图；回到默认时按当前任务栏明暗（Windows）/ 内置图（Linux）还原。
+    #[cfg(not(target_os = "macos"))]
+    fn apply_icon(&mut self, source: &TrayIconSource) {
+        #[cfg(windows)]
+        let dark = windows_theme::taskbar_is_dark();
+        let bytes: &[u8] = match source {
+            TrayIconSource::Image { png, .. } => png,
+            #[cfg(windows)]
+            TrayIconSource::Default => {
+                if dark {
+                    DARK_TASKBAR_ICON_BYTES
+                } else {
+                    LIGHT_TASKBAR_ICON_BYTES
+                }
+            }
+            #[cfg(not(windows))]
+            TrayIconSource::Default => ICON_BYTES,
+        };
+        match decode_icon(bytes) {
+            Ok(icon) => match self.icon.set_icon(Some(icon)) {
+                Ok(()) => {
+                    #[cfg(windows)]
+                    {
+                        self.custom_icon = matches!(source, TrayIconSource::Image { .. });
+                        self.dark_taskbar = dark;
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "could not change tray icon"),
+            },
+            Err(error) => tracing::warn!(%error, "could not decode tray icon"),
+        }
+    }
+
     #[cfg(windows)]
     fn sync_taskbar_theme(&mut self) {
+        if self.custom_icon {
+            return;
+        }
         let dark = windows_theme::taskbar_is_dark();
         if dark == self.dark_taskbar {
             return;

@@ -303,6 +303,7 @@ extension CategoryDto {
             icon: icon,
             extensions: extensions,
             regexPattern: regexPattern,
+            urlPattern: urlPattern,
             position: position,
             visible: visible,
             builtinType: builtinType

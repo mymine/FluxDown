@@ -646,6 +646,8 @@
   /* ── Cells: bento grids with shared 1px borders ── */
   .cells {
     display: grid;
+    /* 显式单列 minmax(0,1fr):隐式 auto 轨道按内容最小宽度撑开,窄屏会横向溢出 */
+    grid-template-columns: minmax(0, 1fr);
     gap: 1px;
     background: var(--line);
   }
@@ -964,6 +966,8 @@
   border-radius: 5px;
   color: var(--fg);
   background: var(--bg-inset);
+  /* 行内长路径 / URL(如 %LOCALAPPDATA%\Programs\FluxDown)在窄屏折行,不撑破正文列 */
+  overflow-wrap: anywhere;
 }
 .prose pre {
   overflow-x: auto;

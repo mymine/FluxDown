@@ -3,6 +3,7 @@
 //! gpui-base 提供交互、键盘与无障碍语义；本 crate 只负责从完整主题 token
 //! 组装稳定的 shadcn 风格。业务组件依赖这里，不直接散落颜色和尺寸字面量。
 
+mod busy;
 mod callout;
 mod icons;
 mod kit;
@@ -11,6 +12,7 @@ mod qr;
 mod sidebar;
 mod tooltip;
 
+pub use busy::{BusyHold, MIN_BUSY_VISIBLE};
 pub use callout::{CalloutTone, RevealCallout};
 pub use icons::{ComponentAssets, FluxIcon, category_icon};
 pub use kit::{

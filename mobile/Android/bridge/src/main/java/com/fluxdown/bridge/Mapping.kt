@@ -337,6 +337,7 @@ internal fun CategoryDto.toCore() = Category(
     icon = icon,
     extensions = extensions,
     regexPattern = regexPattern,
+    urlPattern = urlPattern,
     position = position,
     visible = visible,
     builtinType = builtinType,

@@ -26,6 +26,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -145,15 +146,25 @@ class HostStore(
         w = Working()
         _state.value = HostState()
         sessionJob = scope.launch {
+            var fatalSeen = false
             try {
-                session.signals.collect { apply(it) }
+                session.signals.collect {
+                    if (it is HostSignal.Fatal) fatalSeen = true
+                    apply(it)
+                }
+                // 信号流正常结束：被 detach 取消时这里抛出取消、不改状态；Rust 先发 Fatal 再结束则保持该原因。
+                // 其余（会话驱动意外退出 / panic）不能停在最后一帧不报错——那可能是加载态骨架，界面会一直转圈。
+                ensureActive()
+                if (!fatalSeen) {
+                    apply(HostSignal.Fatal(HostException(HostErrorCode.Unavailable, message = "host session ended unexpectedly")))
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: HostException) {
                 apply(HostSignal.Fatal(e))
-            } catch (e: RuntimeException) {
-                // 绑定层 / 映射 / 归约的意外异常：此作用域没有异常处理器，逃逸即结束整个进程（含后台下载）。
-                // 转成失败态展示并保留原因，进程照常运行。
+            } catch (e: Exception) {
+                // 绑定层 / 映射 / 归约的意外异常（含 UniFFI 的 InternalException，它不是 RuntimeException）：
+                // 此作用域没有异常处理器，逃逸即结束整个进程（含后台下载）。转成失败态展示并保留原因，进程照常运行。
                 apply(HostSignal.Fatal(HostException(HostErrorCode.Internal, message = "signal pump failed: $e", cause = e)))
             }
         }

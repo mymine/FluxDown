@@ -1,6 +1,6 @@
 // Auto-generated — add `gpui-kit.d.ts` to your .gitignore.
 //
-// The built-in modules, as TypeScript declarations, for gpui-shell 0.8.0.
+// The built-in modules, as TypeScript declarations, for gpui-shell 0.8.1.
 // Do not edit: gpui-shell rewrites this on every run, in every directory that
 // imports one of them, from the runtime that is about to execute the script. A
 // committed copy could only ever be the stale one.
@@ -23094,7 +23094,7 @@ declare module "gpui-component" {
   /**
    * A stateless command button. Shell disabled, selected, children, style, and on_click operations are honored.
    */
-  export type ButtonElement = Omit<NativeElement, "on_click" | "disabled" | "label" | "tooltip" | "loading" | "size" | "outline" | "primary" | "secondary" | "danger" | "success" | "warning" | "ghost" | "link" | "compact" | "selected" | "role" | "transition"> & {
+  export type ButtonElement = Omit<NativeElement, "on_click" | "disabled" | "label" | "accessibility_label" | "tooltip" | "loading" | "size" | "outline" | "primary" | "secondary" | "danger" | "success" | "warning" | "ghost" | "link" | "compact" | "selected" | "role" | "transition"> & {
     /**
      * Invokes the callback when this component is activated.
      */
@@ -23107,6 +23107,10 @@ declare module "gpui-component" {
      * Sets the visible button label.
      */
     label(label: string): ButtonElement;
+    /**
+     * Sets the accessible name independently of the visible button label.
+     */
+    accessibility_label(accessibility_label: string): ButtonElement;
     /**
      * Sets concise hover help.
      */
@@ -27923,6 +27927,10 @@ declare module "fluxdown" {
   export function locale(): string;
   /** 在当前活动窗口弹出一条通知（嵌入式视图没有 `ShellRoot`，请用它代替 `window.push_toast`）。 */
   export function toast(level: "info" | "success" | "warning" | "error", text: string): void;
+  /** 关闭承载本视图的容器（登录弹窗、设置弹窗或独立窗口）并返回 `true`；活动栏页 / 任务详情 tab 等无法关闭的嵌入页返回 `false`。关闭在当前事件处理结束后执行。 */
+  export function close(): boolean;
+  /** 切到 FluxDown 主界面的某个页面并把主窗口带到前台：`"downloads" | "rss" | "webhooks" | "share"` 为内置页，`{ view }` 为本插件 `location` 为 `activity` 的视图 id。目标形状非法或页面不存在时同步抛错。 */
+  export function navigate(target: "downloads" | "rss" | "webhooks" | "share" | { view: string }): void;
 }
 
 /**

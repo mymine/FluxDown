@@ -461,7 +461,7 @@ private fun scoreEntries(entries: List<Entry>, tokens: List<String>): List<Score
     }
 
 private fun Task.toRef(index: CategoryIndex): TaskRef {
-    val category = index.categoryOf(fileName)
+    val category = index.categoryOf(fileName, shareUrl)
     return TaskRef(taskId, fileName, status, totalBytes, createdAt, category.tileIcon(this), category.fileCategory())
 }
 

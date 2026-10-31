@@ -155,6 +155,8 @@ export const themeBuilder = defineMessages({
           "builtin:midnight-blue": "Midnight Blue",
           "builtin:nord": "Nord",
           "builtin:warm-light": "Warm Light",
+          "builtin:graphite": "Graphite",
+          "builtin:graphite-light": "Graphite Light",
         },
       },
       layer: {
@@ -445,6 +447,8 @@ export const themeBuilder = defineMessages({
           "builtin:midnight-blue": "午夜蓝",
           "builtin:nord": "Nord",
           "builtin:warm-light": "暖光",
+          "builtin:graphite": "石墨",
+          "builtin:graphite-light": "石墨亮色",
         },
       },
       layer: {

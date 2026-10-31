@@ -183,7 +183,7 @@ data class CloudPlan(
     }
 }
 
-/** `agent.session.device`：本机在 FluxCloud 的受信任设备记录（`CloudDevice` 公开投影）。 */
+/** `agent.session.device` / `agent.device.list` 元素：FluxCloud 受信任设备记录（`CloudDevice` 公开投影）。 */
 data class SessionDeviceDto(
     /** 云端行 id（`agent.device.rename|delete` 用它；不是 [deviceId]）。 */
     val id: String = "",
@@ -214,6 +214,15 @@ data class SessionDeviceDto(
             defaultSaveDir = v.strOrNull("defaultSaveDir"),
             pathStyle = v.strOrNull("pathStyle"),
         )
+
+        /**
+         * `agent.device.list` 结果（云端 `{ "devices": [...] }`；裸数组同样接受，同 agent `cloud_devices_from_value`）。
+         * 缺云端行 id 或 deviceId 的元素无法改名 / 删除，跳过。
+         */
+        fun listFromJson(v: JsonValue?): List<SessionDeviceDto> =
+            (v["devices"].arrayOrNull ?: v.arrayOrNull).orEmpty()
+                .map(::fromJson)
+                .filter { it.id.isNotEmpty() && it.deviceId.isNotEmpty() }
     }
 }
 
@@ -590,6 +599,23 @@ object AccountRules {
         "taskStateConflict" -> "errReasonTaskStateConflict"
         "taskDeviceMismatch" -> "errReasonTaskDeviceMismatch"
         "saveDirUnavailable" -> "errReasonSaveDirUnavailable"
+        "shareUnavailable" -> "errReasonShareUnavailable"
+        "shareNotFound" -> "errReasonShareNotFound"
+        "shareExpired" -> "errReasonShareExpired"
+        "shareStopped" -> "errReasonShareStopped"
+        "shareCodeInvalid" -> "errReasonShareCodeInvalid"
+        "shareRateLimited" -> "errReasonShareRateLimited"
+        "shareTurnstileRequired" -> "errReasonShareTurnstileRequired"
+        "shareFileChanged" -> "errReasonShareFileChanged"
+        "shareSenderOffline" -> "errReasonShareSenderOffline"
+        "shareTaskNotShareable" -> "errReasonShareTaskNotShareable"
+        "shareBridgeUnavailable" -> "errReasonShareBridgeUnavailable"
+        "shareQuotaExceeded" -> "errReasonShareQuotaExceeded"
+        "shareCloudNotReady" -> "errReasonShareCloudNotReady"
+        "shareTrafficExhausted" -> "errReasonShareTrafficExhausted"
+        "shareCloudUnavailable" -> "errReasonShareCloudUnavailable"
+        "shareOwnShare" -> "errReasonShareOwnShare"
+        "shareSourceMissing" -> "errReasonShareSourceMissing"
         else -> null
     }
 

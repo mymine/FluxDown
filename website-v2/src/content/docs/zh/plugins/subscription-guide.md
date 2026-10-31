@@ -3,7 +3,7 @@ title: 订阅源指南
 description: 把任意网站或 API 变成订阅源：manifest 的 subscriptions[]、subscribe(ctx) 契约、全部校验规则，以及与 resolver 配合。
 section: plugins
 order: 6
-sourceHash: "67b668dde377"
+sourceHash: "65b8c70b1a39"
 ---
 
 FluxDown 的 RSS 功能会按计划检查一个*订阅源*，记住已经见过的条目，应用用户设置的过滤规则，并为新条目创建下载任务。默认情况下，订阅源是一个 RSS、Atom 或 JSON Feed 的 URL。**订阅源 provider** 是替换「抓取并解析」这一步的插件，于是订阅源可以是任何能用 `flux.fetch` 读到的东西：JSON API、HTML 列表页、发布页面。
@@ -54,7 +54,7 @@ curl -X POST http://127.0.0.1:17800/api/v1/rss \
 - **首轮从不下载。** 第一次成功抓取只会把当前的条目记为「已见过」（标为已读）。只有后续抓取中新出现的条目才会变成下载。如果想让条目出现在列表里但不下载任何东西，创建订阅源时设置 `"autoDownload": false`（收集模式）。
 - **间隔。** 默认 30 分钟，最小 1 分钟。失败后，每连续失败一次间隔就翻倍，最长 6 小时（但不会短于用户设定的间隔）；成功一次即恢复。
 - **按 `guid` 去重**，范围是单个订阅源。每次抓取最多把 `maxPerFetch`（默认 20，范围 1–100）个新条目变成任务，按 `pubDate` 从旧到新。FluxDown 每个订阅源保留最新的 500 条。
-- 订阅源级别的代理设置对插件 provider **不生效**；`flux.fetch` 使用应用的全局代理设置。
+- 订阅源自带代理时，`flux.fetch` 与 `flux.ytdlp` 走它；否则按订阅地址命中的站点规则与应用全局代理设置（含 Auto 直连失败时改走代理）。
 
 ## 声明 provider
 

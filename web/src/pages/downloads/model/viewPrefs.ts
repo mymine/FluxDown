@@ -86,9 +86,6 @@ export const MIN_WIDTH: Record<ColumnKind, number> = {
 export const MAX_COLUMN_WIDTH = 480
 export const FILE_NAME_MAX_WIDTH = 1600
 
-/** 数字列：单元格与表头右对齐。 */
-export const NUMERIC_COLUMNS = new Set<ColumnKind>(['size', 'speed', 'eta', 'created'])
-
 /** 点击表头切换到的排序键（「智能排序」不对应任何列）；「状态」列按状态优先级排序。 */
 export const COLUMN_SORT_KEY: Partial<Record<ColumnKind, ViewSortKey>> = {
   file_name: 'name',
@@ -105,8 +102,12 @@ export interface ColumnPref {
   width: number
 }
 
+/** 任务表表头文字对齐（视图菜单 › 显示）；默认左对齐，单元格内容对齐不受影响。 */
+export type HeaderAlign = 'left' | 'center' | 'right'
+
 export interface ViewPrefs {
   density: ViewDensity
+  header_align: HeaderAlign
   group_by: ViewGroupBy
   sort_key: ViewSortKey
   sort_dir: SortDir
@@ -132,6 +133,7 @@ export const DETAIL_SIZE_RANGE: Record<DetailPlacement, readonly [number, number
 export function defaultViewPrefs(): ViewPrefs {
   return {
     density: 'comfortable',
+    header_align: 'left',
     group_by: 'none',
     sort_key: 'smart',
     sort_dir: 'desc',
@@ -177,6 +179,7 @@ export function parseViewPrefs(value: unknown): ViewPrefs {
     : []
   return {
     density: oneOf(['comfortable', 'compact', 'relaxed'], json.density, defaults.density),
+    header_align: oneOf(['left', 'center', 'right'], json.header_align, defaults.header_align),
     group_by: oneOf(GROUP_BY_OPTIONS, json.group_by, defaults.group_by),
     sort_key: oneOf(SORT_KEY_OPTIONS, json.sort_key, defaults.sort_key),
     sort_dir: oneOf(['asc', 'desc'], json.sort_dir, defaults.sort_dir),

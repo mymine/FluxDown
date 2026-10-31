@@ -20,9 +20,11 @@ use gpui_component::{
 };
 
 use crate::assets::{CLOUD_ICON_PATH, CROWN_ICON_PATH, REFRESH_ICON_PATH};
+use crate::billing::format_local_date;
+use crate::dialogs::plan_purchase::PurchaseTab;
 use crate::profile_edit::{ProfileField, can_edit_origin_id};
-use crate::t;
 use crate::view::AccountView;
+use crate::{t, t_with};
 
 /// 头像与徽标的浅底透明度。
 const TINT_ALPHA: f32 = 0.12;
@@ -74,6 +76,8 @@ pub(crate) struct ProfileState {
     pub last_error: Option<SharedString>,
     /// 「推介有奖」入口开关当前值（设备本地偏好 `ui.show_settings_referral`）。
     pub show_referral: bool,
+    /// 云端是否上架了可购买的流量包；没有时隐藏「流量包」按钮。
+    pub packs_available: bool,
 }
 
 pub(crate) fn render(
@@ -89,6 +93,7 @@ pub(crate) fn render(
         refreshing,
         last_error,
         show_referral,
+        packs_available,
     } = state;
     let display_name = display_name(session);
     let initial = avatar_initial(&display_name);
@@ -304,7 +309,13 @@ pub(crate) fn render(
         .child(row)
         .child(crate::ui::row_divider(cx))
         .child(plan_row(
-            translator, tokens, &extended, session, disabled, cx,
+            translator,
+            tokens,
+            &extended,
+            session,
+            disabled,
+            packs_available,
+            cx,
         ))
         .child(crate::ui::row_divider(cx))
         .child(referral_row(
@@ -331,6 +342,7 @@ fn plan_row(
     extended: &ExtendedTokens,
     session: &AgentSessionDto,
     disabled: bool,
+    packs_available: bool,
     cx: &mut Context<AccountView>,
 ) -> impl IntoElement {
     let plan = session.current_plan.as_ref();
@@ -343,6 +355,17 @@ fn plan_row(
             }
         })
         .unwrap_or_else(|| "—".to_owned());
+    let subscription_until = session
+        .active_subscription
+        .as_ref()
+        .filter(|sub| !sub.ends_at.is_empty())
+        .map(|sub| {
+            t_with(
+                translator,
+                "accountSubscriptionUntil",
+                &[("date", &format_local_date(&sub.ends_at))],
+            )
+        });
     let badge =
         plan.and_then(|plan| plan_badge(tokens, extended, plan, session.user.membership_ordinal));
 
@@ -374,19 +397,54 @@ fn plan_row(
                         .text_color(tokens.colors.foreground)
                         .child(plan_name),
                 )
-                .when_some(badge, |this, badge| this.child(badge)),
+                .when_some(badge, |this, badge| this.child(badge))
+                .when_some(subscription_until, |this, text| {
+                    this.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(tokens.typography.xs.size)
+                            .line_height(tokens.typography.xs.line_height)
+                            .text_color(tokens.colors.muted_foreground)
+                            .child(text),
+                    )
+                }),
         )
         .child(
-            button(
-                "account-plan-upgrade",
-                t(translator, "accountPlanUpgrade"),
-                ButtonVariant::Primary,
-                cx,
-            )
-            .disabled(disabled)
-            .on_click(cx.listener(|view, _: &ClickEvent, window, cx| {
-                view.open_plan_purchase(window, cx);
-            })),
+            h_flex()
+                .flex_none()
+                .items_center()
+                .gap(tokens.spacing.sm)
+                .when(packs_available, |this| {
+                    this.child(
+                        button(
+                            "account-pack-buy",
+                            t(translator, "accountPackBuy"),
+                            ButtonVariant::Secondary,
+                            cx,
+                        )
+                        .disabled(disabled)
+                        .on_click(cx.listener(
+                            |view, _: &ClickEvent, window, cx| {
+                                view.open_plan_purchase(PurchaseTab::Packs, window, cx);
+                            },
+                        )),
+                    )
+                })
+                .child(
+                    button(
+                        "account-plan-upgrade",
+                        t(translator, "accountPlanUpgrade"),
+                        ButtonVariant::Primary,
+                        cx,
+                    )
+                    .disabled(disabled)
+                    .on_click(cx.listener(
+                        |view, _: &ClickEvent, window, cx| {
+                            view.open_plan_purchase(PurchaseTab::Membership, window, cx);
+                        },
+                    )),
+                ),
         )
 }
 

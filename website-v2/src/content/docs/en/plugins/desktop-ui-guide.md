@@ -17,7 +17,7 @@ Desktop scripts are a power feature. They run with **full trust** and exist only
 | Where it runs | Daemon (QuickJS) | Desktop app process (gpui-shell, QuickJS) |
 | Clients | Desktop app, Web UI | Desktop app only |
 | Look | The fixed node set, themed by the client | Anything gpui can draw, styled by your code |
-| Locations | `activity`, `settings`, `taskDetail` | all four, including `window` |
+| Locations | `activity`, `settings`, `taskDetail`, `auth` | all five, including `window` |
 | Permission | none beyond what `main` needs | `desktop` (risk level **Full**) |
 | Files, processes, clipboard, network | through `flux.*` APIs only | direct access (network: listed hosts only) |
 | Survives without a window open | yes (daemon) | no |
@@ -328,6 +328,8 @@ Import it by bare name inside a desktop script: `import { identity, taskId, call
 | `theme()` | `{ revision, tokens }` | The fully resolved FluxDown theme. `revision` increases whenever the theme changes, and views are re-rendered automatically. |
 | `locale()` | `string` | The UI language, for example `zh-CN` or `en`. |
 | `toast(level, text)` | `void` | Shows a notification in the active window. `level` is `info`, `success`, `warning` or `error`. |
+| `close()` | `boolean` | Closes the container hosting this view (the login dialog of an `auth` view, the settings dialog, a stand-alone window) and returns `true`; the close is deferred until the current call returns. Views embedded in a page (activity page, task-detail tab) have no container: nothing happens and it returns `false`. |
+| `navigate(target)` | `void` | Brings the main window to the front and switches page. `target` is `"downloads"`, `"rss"`, `"webhooks"`, `"share"` or `{ view: "<id>" }` (an `activity` view of this plugin). Synchronous: an invalid shape throws `fluxdown.navigate: …`, and so does a target that is not one of this plugin's contributed activity-bar views. A valid target is executed deferred. |
 
 ### Error semantics
 
@@ -360,11 +362,12 @@ Use `try`/`catch` around `await call(...)` and `await invoke(...)` as in the tut
 
 ## Where desktop views appear
 
-| | Embedded (`activity`, `settings`, `taskDetail`) | Window (`window`) |
+| | Embedded (`activity`, `settings`, `taskDetail`, `auth`) | Window (`window`) |
 |---|---|---|
 | Container | A page / tab inside the main window or settings dialog | Its own resizable, minimizable window with FluxDown's title bar |
 | How users reach it | Activity bar item / plugin settings button / task details tab | The window icon button on the plugin row (Settings → Extensions → Plugins) |
 | `taskId()` | the task (taskDetail only) | `null` |
+| `fluxdown.close()` | Closes the dialog for `auth` and `settings` views and returns `true`; returns `false` for `activity` / `taskDetail` | Closes the window; returns `true` |
 | Overlay APIs `window.push_toast`, `window.open_dialog`, `window.open_sheet` | **Not available** — use `fluxdown.toast` | Available |
 | `width` / `height` | rejected by the manifest | initial size, 240–4096 (default 960 × 640); the minimum size is the smaller of the declared size and 240 on each axis |
 

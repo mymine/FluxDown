@@ -153,6 +153,7 @@ pub(super) async fn start(
             host.ytdlp_permitted,
             host.auth_permitted,
             host.private_network_allowed,
+            host.egress.clone(),
             interrupt_ns.clone(),
             wall_pause,
         )
@@ -421,6 +422,52 @@ fn inject_host_bridge(
         globals.set("__flux_toast", f)?;
     }
 
+    // __flux_view_close(session) -> String(JSON 信封)；JS 侧遇 __fluxError 抛出
+    {
+        let ev = events.clone();
+        let pid = identity.to_string();
+        let f = Function::new(ctx.clone(), move |session: String| -> String {
+            match ev.close_view(&pid, &session) {
+                Ok(()) => serde_json::json!({ "value": null }),
+                Err(e) => serde_json::json!({ "__fluxError": plain_error(&e) }),
+            }
+            .to_string()
+        })?
+        .with_name("__flux_view_close")?;
+        globals.set("__flux_view_close", f)?;
+    }
+
+    // __flux_view_navigate(session, targetJson) -> Promise<String(JSON)>
+    {
+        let ev = events.clone();
+        let pid = identity.to_string();
+        let dl = interrupt_ns.clone();
+        let f = Function::new(
+            ctx.clone(),
+            Async(move |session: String, target_json: String| {
+                let ev = ev.clone();
+                let pid = pid.clone();
+                let dl = dl.clone();
+                async move {
+                    let payload = match serde_json::from_str::<serde_json::Value>(&target_json) {
+                        Ok(target) => {
+                            match credited(&dl, ev.navigate(&pid, &session, target)).await {
+                                Ok(()) => serde_json::json!({ "value": null }),
+                                Err(e) => serde_json::json!({ "__fluxError": plain_error(&e) }),
+                            }
+                        }
+                        Err(e) => serde_json::json!({
+                            "__fluxError": format!("navigate: unknown target ({e})")
+                        }),
+                    };
+                    Ok::<String, rquickjs::Error>(payload.to_string())
+                }
+            }),
+        )?
+        .with_name("__flux_view_navigate")?;
+        globals.set("__flux_view_navigate", f)?;
+    }
+
     // __flux_timer_set(id, delayMs) / __flux_timer_clear(id)
     {
         let ev = events.clone();
@@ -684,12 +731,27 @@ const HOST_PRELUDE: &str = r#"
     };
   }
 
-  const makeCtx = (session, props, taskId, locale) => ({
+  // close / navigate 在 init 内也可调用：动作随会话一起送达客户端（客户端在 open 应答前到达的
+  // 动作会先缓存，登记会话后再执行）。close 幂等：会话已请求关闭后再次调用不做任何事。
+  const makeCtx = (s, session, props, taskId, locale) => ({
     session,
     props: props || {},
     taskId: taskId === undefined ? null : taskId,
     locale: locale || '',
     refresh() { __flux_view_refresh(session); },
+    close() {
+      if (s.closing) return;
+      const r = JSON.parse(__flux_view_close(session));
+      if (r.__fluxError) throw new Error(r.__fluxError);
+      s.closing = true;
+    },
+    navigate(target) {
+      if (s.closing) return Promise.reject(new Error('navigate: the view has been closed; call navigate() before close()'));
+      return __flux_view_navigate(session, JSON.stringify(target === undefined ? null : target)).then((raw) => {
+        const r = JSON.parse(raw);
+        if (r.__fluxError) throw new Error(r.__fluxError);
+      });
+    },
   });
   const renderSession = async (s) => {
     const tree = await s.def.render(s.state, s.ctx);
@@ -706,7 +768,8 @@ const HOST_PRELUDE: &str = r#"
     async viewOpen(a) {
       const def = views.get(a.view);
       if (!def) throw new Error('view not registered: ' + a.view);
-      const s = { def, ctx: makeCtx(a.session, a.props, a.taskId, a.locale), state: {} };
+      const s = { def, closing: false, ctx: null, state: {} };
+      s.ctx = makeCtx(s, a.session, a.props, a.taskId, a.locale);
       sessions.set(a.session, s);
       try {
         if (typeof def.init === 'function') {

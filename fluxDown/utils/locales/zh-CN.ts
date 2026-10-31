@@ -7,6 +7,7 @@ const zhCN = {
   "header.languageSwitch": "切换至{language}",
   "header.checking": "检测中...",
   "header.connected": "已连接",
+  "header.androidHandoff": "交给 FluxDown App",
   "header.disconnected": "未连接",
 
   // Main switch
@@ -145,6 +146,8 @@ const zhCN = {
   "notify.batchSentDetail": "{count} 个任务已发送到 FluxDown",
   "notify.sendFailed": "发送失败",
   "notify.connectionFailed": "无法连接到 FluxDown 应用: {message}",
+  "notify.androidUnsupported": "该下载无法交给 FluxDown Android 应用（音视频分轨、表单提交与 FTP 链接需要桌面或远程通道）",
+  "notify.androidHandoffFailed": "浏览器拒绝唤起 FluxDown Android 应用",
   "notify.fallbackBrowser": "已回退到浏览器下载",
   "notify.fallbackBrowserDetail":
     "无法发送到 FluxDown，已交由浏览器继续下载: {url}",
@@ -283,6 +286,8 @@ const zhCN = {
   // 弹窗 / 侧边栏
   "popup.viewAll": "在侧边栏查看全部（{count}）",
   "popup.sidePanel": "侧边栏",
+  "popup.bypassHint": "{key}+点击跳过接管",
+  "popup.bypassHintTip": "按住 {key} 点击链接，本次下载交给浏览器而不是 FluxDown（磁力链接交给系统默认程序）；网页用脚本触发下载的按钮同样有效。可在「设置 → 下载拦截」更换按键。",
   "sidepanel.tab.resources": "资源",
   "sidepanel.tab.links": "链接",
   "sidepanel.tab.tasks": "任务",
@@ -313,6 +318,19 @@ const zhCN = {
   "sidepanel.diag.unnamed": "（未命名）",
   "sidepanel.diag.exportLog": "导出资源调试日志",
   "sidepanel.diag.exportConn": "导出连接诊断",
+  "sidepanel.diag.errorLog": "扩展错误",
+  "sidepanel.diag.errorLogEmpty": "暂无错误记录",
+  "sidepanel.diag.errorLogClear": "清空",
+  "sidepanel.diag.errorLogCleared": "错误记录已清空",
+  "sidepanel.diag.errorLogClearFailed": "清空错误记录失败",
+  "sidepanel.diag.errorLogHint": "扩展各处的错误都记在这里，保留 7 天（最近 100 条），导出连接诊断时一并附带",
+  "sidepanel.diag.errorLevel.error": "错误",
+  "sidepanel.diag.errorLevel.warn": "警告",
+  "sidepanel.diag.errorSource.background": "后台",
+  "sidepanel.diag.errorSource.popup": "弹出窗口",
+  "sidepanel.diag.errorSource.options": "设置页",
+  "sidepanel.diag.errorSource.sidepanel": "侧边栏",
+  "sidepanel.diag.errorSource.content": "网页",
 
   // Options 迁移项补充说明
   "options.general.statsDesc": "重置弹出窗口中显示的已下载/失败计数",
@@ -322,7 +340,7 @@ const zhCN = {
   "options.protocol.label": "FluxDown 自定义协议",
   "options.protocol.enabled": "已启用，经 fluxdown:// 唤起应用",
   "options.protocol.disabled": "关闭（默认）",
-  "options.protocol.desc": "经 fluxdown:// 协议唤起应用下载，Windows / macOS / Linux / Android 均支持。本机通道功能更全，建议仅在其不可用时开启",
+  "options.protocol.desc": "经 fluxdown:// 协议唤起应用下载，Windows / macOS / Linux 均支持（Android 版浏览器会自动把下载交给 FluxDown 应用，无需开启）。本机通道功能更全，建议仅在其不可用时开启",
 
   // 任务完成通知（任务面板）
   "notify.taskCompletedTitle": "下载完成",
@@ -499,6 +517,10 @@ const zhCN = {
   "options.intercept.localDownloadHint": "网页在浏览器内生成的文件（blob:/data: 链接、Service Worker 流式下载）无法接管，将由浏览器下载",
   "options.intercept.magnet": "接管磁力链接",
   "options.intercept.magnetHint": "关闭后点击磁力链接交给系统默认程序（如 qBittorrent）",
+  "options.intercept.bypassKey": "跳过接管按键",
+  "options.intercept.bypassKeyDesc": "按住此键点击链接，本次下载交给浏览器（磁力链接交给系统默认程序）",
+  "options.intercept.bypassKeyAlt": "Alt（Mac 为 Option）",
+  "options.intercept.bypassKeyOff": "关闭",
   "options.intercept.minSize": "最小文件大小",
   "options.intercept.sizeNoLimit": "不限",
   "options.intercept.fallbackReject": "桌面端拒绝时回退浏览器下载",
@@ -529,6 +551,8 @@ const zhCN = {
   "options.sniff.imagesDesc": "检测网页中的大图片资源（>100KB）",
   "options.sniff.lowConfidence": "显示低置信度资源",
   "options.sniff.lowConfidenceDesc": "在资源列表中同时显示判断把握较低的项目",
+  "options.sniff.maxResources": "单页嗅探上限",
+  "options.sniff.maxResourcesDesc": "页面链接扫描到这么多条后停止（1–{max}）。数值过大时长列表页可能变卡；网络请求中嗅探到的媒体不计入。",
   "options.sites.desc": "为单个站点覆盖全局行为：是否接管下载、是否嗅探、悬浮球与浮钮，以及保存目录。站点配置对其子域同样生效。",
   "options.sites.colHost": "站点",
   "options.sites.colIntercept": "接管",

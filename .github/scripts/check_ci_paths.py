@@ -5,7 +5,7 @@
 （典型：只改 Rust 侧共享夹具，TS 镜像测试不跑，§5 镜像契约漂移进 main）。
 本脚本从源码推导每个门禁的真实输入，逐一比对过滤器：
 
-- Rust 门禁（rust / android / docker）：入口 crate 经 path 依赖的闭包（`cargo metadata
+- Rust 门禁（rust / android / ios / docker）：入口 crate 经 path 依赖的闭包（`cargo metadata
   --no-deps`，不联网）的目录、这些 crate 里 `include_str!` / `include_bytes!` 引到 crate 外的
   文件、根 `Cargo.toml` 的 `[patch]` 路径、`Cargo.toml` / `Cargo.lock`。
 - TS 门禁（web / extension / sdk / website）：项目内源码以相对路径（`from` / `import()` /
@@ -31,6 +31,7 @@ CI = ROOT / ".github" / "workflows" / "ci.yml"
 RUST_GATES: dict[str, list[str] | None] = {
     "rust": None,
     "android": ["fluxdown_mobile"],
+    "ios": ["fluxdown_mobile"],
     "docker": ["fluxdown_agent", "fluxdown_daemon"],
 }
 # 过滤器名 → 项目目录。

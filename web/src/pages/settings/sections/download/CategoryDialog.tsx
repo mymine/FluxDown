@@ -21,7 +21,7 @@ import {
 import { DirPickerDialog } from '../download/DirPickerDialog'
 import { parseExtensions, regexLooksValid, writeCategories } from './categoryModel'
 
-type MatchMode = 'extension' | 'regex'
+type MatchMode = 'extension' | 'regex' | 'url'
 
 export function CategoryDialog({
   open,
@@ -43,9 +43,10 @@ export function CategoryDialog({
   const t = useT()
   const [name, setName] = useState(existing?.name ?? '')
   const [icon, setIcon] = useState(existing?.icon ?? 'file')
-  const [mode, setMode] = useState<MatchMode>(existing?.matchMode === 'regex' ? 'regex' : 'extension')
+  const [mode, setMode] = useState<MatchMode>(existing?.matchMode === 'regex' ? 'regex' : existing?.matchMode === 'url' ? 'url' : 'extension')
   const [extensions, setExtensions] = useState(existing?.extensions.join(', ') ?? '')
   const [regex, setRegex] = useState(existing?.regexPattern ?? '')
+  const [urlPattern, setUrlPattern] = useState(existing?.urlPattern ?? '')
   const [saveDir, setSaveDir] = useState(existing?.saveDir ?? '')
   const [error, setError] = useState<string | null>(null)
   const [picking, setPicking] = useState(false)
@@ -61,15 +62,23 @@ export function CategoryDialog({
     if (trimmedName === '' && !isBuiltin) return setError(t('categoryNameRequired'))
     let nextExtensions = existing?.extensions ?? []
     let nextRegex = existing?.regexPattern ?? ''
+    let nextUrlPattern = existing?.urlPattern ?? ''
     if (!specialBuiltin) {
       if (mode === 'extension') {
         nextExtensions = parseExtensions(extensions)
         if (nextExtensions.length === 0 && !isBuiltin) return setError(t('extensionsRequired'))
         nextRegex = ''
-      } else {
+        nextUrlPattern = ''
+      } else if (mode === 'regex') {
         nextRegex = regex.trim()
         if (nextRegex !== '' && !regexLooksValid(nextRegex)) return setError(t('regexInvalid'))
         nextExtensions = []
+        nextUrlPattern = ''
+      } else {
+        nextUrlPattern = urlPattern.trim()
+        if (nextUrlPattern === '') return setError(t('urlPatternRequired'))
+        nextExtensions = []
+        nextRegex = ''
       }
     }
     const fields = {
@@ -78,6 +87,7 @@ export function CategoryDialog({
       matchMode: mode,
       extensions: nextExtensions,
       regexPattern: nextRegex,
+      urlPattern: nextUrlPattern,
       saveDir: saveDir.trim(),
     }
     if (existing) {
@@ -161,21 +171,32 @@ export function CategoryDialog({
                   items={[
                     { value: 'extension', label: t('matchByExtension') },
                     { value: 'regex', label: t('matchByRegex') },
+                    { value: 'url', label: t('matchByUrl') },
                   ]}
                   value={mode}
                   onValueChange={(next) => {
-                    setMode(next)
+                    setMode(next as MatchMode)
                     setError(null)
                   }}
                   className="self-start"
                 />
               </FormField>
-              <FormField label={t(mode === 'extension' ? 'extensionsLabel' : 'regexLabel')} htmlFor="category-match">
+              <FormField
+                label={t(mode === 'extension' ? 'extensionsLabel' : mode === 'regex' ? 'regexLabel' : 'urlPatternLabel')}
+                hint={mode === 'url' ? t('urlPatternDesc') : undefined}
+                htmlFor="category-match"
+              >
                 <Input
                   id="category-match"
-                  value={mode === 'extension' ? extensions : regex}
-                  placeholder={t(mode === 'extension' ? 'extensionsHint' : 'regexHint')}
-                  onChange={(event) => (mode === 'extension' ? setExtensions(event.target.value) : setRegex(event.target.value))}
+                  value={mode === 'extension' ? extensions : mode === 'regex' ? regex : urlPattern}
+                  placeholder={t(mode === 'extension' ? 'extensionsHint' : mode === 'regex' ? 'regexHint' : 'urlPatternHint')}
+                  onChange={(event) =>
+                    mode === 'extension'
+                      ? setExtensions(event.target.value)
+                      : mode === 'regex'
+                        ? setRegex(event.target.value)
+                        : setUrlPattern(event.target.value)
+                  }
                 />
               </FormField>
             </>

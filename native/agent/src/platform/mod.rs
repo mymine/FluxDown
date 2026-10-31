@@ -1,4 +1,4 @@
-//! agent 桌面系统集成：任务文件打开/定位、官方桌面进程唤起、开机自启、
+//! agent 桌面系统集成：任务文件打开/定位/复制到剪贴板、官方桌面进程唤起、开机自启、
 //! `.torrent` 关联与 URL scheme 注册、系统文件图标提取（见 [`file_icon_png`]）。
 //!
 //! 关联与 URL scheme 的注册目标是官方桌面程序：Windows 指向同级
@@ -12,7 +12,11 @@
 //! `LSUIElement`，常驻时不占 Dock），桌面程序位于外层 `FluxDown.app/Contents/MacOS/`。
 //! 不在该布局内（开发期 `target/release` 平铺）时按同级目录解析。
 
+#[cfg(feature = "desktop")]
+pub(crate) mod app_icon;
 mod autostart;
+#[cfg(feature = "desktop")]
+mod clipboard_files;
 #[cfg(feature = "desktop")]
 mod clipboard_seq;
 mod file_association;
@@ -131,7 +135,7 @@ fn successor_handler(candidates: Vec<String>, mine: &str) -> Option<String> {
 
 /// 引擎下载中临时文件后缀（`fluxdown_engine::downloader::TEMP_EXT`）；agent 不依赖引擎，
 /// 此处镜像同一字面量。
-const DOWNLOADING_SUFFIX: &str = ".fdownloading";
+pub(crate) const DOWNLOADING_SUFFIX: &str = ".fdownloading";
 
 /// 用系统默认程序打开任务产物；最终文件尚不存在（下载中 / 暂停 / 已被移走）时报错，
 /// 不交给系统命令静默失败。
@@ -155,6 +159,60 @@ pub fn reveal_task(task: &fluxdown_protocol::TaskDto) -> Result<(), PlatformErro
 fn reveal_task_file(save_dir: &Path, file_name: &str) -> Result<(), PlatformError> {
     let (path, reveal) = reveal_target(save_dir, file_name)?;
     launch_path(&path, reveal)
+}
+
+/// 任务状态码「已完成」（`TaskDto::status`：0=pending, 1=downloading, 2=paused, 3=completed …）。
+const TASK_STATUS_COMPLETED: i32 = 3;
+
+/// 本构建与当前会话能否把文件写入系统剪贴板：需编入桌面剪贴板（`desktop` 特性，headless / NAS
+/// 构建没有）；Linux 另需图形会话（`WAYLAND_DISPLAY` / `DISPLAY`），否则没有剪贴板可写。网关据此
+/// 按连接下发 `agent.copyTaskFiles`，客户端只在能真正生效时展示「复制文件」。
+#[must_use]
+pub fn copies_files_to_clipboard() -> bool {
+    if !cfg!(all(
+        feature = "desktop",
+        any(windows, target_os = "macos", target_os = "linux")
+    )) {
+        return false;
+    }
+    !cfg!(target_os = "linux")
+        || ["WAYLAND_DISPLAY", "DISPLAY"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+}
+
+/// 把任务产物以文件形式写入系统剪贴板（可在文件管理器 / 聊天软件里粘贴）。任一任务未完成或产物
+/// 已不在磁盘上即整体报 [`PlatformError::NotFound`]，不写入只含部分文件的剪贴板。
+pub fn copy_task_files(tasks: &[fluxdown_protocol::TaskDto]) -> Result<(), PlatformError> {
+    let paths = clipboard_targets(tasks)?;
+    write_clipboard_files(&paths)
+}
+
+/// 剪贴板要写入的产物路径（去重，保持顺序）；校验见 [`copy_task_files`]。
+fn clipboard_targets(tasks: &[fluxdown_protocol::TaskDto]) -> Result<Vec<PathBuf>, PlatformError> {
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let path = Path::new(&task.save_dir).join(&task.file_name);
+        if task.status != TASK_STATUS_COMPLETED || task.file_name.is_empty() || !path.exists() {
+            return Err(PlatformError::NotFound(path));
+        }
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+#[cfg(feature = "desktop")]
+fn write_clipboard_files(paths: &[PathBuf]) -> Result<(), PlatformError> {
+    clipboard_files::write(paths)
+}
+
+#[cfg(not(feature = "desktop"))]
+fn write_clipboard_files(_paths: &[PathBuf]) -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported(
+        "copying files to the clipboard requires the desktop build",
+    ))
 }
 
 /// 用系统默认的目录处理程序打开已存在的目录；不存在时报错，不交给系统命令静默失败。
@@ -908,6 +966,47 @@ pub enum PlatformError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn clip_task(dir: &Path, id: &str, file_name: &str, status: i32) -> fluxdown_protocol::TaskDto {
+        serde_json::from_value(serde_json::json!({
+            "taskId": id, "url": "https://example.com/f", "fileName": file_name,
+            "saveDir": dir.to_string_lossy(), "status": status, "downloadedBytes": 1,
+            "totalBytes": 1, "errorMessage": "", "createdAt": "1", "proxyUrl": "",
+            "queueId": "", "checksum": ""
+        }))
+        .expect("task dto")
+    }
+
+    #[test]
+    fn clipboard_targets_need_every_task_completed_with_its_product_on_disk() {
+        let dir = std::env::temp_dir().join(format!("fluxdown-clip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).expect("create save dir");
+        std::fs::write(dir.join("a.zip"), b"a").expect("write product");
+        std::fs::create_dir(dir.join("album")).expect("create multi-file product");
+        let ok = clip_task(&dir, "1", "a.zip", TASK_STATUS_COMPLETED);
+
+        // 多文件 BT 产物是目录，同样可复制；指向同一产物的任务只写一次。
+        let paths = clipboard_targets(&[
+            ok.clone(),
+            clip_task(&dir, "2", "album", TASK_STATUS_COMPLETED),
+            clip_task(&dir, "3", "a.zip", TASK_STATUS_COMPLETED),
+        ])
+        .expect("targets");
+        assert_eq!(paths, vec![dir.join("a.zip"), dir.join("album")]);
+
+        // 未完成（BT 下载中产物已就位）、产物已删、无文件名：整体拒绝，不写半份剪贴板。
+        for bad in [
+            clip_task(&dir, "4", "a.zip", 1),
+            clip_task(&dir, "5", "gone.zip", TASK_STATUS_COMPLETED),
+            clip_task(&dir, "6", "", TASK_STATUS_COMPLETED),
+        ] {
+            assert!(matches!(
+                clipboard_targets(&[ok.clone(), bad]),
+                Err(PlatformError::NotFound(_))
+            ));
+        }
+        std::fs::remove_dir_all(&dir).expect("remove save dir");
+    }
 
     #[cfg(unix)]
     #[test]

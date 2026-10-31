@@ -39,6 +39,8 @@ type ManifestBack = Rc<dyn Fn(&mut Window, &mut App)>;
 pub(crate) struct ManifestView {
     translator: Entity<Translator>,
     selection: ManifestSelection,
+    /// Identity of the plugin that produced the manifest; copied into the group request.
+    plugin_id: String,
     base: CreateTaskRequest,
     queues: Vec<NewDownloadQueue>,
     group_name: Entity<InputState>,
@@ -46,6 +48,8 @@ pub(crate) struct ManifestView {
     search: Entity<InputState>,
     picking: bool,
     submitting: bool,
+    /// 当前（或最近一次）提交走「稍后下载」：在途时只让被点击的那一侧按钮转圈。
+    submitting_paused: bool,
     on_submit: ManifestSubmit,
     on_back: ManifestBack,
 }
@@ -108,6 +112,7 @@ impl ManifestView {
         Self {
             translator,
             selection: ManifestSelection::new(manifest.items),
+            plugin_id: manifest.plugin_id,
             base,
             queues,
             group_name,
@@ -115,6 +120,7 @@ impl ManifestView {
             search,
             picking: false,
             submitting: false,
+            submitting_paused: false,
             on_submit,
             on_back,
         }
@@ -177,10 +183,12 @@ impl ManifestView {
             self.group_name.read(cx).value().as_str(),
             self.save_dir.read(cx).value().as_str(),
             queue,
+            &self.plugin_id,
             paused,
         ) else {
             return;
         };
+        self.submitting_paused = paused;
         self.set_submitting(true, cx);
         (self.on_submit)(request, window, cx);
     }

@@ -18,6 +18,7 @@ sourceHash: "d9ffd59b929e"
 | `settings` | 可移植与桌面实现均可。插件设置对话框中的一个标签页。 | 仅可移植。插件设置对话框中的标签页（仅当插件已启用、已加载且授权齐全时出现）。 | 不渲染 |
 | `taskDetail` | 可移植与桌面实现均可。任务详情面板与独立任务详情窗口中的标签页。 | 仅可移植。 | 不渲染 |
 | `window` | **仅桌面实现。** 从插件行打开。 | 没有入口。 | 不渲染 |
+| `auth` | 可移植与桌面实现均可。插件**登录**对话框的全部内容（替换默认的站点 / 登录信息表单）；对话框标题仍为「登录 <插件名>」。 | 仅可移植。同左。 | 不渲染，使用默认登录流程 |
 
 - 只有**已启用、已加载、授权已齐**的插件才会贡献视图和命令。
 - Web 端只显示 `portable` 为 true 的视图。声明了 `desktop` 但没有 `portable: true` 的视图在 Web 端不会出现；直接访问它的地址会看到「视图会话已结束」占位，而不是「仅桌面端」卡片。
@@ -51,7 +52,7 @@ sourceHash: "d9ffd59b929e"
 |---|---|
 | `id` | 匹配 `^[a-z][a-z0-9-]{0,31}$`，在插件的视图中唯一。 |
 | `title` | 1–40 个字符，用作页面 / 标签页 / 窗口标题。 |
-| `location` | `activity`、`settings`、`taskDetail` 或 `window`。每个插件至多一个 `settings` 视图。 |
+| `location` | `activity`、`settings`、`taskDetail`、`window` 或 `auth`。每个插件至多一个 `settings` 视图、至多一个 `auth` 视图。`auth` 要求顶层声明 `auth`（见[自定义登录界面](/docs/zh/plugins/auth-guide/#自定义登录界面)）；旧版本应用会拒绝未知 location，请设置 `minAppVersion`。 |
 | `portable` | 只能与 `desktop` 同时出现。`true` 表示 `main` 也实现了该视图。没有 `desktop` 的视图恒为可移植。 |
 | `desktop` | `{ entry, networkHosts?, width?, height? }`，需要 `desktop` 权限，见[原生桌面界面](/docs/zh/plugins/desktop-ui-guide/)。 |
 
@@ -185,8 +186,29 @@ flux.ui.view(id: string, def: {
 | `taskId` | `taskDetail` 视图所属的任务；其他位置为 `null`。 |
 | `locale` | 会话打开时客户端的界面语言（如 `zh-CN`、`en`）；客户端未提供时为空字符串。用户之后切换语言不会更新它。 |
 | `refresh()` | 请求重新渲染该会话。把 `ctx` 保存起来（例如放进 `state`），就能在定时器、命令或事件处理函数里触发刷新。 |
+| `close()` | 关闭承载该视图的容器并结束会话：登录对话框（`auth`）、设置对话框（`settings`）或独立窗口。嵌入页面的视图（活动栏页、任务详情标签页）没有容器，改为显示「视图会话已结束」和**重新打开**按钮。重复调用不做任何事。可以在 `init` 里调用（例如用户已经登录）：客户端显示视图后立即关闭。 |
+| `navigate(target)` | 返回 Promise。让主窗口到前台并切换到某个页面。`target` 为 `"downloads"`、`"rss"`、`"webhooks"`、`"share"`，或用 `{ view: "<id>" }` 指向本插件的某个 `activity` 视图。未知目标会以 `navigate: unknown target …` reject；`{ view }` 不是本插件的 `activity` 视图时以 `navigate: view '<id>' is not an activity view of this plugin` reject；在 `close()` 之后调用会以 `navigate: the view has been closed; call navigate() before close()` reject。可以在 `init` 里调用。目标页面在该客户端不可用（例如 Web 端无法显示仅桌面实现的视图）时，客户端忽略该请求并记录警告日志。只影响打开该会话的那个客户端。 |
 
 `ViewContext`、`ViewEvent`、`ViewDefinition` 这些 TypeScript 类型由 `fluxdown-plugin-sdk` 导出（见 [SDK 参考](/docs/zh/plugins/sdk/)）。
+
+示例：一个活动栏页面添加下载后跳到下载列表：
+
+```js
+flux.ui.view("add", {
+  init: (ctx) => ({ ctx, url: "" }),
+  render: (state) =>
+    h("stack", { gap: "sm", padding: "md" },
+      h("input", { key: "url", value: state.url, placeholder: "https://…" }),
+      h("button", { key: "add", text: "Add and show downloads", variant: "primary" })),
+  async event(state, ev) {
+    if (ev.node === "root/url" && ev.type === "change") state.url = String(ev.value);
+    if (ev.node === "root/add" && ev.type === "press") {
+      await flux.tasks.create({ request: { url: state.url } }); // 需要 `tasks` 权限
+      await state.ctx.navigate("downloads");
+    }
+  },
+});
+```
 
 ### 事件对象
 

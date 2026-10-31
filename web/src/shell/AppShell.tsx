@@ -10,6 +10,7 @@ import { useEffect } from 'react'
 import { useT } from '../i18n'
 import { isPluginEntryActive } from '../pages/plugins/contributions'
 import { usePluginActivityEntries, usePluginShellBridge } from '../pages/plugins/usePluginContributions'
+import { ShareHost } from '../pages/share'
 import { useIsMobile } from '../ui'
 import { AccountGuards } from './AccountGuards'
 import { ActivityRail } from './ActivityRail'
@@ -20,6 +21,7 @@ import { setChromeEditing, useChromeEdit } from './chromeStore'
 import { ChromeZoneView } from './ChromeZone'
 import { ConnectionBanner, ConnectionDot } from './ConnectionStatus'
 import { TitleBar, TitleBarSlotProvider } from './TitleBar'
+import { PluginNotices } from './PluginNotices'
 import { UpdateBanner, UpdateRestartOverlay } from './UpdateStatus'
 
 const TITLE_ZONE = 'flex shrink-0 items-center gap-1'
@@ -34,6 +36,7 @@ function useDefaultTitle(): string {
   }
   if (pathname.startsWith('/rss')) return t('sidebarRss')
   if (pathname.startsWith('/webhooks')) return t('pushNavTitle')
+  if (pathname.startsWith('/share')) return t('shareNavTitle')
   if (pathname.startsWith('/settings')) return t('settings')
   return t('mobileNavDownloads')
 }
@@ -90,6 +93,8 @@ export function AppShell() {
         </div>
         {mobile ? <BottomTabBar /> : null}
         <AccountGuards />
+        <PluginNotices />
+        <ShareHost />
         <UpdateRestartOverlay />
       </div>
     </TitleBarSlotProvider>

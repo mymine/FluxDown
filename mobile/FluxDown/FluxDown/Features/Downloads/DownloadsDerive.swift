@@ -45,7 +45,8 @@ struct DownloadsDeriver {
     private var createdCache: [String: Int64] = [:]
     private var categories: [TaskCategory] = []
     private var index = CategoryIndex(TaskCategory.builtin)
-    private var categoryByName: [String: TaskCategory?] = [:]
+    /// 远程任务的分类缓存（网址规则让分类不再只取决于文件名，键为 文件名 + 来源地址）。
+    private var categoryByKey: [CategoryKey: TaskCategory?] = [:]
     private var sortSignature = 0
     private var lastReorderMs: Int64 = 0
     private var lastPositions: [String: Int] = [:]
@@ -65,7 +66,7 @@ struct DownloadsDeriver {
         if categories != s.categories {
             categories = s.categories
             index = CategoryIndex(s.categories)
-            categoryByName.removeAll()
+            categoryByKey.removeAll()
             entries.removeAll()
         }
         var queuesById: [String: TaskQueue] = [:]
@@ -237,7 +238,7 @@ struct DownloadsDeriver {
             return RemoteRow(
                 task: task,
                 createdAt: created,
-                categoryId: resolveCategory(task.displayName)?.id,
+                categoryId: resolveCategory(task.displayName, url: task.url)?.id,
                 site: Self.site(ofUrl: task.url)
             )
         }
@@ -261,11 +262,17 @@ struct DownloadsDeriver {
         return formatter
     }()
 
-    /// 按文件名解析分类（与本地行共用同一缓存）。
-    private mutating func resolveCategory(_ name: String) -> TaskCategory? {
-        if let cached = categoryByName[name] { return cached }
-        let category = index.categoryOf(name)
-        categoryByName[name] = .some(category)
+    private struct CategoryKey: Hashable {
+        let name: String
+        let url: String
+    }
+
+    /// 按文件名 + 来源地址解析分类（远程行用；本地行优先沿用上一行的分类）。
+    private mutating func resolveCategory(_ name: String, url: String) -> TaskCategory? {
+        let key = CategoryKey(name: name, url: url)
+        if let cached = categoryByKey[key] { return cached }
+        let category = index.categoryOf(name, url: url)
+        categoryByKey[key] = .some(category)
         return category
     }
 
@@ -280,10 +287,19 @@ struct DownloadsDeriver {
         let runtime = s.runtime[task.taskId]
         let queueOrder = s.queueOrder.order(of: task.taskId)
         let boosted = s.priorityTaskId == task.taskId
-        let category = resolveCategory(task.fileName)
         let queue = queuesById[normalizedQueueId(task.queueId)]
 
-        if let previous = entries[task.taskId],
+        let previous = entries[task.taskId]
+        // 分类只取决于文件名与来源地址（网址规则）：二者未变就沿用上一行的分类，不在 10 Hz 派生里重算规则。
+        let category: TaskCategory?
+        if let previous, previous.task.fileName == task.fileName, previous.task.url == task.url,
+           previous.task.originUrl == task.originUrl {
+            category = previous.category
+        } else {
+            category = index.categoryOf(task.fileName, url: task.shareUrl)
+        }
+
+        if let previous = previous,
            previous.task == task, previous.runtime == runtime, previous.down == down, previous.up == up,
            previous.queueOrder == queueOrder, previous.boosted == boosted, previous.awaitingDecision == awaitingDecision,
            previous.category == category, previous.queue == queue {

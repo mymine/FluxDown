@@ -54,7 +54,7 @@ export function NumberField({
   const clamp = (n: number) => Math.min(max ?? Number.POSITIVE_INFINITY, Math.max(min ?? Number.NEGATIVE_INFINITY, n))
   const shown = draft ?? formatNumber(value)
   return (
-    <div className={cn('inline-flex items-center gap-2', WIDTH_NUMBER, unit && 'mobile:w-full', className)}>
+    <div className={cn('inline-flex items-center gap-2', unit ? 'mobile:w-full' : WIDTH_NUMBER, className)}>
       <Input
         type="number"
         inputMode={float ? 'decimal' : 'numeric'}
@@ -64,7 +64,7 @@ export function NumberField({
         max={max}
         step={step}
         disabled={disabled}
-        className="min-w-0 flex-1 tabular"
+        className={cn('min-w-0 tabular', unit ? 'flex-1 desktop:w-[104px] desktop:flex-none' : 'flex-1')}
         onFocus={() => setDraft(formatNumber(value))}
         onChange={(event) => {
           const text = event.target.value

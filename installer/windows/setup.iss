@@ -146,6 +146,10 @@ Type: dirifempty; Name: "{localappdata}\FluxDown\nmh"
 Type: files; Name: "{app}\com.fluxdown.nmh.json"
 Type: files; Name: "{app}\com.fluxdown.nmh.firefox.json"
 
+; 应用图标功能（agent 的 exe_icon）给 exe 打图标补丁时在安装目录留的临时副本；正常流程会自己删除，
+; 这里兜底崩溃遗留，否则卸载后安装目录删不掉。
+Type: files; Name: "{app}\.fluxdown-desktop.exe.icon-*.tmp"
+
 [Code]
 const
   RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';

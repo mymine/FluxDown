@@ -16,9 +16,7 @@
 //! 下载任务的拦截器阶段（`Prepare` … `Finalize`）绑定任务生命周期（落盘、重命名、mux），
 //! 不作用于宿主自身下载。
 
-#[cfg(feature = "plugins")]
 use std::collections::HashMap;
-#[cfg(feature = "plugins")]
 use std::sync::Arc;
 
 use crate::db::{Db, DbError};
@@ -27,7 +25,7 @@ use crate::downloader::DownloadError;
 use crate::logger::{log_info, log_warn};
 #[cfg(feature = "plugins")]
 use crate::plugin::{PluginManager, ResolveRequest, ResolveResult};
-use crate::proxy_config::{ProxyConfig, normalize_no_proxy};
+use crate::proxy_config::{ProxyConfig, proxy_bypass_list};
 
 /// 出口方案无法得出。
 #[derive(Debug, thiserror::Error)]
@@ -132,15 +130,106 @@ pub struct EgressPlan {
 }
 
 /// 把全局代理设置解析成具体代理：`System` 读系统设置（可能起子进程，需在阻塞上下文调用），
-/// `Auto` 与未配置一样直连（同下载任务的兜底 client）。
+/// `Auto` 与未配置一样直连（同下载任务的兜底 client）。直连名单与下载任务 client 同口径：
+/// 环回恒直连 + 归一化后的用户 / 系统名单。
 #[must_use]
 pub fn proxy_endpoint(proxy: &ProxyConfig) -> Option<ProxyEndpoint> {
     let resolved = proxy.resolve();
     let url = resolved.to_proxy_url()?;
     Some(ProxyEndpoint {
         url,
-        no_proxy: normalize_no_proxy(&resolved.no_proxy_list),
+        no_proxy: proxy_bypass_list(&resolved.no_proxy_list),
     })
+}
+
+/// 与 [`proxy_endpoint`] 相同，但先按站点规则匹配 `url`：命中时返回规则出口的端点
+/// （直连为 `None`）。会阻塞（规则出口为系统代理时要检测系统设置）。
+#[must_use]
+pub fn proxy_endpoint_for(proxy: &ProxyConfig, url: &str) -> Option<ProxyEndpoint> {
+    if let Some(rule) = proxy
+        .rules
+        .as_ref()
+        .and_then(|rules| rules.first_match(url))
+    {
+        return proxy_endpoint(&rule.egress().resolve());
+    }
+    proxy_endpoint(proxy)
+}
+
+type Configure = Arc<dyn Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync>;
+
+/// 宿主自身下载用的按 URL 选出口的客户端集合：未命中站点规则用 `base`（全局出口），
+/// 命中则按规则下标惰性构建并缓存对应出口的客户端。
+pub struct RoutedClients {
+    global: ProxyConfig,
+    user_agent: String,
+    configure: Configure,
+    base: reqwest::Client,
+    rule_clients: std::sync::Mutex<HashMap<usize, reqwest::Client>>,
+}
+
+impl RoutedClients {
+    /// 立即构建 `base`，坏代理配置在此失败（不会静默退化为直连）。会阻塞（System 模式要检测
+    /// 系统代理），async 调用方须放到 `spawn_blocking`。
+    pub fn new(
+        global: &ProxyConfig,
+        user_agent: &str,
+        configure: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync + 'static,
+    ) -> Result<Self, DownloadError> {
+        let configure: Configure = Arc::new(configure);
+        let base = configure(crate::downloader::build_client_builder(
+            global, user_agent, false,
+        )?)
+        .build()
+        .map_err(|e| DownloadError::Other(format!("failed to build http client: {e}")))?;
+        Ok(Self {
+            global: global.clone(),
+            user_agent: user_agent.to_string(),
+            configure,
+            base,
+            rule_clients: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// `url` 对应出口的客户端。规则出口客户端构建失败时返回错误，不回退到全局出口。
+    pub async fn client(&self, url: &str) -> Result<reqwest::Client, DownloadError> {
+        let Some(rule) = self
+            .global
+            .rules
+            .as_ref()
+            .and_then(|rules| rules.first_match(url))
+        else {
+            return Ok(self.base.clone());
+        };
+        let index = rule.index();
+        if let Some(client) = self.cached(index) {
+            return Ok(client);
+        }
+        let egress = rule.egress().clone();
+        let configure = Arc::clone(&self.configure);
+        let ua = self.user_agent.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            let proxy = egress.resolve();
+            configure(crate::downloader::build_client_builder(&proxy, &ua, false)?)
+                .build()
+                .map_err(|e| DownloadError::Other(format!("failed to build http client: {e}")))
+        })
+        .await
+        .map_err(|e| DownloadError::Other(format!("proxy rule client task failed: {e}")))??;
+        self.rule_clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(index, client.clone());
+        Ok(client)
+    }
+
+    fn cached(&self, index: usize) -> Option<reqwest::Client> {
+        self.rule_clients
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&index)
+            .cloned()
+    }
 }
 
 /// 宿主自身请求的客户端装配：与下载任务的 client 同一套代理、TLS 与连接参数；调用方可追加
@@ -185,18 +274,27 @@ impl Egress {
         ))
     }
 
-    /// 按当前全局代理装配客户端（引擎默认 UA）。
-    pub async fn client_builder(&self) -> Result<reqwest::ClientBuilder, EgressError> {
+    /// 按当前全局代理（含站点规则）装配客户端集合（引擎默认 UA）；`configure` 追加超时、
+    /// 重定向策略等。坏代理配置在此失败。
+    pub async fn routed(
+        &self,
+        configure: impl Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync + 'static,
+    ) -> Result<RoutedClients, EgressError> {
         let proxy = self.proxy().await?;
         // `System` 模式要读系统代理设置（可能起子进程），放到阻塞线程池。
-        Ok(tokio::task::spawn_blocking(move || client_builder(&proxy, "")).await??)
+        Ok(
+            tokio::task::spawn_blocking(move || RoutedClients::new(&proxy, "", configure))
+                .await??,
+        )
     }
 
     /// 给不在本进程装配客户端的宿主的完整方案；`verified_payload` 语义见
     /// [`Self::route_verified`]，为假时只给代理、地址不变。
     pub async fn plan(&self, url: &str, verified_payload: bool) -> Result<EgressPlan, EgressError> {
         let proxy = self.proxy().await?;
-        let proxy = tokio::task::spawn_blocking(move || proxy_endpoint(&proxy)).await?;
+        let source = url.to_string();
+        let proxy =
+            tokio::task::spawn_blocking(move || proxy_endpoint_for(&proxy, &source)).await?;
         let route = if verified_payload {
             self.route_verified(url).await
         } else {
@@ -381,5 +479,51 @@ mod tests {
                 },
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod rule_tests {
+    use std::sync::Arc;
+
+    use super::proxy_endpoint_for;
+    use crate::proxy_config::{ProxyConfig, ProxyMode, ProxyType};
+    use crate::proxy_rules::ProxyRuleSet;
+
+    const RULES: &str = r#"[
+        {"id":"a","match":"domain","pattern":"github.com","action":"custom","proxy":"http://127.0.0.1:9"},
+        {"id":"b","match":"domain","pattern":"direct.test","action":"direct"}
+    ]"#;
+
+    fn global(mode: ProxyMode) -> ProxyConfig {
+        ProxyConfig {
+            mode,
+            proxy_type: ProxyType::Http,
+            host: "10.0.0.1".to_string(),
+            port: 8080,
+            rules: Some(Arc::new(ProxyRuleSet::compile(
+                RULES,
+                &ProxyConfig::default(),
+            ))),
+            ..ProxyConfig::default()
+        }
+    }
+
+    #[test]
+    fn rule_hit_overrides_global_mode() {
+        let none = global(ProxyMode::None);
+        let hit = proxy_endpoint_for(&none, "https://api.github.com/x");
+        assert!(hit.is_some_and(|e| e.url.starts_with("http://127.0.0.1:9")));
+        let manual = global(ProxyMode::Manual);
+        assert!(proxy_endpoint_for(&manual, "https://x.direct.test/").is_none());
+    }
+
+    #[test]
+    fn rule_miss_uses_global_endpoint() {
+        let none = global(ProxyMode::None);
+        assert!(proxy_endpoint_for(&none, "https://other.test/").is_none());
+        let manual = global(ProxyMode::Manual);
+        let miss = proxy_endpoint_for(&manual, "https://other.test/");
+        assert!(miss.is_some_and(|e| e.url.starts_with("http://10.0.0.1:8080")));
     }
 }

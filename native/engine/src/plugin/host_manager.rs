@@ -24,7 +24,7 @@ use crate::logger::log_info;
 use crate::plugin::audit::{AuditLog, PluginAuditRow};
 use crate::plugin::manifest::{
     PERMISSION_AUTH, PERMISSION_FFMPEG, PERMISSION_PAGE_SCRIPTS, PERMISSION_TASKS,
-    PERMISSION_YTDLP, PluginManifest,
+    PERMISSION_YTDLP, PluginManifest, ViewLocation,
 };
 use crate::plugin::runtime::{
     HostCall, HostContext, HostEvents, HostFuture, HostReply, PluginEntryKind, PluginError,
@@ -215,6 +215,25 @@ impl HostEvents for HostEventsImpl {
         };
         manager.host_settings_update(identity, entries).await
     }
+
+    fn close_view(&self, identity: &str, session: &str) -> Result<(), PluginError> {
+        let Some(manager) = self.manager.upgrade() else {
+            return Err(PluginError::Runtime("plugin manager stopped".to_string()));
+        };
+        manager.host_view_close(identity, session)
+    }
+
+    async fn navigate(
+        &self,
+        identity: &str,
+        session: &str,
+        target: serde_json::Value,
+    ) -> Result<(), PluginError> {
+        let Some(manager) = self.manager.upgrade() else {
+            return Err(PluginError::Runtime("plugin manager stopped".to_string()));
+        };
+        manager.host_view_navigate(identity, session, target).await
+    }
 }
 
 /// `flux.tasks.*` 的 manager 侧包装：审计 + `create` 限流，再转给 daemon 端口。
@@ -387,7 +406,10 @@ impl PluginManager {
                 .find(|p| p.manifest.identity == identity)
                 .ok_or_else(|| PluginError::Runtime(format!("plugin not found: {identity}")))?;
             if !plugin.enabled {
-                return Err(PluginError::Runtime(format!("plugin disabled: {identity}")));
+                return Err(PluginError::Runtime(format!(
+                    "plugin disabled: {identity} ({})",
+                    plugin.disabled_reason.describe()
+                )));
             }
             plugin.manifest.clone()
         };
@@ -455,7 +477,10 @@ impl PluginManager {
                 .find(|p| p.manifest.identity == identity)
                 .ok_or_else(|| PluginError::Runtime(format!("plugin not found: {identity}")))?;
             if !plugin.enabled {
-                return Err(PluginError::Runtime(format!("plugin disabled: {identity}")));
+                return Err(PluginError::Runtime(format!(
+                    "plugin disabled: {identity} ({})",
+                    plugin.disabled_reason.describe()
+                )));
             }
             if plugin.manifest.main.is_none() {
                 return Err(PluginError::Runtime(format!(
@@ -548,13 +573,18 @@ impl PluginManager {
 
     /// 关闭会话（客户端主动）。未知会话静默忽略。
     pub fn close_view(self: &Arc<Self>, session: &str) {
+        self.close_view_with_reason(session, "closed");
+    }
+
+    /// 以给定 `reason` 结束会话并广播 `PluginViewClosed`。未知会话静默忽略。
+    fn close_view_with_reason(self: &Arc<Self>, session: &str, reason: &str) {
         let removed = lock(&self.host.sessions).remove(session);
         let Some(entry) = removed else {
             return;
         };
         self.sink.emit(EngineEvent::PluginViewClosed {
             session: session.to_string(),
-            reason: "closed".to_string(),
+            reason: reason.to_string(),
         });
         self.notify_host_closed(&entry.identity, session);
     }
@@ -607,7 +637,10 @@ impl PluginManager {
             .find(|p| p.manifest.identity == identity)
             .ok_or_else(|| PluginError::Runtime(format!("plugin not found: {identity}")))?;
         if !plugin.enabled {
-            return Err(PluginError::Runtime(format!("plugin disabled: {identity}")));
+            return Err(PluginError::Runtime(format!(
+                "plugin disabled: {identity} ({})",
+                plugin.disabled_reason.describe()
+            )));
         }
         let Some(main) = &plugin.manifest.main else {
             return Err(PluginError::Runtime(format!(
@@ -627,6 +660,8 @@ impl PluginManager {
             ytdlp_permitted: plugin.manifest.has_permission(PERMISSION_YTDLP),
             auth_permitted: plugin.manifest.has_permission(PERMISSION_AUTH),
             private_network_allowed: plugin.dev,
+            // 常驻宿主不绑定某次调用：按全局规则 + 全局模式选出口。
+            egress: None,
         };
         let task_port: Option<Arc<dyn PluginTaskPort>> =
             if plugin.manifest.has_permission(PERMISSION_TASKS) {
@@ -1047,8 +1082,82 @@ impl PluginManager {
     // 设置
     // ---------------------------------------------------------------------
 
+    /// 校验 `session` 属于 `identity`（`ctx.close/navigate` 共用）。`init` 期间（首帧返回前）也
+    /// 放行：动作经事件送达客户端，客户端在 open 应答前收到的动作会先缓存、登记会话后再执行。
+    fn check_view_session(&self, identity: &str, session: &str) -> Result<(), PluginError> {
+        match lock(&self.host.sessions).get(session) {
+            Some(entry) if entry.identity == identity => Ok(()),
+            _ => Err(PluginError::Runtime(format!("unknown session: {session}"))),
+        }
+    }
+
+    /// 会话是否仍存在（daemon 在 open 应答前据此清理插件已在 `init` 中关闭的会话）。
+    #[must_use]
+    pub fn has_view_session(&self, session: &str) -> bool {
+        lock(&self.host.sessions).contains_key(session)
+    }
+
+    /// `ctx.close()`：原因固定为 `requested`（对应 `fluxdown_protocol::VIEW_CLOSE_REASON_REQUESTED`；
+    /// 引擎不依赖 protocol crate，故在此保持同值）。
+    fn host_view_close(self: &Arc<Self>, identity: &str, session: &str) -> Result<(), PluginError> {
+        self.check_view_session(identity, session)?;
+        self.close_view_with_reason(session, "requested");
+        Ok(())
+    }
+
+    /// `ctx.navigate(target)`：把 target 解析为路由 id（对应 `fluxdown_protocol::plugin_route_id`
+    /// 与 `NAV_BUILTIN_TARGETS`）并发出 `PluginViewNavigate`。
+    async fn host_view_navigate(
+        &self,
+        identity: &str,
+        session: &str,
+        target: serde_json::Value,
+    ) -> Result<(), PluginError> {
+        self.check_view_session(identity, session)?;
+        let route = match &target {
+            serde_json::Value::String(s)
+                if ["downloads", "rss", "webhooks", "share"].contains(&s.as_str()) =>
+            {
+                s.clone()
+            }
+            serde_json::Value::Object(map) if map.len() == 1 => {
+                let Some(view) = map.get("view").and_then(serde_json::Value::as_str) else {
+                    return Err(PluginError::Runtime(format!(
+                        "navigate: unknown target {target}"
+                    )));
+                };
+                let snapshot = self.plugins.read().await.clone();
+                let is_activity = snapshot
+                    .iter()
+                    .find(|p| p.manifest.identity == identity)
+                    .and_then(|p| p.manifest.contributes.as_ref())
+                    .is_some_and(|c| {
+                        c.views
+                            .iter()
+                            .any(|v| v.id == view && v.location == ViewLocation::Activity)
+                    });
+                if !is_activity {
+                    return Err(PluginError::Runtime(format!(
+                        "navigate: view '{view}' is not an activity view of this plugin"
+                    )));
+                }
+                format!("plugin:{identity}:{view}")
+            }
+            _ => {
+                return Err(PluginError::Runtime(format!(
+                    "navigate: unknown target {target}"
+                )));
+            }
+        };
+        self.sink.emit(EngineEvent::PluginViewNavigate {
+            session: session.to_string(),
+            target: route,
+        });
+        Ok(())
+    }
+
     /// `flux.settings.update`：与 UI 路径同一校验，额外写审计。
-    async fn host_settings_update(
+    pub(super) async fn host_settings_update(
         &self,
         identity: &str,
         entries: Vec<(String, String)>,

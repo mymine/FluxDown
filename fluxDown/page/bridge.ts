@@ -76,8 +76,14 @@ export interface PageConfig {
   frameIsTop: boolean;
   /** 是否接管本页 magnet 链接点击：settings.enabled && settings.interceptMagnet && 站点 intercept !== "never"。 */
   interceptMagnet: boolean;
+  /** 跳过接管修饰键：settings.enabled 关闭时为 "off"（没有接管可跳过）。 */
+  bypassKey: "alt" | "shift" | "off";
+  /** 按下链接时上报以预热 NMH：settings.enabled && 站点 intercept !== "never"。 */
+  warmOnLinkPress: boolean;
   /** settings.sniffImages：DOM 扫描是否把图片链接算作可下载。 */
   sniffImages: boolean;
+  /** settings.sniffMaxResources：单页 DOM 嗅探最多上报的资源数（fetch / XHR 嗅探不计入）。 */
+  sniffMaxResources: number;
   /**
    * 用户实际生效的 classify 规则（含覆盖 / 吊销 / 本地与插件规则，求值顺序）。页面 / 内容脚本据此
    * 用 `createClassifier` 判定类型；未收到配置前退回随包规则。

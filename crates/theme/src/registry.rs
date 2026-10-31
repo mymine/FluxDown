@@ -789,13 +789,11 @@ mod tests {
                         spec.path
                     );
                 }
-                assert_eq!(
-                    values.len(),
-                    TOKENS
-                        .iter()
-                        .filter(|spec| spec.default == DefaultExpr::Base)
-                        .count()
-                );
+                // 其余条目只能是预设固定的非 Base token，且同样类型合法。
+                for (path, value) in &values {
+                    let spec = token(path).unwrap_or_else(|| panic!("{base:?} 未知 {path}"));
+                    assert!(value.fits(spec.kind), "{base:?} {mode:?} {path}");
+                }
             }
         }
     }

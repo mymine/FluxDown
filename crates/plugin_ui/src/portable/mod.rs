@@ -11,7 +11,7 @@ mod tests;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use fluxdown_protocol::PluginViewFrameDto;
+use fluxdown_protocol::{PluginViewFrameDto, ViewEffect};
 use fluxdown_ui_i18n::Translator;
 use gpui::{App, Entity, Global, Task, WeakEntity};
 use serde_json::json;
@@ -23,6 +23,9 @@ use crate::PluginUiPort;
 
 /// 活跃会话保活间隔（daemon 90 s 无保活即关闭会话）。
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// open 进行中最多为多少个未知会话缓存动作（daemon 向全部 UI 连接广播，别的客户端的会话也会
+/// 落到这里；上限防止 open 卡住时无界增长）。
+const EARLY_SESSIONS_MAX: usize = 32;
 
 /// 渲染与会话共用的进程级依赖。
 pub(crate) struct PortableEnv {
@@ -32,20 +35,69 @@ pub(crate) struct PortableEnv {
 
 impl Global for PortableEnv {}
 
+/// 在 `view.open` 应答之前就到达的会话动作：插件可以在 `init` 里 `ctx.navigate()` /
+/// `ctx.close()`，这些事件与 open 应答走不同通道，可能先到。登记会话时一并执行。
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct EarlyActions {
+    pub effects: Vec<ViewEffect>,
+    pub closed: Option<String>,
+}
+
 /// session id → 宿主实体。
 #[derive(Default)]
 struct PortableSessions {
     by_session: HashMap<String, WeakEntity<PluginViewHost>>,
     keepalive: Option<Task<()>>,
+    /// 进行中的 `view.open` 数；只有大于 0 时才缓存未知会话的动作。
+    opening: usize,
+    early: HashMap<String, EarlyActions>,
 }
 
 impl Global for PortableSessions {}
 
 impl PortableSessions {
-    fn register(session: String, host: WeakEntity<PluginViewHost>, cx: &mut App) {
+    /// 登记会话，返回 open 应答前已到达的动作（由宿主随即执行）。
+    fn register(
+        session: String,
+        host: WeakEntity<PluginViewHost>,
+        cx: &mut App,
+    ) -> Option<EarlyActions> {
         let sessions = cx.default_global::<PortableSessions>();
+        let early = sessions.early.remove(&session);
         sessions.by_session.insert(session, host);
         ensure_keepalive(cx);
+        early
+    }
+
+    fn begin_open(cx: &mut App) {
+        cx.default_global::<PortableSessions>().opening += 1;
+    }
+
+    /// 一次 open 结束（成功、失败或宿主已释放）；全部结束后丢弃缓存。
+    fn end_open(cx: &mut App) {
+        let sessions = cx.default_global::<PortableSessions>();
+        sessions.opening = sessions.opening.saturating_sub(1);
+        if sessions.opening == 0 {
+            sessions.early.clear();
+        }
+    }
+
+    /// 未知会话的动作：open 进行中才缓存（可能属于即将登记的会话）。
+    fn stash(session: &str, cx: &mut App, record: impl FnOnce(&mut EarlyActions)) {
+        let Some(sessions) = cx.try_global::<PortableSessions>() else {
+            return;
+        };
+        if sessions.opening == 0 {
+            return;
+        }
+        if !sessions.early.contains_key(session) && sessions.early.len() >= EARLY_SESSIONS_MAX {
+            log::warn!(
+                "plugin view early actions dropped for {session}: too many pending sessions"
+            );
+            return;
+        }
+        let sessions = cx.global_mut::<PortableSessions>();
+        record(sessions.early.entry(session.to_owned()).or_default());
     }
 
     fn unregister(session: &str, cx: &mut App) {
@@ -112,18 +164,26 @@ pub fn notify_all(cx: &mut App) {
     }
 }
 
-/// daemon 推来的增量帧。未知会话（别的窗口 / 已关闭）忽略。
+/// daemon 推来的增量帧。未知会话（别的窗口 / 已关闭）忽略；open 进行中则先缓存其动作。
 pub fn dispatch_frame(frame: PluginViewFrameDto, cx: &mut App) {
     let Some(host) = PortableSessions::host(&frame.session, cx).and_then(|weak| weak.upgrade())
     else {
+        if !frame.effects.is_empty() {
+            PortableSessions::stash(&frame.session, cx, |early| {
+                early.effects.extend(frame.effects);
+            });
+        }
         return;
     };
     host.update(cx, |host, cx| host.apply_frame(frame, cx));
 }
 
-/// daemon 宣布会话结束（插件卸载 / 禁用等）。
+/// daemon 宣布会话结束（插件卸载 / 禁用 / 插件 `ctx.close()` 等）。open 进行中的未知会话先缓存。
 pub fn dispatch_closed(session: &str, reason: &str, cx: &mut App) {
     let Some(host) = PortableSessions::host(session, cx).and_then(|weak| weak.upgrade()) else {
+        PortableSessions::stash(session, cx, |early| {
+            early.closed = Some(reason.to_owned());
+        });
         return;
     };
     host.update(cx, |host, cx| host.mark_closed(reason, cx));

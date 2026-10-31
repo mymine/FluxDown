@@ -94,7 +94,7 @@ internal fun buildDetailModel(state: HostState, taskId: String, categories: Cate
         queuePosition = pos,
         queue = state.queues.firstOrNull { it.queueId == task.queueId || (task.queueId.isEmpty() && it.queueId == Queue.MAIN) },
         group = task.groupId.takeIf { it.isNotEmpty() }?.let { id -> state.groups.firstOrNull { it.groupId == id } },
-        category = categories.of(state.categories).categoryOf(task.fileName),
+        category = categories.of(state.categories).categoryOf(task.fileName, task.shareUrl),
         speedDown = speed?.down ?: 0L,
         speedUp = speed?.up ?: 0L,
         runtime = state.runtime[taskId],

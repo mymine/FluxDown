@@ -66,15 +66,26 @@ object ExternalIntake {
     /**
      * VIEW 的 data：`fluxdown://download?url=…&filename=…&cookies=…&referrer=…&headers=<JSON>` 走协议解析；
      * 其余（http(s) 直链 / magnet / ed2k）原样作为链接，X 浏览器等经 extra 附带的 [userAgent] / [cookie] /
-     * [referer] 随之带上。
+     * [referer] 随之带上；浏览器扩展的 Android Intent 另带 [fileName] 与完整请求头 [headersJson]
+     * （[userAgent] 只在请求头里没有 User-Agent 时补上）。
      */
-    fun fromView(data: String?, userAgent: String? = null, cookie: String? = null, referer: String? = null): ExternalDownload? {
+    fun fromView(
+        data: String?,
+        userAgent: String? = null,
+        cookie: String? = null,
+        referer: String? = null,
+        fileName: String? = null,
+        headersJson: String? = null,
+    ): ExternalDownload? {
         val raw = data?.trim().orEmpty()
         if (raw.isEmpty()) return null
         if (raw.startsWith(PROTOCOL_PREFIX, ignoreCase = true)) return fromProtocol(raw)
+        val headers = LinkedHashMap(decodeHeaders(headersJson))
         val ua = userAgent?.trim().orEmpty()
-        val headers = if (ua.isEmpty()) emptyMap() else mapOf("User-Agent" to ua.take(MAX_HEADER_VALUE_LEN))
-        return normalize(raw, "", cookie.orEmpty(), referer.orEmpty(), headers)
+        if (ua.isNotEmpty() && headers.keys.none { it.equals("User-Agent", ignoreCase = true) } && headers.size < MAX_HEADERS) {
+            headers["User-Agent"] = ua.take(MAX_HEADER_VALUE_LEN)
+        }
+        return normalize(raw, fileName.orEmpty(), cookie.orEmpty(), referer.orEmpty(), headers)
     }
 
     /** 从文本中提取首个可下载链接；无匹配返回 null。 */

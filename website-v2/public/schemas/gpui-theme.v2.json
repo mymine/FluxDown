@@ -42,7 +42,9 @@
         "builtin:default-light",
         "builtin:midnight-blue",
         "builtin:nord",
-        "builtin:warm-light"
+        "builtin:warm-light",
+        "builtin:graphite",
+        "builtin:graphite-light"
       ],
       "default": "builtin:default"
     },

@@ -25,6 +25,7 @@ import type { PageScriptStore } from "./store";
 import { buildStatus } from "./status";
 import { createPageScriptSync } from "./sync";
 import type { PageScriptSync, SyncCaps, SyncTrigger, UserScriptsApi } from "./sync";
+import { logWarn } from "@/utils/error-log";
 
 const SYNC_ALARM = "fluxdown-page-scripts-sync";
 const SYNC_PERIOD_MIN = 10;
@@ -120,7 +121,7 @@ function createServices(): Services {
 
 function reconcileInBackground(trigger: SyncTrigger, caps?: SyncCaps): void {
   if (!services) return;
-  services.sync.reconcile(trigger, caps).catch((e) => console.warn(`[FluxDown] page scripts sync (${trigger}) failed:`, e));
+  services.sync.reconcile(trigger, caps).catch((e) => logWarn(`[FluxDown] page scripts sync (${trigger}) failed:`, e));
 }
 
 /** 注册 `runtime.onUserScriptMessage`（事件不存在时跳过，授权后再试）。 */
@@ -156,7 +157,7 @@ async function syncAlarm(hasApprovals: boolean): Promise<void> {
     if (existing?.periodInMinutes === SYNC_PERIOD_MIN) return;
     await browser.alarms.create(SYNC_ALARM, { periodInMinutes: SYNC_PERIOD_MIN });
   } catch (e) {
-    console.warn("[FluxDown] page scripts alarm setup failed:", e);
+    logWarn("[FluxDown] page scripts alarm setup failed:", e);
   }
 }
 
@@ -186,7 +187,7 @@ export function installPageScripts(): void {
   store
     .loadApprovals()
     .then((approvals) => syncAlarm(Object.keys(approvals).length > 0))
-    .catch((e) => console.warn("[FluxDown] page scripts approvals load failed:", e));
+    .catch((e) => logWarn("[FluxDown] page scripts approvals load failed:", e));
 }
 
 // ===== 给 messages.ts 的 API =====
@@ -199,11 +200,11 @@ function requireServices(): Services {
 export async function getPageScriptsStatus(refresh: "none" | "stale" | "force" = "none"): Promise<PageScriptsStatus> {
   const { store, sync } = requireServices();
   if (refresh === "force") {
-    await sync.reconcile("user").catch((e) => console.warn("[FluxDown] page scripts sync failed:", e));
+    await sync.reconcile("user").catch((e) => logWarn("[FluxDown] page scripts sync failed:", e));
   } else if (refresh === "stale") {
     const state = await store.loadSync();
     if (state.lastAttemptAt === undefined || Date.now() - state.lastAttemptAt > STALE_AFTER_MS) {
-      await sync.reconcile("view").catch((e) => console.warn("[FluxDown] page scripts sync failed:", e));
+      await sync.reconcile("view").catch((e) => logWarn("[FluxDown] page scripts sync failed:", e));
     }
   }
   const [state, approvals, availability] = await Promise.all([
@@ -223,7 +224,7 @@ export async function approvePageScripts(identity: string): Promise<PageScriptsA
   await store.approve(identity, entry.pluginName, Date.now());
   await syncAlarm(true);
   registerBridgeListener();
-  await sync.reconcile("user").catch((e) => console.warn("[FluxDown] page scripts sync failed:", e));
+  await sync.reconcile("user").catch((e) => logWarn("[FluxDown] page scripts sync failed:", e));
   return { ok: true, status: await getPageScriptsStatus() };
 }
 
@@ -234,7 +235,7 @@ export async function revokePageScripts(identity: string): Promise<PageScriptsAc
   try {
     await sync.removePlugin(identity);
   } catch (e) {
-    console.warn("[FluxDown] page scripts unregister failed:", e);
+    logWarn("[FluxDown] page scripts unregister failed:", e);
     return { ok: false, message: e instanceof Error ? e.message : String(e), status: await getPageScriptsStatus() };
   }
   await syncAlarm(Object.keys(await store.loadApprovals()).length > 0);

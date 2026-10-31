@@ -15,6 +15,7 @@
  */
 import type { ConnectionDiagnostic } from "./connection-diagnostics-store";
 import type { NmhPortLike } from "./nmh-dedicated";
+import { logError, logWarn } from "./error-log";
 
 type SharedFailure = "native_messaging_unavailable" | "timeout" | "port disconnected" | "postMessage failed";
 
@@ -116,7 +117,7 @@ export function createSharedChannel(options: SharedChannelOptions): SharedChanne
     try {
       port = options.connect();
     } catch (e) {
-      console.error("[FluxDown NMH] connectNative() threw:", e);
+      logError("[FluxDown NMH] connectNative() threw:", e);
       options.record({ event: "native.connect_failed", detail: e instanceof Error ? e.message : String(e) });
       return null;
     }
@@ -127,8 +128,8 @@ export function createSharedChannel(options: SharedChannelOptions): SharedChanne
       // 常见原因："No such native application"、"Access to the specified native messaging host
       // is forbidden"（扩展 ID 与 NMH manifest 的 allowed_origins 不符）。
       const reason = options.disconnectReason(port);
-      if (reason) console.error("[FluxDown NMH] port disconnected, reason:", reason);
-      else console.warn("[FluxDown NMH] port disconnected (no error reason)");
+      if (reason) logError("[FluxDown NMH] port disconnected, reason:", reason);
+      else logWarn("[FluxDown NMH] port disconnected (no error reason)");
       close(opened, reason || "port disconnected (no error reason)");
     });
     return opened;

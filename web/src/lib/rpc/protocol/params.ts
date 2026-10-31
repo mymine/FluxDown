@@ -13,6 +13,24 @@ export interface TaskIdParams {
   taskId: string;
 }
 
+/** `daemon.task.seedLocal`：把守护进程所在机器上已有的文件 / 目录登记为已完成 BT 任务并做种。 */
+export interface DaemonSeedLocalParams {
+  /** 守护进程所在机器上的绝对路径（文件或目录）。 */
+  path: string;
+  /** 已有 .torrent 的绝对路径；省略 = 由守护进程生成。 */
+  torrentPath?: string;
+  /** 生成种子时写入的 announce 地址。 */
+  trackers?: string[];
+  /** true = 不因分享率 / 时长 / 不活跃限制而停止做种。 */
+  unlimited: boolean;
+}
+
+/** `daemon.task.torrentShare`：取 BT 任务的磁力链接，可选同时带回 .torrent 字节。 */
+export interface DaemonTorrentShareParams {
+  taskId: string;
+  includeTorrent: boolean;
+}
+
 export interface TaskRenameParams {
   taskId: string;
   /** 不含路径分隔符；引擎侧校验非法字符与状态。 */

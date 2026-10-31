@@ -14,7 +14,7 @@ use fluxdown_protocol::{
     SelectionOutcome, SelectionRequestDto, SelectionResolutionDto,
 };
 use fluxdown_ui_components::{
-    CheckState, ControlExt as _, check_mark, check_row, field_hint, tabular_numbers,
+    BusyExt as _, CheckState, ControlExt as _, check_mark, check_row, field_hint, tabular_numbers,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -612,6 +612,7 @@ impl SelectionView {
                             .primary()
                             .control(cx)
                             .label(confirm_label)
+                            .busy(self.submitting)
                             .disabled(self.submitting || !self.can_confirm())
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.confirm(window, cx);

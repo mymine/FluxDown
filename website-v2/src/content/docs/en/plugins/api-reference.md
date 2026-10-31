@@ -316,12 +316,12 @@ Guard rails, all enforced host-side:
 |---|---|
 | Schemes | `http` / `https` only |
 | Destinations | Publicly routable addresses only. Loopback, LAN, link-local, CGNAT, documentation/benchmark ranges and cloud-metadata IPs are blocked — checked against the literal URL, at DNS resolution (so DNS rebinding is covered), and again on every redirect hop. When the user has configured a proxy in the app, DNS is resolved by the proxy and only the literal-IP and redirect checks apply. |
-| Dev-mode exception | Plugins loaded through "Install from directory (developer mode)" are not subject to the public-address restriction: they can reach `localhost`, LAN hosts, etc. (direct connection, bypassing the global proxy) so they can talk to local services during development. Normally installed plugins are unchanged. |
+| Dev-mode exception | Plugins loaded through "Install from directory (developer mode)" are not subject to the public-address restriction: they can reach `localhost`, LAN hosts, etc. so they can talk to local services during development. They follow the same proxy settings and site rules as other plugins, except that loopback, private LAN ranges and local domains (`.local`, `.lan`, `.home.arpa`, `.internal`) are always reached directly. Normally installed plugins are unchanged. |
 | Response body cap | 8 MB, then truncated |
 | Per-request timeout | 10 s |
 | Concurrent requests | 8, shared across all plugins |
 | Max redirects | 30 |
-| Proxy | The app's proxy configuration is used, as captured when the engine started (changing the proxy later takes effect after a restart). |
+| Proxy | Follows the app's current proxy settings (changes apply to the next request). A request whose URL matches a site proxy rule uses that rule; any other request uses the egress of the call: the task's own proxy (site rules are then ignored), else the rule matching the task's link, else the global mode. In **Auto** mode a call starts direct (or on the proxy that recently worked for that site); if it fails because its requests could not get through the network, the host re-runs the whole call once through each candidate proxy, and the download then uses the same exit as the successful resolve. |
 
 Credentials and redirects: a request that actually received stored credentials (explicit or implicit `authRef`) is sent through a stricter client that **does not follow a redirect to another origin** (different scheme, host or port). You get the `3xx` response back (`status`, `headers.location`) and must decide yourself whether to follow it, so credentials never leak cross-origin. Requests without credentials follow redirects normally.
 
@@ -523,7 +523,7 @@ What FluxDown adds for you:
 - `--ignore-config` is always prepended, so none of yt-dlp's own config files get read.
 - `--ffmpeg-location` pointing at the resolved managed/system ffmpeg is injected when ffmpeg is installed, so merges (bestvideo+bestaudio), `-x` audio extraction, remuxing and recoding work. A plugin-supplied `--ffmpeg-location` is still rejected; only the host's own path is trusted.
 - `--cache-dir <workspace>/.cache` keeps yt-dlp's cache inside the workspace; your own `--cache-dir` (a relative path) overrides it.
-- `--proxy`: when the user configured a proxy in the app, the host appends its `--proxy` **after** your arguments, so the user's proxy wins. Without a configured proxy, your own `--proxy` is honoured. The proxy is read when the engine starts.
+- `--proxy`: when the app decides an exit for the call (a configured proxy, a site rule, the task's own proxy, or Auto switching to a proxy), the host appends its `--proxy` **after** your arguments, so the app's choice wins; a direct exit chosen by a rule or by the task is passed as `--proxy ""`. Without a configured proxy (or while Auto tries the direct route), your own `--proxy` is honoured. Rules are matched against the first URL argument.
 - The child process gets a complete `PATH` (on Windows including user-level entries) so yt-dlp can find JavaScript runtimes such as Node or Deno.
 
 At most 2 yt-dlp processes run at once across all plugins; time spent waiting for a free slot is not charged to your script's time budget. Each child is killed on timeout or cancellation.

@@ -48,8 +48,8 @@ function LimitField({
     { value: 'custom', label: t('btSeedLimitsModeCustom') },
   ]
   return (
-    <FormField label={label} hint={kind === 'minutes' ? t('timeUnitMinutes') : undefined}>
-      <div className="flex gap-2">
+    <FormField label={label}>
+      <div className="flex items-center gap-2">
         <div className="w-32 shrink-0">
           <Select<SeedMode> aria-label={label} value={value.mode} options={options} onValueChange={(mode) => onChange({ ...value, mode })} />
         </div>
@@ -61,6 +61,7 @@ function LimitField({
           invalid={!isFieldValid(kind, value)}
           onChange={(e) => onChange({ ...value, text: e.target.value })}
         />
+        <span className="shrink-0 text-xs text-muted-foreground">{kind === 'minutes' ? t('timeUnitMinutes') : t('btSeedRatioUnit')}</span>
       </div>
     </FormField>
   )

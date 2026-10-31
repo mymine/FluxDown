@@ -5,8 +5,8 @@ import type { TFunction } from '../../../i18n'
 /** 行内控件宽度档位（桌面），移动端一律撑满。 */
 export const WIDTH_INPUT = 'mobile:w-full desktop:w-[240px]'
 export const WIDTH_INPUT_WIDE = 'mobile:w-full desktop:w-[420px]'
-/** 与 WIDTH_DROPDOWN 最小宽同档（GPUI `NUMBER_WIDTH` = `DROPDOWN_MIN_WIDTH`）。 */
-export const WIDTH_NUMBER = 'mobile:w-full desktop:w-[160px]'
+/** 数字框宽度档（GPUI `NUMBER_WIDTH`）：只放得下 5~6 位数字，比下拉窄；单位紧随其后。 */
+export const WIDTH_NUMBER = 'mobile:w-full desktop:w-[104px]'
 export const WIDTH_DROPDOWN = 'mobile:w-full desktop:min-w-[160px]'
 
 /** 翻译键存在才返回文案（GPUI `item()`：描述键不存在则不显示描述）。 */

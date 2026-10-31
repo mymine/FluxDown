@@ -18,6 +18,7 @@ use crate::model::{
     devices::{DeviceEntry, local_device_id, other_devices},
     file_conflict::FileConflictSet,
     group_tree::{GroupAggregate, GroupMeta},
+    share::ShareFacts,
 };
 
 /// 本机偏好：新建下载对话框上次使用的保存目录（设备本地，不进云同步）。
@@ -98,6 +99,15 @@ pub enum DownloadsCommand {
     TaskActivity(TaskActivityQuery),
     /// 读取 daemon 持久化的任务全生命周期速度曲线与统计（`daemon.task.speedHistory`）。
     TaskSpeedHistory(fluxdown_protocol::TaskSpeedHistoryQuery),
+    /// 读取 BT 任务的 peer / tracker 实况（`daemon.task.btStatus`），详情页轮询。
+    BtStatus(fluxdown_protocol::DaemonBtStatusParams),
+    /// 防吸血：给 IP 组加封禁 / 限速 / 加白条目（`daemon.bt.guard.entries.add`），连接页右键菜单用。
+    BtGuardAddEntry(fluxdown_protocol::BtGuardEntriesAddParams),
+    /// 防吸血「查看证据」：读取该 IP 组相关的名单条目与近期事件，结果为
+    /// [`DownloadsResult::BtGuardEvidence`]。
+    BtGuardEvidence {
+        ip_group: String,
+    },
     Create(Box<fluxdown_protocol::DaemonCreateTaskParams>),
     /// 批量建任务（`daemon.task.createMany`）：整块一个事务、按 `batch_id` 幂等，
     /// 结果不确定时可原样重发。
@@ -128,6 +138,12 @@ pub enum DownloadsCommand {
     /// [`DownloadsResult::TaskVerify`]；同一任务校验在途时为 `conflict`。
     VerifyTask {
         task_id: String,
+    },
+    /// BT 任务的分享材料（`daemon.task.torrentShare`）：结果为
+    /// [`DownloadsResult::TorrentShare`]。
+    TorrentShare {
+        task_id: String,
+        include_torrent: bool,
     },
     Delete {
         task_id: String,
@@ -237,6 +253,11 @@ pub enum DownloadsCommand {
     RevealTask {
         task_id: String,
     },
+    /// 把已完成任务的产物以文件形式写入系统剪贴板（`agent.platform.copyTaskFiles`，可在文件管理器
+    /// 里粘贴）；任一产物已不在磁盘上即整体失败（`notFound`）。
+    CopyTaskFiles {
+        task_ids: Vec<String>,
+    },
     /// 重扫已完成任务的产物是否仍在下载目录（`daemon.task.rescan`，结果经
     /// `fileMissingChanged` 事件回流）。
     RescanFiles,
@@ -250,6 +271,17 @@ pub enum DownloadsCommand {
         save_dir: Option<String>,
         queue_id: Option<String>,
         start_paused: Option<bool>,
+    },
+    /// 本机做种（`daemon.task.seedLocal`，慢方法：无现成种子时 daemon 要为数据做哈希）：
+    /// 把 daemon 主机上已有的文件 / 文件夹登记为已完成 BT 任务并开始做种。结果为
+    /// `{taskId, duplicate?, existingName?}`（`DownloadsResult::Value`；`duplicate` 为真时未新建任务，
+    /// `taskId` 是已持有同 info hash 的现有任务）；路径 / 种子不匹配或 BT 被禁用为 `invalidArgument`。
+    /// 提交类命令，失败后不自动重试。`trackers` 仅在 `torrent_path` 为 `None` 时有意义。
+    SeedLocal {
+        path: String,
+        torrent_path: Option<String>,
+        trackers: Vec<String>,
+        unlimited: bool,
     },
     /// 系统文件管理器为该文件显示的图标（`agent.platform.fileIcon`，结果为 PNG）。
     FileIcon(fluxdown_protocol::PlatformFileIconParams),
@@ -285,6 +317,10 @@ pub enum DownloadsResult {
     TaskActivity(TaskActivityPage),
     /// 无记录（从未下载或已重新下载重置）时为 `None`。
     TaskSpeedHistory(Option<fluxdown_protocol::TaskSpeedHistoryDto>),
+    /// `BtStatus` 的 peer / tracker 实况。
+    BtStatus(fluxdown_protocol::BtStatusDto),
+    /// `BtGuardEvidence` 的名单条目与事件。
+    BtGuardEvidence(BtGuardEvidence),
     Preview(fluxdown_protocol::ResolvePreviewResponse),
     /// `FileIcon` 的 PNG 字节。
     FileIcon(Vec<u8>),
@@ -292,6 +328,24 @@ pub enum DownloadsResult {
     CreateMany(fluxdown_protocol::DaemonCreateTasksResult),
     /// `VerifyTask` 的校验报告。
     TaskVerify(fluxdown_protocol::TaskVerifyResult),
+    /// `TorrentShare` 的磁力链接与（按需）已解码的 `.torrent` 字节。
+    TorrentShare(TorrentShare),
+}
+
+/// [`DownloadsResult::TorrentShare`] 载荷。
+pub struct TorrentShare {
+    pub name: String,
+    pub magnet: String,
+    /// `.torrent` 文件内容；未请求或纯磁力任务（库里没有种子字节）为 `None`。
+    pub torrent: Option<Vec<u8>>,
+}
+
+/// [`DownloadsResult::BtGuardEvidence`] 载荷：宿主按 IP 组精确查询得到的条目（覆盖该 IP 的
+/// 全部名单层）与事件（该 IP 组的事件），UI 直接展示，不再客户端筛选。
+#[derive(Clone, Debug, Default)]
+pub struct BtGuardEvidence {
+    pub entries: Vec<fluxdown_protocol::BtGuardEntryDto>,
+    pub events: Vec<fluxdown_protocol::BtGuardEventDto>,
 }
 
 impl DownloadsResult {
@@ -424,6 +478,8 @@ impl DownloadsController {
         if self.stale {
             self.task_runtime.clear();
         }
+        self.store
+            .replace_share(ShareFacts::from_state(&snapshot.share));
         self.rebuild_all();
         self.rebuild_remote();
     }
@@ -490,6 +546,10 @@ impl DownloadsController {
                 self.set_preferences(&preferences.values);
                 true
             }
+            AgentEvent::ShareChanged(state) => {
+                self.store.replace_share(ShareFacts::from_state(state))
+            }
+            AgentEvent::ShareProgress(progress) => self.store.apply_share_progress(progress),
             AgentEvent::Daemon(event) => self.apply_daemon_event(event),
             _ => false,
         }
@@ -2378,5 +2438,85 @@ mod tests {
         assert!(controller.store().remote().is_empty());
         assert!(controller.other_devices().is_empty());
         assert_eq!(controller.local_device_id(), None);
+    }
+
+    fn share_state(
+        path_kind: fluxdown_protocol::SharePathKind,
+    ) -> fluxdown_protocol::ShareStateDto {
+        let mut state = fluxdown_protocol::ShareStateDto {
+            available: true,
+            can_send: true,
+            ..fluxdown_protocol::ShareStateDto::default()
+        };
+        state.task_facts.insert(
+            "t1".into(),
+            fluxdown_protocol::ShareTaskFactsDto {
+                is_share_receive: true,
+                path_kind,
+                session_id: Some("s1".into()),
+                ..fluxdown_protocol::ShareTaskFactsDto::default()
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn share_facts_follow_snapshot_changed_and_progress_events() {
+        use fluxdown_protocol::{SharePathKind, ShareProgressDto};
+        let mut controller = DownloadsController::new(Arc::new(NullPort));
+        assert!(!controller.store().share().available());
+
+        let snapshot = fluxdown_protocol::AgentSnapshot {
+            share: share_state(SharePathKind::Relay),
+            ..fluxdown_protocol::AgentSnapshot::default()
+        };
+        controller.replace_snapshot(&snapshot);
+        {
+            let share = controller.store().share();
+            assert!(share.available() && share.can_send());
+            assert_eq!(
+                share.task("t1").map(|facts| facts.path_kind),
+                Some(SharePathKind::Relay)
+            );
+        }
+
+        // 整体替换：内容相同不算变化（不触发表格重绘），内容变了才算。
+        assert!(
+            !controller.apply_event(&agent(AgentEvent::ShareChanged(share_state(
+                SharePathKind::Relay
+            ))))
+        );
+        assert!(
+            controller.apply_event(&agent(AgentEvent::ShareChanged(share_state(
+                SharePathKind::DirectLan
+            ))))
+        );
+
+        // 进度只刷新匹配会话的路径；路径没变的高频帧不重绘。
+        let progress = |session: &str, path_kind| {
+            agent(AgentEvent::ShareProgress(ShareProgressDto {
+                session_id: session.into(),
+                path_kind,
+                ..ShareProgressDto::default()
+            }))
+        };
+        assert!(!controller.apply_event(&progress("other", SharePathKind::Relay)));
+        assert!(!controller.apply_event(&progress("s1", SharePathKind::DirectLan)));
+        assert!(controller.apply_event(&progress("s1", SharePathKind::Relay)));
+        assert_eq!(
+            controller
+                .store()
+                .share()
+                .task("t1")
+                .map(|facts| facts.path_kind),
+            Some(SharePathKind::Relay)
+        );
+
+        // FluxMesh不可用：入口门控随之关闭。
+        controller.apply_event(&agent(AgentEvent::ShareChanged(
+            fluxdown_protocol::ShareStateDto::default(),
+        )));
+        assert!(!controller.store().share().available());
+        assert!(!controller.store().share().is_share_receive("t1"));
     }
 }

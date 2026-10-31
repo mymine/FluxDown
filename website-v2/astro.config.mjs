@@ -20,6 +20,9 @@ const noindexPathnames = new Set([
   // 产品短片录制舞台
   "/film",
   "/zh/film",
+  // FluxMesh说明页(分享落地页 /s/<slug> 是 SSR 动态页,不在静态路径里)
+  "/s",
+  "/zh/s",
 ]);
 
 // 构建时刻(ISO8601),用作 sitemap lastmod —— 每次部署刷新站点 freshness 信号。
@@ -198,7 +201,7 @@ export default defineConfig({
 
       // ── 可选：阿里云 OSS 发布资产 + dl-cn 下载镜像（/api/download，见 src/lib/oss.ts）──
       // 对象布局 `<OSS_RELEASE_PREFIX>/<tag>/<file>`，与 .github/actions/oss-upload 一致。
-      // bucket 私有：官网用 AK/SK 只做 HEAD 存在性探测；中国大陆访客（src/lib/geoip.ts）与 source=oss
+      // bucket 私有：官网用 AK/SK 只做 HEAD 存在性探测；中国大陆访客（ESA 国家码，client-ip.ts）与 source=oss
       // 302 到 CN_CDN_BASE（URL 鉴权 A），其余访客走 GitHub。AK/SK 或 CN_CDN_AUTH_KEY 缺失时全部走 GitHub。
       OSS_ACCESS_KEY_ID: envField.string({
         context: "server",
@@ -225,8 +228,8 @@ export default defineConfig({
         access: "secret",
         default: "FluxDownRelease",
       }),
-      // dl-cn 下载镜像：现为 Cloudflare Worker（website-v2/cdn/oss-proxy.js，私有 OSS 回源），ICP 备案后
-      // 改回阿里云 CDN；两者都按「URL 鉴权 A 方式」校验 CN_CDN_AUTH_KEY，缺省则镜像关闭。
+      // dl-cn 下载镜像：阿里云 ESA 边缘函数（website-v2/cdn/esa-dl-cn.js，私有 OSS 回源），
+      // 按「URL 鉴权 A 方式」校验 CN_CDN_AUTH_KEY，缺省则镜像关闭。
       CN_CDN_BASE: envField.string({
         context: "server",
         access: "secret",
@@ -236,6 +239,55 @@ export default defineConfig({
         context: "server",
         access: "secret",
         optional: true,
+      }),
+      // 官网浏览器下载的验证码通行证（src/lib/download-pass.ts）：HMAC 密钥，随机 32 字节以上。
+      // 配置后浏览器（非 FluxDown 更新器 UA）须先过 ESA AI 验证码才拿 dl-cn 镜像，否则 GitHub；留空则不要求。
+      // 先在两个站点的反代写好 X-Fluxdown-Edge（见 .omp/knowledge/ops.md「下载准入」）再配置，否则浏览器全部回落 GitHub。
+      DOWNLOAD_PASS_SECRET: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+      // 123 云盘下载源（src/lib/pan123.ts）：.github/scripts/pan123_mirror.sh 经 WebDAV 上传到同一对象键；
+      // 仅 ≥ 0.6.0 的应用内更新（规则见 download-gate.ts::isPan123Updater）优先 302 到 123 直链（10 分钟有效），失败再走 dl-cn / GitHub；官网浏览器下载不走 123。
+      // WebDAV 账号 / 应用密码（只授权发布目录）用于 PROPFIND 确认资产；UID + 鉴权密钥用于签直链。缺任一项则关闭。
+      PAN123_WEBDAV_URL: envField.string({
+        context: "server",
+        access: "secret",
+        default: "https://webdav.123pan.cn/webdav",
+      }),
+      PAN123_WEBDAV_USER: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+      PAN123_WEBDAV_PASSWORD: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+      PAN123_UID: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+      // 123「直链管理 → URL 鉴权」密钥（1–16 位字母数字）
+      PAN123_AUTH_KEY: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+      // 空 = https://<PAN123_UID>.cdn.123clouddisk.cn（备用域名 123clouddisk.com）
+      PAN123_DIRECT_BASE: envField.string({
+        context: "server",
+        access: "secret",
+        default: "",
+      }),
+      // 已启用直链空间的根目录文件夹（即 WebDAV 授权目录）
+      PAN123_DIRECT_FOLDER: envField.string({
+        context: "server",
+        access: "secret",
+        default: "fd-release",
       }),
 
       // ── 赞助名录（Sponsor Wall）──

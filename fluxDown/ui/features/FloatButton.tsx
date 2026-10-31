@@ -14,6 +14,7 @@ import type { CandidateRow } from "@/background/protocol";
 import type { PageConfig } from "@/page/bridge";
 import { isMediaTag, minTargetSize, type MediaTracker, type TrackedMedia } from "@/page/media-tracker";
 import { loadSiteProfiles, profileFor, saveSiteProfile } from "@/utils/site-profiles";
+import { contentCss } from "@/ui/content-css";
 import { Icon } from "@/ui/components/Icon";
 import { ToastHost, showToast } from "@/ui/components/Toast";
 import { useT } from "@/ui/i18n";
@@ -25,6 +26,7 @@ import { variantLabel } from "./labels";
 import "@/ui/theme/tokens.css";
 import "@/ui/theme/base.css";
 import "./float.css";
+import { logWarn } from "@/utils/error-log";
 
 export interface FloatButtonController {
   /** 配置变化：决定是否启用、触发方式。 */
@@ -43,6 +45,11 @@ const HIDE_DELAY_MS = 400;
 const BTN_MARGIN = 8;
 const CANDIDATE_POLL_MS = 2000;
 const FLASH_MS = 1500;
+/** 触屏（主指针为粗指针）没有 hover：浮钮改为常驻 + 点按视频显示。 */
+const COARSE_QUERY = "(pointer: coarse)";
+/** 触屏点按视频后浮钮保持显示的时长（无 hover 可依，比指针的 400ms 长得多）。 */
+const TOUCH_HIDE_MS = 4000;
+const POP_MARGIN = 8;
 
 function fullscreenElementOf(): Element | null {
   const doc = document as Document & { webkitFullscreenElement?: Element | null };
@@ -85,16 +92,30 @@ function FloatRoot(props: FloatRootProps): JSX.Element {
   const evaluateRef = useRef<(() => void) | null>(null);
   const rowsRef = useRef<CandidateRow[]>([]);
   rowsRef.current = rows;
+  const popRef = useRef<HTMLDivElement>(null);
+  const [coarse, setCoarse] = useState(() => typeof matchMedia === "function" && matchMedia(COARSE_QUERY).matches);
+  useEffect(() => {
+    if (typeof matchMedia !== "function") return;
+    const mq = matchMedia(COARSE_QUERY);
+    const onChange = (): void => setCoarse(mq.matches);
+    mq.addEventListener("change", onChange);
+    onChange();
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
   const trigger = config.floatTrigger;
 
   // ===== 目标元素选择 =====
   useEffect(() => {
     let raf = 0;
     let hideTimer: number | undefined;
+    let tapTimer: number | undefined;
     let x = -1;
     let y = -1;
     let current: TrackedMedia | null = null;
     let pending = false;
+    /** 触屏：最近一次点按到的媒体元素及其显示截止时间。 */
+    let tappedKey: string | null = null;
+    let tappedUntil = 0;
 
     const choose = (next: TrackedMedia | null): void => {
       if ((next?.key ?? null) === (current?.key ?? null)) return;
@@ -103,16 +124,30 @@ function FloatRoot(props: FloatRootProps): JSX.Element {
       if (!next) setMenuOpen(false);
     };
 
+    /** 尺寸达标且未被 page 规则排除。 */
+    const usable = (item: TrackedMedia): boolean => {
+      const r = item.el.getBoundingClientRect();
+      const min = minTargetSize(item.tag);
+      return r.width >= min.w && r.height >= min.h && !tracker.isFloatExcluded(item.el);
+    };
+
     const evaluate = (): void => {
       if (current && !tracker.get(current.key)) {
         choose(null);
         return;
       }
-      if (trigger === "always") {
+      if (trigger === "always" || coarse) {
+        if (coarse && tappedKey !== null && Date.now() < tappedUntil) {
+          const tapped = tracker.get(tappedKey);
+          if (tapped && usable(tapped)) {
+            choose(tapped);
+            return;
+          }
+        }
         const active = tracker.activePlaying();
-        const r = active?.el.getBoundingClientRect();
-        const min = active ? minTargetSize(active.tag) : null;
-        const ok = active && r && min && r.width >= min.w && r.height >= min.h && !tracker.isFloatExcluded(active.el);
+        const ok = active && usable(active);
+        // 触屏：菜单展开期间不因点按窗口到期 / 暂停播放而收起
+        if (coarse && !ok && current && menuOpenRef.current) return;
         choose(ok ? active : null);
         return;
       }
@@ -150,8 +185,20 @@ function FloatRoot(props: FloatRootProps): JSX.Element {
       y = -1;
       schedule();
     };
+    // 触屏点按：用 pointerup（滚动会触发 pointercancel，不会误显示）；捕获 + passive，不干扰页面自己的点按处理
+    const onTap = (e: PointerEvent): void => {
+      const hit = tracker.fromEvent(e);
+      if (!hit) return;
+      tappedKey = hit.key;
+      tappedUntil = Date.now() + TOUCH_HIDE_MS;
+      window.clearTimeout(tapTimer);
+      tapTimer = window.setTimeout(schedule, TOUCH_HIDE_MS + 50);
+      schedule();
+    };
 
-    if (trigger === "hover") {
+    if (coarse) {
+      document.addEventListener("pointerup", onTap, { capture: true, passive: true });
+    } else if (trigger === "hover") {
       document.addEventListener("pointermove", onMove, { capture: true, passive: true });
       document.documentElement.addEventListener("pointerleave", onLeave, { passive: true });
     }
@@ -161,14 +208,16 @@ function FloatRoot(props: FloatRootProps): JSX.Element {
     schedule();
 
     return () => {
+      document.removeEventListener("pointerup", onTap, { capture: true });
       document.removeEventListener("pointermove", onMove, { capture: true });
       document.documentElement.removeEventListener("pointerleave", onLeave);
       unsubscribe();
       cancelAnimationFrame(raf);
       window.clearTimeout(hideTimer);
+      window.clearTimeout(tapTimer);
       evaluateRef.current = null;
     };
-  }, [tracker, trigger]);
+  }, [tracker, trigger, coarse]);
 
   // ===== 候选（只取绑定到目标元素的行） =====
   // 按元素缓存上次结果：指针移出再移入同一播放器时立即显示，不必等一次后台往返（MV3
@@ -243,6 +292,14 @@ function FloatRoot(props: FloatRootProps): JSX.Element {
           const top = clamp(y0, 4, vh - bh - 4);
           wrap.style.transform = `translate(${Math.round(left)}px, ${Math.round(top)}px)`;
           wrap.style.visibility = "visible";
+          // 触屏窄屏：菜单优先右对齐按钮，放不下时整体夹进视口，避免左右溢出
+          const pop = popRef.current;
+          if (coarse && pop) {
+            const pw = pop.offsetWidth;
+            const want = clamp(left + bw - pw, POP_MARGIN, vw - pw - POP_MARGIN);
+            pop.style.right = "auto";
+            pop.style.left = `${Math.round(want - left)}px`;
+          }
         }
       }
       evaluateRef.current?.();
@@ -250,7 +307,7 @@ function FloatRoot(props: FloatRootProps): JSX.Element {
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [el, showBtn, position]);
+  }, [el, showBtn, position, coarse]);
 
   // ===== 弹层：点击外部 / Esc 关闭 =====
   useEffect(() => {
@@ -333,7 +390,12 @@ function FloatRoot(props: FloatRootProps): JSX.Element {
       return;
     }
     const wrap = wrapRef.current;
-    if (wrap) setFlip(wrap.getBoundingClientRect().bottom + 300 > window.innerHeight);
+    if (wrap) {
+      const r = wrap.getBoundingClientRect();
+      const below = window.innerHeight - r.bottom;
+      // 触屏（含横屏矮视口）：下方放不下时，仅当上方空间更大才翻转
+      setFlip(coarse ? below < 300 && r.top > below : r.bottom + 300 > window.innerHeight);
+    }
     setMenuOpen((open) => !open);
   };
 
@@ -397,7 +459,7 @@ function FloatRoot(props: FloatRootProps): JSX.Element {
           <span class="fd-float-label">{state === "done" ? t("float.done") : label}</span>
         </button>
         {menuOpen ? (
-          <div class={`fd-float-pop${flip ? " fd-flip" : ""}`} onClick={stop}>
+          <div ref={popRef} class={`fd-float-pop${flip ? " fd-flip" : ""}`} onClick={stop}>
             <QualityPicker
               rows={rows}
               onDone={() => {
@@ -487,6 +549,7 @@ export function createFloatButton(deps: FloatButtonDeps): FloatButtonController 
       await initI18n();
       const created = await createShadowRootUi<HTMLElement>(ctx, {
         name: "fluxdown-float",
+        css: contentCss(),
         position: "inline",
         anchor: () => hostAnchor(),
         append: "last",
@@ -509,7 +572,7 @@ export function createFloatButton(deps: FloatButtonDeps): FloatButtonController 
       ui = created;
       ui.mount();
     } catch (e) {
-      console.warn("[FluxDown] float button mount failed:", e);
+      logWarn("[FluxDown] float button mount failed:", e);
     } finally {
       creating = false;
     }

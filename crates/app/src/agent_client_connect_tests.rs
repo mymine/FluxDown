@@ -119,6 +119,7 @@ async fn peer_that_accepts_but_never_answers_times_out_as_transient() {
         &url,
         Duration::from_secs(2),
         Duration::from_millis(250),
+        true,
     )
     .await;
     server.abort();
@@ -149,6 +150,7 @@ async fn peer_that_upgrades_but_never_answers_hello_times_out_as_transient() {
         &url,
         Duration::from_secs(2),
         Duration::from_millis(250),
+        true,
     )
     .await;
     server.abort();

@@ -140,7 +140,7 @@ pub(crate) fn prompt_closed(cx: &mut App) {
         let store = store.read(cx);
         let status = store.update_status();
         !install_in_flight(status)
-            && !store.is_busy("updateInstall")
+            && !store.in_flight("updateInstall")
             && update_prompt::is_due(status, store.preferences(), now_ms())
     };
     if !snooze {

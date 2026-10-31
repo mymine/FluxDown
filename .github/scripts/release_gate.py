@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 
-REUSABLE = ("app", "server", "cli", "mobile")
+REUSABLE = ("app", "server", "cli", "mobile", "ios")
 
 
 def gh_api(path: str) -> dict:

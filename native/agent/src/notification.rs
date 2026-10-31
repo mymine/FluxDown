@@ -27,7 +27,10 @@ pub fn handle_activation(args: &[String]) -> Option<Result<(), String>> {
     windows::handle_activation(args)
 }
 #[cfg(any(windows, target_os = "linux"))]
-use std::{path::Path, sync::OnceLock};
+use std::path::Path;
+use std::sync::Arc;
+#[cfg(any(windows, target_os = "linux"))]
+use std::sync::{Mutex, PoisonError};
 
 /// 通知显示的应用名。
 #[cfg(any(windows, target_os = "linux"))]
@@ -36,8 +39,36 @@ const APP_NAME: &str = "FluxDown";
 /// 通知图标（写入 agent 数据目录，供 Windows `IconUri` 与 Linux 通知图标使用）。
 #[cfg(any(windows, target_os = "linux"))]
 const ICON_BYTES: &[u8] = include_bytes!("../../../assets/logo/fluxdown_logo.png");
-#[cfg(any(windows, target_os = "linux"))]
-const ICON_FILE_NAME: &str = "notification_icon.png";
+
+/// 用户选择的应用图标在通知里的形态（见 `app_icon`）。`tag` 是图标身份（`bolt` /
+/// `custom-<revision>`）：同一个 tag 同一张图，文件名据此区分，Windows 通知图标缓存按路径失效。
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    not(all(feature = "desktop", any(windows, target_os = "linux"))),
+    allow(
+        dead_code,
+        reason = "只有桌面构建的 Windows / Linux 才会构造并读取自选通知图标"
+    )
+)]
+pub(crate) struct NotifierIcon {
+    pub tag: String,
+    pub png: Arc<[u8]>,
+}
+
+/// 图标文件名：默认 `notification_icon.png`，自选图标 `notification_icon-<tag>.png`。
+#[cfg(any(windows, target_os = "linux", test))]
+fn icon_file_name(tag: Option<&str>) -> String {
+    tag.map_or_else(
+        || "notification_icon.png".to_owned(),
+        |tag| format!("notification_icon-{tag}.png"),
+    )
+}
+
+/// `name` 是不是应当清理的旧通知图标文件（同族命名、但不是当前这份）。
+#[cfg(any(windows, target_os = "linux", test))]
+fn is_stale_icon_file(name: &str, keep: &str) -> bool {
+    name != keep && name.starts_with("notification_icon") && name.ends_with(".png")
+}
 
 /// Windows toast 的 AppUserModelID。刻意不与 Flutter 版（`Com.FluxDown.App`，注册表键
 /// 不区分大小写）共用：那个键上挂着 Flutter 的 COM 激活器，共用会让点击本通知去拉起
@@ -49,16 +80,26 @@ const WINDOWS_AUMID: &str = "dev.zerx.fluxdown";
 #[cfg(target_os = "linux")]
 const LINUX_DESKTOP_ENTRY: &str = "com.fluxdown.app";
 
-/// 发送系统通知；平台应用身份在首次发送时一次性准备。
+/// 发送系统通知；平台应用身份在首次发送时准备，应用图标变化后按新图标重新准备。
 pub struct Notifier {
     #[cfg(any(windows, target_os = "linux"))]
     data_dir: PathBuf,
     #[cfg(any(windows, target_os = "linux"))]
-    prepared: OnceLock<Prepared>,
+    icon_state: Mutex<IconState>,
+}
+
+/// 当前应用图标与按它准备好的平台身份。
+#[cfg(any(windows, target_os = "linux"))]
+#[derive(Default)]
+struct IconState {
+    icon: Option<NotifierIcon>,
+    /// `(图标 tag, 已准备的身份)`；tag 与当前图标一致才可复用。
+    prepared: Option<(Option<String>, Prepared)>,
 }
 
 /// 首次发送前准备好的平台身份。
 #[cfg(any(windows, target_os = "linux"))]
+#[derive(Clone)]
 struct Prepared {
     #[cfg(windows)]
     identity: Result<(), String>,
@@ -77,8 +118,42 @@ impl Notifier {
             #[cfg(any(windows, target_os = "linux"))]
             data_dir,
             #[cfg(any(windows, target_os = "linux"))]
-            prepared: OnceLock::new(),
+            icon_state: Mutex::new(IconState::default()),
         }
+    }
+
+    #[cfg(feature = "desktop")]
+    /// 切换通知使用的应用图标（`None` = 内置默认图）。只记录选择：文件与 Windows 注册表
+    /// 在下一次发送通知时才按需写入，没有通知就没有任何 IO。
+    pub(crate) fn set_icon(&self, icon: Option<NotifierIcon>) {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let mut state = self
+                .icon_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            state.icon = icon;
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let _ = icon;
+    }
+
+    /// 按当前图标准备（或复用）平台身份。
+    #[cfg(any(windows, target_os = "linux"))]
+    fn prepared(&self) -> Prepared {
+        let mut state = self
+            .icon_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let tag = state.icon.as_ref().map(|icon| icon.tag.clone());
+        if let Some((prepared_tag, prepared)) = &state.prepared
+            && *prepared_tag == tag
+        {
+            return prepared.clone();
+        }
+        let prepared = prepare(&self.data_dir, state.icon.as_ref());
+        state.prepared = Some((tag, prepared.clone()));
+        prepared
     }
 
     /// 阻塞发送一条通知；失败只记日志（通知是尽力而为的旁路效果）。
@@ -132,7 +207,7 @@ impl Notifier {
         actions: Option<&CompletionActions>,
         silent: bool,
     ) -> Result<(), String> {
-        let prepared = self.prepared.get_or_init(|| prepare(&self.data_dir));
+        let prepared = self.prepared();
         prepared.identity.as_ref().map_err(Clone::clone)?;
         windows::show(&self.data_dir, title, body, actions, silent)
     }
@@ -145,13 +220,13 @@ impl Notifier {
         _actions: Option<&CompletionActions>,
         silent: bool,
     ) -> Result<(), String> {
-        let prepared = self.prepared.get_or_init(|| prepare(&self.data_dir));
+        let prepared = self.prepared();
         let mut notification = notify_rust::Notification::new();
         notification.appname(APP_NAME).summary(title).body(body);
         if silent {
             notification.hint(notify_rust::Hint::SuppressSound(true));
         }
-        apply_platform_identity(&mut notification, prepared);
+        apply_platform_identity(&mut notification, &prepared);
         notification
             .show()
             .map(|_| ())
@@ -249,9 +324,9 @@ pub fn availability() -> NotificationAvailability {
 }
 
 #[cfg(windows)]
-fn prepare(data_dir: &Path) -> Prepared {
+fn prepare(data_dir: &Path, icon: Option<&NotifierIcon>) -> Prepared {
     Prepared {
-        identity: write_icon(data_dir)
+        identity: write_icon(data_dir, icon)
             .ok_or_else(|| "could not prepare FluxDown notification icon".to_owned())
             .and_then(|icon| {
                 register_windows_aumid(Some(&icon)).map_err(|error| {
@@ -262,9 +337,9 @@ fn prepare(data_dir: &Path) -> Prepared {
 }
 
 #[cfg(target_os = "linux")]
-fn prepare(data_dir: &Path) -> Prepared {
+fn prepare(data_dir: &Path, icon: Option<&NotifierIcon>) -> Prepared {
     Prepared {
-        icon: write_icon(data_dir),
+        icon: write_icon(data_dir, icon),
     }
 }
 
@@ -281,18 +356,37 @@ fn apply_platform_identity(notification: &mut notify_rust::Notification, prepare
         ));
 }
 
-/// 把内嵌图标写到数据目录（内容相同则不重写）；失败返回 `None`。
+/// 把通知图标写到数据目录（内容相同则不重写），并清理旧图标文件；失败返回 `None`。
+/// 默认用内置图，自选图标用其 PNG 与带 tag 的文件名。
 #[cfg(any(windows, target_os = "linux"))]
-fn write_icon(data_dir: &Path) -> Option<PathBuf> {
-    let path = data_dir.join(ICON_FILE_NAME);
-    if std::fs::read(&path).is_ok_and(|existing| existing == ICON_BYTES) {
-        return Some(path);
+fn write_icon(data_dir: &Path, icon: Option<&NotifierIcon>) -> Option<PathBuf> {
+    let name = icon_file_name(icon.map(|icon| icon.tag.as_str()));
+    let bytes: &[u8] = icon.map_or(ICON_BYTES, |icon| &icon.png);
+    let path = data_dir.join(&name);
+    if !std::fs::read(&path).is_ok_and(|existing| existing == bytes)
+        && let Err(error) =
+            std::fs::create_dir_all(data_dir).and_then(|()| std::fs::write(&path, bytes))
+    {
+        tracing::warn!(path = %path.display(), error = %error, "could not write notification icon");
+        return None;
     }
-    match std::fs::create_dir_all(data_dir).and_then(|()| std::fs::write(&path, ICON_BYTES)) {
-        Ok(()) => Some(path),
-        Err(error) => {
-            tracing::warn!(path = %path.display(), error = %error, "could not write notification icon");
-            None
+    remove_stale_icons(data_dir, &name);
+    Some(path)
+}
+
+/// 删除数据目录里不再使用的旧通知图标；失败只记调试日志。
+#[cfg(any(windows, target_os = "linux"))]
+fn remove_stale_icons(data_dir: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| is_stale_icon_file(name, keep));
+        if stale && let Err(error) = std::fs::remove_file(entry.path()) {
+            tracing::debug!(path = %entry.path().display(), %error, "could not remove stale notification icon");
         }
     }
 }
@@ -409,7 +503,30 @@ impl NoticeText {
 
 #[cfg(test)]
 mod tests {
-    use super::{completion_text, english_text as english, rss_auto_download_text};
+    use super::{
+        completion_text, english_text as english, icon_file_name, is_stale_icon_file,
+        rss_auto_download_text,
+    };
+
+    #[test]
+    fn notification_app_icon_files_are_tagged_and_only_stale_ones_are_removed() {
+        assert_eq!(icon_file_name(None), "notification_icon.png");
+        assert_eq!(
+            icon_file_name(Some("custom-0a1b")),
+            "notification_icon-custom-0a1b.png"
+        );
+
+        let keep = icon_file_name(Some("bolt"));
+        assert!(!is_stale_icon_file(&keep, &keep));
+        assert!(is_stale_icon_file("notification_icon.png", &keep));
+        assert!(is_stale_icon_file(
+            "notification_icon-custom-0a1b.png",
+            &keep
+        ));
+        // 数据目录里的其它文件（令牌、状态）永远不动。
+        assert!(!is_stale_icon_file("agent-state.json", &keep));
+        assert!(!is_stale_icon_file("notification_actions.json", &keep));
+    }
 
     #[test]
     fn rss_auto_download_text_reports_count_and_first_title() {

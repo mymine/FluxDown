@@ -19,7 +19,7 @@ const MAX_NODES_DAT_BYTES: usize = 4 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 从 `url` 下载 `nodes.dat` 原始字节并校验可解析出 ≥1 个联系点。请求经宿主统一出口
-/// （[`crate::egress::client_builder`]），与下载任务同一套全局代理。
+/// （[`crate::egress::RoutedClients`]），与下载任务同一套全局代理与站点规则。
 ///
 /// 成功返回原始字节（供缓存 + [`node::find_sources_kad`] 使用）；网络失败、
 /// 超限、或解析不出任何联系点均返回 `Err`（调用方容错，不影响服务器找源）。
@@ -40,11 +40,9 @@ pub async fn fetch_nodes_dat(
     url: &str,
     proxy: &crate::proxy_config::ProxyConfig,
 ) -> Result<Vec<u8>, String> {
-    let client = crate::egress::client_builder(proxy, "")
-        .map_err(|e| format!("failed to build http client: {e}"))?
-        .timeout(FETCH_TIMEOUT)
-        .build()
+    let clients = crate::egress::RoutedClients::new(proxy, "", |b| b.timeout(FETCH_TIMEOUT))
         .map_err(|e| format!("failed to build http client: {e}"))?;
+    let client = clients.client(url).await.map_err(|e| e.to_string())?;
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     let status = resp.status();
     if !status.is_success() {

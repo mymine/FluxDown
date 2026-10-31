@@ -7,17 +7,18 @@ use fluxdown_ui_components::{ControlExt as _, dialog_scroll_body, tabular_number
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    App, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div,
-    prelude::FluentBuilder as _,
+    App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement, Render,
+    SharedString, Styled, Subscription, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{
     WindowExt as _, button::Button, dialog::DialogFooter, h_flex, link::Link, v_flex,
 };
 
+use super::plugin_live::LivePlugins;
 use crate::{pages::Frame, ui};
 
 /// 详情对话框的数据；调用侧从各自 DTO 拆字段。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PluginDetail {
     pub name: String,
     pub version: String,
@@ -140,33 +141,72 @@ pub fn permission_label(translator: &Translator, permission: &str) -> (String, S
 /// 详情对话框「审计记录」入口回调；仅已安装插件提供。
 pub type OpenAudit = Rc<dyn Fn(&mut Window, &mut App)>;
 
-/// 打开详情对话框；对话框构造器每帧重建，内容从共享的只读快照按需渲染。
+/// 详情对话框内容：内容放在实体里，已安装插件可按 identity 跟随实时列表刷新。
+struct DetailBody {
+    detail: PluginDetail,
+    translator: Translator,
+    /// 插件被卸载后已关过一次对话框：之后的列表更新不得再关掉别的对话框。
+    closed: bool,
+    _live: Option<Subscription>,
+}
+
+impl Render for DetailBody {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        render_detail(&self.detail, &self.translator, cx)
+    }
+}
+
+/// 打开详情对话框。`live` 仅已安装插件提供：详情随最新列表刷新，插件被卸载时关闭对话框。
 pub fn open_plugin_detail(
     detail: PluginDetail,
     translator: Translator,
     open_audit: Option<OpenAudit>,
+    live: Option<Entity<LivePlugins>>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let detail = Rc::new(detail);
-    let translator = Rc::new(translator);
+    let audit_label = SharedString::from(translator.text("pluginAuditOpenForPlugin").to_owned());
+    let body = cx.new(|_| DetailBody {
+        detail,
+        translator,
+        closed: false,
+        _live: None,
+    });
+    if let Some(live) = live {
+        body.update(cx, |this, cx| {
+            this._live = Some(cx.observe_in(&live, window, |this, live, window, cx| {
+                let Some(plugin) = live.read(cx).plugin(&this.detail.identity) else {
+                    if !this.closed {
+                        this.closed = true;
+                        window.close_dialog(cx);
+                    }
+                    return;
+                };
+                let next = PluginDetail::from_plugin(plugin);
+                if next == this.detail {
+                    return;
+                }
+                // 标题在对话框构造器里每帧重建：改名时整窗重绘才能带上新标题。
+                if next.name != this.detail.name {
+                    window.refresh();
+                }
+                this.detail = next;
+                cx.notify();
+            }));
+        });
+    }
     window.open_dialog(cx, move |dialog, _, cx| {
-        let detail = detail.clone();
-        let translator = translator.clone();
-        let audit_label =
-            SharedString::from(translator.text("pluginAuditOpenForPlugin").to_owned());
+        let name = body.read(cx).detail.name.clone();
+        let content = body.clone();
         let open_audit = open_audit.clone();
         dialog
-            .title(fluxdown_ui_components::dialog_title(
-                detail.name.clone(),
-                cx,
-            ))
+            .title(fluxdown_ui_components::dialog_title(name, cx))
             .w(active_theme(cx).text_extent(480.))
             .content(move |root, _, cx| {
                 root.min_h_0().child(dialog_scroll_body(
                     "plugin-detail-body",
                     None,
-                    render_detail(&detail, &translator, cx),
+                    content.clone(),
                     cx,
                 ))
             })

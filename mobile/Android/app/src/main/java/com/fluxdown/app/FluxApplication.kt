@@ -29,6 +29,7 @@ import com.fluxdown.core.host.ImportSummary
 import com.fluxdown.core.host.ImportUpdate
 import com.fluxdown.core.model.HostRef
 import com.fluxdown.core.model.SelectionOutcome
+import com.fluxdown.core.store.Connection
 import com.fluxdown.core.store.HostState
 import com.fluxdown.core.store.HostStore
 import com.fluxdown.app.update.AppUpdateController
@@ -47,6 +48,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
@@ -157,6 +159,11 @@ class AppContainer(context: Context) {
                 val opened = openOrFail(localRef)
                 adopt(localRef, opened.getOrElse { UnavailableSession(it.asHostException()) })
             }
+        }
+        // 连接 / 任务表载入状态的每次变化记入诊断事件：界面卡在加载 / 断连时，导出的日志能看出停在哪一态。
+        // 只在状态切换时写一行（StateFlow 的 10 Hz 发布经 distinctUntilChanged 折叠），不做周期写入。
+        appScope.launch(Dispatchers.IO) {
+            store.state.map(::connectionSummary).distinctUntilChanged().collect { AppDiagnostics.event("host $it") }
         }
     }
 
@@ -295,6 +302,7 @@ class AppContainer(context: Context) {
         throw e
     } catch (e: Exception) {
         Log.w(TAG, "open host ${ref.id} failed: ${e.message}")
+        AppDiagnostics.event("host open failed (${hostKind(ref)}): ${e.message}")
         Result.failure(e.asHostException())
     }
 
@@ -315,6 +323,7 @@ class AppContainer(context: Context) {
         val old = session
         session = next
         _host.value = ref
+        AppDiagnostics.event("host session attached (${hostKind(ref)})")
         old.close()
         store.attach(next)
         restartLocalMonitor(ref)
@@ -447,6 +456,20 @@ class AppContainer(context: Context) {
         const val CONNECT_TIMEOUT_MS = 15_000L
     }
 }
+
+/** 诊断事件里的连接摘要：连接态 + 任务表是否在分页载入（不含任务数据）。 */
+private fun connectionSummary(state: HostState): String {
+    val connection = when (val c = state.connection) {
+        Connection.Connecting -> "connecting"
+        Connection.Live -> "live"
+        Connection.Stale -> "stale"
+        is Connection.Failed -> "failed ${c.error.code}: ${c.error.message}"
+    }
+    return if (state.tasksLoading) "$connection, tasks loading (${state.taskTotal})" else connection
+}
+
+/** 诊断事件只记主机类别，不记远端地址。 */
+private fun hostKind(ref: HostRef): String = if (ref is HostRef.Local) "local" else "remote"
 
 /**
  * 没有可用连接时的占位会话：信号流只发 [HostSignal.Fatal]（store 显示失败态），命令一律抛同一个 [HostException]。

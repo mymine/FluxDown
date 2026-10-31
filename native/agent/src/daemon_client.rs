@@ -638,12 +638,15 @@ async fn run_client(
     let mut startup_polls = 0_usize;
     // 每个 agent 进程只尝试替换一次协议不兼容的 daemon，避免同目录二进制错配时反复互杀。
     let mut replaced_incompatible = false;
+    // 同理只替换一次应用版本旧于本 agent 的 daemon：agent 单独退出（SIGTERM、崩溃、被结束）
+    // 后 daemon 按设计继续运行，升级后的新 agent 会连到这个旧版 daemon，旧引擎继续干活。
+    let mut replaced_outdated = false;
     // 被旧版 daemon（或冒充者）占着端口时已尝试结束同名进程的次数，见 `LEGACY_REPLACE_ATTEMPTS`。
     let mut legacy_attempts = 0_u32;
     loop {
         let (target, outcome) = match config.resolve(supervisor.child_alive().await).await {
             Ok(Resolution::Connect(target)) => {
-                let outcome = connect(&config, &target).await;
+                let outcome = connect(&config, &target, !replaced_outdated).await;
                 (Some(target), outcome)
             }
             Ok(Resolution::NotReady) => (None, Err(ConnectError::NotReady)),
@@ -738,6 +741,26 @@ async fn run_client(
                 tracing::warn!(
                     "the default daemon port belongs to another fluxdownd (another user or data directory); waiting for this data directory's fluxdownd to publish its endpoint"
                 );
+            }
+            Some(ConnectError::Outdated(version)) => {
+                replaced_outdated = true;
+                tracing::warn!(
+                    running = %version,
+                    own = fluxdown_protocol::APP_VERSION,
+                    "fluxdownd is older than this agent; asking it to exit"
+                );
+                if let Some(target) = target.as_ref() {
+                    match shutdown_target(&config, target).await {
+                        Ok(()) => wait_until_stopped(target, Duration::from_secs(30)).await,
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "outdated fluxdownd refused shutdown; keeping it"
+                        ),
+                    }
+                }
+                // 关停失败也照常重连：下一轮不再比较版本，沿用正在运行的 daemon。
+                attempt = 0;
+                continue;
             }
             Some(ConnectError::Incompatible) if !replaced_incompatible => {
                 replaced_incompatible = true;
@@ -964,7 +987,9 @@ fn describe_connect_error(error: ConnectError) -> String {
     match error {
         ConnectError::Fatal(data) => format!("{:?}", data.code),
         ConnectError::Transient(message) => message,
-        ConnectError::Refused | ConnectError::Incompatible => "daemon unreachable".to_owned(),
+        ConnectError::Refused | ConnectError::Incompatible | ConnectError::Outdated(_) => {
+            "daemon unreachable".to_owned()
+        }
         ConnectError::NotReady => "daemon not ready".to_owned(),
         ConnectError::LegacyPeer => "legacy daemon".to_owned(),
     }
@@ -1037,8 +1062,14 @@ async fn wait_until_stopped(target: &DaemonTarget, timeout: Duration) {
 async fn connect(
     config: &DaemonClientConfig,
     target: &DaemonTarget,
+    reject_outdated: bool,
 ) -> Result<(Socket, Snapshot, Vec<EventFrame>), ConnectError> {
-    let result = match tokio::time::timeout(HANDSHAKE_TIMEOUT, establish(config, target)).await {
+    let result = match tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        establish(config, target, reject_outdated),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => Err(ConnectError::Transient(format!(
             "handshake with {} timed out after {}s",
@@ -1108,6 +1139,7 @@ async fn load_snapshot_tables(
 async fn establish(
     config: &DaemonClientConfig,
     target: &DaemonTarget,
+    reject_outdated: bool,
 ) -> Result<(Socket, Snapshot, Vec<EventFrame>), ConnectError> {
     let token = config.load_token().await?;
     let mut socket = open_socket(target).await?;
@@ -1145,6 +1177,14 @@ async fn establish(
     }
     if service.protocol_version != fluxdown_protocol::PROTOCOL_VERSION {
         return Err(ConnectError::Incompatible);
+    }
+    if reject_outdated
+        && fluxdown_protocol::is_older_app_version(
+            &service.service_version,
+            fluxdown_protocol::APP_VERSION,
+        )
+    {
+        return Err(ConnectError::Outdated(service.service_version));
     }
     let snapshot_value = call_on_socket(
         &mut socket,
@@ -1620,6 +1660,8 @@ enum ConnectError {
     Transient(String),
     /// 对端协议版本不兼容：可尝试让旧进程退出后由监管拉起同版本 daemon。
     Incompatible,
+    /// 对端协议兼容但应用版本旧于本 agent：让它退出，由监管拉起同级（同版本）daemon。
+    Outdated(String),
     /// 对端是不认识挑战应答握手的旧版 daemon（或冒充者）：不得向它发送 token，只能结束
     /// 同名旧进程后由监管拉起新 daemon。
     LegacyPeer,
@@ -1971,7 +2013,7 @@ mod tests {
             let target = fixed(&url);
             let (tx, mut rx) = tokio::sync::mpsc::channel(16);
             let (command_tx, mut commands) = tokio::sync::mpsc::channel(1);
-            let (socket, snapshot, buffered) = super::connect(&config, &target)
+            let (socket, snapshot, buffered) = super::connect(&config, &target, true)
                 .await
                 .unwrap_or_else(|_| panic!("connect"));
             assert!(
@@ -2001,7 +2043,7 @@ mod tests {
             };
             assert_eq!((first.sequence, second.sequence), (6, 7));
             assert!(rx.try_recv().is_err(), "gap event must not be delivered");
-            let (socket, snapshot, buffered) = super::connect(&config, &target)
+            let (socket, snapshot, buffered) = super::connect(&config, &target, true)
                 .await
                 .unwrap_or_else(|_| panic!("reconnect"));
             assert_eq!((snapshot.epoch.as_str(), snapshot.sequence), ("b", 20));
@@ -2214,7 +2256,7 @@ mod tests {
             });
 
             let config = super::DaemonClientConfig::new(url.clone(), TOKEN);
-            let (socket, snapshot, buffered) = super::connect(&config, &fixed(&url))
+            let (socket, snapshot, buffered) = super::connect(&config, &fixed(&url), true)
                 .await
                 .unwrap_or_else(|_| panic!("connect"));
             let SnapshotBody::Daemon(mut daemon) = snapshot.body else {
@@ -2342,7 +2384,7 @@ mod tests {
                 .await;
             });
             let config = super::DaemonClientConfig::new(url.clone(), TOKEN);
-            let (socket, snapshot, buffered) = super::connect(&config, &fixed(&url))
+            let (socket, snapshot, buffered) = super::connect(&config, &fixed(&url), true)
                 .await
                 .unwrap_or_else(|_| panic!("connect"));
             let (tx, _rx) = tokio::sync::mpsc::channel(16);
@@ -2428,7 +2470,7 @@ mod tests {
                 ws
             });
             let config = super::DaemonClientConfig::new(url.clone(), TOKEN);
-            let (_socket, snapshot, _buffered) = super::connect(&config, &fixed(&url))
+            let (_socket, snapshot, _buffered) = super::connect(&config, &fixed(&url), true)
                 .await
                 .unwrap_or_else(|_| panic!("oversized snapshot must not break the handshake"));
             let SnapshotBody::Daemon(daemon) = snapshot.body else {
@@ -2540,7 +2582,8 @@ mod tests {
                 }
             });
             let config = super::DaemonClientConfig::new(url.clone(), TOKEN);
-            let Err(super::ConnectError::Fatal(data)) = super::connect(&config, &fixed(&url)).await
+            let Err(super::ConnectError::Fatal(data)) =
+                super::connect(&config, &fixed(&url), true).await
             else {
                 panic!("an endpoint that cannot prove the token must be rejected");
             };
@@ -2689,7 +2732,8 @@ mod tests {
                 String::from_utf8_lossy(&received).to_ascii_lowercase()
             });
             let config = super::DaemonClientConfig::new(url.clone(), TOKEN);
-            let Err(super::ConnectError::LegacyPeer) = super::connect(&config, &fixed(&url)).await
+            let Err(super::ConnectError::LegacyPeer) =
+                super::connect(&config, &fixed(&url), true).await
             else {
                 panic!("an upgrade rejected with 401 marks a legacy daemon");
             };
@@ -2743,7 +2787,7 @@ mod tests {
             let config = super::DaemonClientConfig::new(url.clone(), TOKEN);
             for _ in 0..2 {
                 let Err(super::ConnectError::LegacyPeer) =
-                    super::connect(&config, &fixed(&url)).await
+                    super::connect(&config, &fixed(&url), true).await
                 else {
                     panic!("a peer that does not know the challenge is a legacy daemon");
                 };

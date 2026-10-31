@@ -1,6 +1,6 @@
 /**
  * 侧边栏「诊断」页：桌面端连接 / 协议 / 解析插件 / 规则同步状态，
- * 当前页资源命中的规则聚合，以及调试日志与连接诊断导出。
+ * 当前页资源命中的规则聚合、扩展错误日志，以及调试日志与连接诊断导出。
  */
 import type { JSX } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
@@ -16,6 +16,7 @@ import { showToast } from "@/ui/components/Toast";
 import { resourceDisplayName } from "@/ui/features/labels";
 import { useT } from "@/ui/i18n";
 import { syncProblemLabel, userSyncProblems } from "../options/panels/rules/sync-labels";
+import { ErrorLogCard } from "./ErrorLogCard";
 
 interface Props {
   view: TabView | null;
@@ -257,6 +258,8 @@ export function DiagnosticsPane(props: Props): JSX.Element {
           })
         )}
       </section>
+
+      <ErrorLogCard />
 
       <div class="sp-diag-actions">
         <Button disabled={!view || exportingLog} onClick={exportResourceLog}>

@@ -11,6 +11,7 @@ import { docExpiry } from "@/utils/doc-expiry";
 import { sendAction } from "@/utils/messaging";
 import { settings, updateSettings } from "../../lib/store";
 import { syncOutcomeLabels, syncProblemLabel, userSyncProblems } from "./sync-labels";
+import { logError } from "@/utils/error-log";
 
 interface SyncCardProps {
   sync: RuleSyncStatus | null;
@@ -39,7 +40,7 @@ export function SyncCard(props: SyncCardProps): JSX.Element | null {
       const [msg, kind] = syncOutcomeLabels()[outcome];
       showToast(msg, kind);
     } catch (e) {
-      console.error("[FluxDown Options] rulesSyncNow failed:", e);
+      logError("[FluxDown Options] rulesSyncNow failed:", e);
       showToast(t("rules.sync.failed"), "error");
     } finally {
       setSyncing(false);

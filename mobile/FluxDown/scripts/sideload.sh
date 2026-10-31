@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 打包原生 iOS App（mobile/FluxDown）的侧载（full flavor）**未签名** IPA，供 AltStore / SideStore / Sideloadly 等用户自签安装。
 # 与 testflight.sh 的区别：full flavor（本机引擎含 BitTorrent / eD2K，App 定义 FULL_FLAVOR）、不签名、不上传。
-# 本机与 CI（.github/workflows/ios-testflight.yml 的 sideload job）共用这一份流程。
+# 本机与 CI（.github/workflows/ios-sideload.yml，由 release.yml 的 ios 组件调用）共用这一份流程。
 #
 # 用法：mobile/FluxDown/scripts/sideload.sh --version X.Y.Z --build N [--out DIR] [--skip-core]
 #   --version    CFBundleShortVersionString（不带 -rc 后缀）

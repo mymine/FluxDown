@@ -19,11 +19,12 @@ import {
   installedVersionYanked,
   latestPerPlugin,
   marketAction,
+  marketNeedsLoad,
   permissionsToConfirm,
   riskOf,
   yankedLabelKey,
 } from './logic'
-import type { ConsentSet, MarketSort } from './logic'
+import type { ConsentSet, MarketLoadState, MarketSort } from './logic'
 import { PluginConsentDialog, RiskBadge } from './PluginConsentDialog'
 import type { ConsentView } from './PluginConsentDialog'
 
@@ -35,14 +36,17 @@ interface MarketState {
 
 export function MarketSection({
   stale,
+  active,
   plugins,
   onInstalled,
   onInstallFailed,
   onShowDetail,
 }: {
   stale: boolean
+  /** 插件页当前可见（组件页隐藏时为 false）；进入时检查目录是否过期。 */
+  active: boolean
   plugins: readonly PluginDto[]
-  onInstalled: (result: InstalledPlugin, confirmed: ConsentSet | null) => void | Promise<void>
+  onInstalled: (result: InstalledPlugin, confirmed: ConsentSet | null, updating: boolean) => void | Promise<void>
   onInstallFailed: (error: unknown) => void
   onShowDetail: (detail: PluginDetail) => void
 }) {
@@ -52,7 +56,8 @@ export function MarketSection({
   const [limit, setLimit] = useState(MARKET_PAGE_SIZE)
   const [pending, setPending] = useState<ReadonlySet<string>>(new Set())
   const [confirm, setConfirm] = useState<{ view: ConsentView; resolve: (ok: boolean) => void } | null>(null)
-  const requested = useRef(false)
+  const loadState = useRef<MarketLoadState>({ requested: false, retryOnReconnect: false, failed: false, loadedAt: null })
+  const inflight = useRef<Promise<void> | null>(null)
   const signedIn = useAgent((snapshot) => snapshot.session !== null && snapshot.session !== undefined, false)
   const [sort, setSort] = useState<MarketSort>('default')
   const [favoritesOnlyRaw, setFavoritesOnly] = useState(false)
@@ -74,17 +79,28 @@ export function MarketSection({
     }
   }
 
-  const load = async () => {
-    requested.current = true
+  const fetchCatalog = async () => {
+    loadState.current = { ...loadState.current, requested: true, retryOnReconnect: false, failed: false }
     setMarket((current) => ({ ...current, loading: true, error: null }))
     void loadFavorites()
     try {
       const entries = await rpc.daemon.plugin.marketList()
+      loadState.current = { ...loadState.current, failed: false, loadedAt: Date.now() }
       setMarket({ loading: false, error: null, entries })
       setLimit(MARKET_PAGE_SIZE)
     } catch (error) {
+      // 断连 / 超时类失败：连接恢复后自动重试一次；其他失败保持手动刷新。
+      const transport = error instanceof RpcError && (error.appCode === 'unavailable' || error.appCode === 'timeout')
+      loadState.current = { ...loadState.current, failed: true, retryOnReconnect: transport }
       setMarket((current) => ({ ...current, loading: false, error: extensionErrorText(t, error) }))
     }
+  }
+  /** 同一时刻只有一个目录请求：在途时复用其 Promise。 */
+  const load = (): Promise<void> => {
+    inflight.current ??= fetchCatalog().finally(() => {
+      inflight.current = null
+    })
+    return inflight.current
   }
   const loadRef = useRef(load)
   loadRef.current = load
@@ -96,13 +112,15 @@ export function MarketSection({
   useEffect(() => {
     if (lastSignedIn.current === signedIn) return
     lastSignedIn.current = signedIn
-    if (requested.current) void loadFavoritesRef.current()
+    if (loadState.current.requested) void loadFavoritesRef.current()
   }, [signedIn])
 
-  // 首次进入插件页且连接就绪时自动拉取一次（与 GPUI `ensure_market_loaded` 一致）。
+  // 进入插件页（含从组件页切回）且连接就绪时按需拉取：从未请求、断连失败待重试、或目录已超过
+  // `MARKET_MAX_AGE_MS`（与 GPUI `ensure_market_loaded` 一致）；在途请求不重复发起。
   useEffect(() => {
-    if (!requested.current && !stale) void loadRef.current()
-  }, [stale])
+    if (!active || stale || inflight.current !== null) return
+    if (marketNeedsLoad(loadState.current, Date.now())) void loadRef.current()
+  }, [active, stale])
 
   const install = async (entry: MarketEntryDto, installed: PluginDto | undefined) => {
     const pluginId = entry.pluginId
@@ -130,7 +148,7 @@ export function MarketSection({
     }
     setPending((current) => new Set(current).add(pluginId))
     try {
-      await onInstalled(await rpc.daemon.plugin.marketInstall({ pluginId, version: entry.version }), confirmed)
+      await onInstalled(await rpc.daemon.plugin.marketInstall({ pluginId, version: entry.version }), confirmed, installed !== undefined)
     } catch (error) {
       // 用户确认的版本已不是最新：刷新目录，让下一次点击按新版本重新确认权限。
       if (error instanceof RpcError && error.reason === 'marketVersionChanged') await load()

@@ -1,5 +1,6 @@
 // 任务行 / 分组头右键菜单（移植 task_table.rs 的 `context_menu_items` 与 `group_context_menu`）。
-// 「打开文件 / 在文件夹中显示」仅在 agent 下发 `agent.openTaskFiles`（同机）时出现，其余情况用浏览器下载已完成文件。
+// 「打开文件 / 在文件夹中显示」仅在 agent 下发 `agent.openTaskFiles`（同机）时出现，「复制文件」仅在下发
+// `agent.copyTaskFiles`（同机桌面会话）时出现；远程 / NAS 连接都用浏览器下载已完成文件。
 
 import {
   AppWindow,
@@ -7,8 +8,11 @@ import {
   CircleCheck,
   Copy,
   Download,
+  FileDown,
+  Files,
   Layers,
   Link2,
+  Magnet,
   FolderOpen,
   Pause,
   PanelRight,
@@ -17,6 +21,8 @@ import {
   SquareCheck,
   RotateCw,
   Rows3,
+  Share2,
+  Square,
   ShieldCheck,
   Trash2,
   Zap,
@@ -27,6 +33,7 @@ import type { PluginCommandRef } from '../../plugins/contributions'
 import type { MenuEntry } from '../../../ui'
 import {
   canOpenGroupFolder,
+  canCopyTaskFiles,
   canOpenTaskFile,
   canRedownload,
   canRevealTaskFile,
@@ -35,6 +42,10 @@ import {
   confirmIgnorePluginRetry,
   copySourceLink,
   copyUrls,
+  copyMagnet,
+  exportTorrent,
+  canShareTorrent,
+  copyTaskFiles,
   deleteGroup,
   deleteViews,
   downloadViewsFiles,
@@ -54,12 +65,13 @@ import {
   verifyTaskIntegrity,
 } from '../model/actions'
 import { remoteCan } from '../model/batchPlan'
-import { canChangeSegments, canChangeUrl, canVerifyIntegrity } from '../model/taskEdit'
+import { canChangeSegments, canChangeUrl, canRename, canVerifyIntegrity } from '../model/taskEdit'
 import { canPause, canResumeSeeding } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
 import { anyActive, anyResumable } from '../model/groupTree'
 import type { GroupCounts } from '../model/groupTree'
 import { openChangeSegments, openChangeUrl, openGroupDetail, openRename } from '../dialogs'
+import { openSharePanel, peekSendState, peekShareTaskFacts, providingRecordId, stopProviding } from '../../share'
 
 type Translate = (key: string, params?: Record<string, string | number>) => string
 
@@ -162,7 +174,34 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
       onSelect: () => void revealTaskFile(only.taskId),
     })
   }
-  if (only && only.source === 'local') {
+  if (canCopyTaskFiles(views)) {
+    entries.push({
+      type: 'item',
+      key: 'copy-files',
+      label: t('copyFileAction'),
+      icon: Files,
+      onSelect: () => void copyTaskFiles(views),
+    })
+  }
+  // 分享：未编入FluxMesh时不出现；未完成 / 文件丢失 / 远程任务 / 未登录时置灰并在说明行给出原因（多选合成一个分享）。
+  const shareState = peekSendState(views)
+  if (shareState !== 'hidden') {
+    entries.push({
+      type: 'item',
+      key: 'share',
+      label: t('sharePanelTitle'),
+      icon: Share2,
+      disabled: shareState !== 'ok',
+      ...(shareState === 'ok' ? {} : { description: t(shareState) }),
+      onSelect: () => openSharePanel(views.map((view) => view.taskId)),
+    })
+  }
+  // 停止共享：单选且该接收任务的记录仍在共享（含已完成回传中的任务）。
+  const providingId = only ? providingRecordId(peekShareTaskFacts(only.taskId)) : null
+  if (providingId) {
+    entries.push({ type: 'item', key: 'stop-providing', label: t('shareStopProviding'), icon: Square, onSelect: () => void stopProviding(providingId, t) })
+  }
+  if (only && canRename(only)) {
     entries.push({ type: 'item', key: 'rename', label: t('renameTask'), icon: Pen, onSelect: () => openRename(only.taskId) })
   }
   if (only && canChangeUrl(only)) {
@@ -196,6 +235,10 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
     })
   }
   entries.push({ type: 'item', key: 'copy-url', label: t('copyUrl'), icon: Copy, onSelect: () => copyUrls(views) })
+  if (only && canShareTorrent(views)) {
+    entries.push({ type: 'item', key: 'copy-magnet', label: t('btCopyMagnet'), icon: Magnet, onSelect: () => void copyMagnet(only) })
+    entries.push({ type: 'item', key: 'export-torrent', label: t('btExportTorrent'), icon: FileDown, onSelect: () => void exportTorrent(only) })
+  }
   if (allLocal && queues.length > 0) {
     entries.push({
       type: 'sub',

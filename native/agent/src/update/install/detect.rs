@@ -283,7 +283,7 @@ fn third_party_package(facts: &Facts, kind: UpdateInstallKind) -> bool {
 }
 
 /// 当前可执行文件路径。Linux 上程序被换掉后 `/proc/self/exe` 会带 ` (deleted)` 后缀，去掉它。
-pub(super) fn current_exe_path() -> Option<PathBuf> {
+pub(crate) fn current_exe_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     #[cfg(target_os = "linux")]
     if let Some(stripped) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {

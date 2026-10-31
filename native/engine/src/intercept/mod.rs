@@ -123,6 +123,47 @@ pub struct InterceptorEntry {
     pub fail_task: bool,
 }
 
+/// 任务当前出口：拦截阶段里插件的 `flux.fetch` / yt-dlp 未命中站点规则时走它，使插件
+/// 请求（如 Refresh 刷新签名直链）与下载同出口。
+#[derive(Debug, Clone)]
+pub struct TaskEgressView {
+    /// 具体出口（`None` / `Manual` 模式）。
+    pub proxy: crate::proxy_config::ProxyConfig,
+    /// 出口来自显式设定（任务自带代理 / 站点规则 / 走代理）：yt-dlp 强制注入 `--proxy`。
+    pub explicit: bool,
+    /// 站点规则；任务自带代理时为 `None`。
+    pub rules: Option<Arc<crate::proxy_rules::ProxyRuleSet>>,
+}
+
+impl TaskEgressView {
+    /// 从下载参数的当前出口派生（规则改道 / PAC / 探测竞速改写 `proxy_config` 后重取）。
+    pub fn of(p: &DownloadParams) -> Self {
+        let rule_decided = p
+            .spec
+            .egress
+            .as_ref()
+            .is_some_and(|router| router.base_rule().is_some());
+        Self {
+            proxy: p.proxy_config.clone(),
+            explicit: p.proxy_config.mode != crate::proxy_config::ProxyMode::None
+                || !p.run_meta.proxy_url.is_empty()
+                || rule_decided,
+            rules: p
+                .spec
+                .egress
+                .as_ref()
+                .map(|router| Arc::clone(router.rules())),
+        }
+    }
+}
+
+/// 把任务当前出口同步给拦截器（无拦截插件时零开销）。下载出口每次被改写后调用。
+pub fn sync_egress(p: &DownloadParams) {
+    if !p.interceptor.entries().is_empty() {
+        p.interceptor.set_egress(TaskEgressView::of(p));
+    }
+}
+
 /// 引擎调用插件拦截器的唯一入口。
 #[async_trait::async_trait]
 pub trait TaskInterceptor: Send + Sync {
@@ -130,6 +171,9 @@ pub trait TaskInterceptor: Send + Sync {
     fn entries(&self) -> &[InterceptorEntry];
     /// 任务持久化的原始 URL。
     fn source_url(&self) -> &str;
+    /// 任务当前出口变化（见 [`sync_egress`]）；之后的调用按它选插件请求出口。未同步过的
+    /// 拦截器（元数据探测、失败阶段）按全局规则 + 全局模式。
+    fn set_egress(&self, _egress: TaskEgressView) {}
     /// 调用 `identity` 的 `intercept(ctx)`；`Ok(None)` = 插件不做改动。
     /// 调用方丢弃返回的 future 即中止插件侧执行。
     async fn call(

@@ -87,8 +87,8 @@ const columns: { title: string; links: FooterLink[] }[] = [
 
 <footer class="site-footer frame">
   <div class="rule"></div>
-  <div class="grid gap-x-8 gap-y-12 px-[clamp(20px,4vw,56px)] pb-10 pt-16 sm:grid-cols-3 lg:grid-cols-[1.3fr_repeat(5,1fr)]">
-    <div class="flex flex-col gap-5 sm:col-span-3 lg:col-span-1">
+  <div class="grid grid-cols-2 gap-x-8 gap-y-10 px-[clamp(20px,4vw,56px)] pb-10 pt-16 sm:grid-cols-3 sm:gap-y-12 lg:grid-cols-[1.3fr_repeat(5,1fr)]">
+    <div class="col-span-2 flex flex-col gap-5 sm:col-span-3 lg:col-span-1">
       <Logo size={26} />
       <p class="max-w-[30ch] text-[14px] leading-relaxed text-muted">{common[lang].brandTagline}</p>
       <div class="flex flex-wrap gap-2">
@@ -143,6 +143,7 @@ const columns: { title: string; links: FooterLink[] }[] = [
       <span>{t.copyright(year)}</span>
       <span>{t.license}</span>
       <span>{t.built}</span>
+      <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener noreferrer" class="footer-link">{t.icp}</a>
     </div>
     <div class="flex items-center gap-1">
       {
@@ -168,18 +169,21 @@ const columns: { title: string; links: FooterLink[] }[] = [
 </footer>
 
 <script>
-  import { mountStage } from "../../scripts/particle-stage";
-  import { WordmarkField } from "./wordmark-field";
+  import { whenIdle } from "../../scripts/idle";
 
-  // 粒子字标:挂载后隐藏描边文字(保留排版供采样定位);字体就绪后重采一次
+  // 粒子字标:首屏绘制后的空闲时段再加载;挂载后隐藏描边文字(保留排版供采样定位),字体就绪后重采一次
   const host = document.querySelector<HTMLElement>("[data-wordmark]");
   const text = host?.querySelector<HTMLElement>("[data-wordmark-text]");
   const canvas = host?.querySelector<HTMLCanvasElement>("[data-wordmark-canvas]");
   if (host && text && canvas) {
-    const field = new WordmarkField(text, canvas);
-    host.classList.add("is-particles");
-    mountStage(canvas, host, field);
-    void document.fonts.ready.then(() => field.sample());
+    whenIdle(async () => {
+      const [{ mountStage }, { WordmarkField }] = await Promise.all([import("../../scripts/particle-stage"), import("./wordmark-field")]);
+      const field = new WordmarkField(text, canvas);
+      host.classList.add("is-particles");
+      mountStage(canvas, host, field);
+      await document.fonts.ready;
+      field.sample();
+    });
   }
 </script>
 

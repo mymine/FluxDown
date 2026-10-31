@@ -8,6 +8,7 @@ import { Button } from "@/ui/components/Button";
 import { Icon } from "@/ui/components/Icon";
 import { showToast } from "@/ui/components/Toast";
 import { useT } from "@/ui/i18n";
+import { usePlatform } from "@/ui/hooks/usePlatform";
 import "./features.css";
 
 const RESOLVE_POLL_MS = 1000;
@@ -38,8 +39,9 @@ async function fetchTask(taskId: string): Promise<TrackedTask> {
   return null;
 }
 
-export function HandoffCard(props: { handoff: HandoffState; tabId: number }): JSX.Element {
+export function HandoffCard(props: { handoff: HandoffState; tabId: number }): JSX.Element | null {
   const t = useT();
+  const { desktopApp } = usePlatform();
   const [busy, setBusy] = useState(false);
   /** 正在桌面端解析的任务 ID；为空表示没有在途解析。 */
   const [resolving, setResolving] = useState<string | null>(null);
@@ -103,6 +105,9 @@ export function HandoffCard(props: { handoff: HandoffState; tabId: number }): JS
       text = resolving ? t("handoff.resolving") : t("handoff.match", { name: h.name });
       break;
   }
+
+  // 交给桌面解析依赖 NMH；Android 无桌面 App，也不探测完成前先隐藏
+  if (!desktopApp) return null;
 
   return (
     <div class={`fd-handoff fd-handoff-${h.kind}`}>

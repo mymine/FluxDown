@@ -5,4 +5,5 @@ pub mod plugin_auth;
 mod plugin_auth_challenge;
 pub mod plugin_consent;
 pub mod plugin_detail;
+pub mod plugin_live;
 pub mod plugin_settings;

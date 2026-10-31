@@ -3,7 +3,7 @@ title: 使用扩展
 description: 下载拦截的工作方式、三种拦截模式、资源嗅探与弹窗常用控制项。
 section: browser-extension
 order: 2
-sourceHash: "c6ed8d4c0d44"
+sourceHash: "2e2e525f0046"
 ---
 
 ## 下载拦截的工作方式
@@ -42,6 +42,12 @@ sourceHash: "c6ed8d4c0d44"
 
 工具栏图标本身也会反映当前状态(拦截关闭时图标会变暗),不用打开弹窗也能一眼看出。
 
+## 与 SingleFile 一起使用
+
+在 Chrome、Brave 等 Chromium 内核浏览器中同时启用 FluxDown 扩展和 [SingleFile](https://github.com/gildas-lormeau/SingleFile) 时,SingleFile 保存的网页文件名可能变成一串随机 ID(例如 `fc17bc0e-762a-4990-a07d-b8a4b7c91ae2.htm`)。这是 Chromium 的已知问题([crbug 41418926](https://issues.chromium.org/issues/41418926)):只要有扩展在参与下载文件名的决定,其他扩展通过下载接口指定的文件名就可能丢失。IDM、XDown、Video DownloadHelper 等下载扩展同样会触发。
+
+解决方法:打开 SingleFile 的选项,在 **Misc(其他)** 中关闭 **Save pages in background(在后台保存页面)**。之后 SingleFile 改为在页面内保存,文件名恢复正常,FluxDown 的下载拦截也不受影响。
+
 ## fluxdown:// 协议模式
 
 通常情况下,扩展经 Native Messaging 把下载转交给 FluxDown 客户端。弹窗快捷设置和选项页中的 **FluxDown 自定义协议**开关(默认关闭)会切换到另一条通道:被拦截的下载导航到一个 `fluxdown://download?url=...&filename=...` 协议 URL,由操作系统唤起注册了该协议的应用——FluxDown 桌面或 Android 客户端。
@@ -74,6 +80,8 @@ sourceHash: "c6ed8d4c0d44"
 ## 检测页面中的媒体与可下载资源
 
 FluxDown 会持续扫描每个页面中的可下载资源——视频、音频元素,流媒体清单(HLS 的 `.m3u8`、DASH 的 `.mpd`),字幕文件,以及看起来像文件的链接或网络响应——扫描 DOM 结构的同时,也实时监听页面的网络请求。检测到的资源会被分类(视频、音频、文档、压缩包、图片、种子、流媒体、字幕、磁力链接、其他)并做轻量过滤,让列表尽量只保留真正可下载的内容,而不是把每个图标、广告请求或预加载片段都塞进来:体积过小的文件按类型分别过滤掉,追踪/统计类请求会被忽略,原始的流媒体分片除非大到足以单独构成一个完整文件,否则也不会显示。图片嗅探默认关闭,因此页面上的普通图片不会出现在结果里。
+
+扫描页面链接得到的资源默认每页最多 200 条，避免超长列表页变卡。如果页面上的文件比这更多（例如有几百个条目的模型库），可以在设置页的**资源嗅探**里调高**单页嗅探上限**（最大 99999）。从网络请求中嗅探到的媒体不计入这个上限。
 
 哪些内容算可下载资源由嗅探规则决定。如果某个网站识别不对，可以在设置页的**嗅探规则**里自己编写规则，详见[嗅探规则参考](/docs/zh/browser-extension/sniff-rules/)。
 

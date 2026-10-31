@@ -169,12 +169,14 @@ public enum TorrentFile {
 // MARK: - 插件失败
 
 public enum PluginFailure {
-    /// 引擎 / daemon 插件失败任务的错误消息前缀（`download_manager.rs`、GPUI `PLUGIN_ERROR_PREFIX`）。
+    /// 可「忽略插件重试」的插件失败错误消息前缀（`download_manager.rs`、GPUI `PLUGIN_ERROR_PREFIX`；
+    /// 二段解析任务失败用 `[解析插件]`，不匹配本前缀）。
     public static let prefix = "[插件]"
 
-    /// 仅“失败 + 错误消息以插件前缀开头”的任务提供「忽略插件重试」。
-    public static func isIgnorable(status: TaskStatus, errorMessage: String) -> Bool {
-        status == .failed && errorMessage.hasPrefix(prefix)
+    /// 仅“失败 + 错误消息以插件前缀开头 + 非任务组成员”的任务提供「忽略插件重试」
+    /// （组成员的原始链接是分享页，daemon 拒绝忽略重试）。
+    public static func isIgnorable(status: TaskStatus, errorMessage: String, groupId: String) -> Bool {
+        status == .failed && groupId.isEmpty && errorMessage.hasPrefix(prefix)
     }
 }
 

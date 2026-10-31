@@ -45,6 +45,7 @@ fn spec(args: &[&str]) -> YtdlpSpec {
         subdir: None,
         timeout_ms: Some(30_000),
         wall_pause: None,
+        egress: None,
     }
 }
 

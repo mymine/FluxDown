@@ -35,7 +35,7 @@ use crate::proxy_config::{ProxyConfig, ProxyMode};
 // api TaskDto.autoRoute 与 Web WS 逐字一致）
 // ---------------------------------------------------------------------------
 
-/// `tasks.auto_route` 的 wire 标签。空串 = 非 Auto 模式（或任务尚未启动过）。
+/// `tasks.auto_route` 的 wire 标签。空串 = 非 Auto 且未命中站点规则（或任务尚未启动过）。
 ///
 /// 代理类标签带候选来源后缀 `:system`（系统代理检测）/ `:manual`（手动
 /// 字段回退），UI 通用解析后缀展示「最终用的是谁」；无后缀的裸标签是
@@ -64,6 +64,20 @@ pub mod route {
     pub const PROXY_CACHED_MANUAL: &str = "proxy:cached:manual";
     pub const PROXY_FAILOVER_SYSTEM: &str = "proxy:failover:system";
     pub const PROXY_FAILOVER_MANUAL: &str = "proxy:failover:manual";
+    /// 站点规则决定任务出口，实际直连（`direct` 动作、`system` 未检测到代理、
+    /// `manual` 未配置）。
+    pub const RULE_DIRECT: &str = "rule:direct";
+    /// 站点规则决定任务出口，经系统代理。
+    pub const RULE_SYSTEM: &str = "rule:system";
+    /// 站点规则决定任务出口，经手动代理。
+    pub const RULE_MANUAL: &str = "rule:manual";
+    /// 站点规则决定任务出口，经规则自带的自定义代理。
+    pub const RULE_CUSTOM: &str = "rule:custom";
+
+    /// 是否为站点规则标签（Auto 故障转移等 Auto 专属逻辑必须跳过这类任务）。
+    pub fn is_rule_label(label: &str) -> bool {
+        label.starts_with("rule:")
+    }
 
     /// 代理基础标签 + 候选来源 → 带后缀标签（非代理基础标签原样返回）。
     pub fn with_source(base: &'static str, source: CandidateSource) -> &'static str {
@@ -166,6 +180,8 @@ fn resolve_candidates_with_system(
     if !config.host.is_empty() && config.port != 0 {
         let mut manual = config.clone();
         manual.mode = ProxyMode::Manual;
+        // 派生出口配置不携带站点规则（规则只挂在全局配置上）。
+        manual.rules = None;
         candidates.push(ProxyCandidate {
             config: manual,
             source: CandidateSource::ManualFields,
@@ -301,6 +317,7 @@ mod tests {
             username: String::new(),
             password: String::new(),
             no_proxy_list: String::new(),
+            rules: None,
         }
     }
 

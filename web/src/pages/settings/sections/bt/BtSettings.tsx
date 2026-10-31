@@ -1,19 +1,27 @@
-// BitTorrent：基础（DHT/UPnP/端口）、Tracker（列表 + 订阅）、做种（GPUI `sections/bt.rs`）。
+// BitTorrent：基础（DHT/UPnP/端口）、Tracker（列表 + 订阅）、做种、防吸血（设置 / 封禁名单 / 事件日志）（GPUI `sections/bt.rs`）。
 
 import { useT } from '../../../../i18n'
+import { daemonConfigField } from '../../../../lib/rpc'
 import {
   DaemonEnumRow,
   DaemonNumberRow,
   DaemonSwitchRow,
   DropdownField,
+  NumberField,
   SettingsPage,
   SettingsRow,
   SettingsSection,
+  camel,
   setDaemon,
+  setDaemonNumber,
   useDaemonBool,
+  useDaemonNumber,
   useDaemonValue,
 } from '../../kit'
 import { ListEditorRow, SubscriptionStatusRow } from '../subscription'
+import { GuardBansTab } from './guard/GuardBans'
+import { GuardEventsTab } from './guard/GuardEvents'
+import { GuardSettingsTab } from './guard/GuardSettings'
 
 function BasicTab({ btEnabled }: { btEnabled: boolean }) {
   const t = useT()
@@ -70,6 +78,30 @@ function ThenActionRow() {
   )
 }
 
+/** 时长限制：数字 + 单位下拉同一行（GPUI `duration_control`）。 */
+function DurationRow({ valueKey, unitKey, titleKey }: { valueKey: string; unitKey: string; titleKey: string }) {
+  const t = useT()
+  const title = t(titleKey)
+  const value = useDaemonNumber(valueKey)
+  const unit = useDaemonValue(unitKey)
+  const field = daemonConfigField(valueKey)
+  const unitOptions = (daemonConfigField(unitKey)?.options ?? []).map((option) => ({ value: option, label: t(`timeUnit${camel(option)}`) }))
+  return (
+    <SettingsRow title={title}>
+      <div className="flex items-center gap-2 mobile:w-full">
+        <NumberField
+          value={value}
+          {...(field?.min !== undefined ? { min: field.min } : {})}
+          {...(field?.max !== undefined ? { max: field.max } : {})}
+          aria-label={title}
+          onCommit={(next) => setDaemonNumber(valueKey, next)}
+        />
+        <DropdownField value={unit} options={unitOptions} aria-label={title} className="desktop:min-w-[88px] mobile:w-auto" onValueChange={(next) => setDaemon(unitKey, next)} />
+      </div>
+    </SettingsRow>
+  )
+}
+
 function SeedingTab() {
   const t = useT()
   const seedEnabled = useDaemonBool('bt_seed_enabled')
@@ -85,12 +117,10 @@ function SeedingTab() {
         <>
           <DaemonNumberRow configKey="bt_seed_max_active" titleKey="btSeedMaxActive" descKey="btSeedMaxActiveDesc" />
           <DaemonSwitchRow configKey="bt_auto_reseed" titleKey="btAutoReseed" descKey="btAutoReseedDesc" />
-          <DaemonNumberRow configKey="bt_seed_ratio_limit" titleKey="btSeedRatioLimit" step={0.1} />
-          <DaemonNumberRow configKey="bt_seed_post_ratio_limit" titleKey="btSeedPostRatioLimit" step={0.1} />
-          <DaemonNumberRow configKey="bt_seed_time_limit_minutes" titleKey="btSeedTimeLimit" />
-          <DaemonEnumRow configKey="bt_seed_time_limit_unit" titleKey="btSeedTimeLimitUnit" labelPrefix="timeUnit" />
-          <DaemonNumberRow configKey="bt_seed_inactive_time_limit_minutes" titleKey="btSeedInactiveTimeLimit" />
-          <DaemonEnumRow configKey="bt_seed_inactive_time_limit_unit" titleKey="btSeedInactiveTimeLimitUnit" labelPrefix="timeUnit" />
+          <DaemonNumberRow configKey="bt_seed_ratio_limit" titleKey="btSeedRatioLimit" step={0.1} unit={t('btSeedRatioUnit')} />
+          <DaemonNumberRow configKey="bt_seed_post_ratio_limit" titleKey="btSeedPostRatioLimit" step={0.1} unit={t('btSeedRatioUnit')} />
+          <DurationRow valueKey="bt_seed_time_limit_minutes" unitKey="bt_seed_time_limit_unit" titleKey="btSeedTimeLimit" />
+          <DurationRow valueKey="bt_seed_inactive_time_limit_minutes" unitKey="bt_seed_inactive_time_limit_unit" titleKey="btSeedInactiveTimeLimit" />
           <SettingsRow title={t('btSeedConditionsOperator')}>
             <DropdownField
               value={operator}
@@ -116,6 +146,9 @@ export function BtSettings() {
     tabs.push(
       { id: 'tracker', label: t('settingsTabTracker'), content: <TrackerTab /> },
       { id: 'seeding', label: t('settingsTabSeeding'), content: <SeedingTab /> },
+      { id: 'guard', label: t('btGuardTab'), content: <GuardSettingsTab /> },
+      { id: 'guardBans', label: t('btGuardTabBans'), content: <GuardBansTab /> },
+      { id: 'guardEvents', label: t('btGuardTabEvents'), content: <GuardEventsTab /> },
     )
   }
   return (

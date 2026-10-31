@@ -14,6 +14,7 @@ import type { SiteProfile } from "./site-profiles";
 import { RemoteSettingsStore } from "./remote-settings";
 import type { RemoteSettings } from "./remote-settings";
 import type { RemotePingResult, RemoteServerConfig } from "./remote-server";
+import { SNIFF_MAX_RESOURCES_DEFAULT, normalizeSniffMaxResources } from "./sniff-limit";
 
 /**
  * 拦截模式：
@@ -29,6 +30,9 @@ export type InterceptMode = "smart" | "all";
  * - 'always': 仅走远程 HTTP 下载源，不再尝试连接桌面 App
  */
 export type RemoteMode = "off" | "fallback" | "always";
+
+/** 按住后点击链接跳过本次接管（交给浏览器下载）的修饰键；"off" = 关闭。 */
+export type BypassKey = "alt" | "shift" | "off";
 
 export interface FluxDownSettings {
   /** 是否启用下载拦截 */
@@ -54,6 +58,11 @@ export interface FluxDownSettings {
    * 供手动选择用 FluxDown 下载。默认开启。
    */
   interceptMagnet: boolean;
+  /**
+   * IDM 式「按住修饰键点击跳过接管」：按住期间发起的请求（及其重定向）
+   * 产生的下载一律交给浏览器，magnet 点击也交还系统处理程序。默认 Alt（macOS 为 Option）。
+   */
+  bypassKey: BypassKey;
 
   // === 任务发送通知 ===
 
@@ -78,6 +87,11 @@ export interface FluxDownSettings {
   floatButtonPosition: "top-right" | "top-left" | "bottom-right" | "bottom-left";
   /** 是否在资源列表中显示低置信度项 */
   showLowConfidence: boolean;
+  /**
+   * 单页面 DOM 扫描最多上报的资源数（#288：长列表页无节制扫描会卡顿）。fetch / XHR 嗅探到的媒体不计入。
+   * 取值经 `normalizeSniffMaxResources`（utils/sniff-limit.ts）规整到 1…99999。
+   */
+  sniffMaxResources: number;
 
   // === 失败回退与询问 ===
 
@@ -115,15 +129,16 @@ export interface FluxDownSettings {
   // === 自定义协议 ===
 
   /**
-   * 启用 fluxdown:// 自定义协议下载（Android 与桌面均生效）。
+   * 启用 fluxdown:// 自定义协议下载（仅桌面端生效；Android 忽略此开关）。
    * 开启后拦截下载时不再投递 NMH/远端，而是导航到
    * fluxdown://download?url=... 协议 URL，由系统唤起已注册该协议的
-   * FluxDown 客户端（Android: VIEW intent；桌面: Windows 注册表 /
-   * Linux x-scheme-handler / macOS CFBundleURLTypes 协议处理器）。
+   * FluxDown 客户端（Windows 注册表 / Linux x-scheme-handler / macOS
+   * CFBundleURLTypes 协议处理器）。
    * 限制：不经 NMH，Cookie/Headers/method/body 无法携带；
    * 音视频分轨（audioUrl）请求会回退浏览器下载。
    * 桌面端 NMH 链路功能是协议模式的严格超集，建议仅在 NMH 不可用的
-   * 受限环境开启。默认关闭。
+   * 受限环境开启。Android 版浏览器始终走 Intent 唤起
+   * （background/android-handoff.ts，可携带 Cookie / 来源页 / 请求头），不读取此开关。默认关闭。
    */
   enableFluxdownProtocol: boolean;
 }
@@ -242,6 +257,7 @@ const DEFAULT_SETTINGS: FluxDownSettings = {
   customExtensions: [],
   excludeExtensions: [],
   interceptMagnet: true,
+  bypassKey: "alt",
 
   // 任务发送通知（本地默认关闭，按需开启；远程默认开启）
   notifyLocalTask: false,
@@ -255,6 +271,7 @@ const DEFAULT_SETTINGS: FluxDownSettings = {
   floatButtonPosition: "top-right",
   showLowConfidence: false,
   sniffImages: false,
+  sniffMaxResources: SNIFF_MAX_RESOURCES_DEFAULT,
 
   // 失败回退与询问
   fallbackOnReject: true,
@@ -419,6 +436,7 @@ export function migrateSettings(raw: unknown): FluxDownSettings {
   if ((merged.interceptMode as string) === "extension") {
     merged.interceptMode = "smart";
   }
+  merged.sniffMaxResources = normalizeSniffMaxResources(merged.sniffMaxResources);
   return merged;
 }
 
@@ -602,6 +620,40 @@ export function shouldIntercept(
   //    同类产品（IDM/FDM）在此场景下也会拦截。
   //    如果用户不想拦截特定站点，可通过排除域名列表处理。
   return true;
+}
+
+/**
+ * 点击链接时（响应头到达前）是否像一次会被接管的下载：用于提前预热 NMH，让 App 冷启动与
+ * 对方服务器首字节等待并行。只认强信号——`<a download>` 或 URL 扩展名命中生效拦截列表；
+ * 预热会拉起 App，普通网页链接绝不能触发。站点 never、排除扩展名、自身远程 Web UI 一律否。
+ */
+export function isLikelyDownloadClick(
+  url: string,
+  hasDownloadAttr: boolean,
+  pageUrl: string | undefined,
+  settings: FluxDownSettings,
+  profiles: Record<string, SiteProfile> = {},
+): boolean {
+  if (!settings.enabled) return false;
+  if (isFluxDownServerDownload(url, pageUrl, settings.remoteUrl)) return false;
+  for (const target of [url, pageUrl]) {
+    if (!target) continue;
+    let host: string;
+    try {
+      host = new URL(target).hostname;
+    } catch {
+      if (target === url) return false;
+      continue;
+    }
+    if (profileFor(profiles, host).profile.intercept === "never") return false;
+  }
+  if (
+    settings.excludeExtensions.length > 0 &&
+    matchByExtension(url, undefined, settings.excludeExtensions)
+  ) {
+    return false;
+  }
+  return hasDownloadAttr || matchByExtension(url, undefined, effectiveExtensions(settings));
 }
 
 /**

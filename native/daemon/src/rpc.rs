@@ -810,6 +810,7 @@ mod tests {
             method::DAEMON_RSS_VALIDATE,
             method::DAEMON_LINK_PROBE,
             method::DAEMON_CONFIG_PROXY_TEST,
+            method::DAEMON_CONFIG_PROXY_ROUTE,
             method::DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH,
             method::DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH,
         ] {

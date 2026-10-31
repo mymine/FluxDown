@@ -227,11 +227,14 @@ enum GeneralCategoryText {
         return entry.name
     }
 
-    /// 详情行：`.ext, .ext` 或 `正则表达式: pattern`；无规则（全部 / 其他）为 nil。
+    /// 详情行：`.ext, .ext` / `正则表达式: pattern` / `网址模式: pattern`；无规则（全部 / 其他）为 nil。
     static func detail(_ entry: CustomCategoryDto) -> String? {
         guard entry.hasMatchRules else { return nil }
         if entry.isRegex {
             return entry.regexPattern.isEmpty ? nil : "\(L("regexLabel")): \(entry.regexPattern)"
+        }
+        if entry.isUrl {
+            return entry.urlPattern.isEmpty ? nil : "\(L("urlPatternLabel")): \(entry.urlPattern)"
         }
         return entry.extensions.isEmpty ? nil : entry.extensions.map { ".\($0)" }.joined(separator: ", ")
     }

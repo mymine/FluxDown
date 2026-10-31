@@ -24,11 +24,13 @@ import com.fluxdown.core.protocol.RegisterVerifyParams
 import com.fluxdown.core.protocol.ResetPasswordParams
 import com.fluxdown.core.protocol.SendCodeParams
 import com.fluxdown.core.protocol.SendNewEmailCodeParams
+import com.fluxdown.core.protocol.SessionDeviceDto
 import com.fluxdown.core.protocol.SyncLocalOnlyParams
 import com.fluxdown.core.protocol.TtlResult
 import com.fluxdown.core.protocol.VerifyCodeParams
 import com.fluxdown.core.protocol.callJson
 import com.fluxdown.core.protocol.callUnit
+import com.fluxdown.core.protocol.jsonObject
 
 /**
  * 账户 / 同步 / 云连接的类型化 agent 调用：对 `HostSession` 通用通道的薄封装（同 iOS `AgentAPI`）。
@@ -115,8 +117,12 @@ internal class AccountApi(private val session: HostSession) {
 
     // ── 云端设备 / 连接 ──
 
-    /** 刷新快照里的云端设备名册（结果经事件推送，这里不解码返回值）。 */
-    suspend fun deviceList() = session.callUnit(HostMethod.agentDeviceList)
+    /** 云端设备完整记录（含删除所需的云端行 id）；同时刷新快照里的云端设备名册。 */
+    suspend fun deviceList(): List<SessionDeviceDto> =
+        SessionDeviceDto.listFromJson(session.callJson(HostMethod.agentDeviceList))
+
+    /** 删除受信任设备（[id] = 云端行 id，不是 deviceId）；删除本机时 agent 随即清除本机会话。 */
+    suspend fun deviceDelete(id: String) = session.callUnit(HostMethod.agentDeviceDelete, jsonObject("id" to id))
 
     /** 请求立即重连云端任务连接；`accepted` 不表示已连上。 */
     suspend fun remoteReconnect() = session.callUnit(HostMethod.agentRemoteReconnect)

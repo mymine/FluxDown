@@ -18,7 +18,7 @@ sourceHash: "2b27d0ee563e"
 | 运行位置 | daemon（QuickJS） | 桌面端进程（gpui-shell，QuickJS） |
 | 客户端 | 桌面端、Web 端 | 仅桌面端 |
 | 外观 | 固定的节点集合，由客户端套用主题 | gpui 能画的一切，样式由你的代码决定 |
-| 位置 | `activity`、`settings`、`taskDetail` | 四种全部，包括 `window` |
+| 位置 | `activity`、`settings`、`taskDetail`、`auth` | 五种全部，包括 `window` |
 | 权限 | 只需 `main` 所需的权限 | `desktop`（风险等级**完全信任**） |
 | 文件、进程、剪贴板、网络 | 只能经 `flux.*` API | 直接访问（网络仅限列出的主机） |
 | 没打开窗口时是否运行 | 是（在 daemon 里） | 否 |
@@ -329,6 +329,8 @@ export default class Inspector extends View {
 | `theme()` | `{ revision, tokens }` | FluxDown 当前完整已解析的主题。主题每变化一次 `revision` 就递增，并且视图会自动重绘。 |
 | `locale()` | `string` | 界面语言，例如 `zh-CN`、`en`。 |
 | `toast(level, text)` | `void` | 在当前活动窗口弹出通知。`level` 为 `info`、`success`、`warning` 或 `error`。 |
+| `close()` | `boolean` | 关闭承载该视图的容器（`auth` 视图的登录对话框、设置对话框、独立窗口）并返回 `true`；关闭会推迟到当前调用返回之后执行。嵌入页面的视图（活动栏页、任务详情标签页）没有容器：什么也不做并返回 `false`。 |
+| `navigate(target)` | `void` | 让主窗口到前台并切换页面。`target` 为 `"downloads"`、`"rss"`、`"webhooks"`、`"share"` 或 `{ view: "<id>" }`（本插件的某个 `activity` 视图）。同步执行：形状非法会抛出 `fluxdown.navigate: …`，目标不是本插件已贡献的活动栏视图时同样抛错；合法目标则推迟执行。 |
 
 ### 错误语义
 
@@ -361,11 +363,12 @@ export default class Inspector extends View {
 
 ## 桌面视图出现在哪里
 
-| | 嵌入式（`activity`、`settings`、`taskDetail`） | 窗口（`window`） |
+| | 嵌入式（`activity`、`settings`、`taskDetail`、`auth`） | 窗口（`window`） |
 |---|---|---|
 | 容器 | 主窗口或设置对话框里的页面 / 标签页 | 独立、可调整大小、可最小化的窗口，带 FluxDown 标题栏 |
 | 用户如何到达 | 活动栏条目 / 插件设置按钮 / 任务详情标签页 | 插件行上的窗口图标按钮（设置 → 扩展 → 插件） |
 | `taskId()` | 对应的任务（仅 taskDetail） | `null` |
+| `fluxdown.close()` | `auth`、`settings` 视图关闭所在对话框并返回 `true`；`activity` / `taskDetail` 返回 `false` | 关闭该窗口，返回 `true` |
 | 浮层 API `window.push_toast`、`window.open_dialog`、`window.open_sheet` | **不可用**——请用 `fluxdown.toast` | 可用 |
 | `width` / `height` | manifest 会拒绝 | 初始尺寸，240–4096（默认 960 × 640）；每个方向的最小尺寸取声明值与 240 中较小者 |
 

@@ -19,9 +19,10 @@ WORKDIR /src/web
 COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY web/ ./
-# Vite 别名从仓库根引用共享文案、GPUI 主题解析器与内置文件图标包（与 GPUI 同一份事实源）
+# Vite 别名从仓库根引用共享文案、GPUI 主题解析器、内置文件图标包与国旗（与 GPUI 同一份事实源）
 COPY assets/i18n/ /src/assets/i18n/
 COPY assets/icon-packs/ /src/assets/icon-packs/
+COPY assets/flags/ /src/assets/flags/
 COPY website-v2/src/lib/gpui-theme/ /src/website-v2/src/lib/gpui-theme/
 RUN bun run build
 
@@ -37,8 +38,8 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
     AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
 RUN case "$TARGETARCH" in \
-      amd64) echo x86_64-unknown-linux-gnu > /rust-target && echo '-C target-cpu=x86-64' > /rust-flags ;; \
-      arm64) echo aarch64-unknown-linux-gnu > /rust-target && : > /rust-flags \
+      amd64) echo x86_64-unknown-linux-gnu > /rust-target ;; \
+      arm64) echo aarch64-unknown-linux-gnu > /rust-target \
         && rustup target add aarch64-unknown-linux-gnu \
         && apt-get update \
         && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
@@ -46,8 +47,6 @@ RUN case "$TARGETARCH" in \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac
 COPY Cargo.toml Cargo.lock ./
-# .cargo/config.toml 的 x86-64-v2 只服务桌面产物；镜像面向 NAS/老服务器，amd64 用
-# RUSTFLAGS（整体替换 config 的 rustflags，该文件当前只有 target-cpu 一项）回退基线 x86-64。
 COPY .cargo/ .cargo/
 # cargo 解析 workspace 时要读全部成员的 manifest，包括桌面开发工具。
 COPY native/ native/
@@ -81,16 +80,16 @@ FROM server-src AS server-check
 ARG TARGETARCH
 RUN --mount=type=cache,id=fluxdown-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=fluxdown-cargo-check-$TARGETARCH,target=/src/target,sharing=locked \
-    RUSTFLAGS="$(cat /rust-flags)" cargo check --locked -p fluxdown_agent --features web-ui --target "$(cat /rust-target)" \
-    && RUSTFLAGS="$(cat /rust-flags)" cargo check --locked -p fluxdown_daemon --target "$(cat /rust-target)"
+    cargo check --locked -p fluxdown_agent --features web-ui --target "$(cat /rust-target)" \
+    && cargo check --locked -p fluxdown_daemon --target "$(cat /rust-target)"
 
 # ── Stage 2c: Rust 服务器（编译 fluxdown_agent(web-ui) + fluxdown_daemon，按 TARGETARCH 交叉编译）──
 FROM server-src AS server
 ARG TARGETARCH
 RUN --mount=type=cache,id=fluxdown-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=fluxdown-cargo-target-$TARGETARCH,target=/src/target,sharing=locked \
-    RUSTFLAGS="$(cat /rust-flags)" cargo build --release --locked -p fluxdown_agent --features web-ui --target "$(cat /rust-target)" \
-    && RUSTFLAGS="$(cat /rust-flags)" cargo build --release --locked -p fluxdown_daemon --target "$(cat /rust-target)" \
+    cargo build --release --locked -p fluxdown_agent --features web-ui --target "$(cat /rust-target)" \
+    && cargo build --release --locked -p fluxdown_daemon --target "$(cat /rust-target)" \
     && cp "target/$(cat /rust-target)/release/fluxdown-agent" "target/$(cat /rust-target)/release/fluxdownd" /usr/local/bin/
 
 # ── Stage 3: 运行时（目标架构 debian-slim + ca-certificates，rustls 读系统根证书）──
@@ -104,7 +103,7 @@ WORKDIR /app
 COPY --from=server /usr/local/bin/fluxdown-agent /usr/local/bin/fluxdownd /app/
 # FLUXDOWN_BIND / FLUXDOWN_DATABASE_URL / FLUXDOWN_DEMO / FLUXDOWN_LANG 等见 native/agent 的 server 模式说明
 # FLUXDOWN_INSTALL_SOURCE：容器内替换二进制会随重建丢失，应用内更新改为提示拉取新镜像。
-ENV FLUXDOWN_BIND=0.0.0.0:17800 \
+ENV FLUXDOWN_BIND=[::]:17800 \
     FLUXDOWN_DATA_DIR=/data \
     FLUXDOWN_INSTALL_SOURCE=docker
 VOLUME /data

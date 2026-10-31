@@ -45,6 +45,8 @@ struct CachedRules {
     file: String,
     modified: Option<SystemTime>,
     len: u64,
+    /// 缓存对应的插件包修订号；与当前不同即视为过期（更新后绝不返回旧内容）。
+    revision: u64,
     rules: Vec<Value>,
     /// `rules` 序列化后的字节数（聚合上限判定用）。
     bytes: usize,
@@ -156,7 +158,7 @@ async fn collect_rules(plugins: &[PluginInfo]) -> Vec<Value> {
         {
             continue;
         }
-        refresh_cached(&mut cache, &key, file).await;
+        refresh_cached(&mut cache, &key, file, info.package_revision).await;
         let Some(cached) = cache.get(&key) else {
             continue;
         };
@@ -184,6 +186,7 @@ async fn refresh_cached(
     cache: &mut BTreeMap<(String, String), CachedRules>,
     key: &(String, String),
     file: &str,
+    revision: u64,
 ) {
     let (identity, dir) = key;
     let path = Path::new(dir).join(file);
@@ -191,21 +194,22 @@ async fn refresh_cached(
         Ok(meta) => meta,
         Err(error) => {
             crate::log_warn!("[plugin-sniff] {identity} 规则文件状态读取失败: {error}");
+            drop_if_stale(cache, key, revision);
             return;
         }
     };
     let modified = meta.modified().ok();
     let len = meta.len();
-    if cache
-        .get(key)
-        .is_some_and(|c| c.file == file && c.modified == modified && c.len == len)
-    {
+    if cache.get(key).is_some_and(|c| {
+        c.file == file && c.modified == modified && c.len == len && c.revision == revision
+    }) {
         return;
     }
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(error) => {
             crate::log_warn!("[plugin-sniff] {identity} 规则读取失败: {error}");
+            drop_if_stale(cache, key, revision);
             return;
         }
     };
@@ -222,10 +226,30 @@ async fn refresh_cached(
             file: file.to_string(),
             modified,
             len,
+            revision,
             rules,
             bytes: size,
         },
     );
+}
+
+/// IO 失败时沿用旧缓存只限同一包修订；修订已变则丢弃，不得回放旧版本内容。
+fn drop_if_stale(
+    cache: &mut BTreeMap<(String, String), CachedRules>,
+    key: &(String, String),
+    revision: u64,
+) {
+    if cache.get(key).is_some_and(|c| c.revision != revision) {
+        cache.remove(key);
+    }
+}
+
+/// 卸载插件时清除其全部规则缓存条目。
+pub(crate) async fn purge_identity(identity: &str) {
+    RULES_CACHE
+        .lock()
+        .await
+        .retain(|(cached_identity, _), _| cached_identity != identity);
 }
 
 /// 校验并改写单个规则文件：返回改写后的规则与其序列化字节数。

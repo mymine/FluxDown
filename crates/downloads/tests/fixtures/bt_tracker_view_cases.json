@@ -1,0 +1,27 @@
+{
+  "_doc": "Tracker 页筛选 / 排序纯模型（GPUI crates/downloads/src/model/bt_trackers.rs ↔ Web web/src/pages/downloads/detail/btStatus.ts::trackerView）。expect 为 trackers 下标。排序稳定（平局保持服务端顺序）；peers 缺省 / lastOkAt=0 / nextAnnounceAt=0 无论升降序都排最后。升序：status 按 notWorking<updating<working<notContacted<unknown（首次点击先看失败）；url 不区分大小写；peers 小→大；nextAnnounce 早→晚；lastOk 最近→最久。",
+  "trackers": [
+    { "url": "udp://B.example:80/announce", "source": "torrent", "status": "working", "peers": 5, "lastOkAt": 100, "nextAnnounceAt": 900 },
+    { "url": "udp://a.example:80/announce", "source": "torrent", "status": "notWorking", "lastOkAt": 50 },
+    { "url": "http://c.example/announce", "source": "session", "status": "updating" },
+    { "url": "udp://d.example:80/announce", "source": "session", "status": "working", "peers": 0, "lastOkAt": 200, "nextAnnounceAt": 500 },
+    { "url": "udp://e.example:80/announce", "source": "session", "status": "notContacted" },
+    { "url": "udp://f.example:80/announce", "source": "session", "status": "notWorking", "peers": 2, "lastOkAt": 0 },
+    { "url": "udp://g.example:80/announce", "source": "session", "status": "unknown" }
+  ],
+  "counts": { "all": 7, "working": 2, "updating": 1, "notWorking": 2, "notContacted": 1 },
+  "cases": [
+    { "name": "默认：全部 + 服务端顺序", "filter": "all", "sort": null, "expect": [0, 1, 2, 3, 4, 5, 6] },
+    { "name": "只看失败", "filter": "notWorking", "sort": null, "expect": [1, 5] },
+    { "name": "只看正常", "filter": "working", "sort": null, "expect": [0, 3] },
+    { "name": "状态升序：失败在前，平局保持服务端顺序", "filter": "all", "sort": { "key": "status", "desc": false }, "expect": [1, 5, 2, 0, 3, 4, 6] },
+    { "name": "状态降序", "filter": "all", "sort": { "key": "status", "desc": true }, "expect": [6, 4, 0, 3, 2, 1, 5] },
+    { "name": "地址升序不区分大小写", "filter": "all", "sort": { "key": "url", "desc": false }, "expect": [2, 1, 0, 3, 4, 5, 6] },
+    { "name": "Peer 降序，缺省垫底", "filter": "all", "sort": { "key": "peers", "desc": true }, "expect": [0, 5, 3, 1, 2, 4, 6] },
+    { "name": "Peer 升序，缺省仍垫底", "filter": "all", "sort": { "key": "peers", "desc": false }, "expect": [3, 5, 0, 1, 2, 4, 6] },
+    { "name": "下次汇报升序：越早越前，未知垫底", "filter": "all", "sort": { "key": "nextAnnounce", "desc": false }, "expect": [3, 0, 1, 2, 4, 5, 6] },
+    { "name": "上次成功升序：最近在前，从未垫底", "filter": "all", "sort": { "key": "lastOk", "desc": false }, "expect": [3, 0, 1, 2, 4, 5, 6] },
+    { "name": "上次成功降序：最久在前，从未仍垫底", "filter": "all", "sort": { "key": "lastOk", "desc": true }, "expect": [1, 0, 3, 2, 4, 5, 6] },
+    { "name": "筛选 + 排序组合", "filter": "notWorking", "sort": { "key": "lastOk", "desc": false }, "expect": [1, 5] }
+  ]
+}

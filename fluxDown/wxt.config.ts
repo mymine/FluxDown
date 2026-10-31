@@ -1,4 +1,41 @@
+import type { Plugin } from "vite";
 import { defineConfig } from "wxt";
+
+/**
+ * 内联 CSS 虚拟模块的 id：`\0` 前缀让其他插件跳过它；`.js` 后缀不可省，以 `.css` 结尾的 id
+ * 会被 Vite 的 CSS 插件当成样式表处理。
+ */
+const CONTENT_CSS_PREFIX = "\0fluxdown-content-css:";
+const CONTENT_CSS_SUFFIX = ".js";
+
+/**
+ * 只用于 `cssInjectionMode: "manual"` 的内容脚本构建：把依赖图里的每个 `import "x.css"` 换成
+ * 「`x.css?inline` 字符串 + 登记到 ui/content-css.ts」的虚拟模块，产物不再有 content-scripts/*.css，
+ * UI 经 `createShadowRootUi(ctx, { css: contentCss() })` 注入，运行期零 fetch（原因见 ui/content-css.ts）。
+ * 组件仍照常 `import "./x.css"`，扩展页面构建不受影响。
+ */
+function inlineContentCss(): Plugin {
+  return {
+    name: "fluxdown:inline-content-css",
+    enforce: "pre",
+    async resolveId(source, importer, options) {
+      if (!importer || !source.endsWith(".css")) return null;
+      if (importer.startsWith(CONTENT_CSS_PREFIX) || /\.css(?:$|\?)/.test(importer)) return null;
+      const resolved = await this.resolve(source, importer, { ...options, skipSelf: true });
+      if (!resolved || resolved.external) return null;
+      return CONTENT_CSS_PREFIX + resolved.id + CONTENT_CSS_SUFFIX;
+    },
+    load(id) {
+      if (!id.startsWith(CONTENT_CSS_PREFIX) || !id.endsWith(CONTENT_CSS_SUFFIX)) return null;
+      const file = id.slice(CONTENT_CSS_PREFIX.length, -CONTENT_CSS_SUFFIX.length).replaceAll("\\", "/");
+      return [
+        `import css from ${JSON.stringify(`${file}?inline`)};`,
+        `import { registerContentCss } from "@/ui/content-css";`,
+        "registerContentCss(css);",
+      ].join("\n");
+    },
+  };
+}
 
 export default defineConfig({
   // 关闭 unimport 自动导入：utils/ 下 download-dispatch 与 native-messaging
@@ -135,6 +172,11 @@ export default defineConfig({
         // 追加 style-src 允许从 dev server 加载 CSS
         csp.extension_pages += `; style-src 'self' ${origin} 'unsafe-inline'`;
       }
+    },
+    // 内容脚本逐个单独构建：cssInjectionMode "manual" 的（panel / sensor）把 CSS 内联进脚本，见 inlineContentCss。
+    "vite:build:extendConfig"(entrypoints, viteConfig) {
+      const inline = entrypoints.some((e) => e.type === "content-script" && e.options.cssInjectionMode === "manual");
+      if (inline) viteConfig.plugins = [...(viteConfig.plugins ?? []), inlineContentCss()];
     },
   },
 });

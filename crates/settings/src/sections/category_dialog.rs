@@ -94,6 +94,7 @@ pub(crate) fn regex_looks_valid(pattern: &str) -> bool {
 enum MatchMode {
     Extension,
     Regex,
+    Url,
 }
 
 impl MatchMode {
@@ -101,6 +102,7 @@ impl MatchMode {
         match self {
             Self::Extension => "extension",
             Self::Regex => "regex",
+            Self::Url => "url",
         }
     }
 }
@@ -112,6 +114,7 @@ pub(crate) struct CategoryDialog {
     name: Entity<InputState>,
     extensions: Entity<InputState>,
     regex: Entity<InputState>,
+    url_pattern: Entity<InputState>,
     save_dir: Entity<InputState>,
     icon: String,
     match_mode: MatchMode,
@@ -160,6 +163,7 @@ impl CategoryDialog {
         let name_hint = SharedString::from(translator.text("categoryNameHint").to_owned());
         let ext_hint = SharedString::from(translator.text("extensionsHint").to_owned());
         let regex_hint = SharedString::from(translator.text("regexHint").to_owned());
+        let url_hint = SharedString::from(translator.text("urlPatternHint").to_owned());
         let dir_hint = SharedString::from(translator.text("selectSaveDir").to_owned());
         let name = cx.new(|cx| {
             InputState::new(window, cx)
@@ -184,6 +188,15 @@ impl CategoryDialog {
                 )
                 .placeholder(regex_hint)
         });
+        let url_pattern = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(
+                    entry
+                        .map(|entry| entry.url_pattern.clone())
+                        .unwrap_or_default(),
+                )
+                .placeholder(url_hint)
+        });
         let save_dir = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(
@@ -197,6 +210,7 @@ impl CategoryDialog {
         cx.observe(&save_dir, |_, _, cx| cx.notify()).detach();
         let match_mode = match entry.map(|entry| entry.match_mode.as_str()) {
             Some("regex") => MatchMode::Regex,
+            Some("url") => MatchMode::Url,
             _ => MatchMode::Extension,
         };
         Self {
@@ -207,6 +221,7 @@ impl CategoryDialog {
             name,
             extensions,
             regex,
+            url_pattern,
             save_dir,
             match_mode,
             error: None,
@@ -261,6 +276,11 @@ impl CategoryDialog {
             .as_ref()
             .map(|entry| entry.regex_pattern.clone())
             .unwrap_or_default();
+        let mut url_pattern = self
+            .existing
+            .as_ref()
+            .map(|entry| entry.url_pattern.clone())
+            .unwrap_or_default();
         if !self.is_special_builtin() {
             match self.match_mode {
                 MatchMode::Extension => {
@@ -270,6 +290,7 @@ impl CategoryDialog {
                         return;
                     }
                     regex_pattern = String::new();
+                    url_pattern = String::new();
                 }
                 MatchMode::Regex => {
                     regex_pattern = self.regex.read(cx).value().trim().to_owned();
@@ -278,6 +299,16 @@ impl CategoryDialog {
                         return;
                     }
                     extensions = Vec::new();
+                    url_pattern = String::new();
+                }
+                MatchMode::Url => {
+                    url_pattern = self.url_pattern.read(cx).value().trim().to_owned();
+                    if url_pattern.is_empty() {
+                        self.fail("urlPatternRequired", cx);
+                        return;
+                    }
+                    extensions = Vec::new();
+                    regex_pattern = String::new();
                 }
             }
         }
@@ -289,6 +320,7 @@ impl CategoryDialog {
                 match_mode: self.match_mode.wire().to_owned(),
                 extensions,
                 regex_pattern,
+                url_pattern,
                 save_dir,
                 ..existing.clone()
             },
@@ -299,6 +331,7 @@ impl CategoryDialog {
                 match_mode: self.match_mode.wire().to_owned(),
                 extensions,
                 regex_pattern,
+                url_pattern,
                 position: 999,
                 visible: true,
                 is_builtin: false,
@@ -438,17 +471,22 @@ impl CategoryDialog {
             self.t("matchMode"),
             h_flex().child(segmented_tabs(
                 "category-match-mode",
-                [self.t("matchByExtension"), self.t("matchByRegex")],
+                [
+                    self.t("matchByExtension"),
+                    self.t("matchByRegex"),
+                    self.t("matchByUrl"),
+                ],
                 match self.match_mode {
                     MatchMode::Extension => 0,
                     MatchMode::Regex => 1,
+                    MatchMode::Url => 2,
                 },
                 move |index, _, cx| {
                     view.update(cx, |this, cx| {
-                        this.match_mode = if index == 0 {
-                            MatchMode::Extension
-                        } else {
-                            MatchMode::Regex
+                        this.match_mode = match index {
+                            1 => MatchMode::Regex,
+                            2 => MatchMode::Url,
+                            _ => MatchMode::Extension,
                         };
                         this.error = None;
                         cx.notify();
@@ -462,14 +500,19 @@ impl CategoryDialog {
     }
 
     fn render_match_input(&self, cx: &mut Context<Self>) -> Div {
-        let (label, input) = match self.match_mode {
-            MatchMode::Extension => ("extensionsLabel", &self.extensions),
-            MatchMode::Regex => ("regexLabel", &self.regex),
+        let (label, desc, input) = match self.match_mode {
+            MatchMode::Extension => ("extensionsLabel", None, &self.extensions),
+            MatchMode::Regex => ("regexLabel", None, &self.regex),
+            MatchMode::Url => (
+                "urlPatternLabel",
+                Some(self.t("urlPatternDesc")),
+                &self.url_pattern,
+            ),
         };
         form_field(
             self.t(label),
             Input::new(input).control(cx).w_full(),
-            None,
+            desc,
             cx,
         )
     }

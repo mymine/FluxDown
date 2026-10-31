@@ -591,8 +591,9 @@ fn init_at(log_dir: PathBuf) -> Result<(), LoggerInitError> {
         std::env::var("RUST_LOG").ok().as_deref(),
         resolve_default_level_filter(),
     );
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(AppLogWriterFactory {
             logger: logger.clone(),
         })
@@ -602,7 +603,11 @@ fn init_at(log_dir: PathBuf) -> Result<(), LoggerInitError> {
         .with_line_number(true)
         .without_time()
         .compact()
-        .finish();
+        .with_filter(filter);
+    let subscriber = tracing_subscriber::registry().with(fmt_layer);
+    // tracker 汇报状态旁路采集层（自带每层过滤，不受上面主输出过滤影响）。
+    #[cfg(feature = "bt")]
+    let subscriber = subscriber.with(crate::bt_status::layer());
     if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
         // subscriber 已被上次 runtime 装上。把本次 logger 挂上（或接受
         // 竞态下别人先挂上的），不要当成致命错误掐死 actor。

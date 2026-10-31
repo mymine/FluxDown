@@ -154,7 +154,7 @@ const isActive = (links: typeof PRODUCT_LINKS) =>
       <a href={otherHref} class="icon-btn hidden sm:inline-grid" hreflang={other} data-lang-switch={other} aria-label={LANG_LABEL[other]} title={LANG_LABEL[other]}>
         <span class="mono text-[11.5px] font-semibold">{other === "zh" ? "中" : "EN"}</span>
       </a>
-      <button type="button" class="icon-btn" data-theme-toggle aria-label={t.theme.toggle}>
+      <button type="button" class="icon-btn header-theme" data-theme-toggle aria-label={t.theme.toggle}>
         <Sun size={16} strokeWidth={1.75} className="theme-sun" />
         <Moon size={16} strokeWidth={1.75} className="theme-moon" />
       </button>
@@ -269,6 +269,15 @@ const isActive = (links: typeof PRODUCT_LINKS) =>
       gap: 20px;
       height: 100%;
       padding-inline: clamp(14px, 2vw, 22px);
+    }
+    /* 超窄屏(<360px,英文「Download」更宽):收紧间距并让出主题按钮(页脚仍有),避免右侧菜单按钮被挤出视口 */
+    @media (max-width: 359px) {
+      .header-inner {
+        gap: 10px;
+      }
+      .header-inner .header-theme {
+        display: none;
+      }
     }
     .nav-item {
       position: relative;

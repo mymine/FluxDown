@@ -67,27 +67,6 @@ fi
 echo "[2/4] 重建 Docker 镜像..."
 ${DOCKER} compose build website
 
-# ── IP 归属地库（/api/download 判定中国大陆访客，见 src/lib/geoip.ts）──
-# 只读挂载进容器（docker-compose.yml），不进镜像与仓库；缺失或超过 30 天时重新下载，
-# 下载失败时沿用旧文件，连旧文件都没有才中止。
-GEO_XDB="${SCRIPT_DIR}/geo/ip2region_v4.xdb"
-if [ ! -s "${GEO_XDB}" ] || [ -n "$(find "${GEO_XDB}" -mtime +30 2>/dev/null)" ]; then
-  echo "[+] 更新 IP 归属地库..."
-  mkdir -p "$(dirname "${GEO_XDB}")"
-  if curl -fsSL --retry 3 -m 120 -o "${GEO_XDB}.tmp" \
-      https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/ip2region_v4.xdb \
-      && [ "$(stat -c %s "${GEO_XDB}.tmp")" -gt 1000000 ]; then
-    mv "${GEO_XDB}.tmp" "${GEO_XDB}"
-  else
-    rm -f "${GEO_XDB}.tmp"
-    if [ ! -s "${GEO_XDB}" ]; then
-      echo "      IP 归属地库下载失败且本地没有旧文件" >&2
-      exit 1
-    fi
-    echo "      下载失败，沿用现有文件"
-  fi
-fi
-
 # ── 3. 重启容器 ──────────────────────────────
 echo "[3/4] 启动/重启容器..."
 ${DOCKER} compose down --remove-orphans >/dev/null 2>&1 || true
@@ -95,26 +74,8 @@ ${DOCKER} compose down --remove-orphans >/dev/null 2>&1 || true
 ${DOCKER} rm -f fluxdown-website-v2 >/dev/null 2>&1 || true
 ${DOCKER} compose up -d --wait website
 
-# ── 清除 Cloudflare 边缘缓存（仅根部署）────────
-# 静态页面在 Cloudflare 边缘缓存 1 天（区域 Cache Rules），旧 HTML 引用的 /_astro 哈希资源
-# 在新镜像里已不存在，必须在新容器就绪后按主机名清除。失败即中止且不写部署戳，下次重跑会再清。
-if [ -z "${SITE_BASE}" ]; then
-  echo "[+] 清除 Cloudflare 缓存（fluxdown.com / www.fluxdown.com）..."
-  CF_TOKEN="$(sed -n 's/^CLOUDFLARE_API_TOKEN=//p' "${SCRIPT_DIR}/.env" 2>/dev/null | tail -n 1)"
-  CF_ZONE="${CLOUDFLARE_ZONE_ID:-ccb51a98de238a1916428142f890db4d}"
-  if [ -z "${CF_TOKEN}" ]; then
-    echo "      .env 缺少 CLOUDFLARE_API_TOKEN（需 区域.清除缓存 权限）" >&2
-    exit 1
-  fi
-  PURGE="$(curl -sS -m 30 -X POST \
-    -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" \
-    "https://api.cloudflare.com/client/v4/zones/${CF_ZONE}/purge_cache" \
-    -d '{"hosts":["fluxdown.com","www.fluxdown.com"]}')"
-  if ! printf '%s' "${PURGE}" | grep -q '"success":[[:space:]]*true'; then
-    echo "      清除失败: ${PURGE}" >&2
-    exit 1
-  fi
-fi
+# 官网经阿里云 ESA（中国内地）加速：HTML 为 max-age=0、/api/ 绕过缓存，只有带哈希的 /_astro 按源站
+# immutable 长缓存，部署后无需清除边缘缓存。
 echo "${TREE} ${SITE_BASE}" > "${STAMP}"
 
 # ── 4. 清理悬空镜像 ──────────────────────────

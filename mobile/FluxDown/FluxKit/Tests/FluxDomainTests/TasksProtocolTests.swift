@@ -329,9 +329,10 @@ struct TasksProtocolTests {
     // MARK: 插件失败
 
     @Test func pluginFailureDetection() {
-        #expect(PluginFailure.isIgnorable(status: .failed, errorMessage: "[插件] yt: boom"))
-        #expect(!PluginFailure.isIgnorable(status: .failed, errorMessage: "connection reset"))
-        #expect(!PluginFailure.isIgnorable(status: .paused, errorMessage: "[插件] yt: boom"))
+        #expect(PluginFailure.isIgnorable(status: .failed, errorMessage: "[插件] yt: boom", groupId: ""))
+        #expect(!PluginFailure.isIgnorable(status: .failed, errorMessage: "connection reset", groupId: ""))
+        #expect(!PluginFailure.isIgnorable(status: .paused, errorMessage: "[插件] yt: boom", groupId: ""))
+        #expect(!PluginFailure.isIgnorable(status: .failed, errorMessage: "[插件] yt: boom", groupId: "g1"))
     }
 
     @Test func taskErrorMessageLocalization() {

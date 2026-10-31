@@ -18,12 +18,16 @@ name: Release
 #   副作用步骤一律以 rehearsal == 'false' 放行（失败即关闭）。
 #   gh workflow run release.yml --ref stable -f rehearsal=true -f tag=vX.Y.Z -f component=changed
 # 演练产物晋升（只构建一次）：tag 推送时 changes 找同一提交、同一 tag 的演练（.github/scripts/release_gate.py），
-#   演练里已产出完成哨兵的组件（app / server / cli / mobile）不再重新构建，upload-* 直接取该演练运行的
+#   演练里已产出完成哨兵的组件（app / server / cli / mobile / ios）不再重新构建，upload-* 直接取该演练运行的
 #   artifact，Docker 只把演练 digest 改打版本 tag；扩展恒重建（1–2 分钟，商店提交在同一 job）。
 #   找不到可复用演练时整条流水线照常从源码构建。演练失败的组件在演练运行页 Re-run 即可，什么都没发布。
 # tag 推送前置：同一提交的 CI（ci.yml）必须成功（仍在跑则等待），否则在建草稿、开始构建前失败。
 # Artifact 生命周期：只作中间产物，release 转正即由 cleanup-artifacts 删除；未发布 tag 的演练 / 草稿
 #   运行保留供晋升与 Re-run；所有构建 artifact 带 retention-days 兜底，不会长期堆积在 Actions 里。
+# 缓存：tag 推送运行只恢复、不保存（Swatinem save-if / actions/cache/save 均以 ref_type != tag 放行）。
+#   GitHub 缓存按 ref 隔离，tag 作用域的缓存之后任何运行都恢复不了，只会占满仓库 10 GB 缓存额度、按 LRU
+#   挤掉 stable / main 上可复用的缓存；演练与补发（stable / main 上的 workflow_dispatch）照常保存。
+#   缓存超额只会被 LRU 淘汰、不会让任何 job 失败；已发布 tag 遗留的缓存由 cleanup-artifacts 一并删除。
 run-name: >-
   ${{ inputs.rehearsal && format('Release 演练 {0}（不发布）', inputs.tag)
   || (github.event_name == 'workflow_dispatch' && format('Release 补发 {0} · {1}', inputs.tag, inputs.component))
@@ -56,6 +60,7 @@ on:
           - server
           - cli
           - mobile
+          - ios
       source_ref:
         description: "补发的构建源码（分支 / 提交，须包含该 tag 且在发布分支上）；留空 = tag 本身。演练不接受此项"
         required: false
@@ -65,7 +70,7 @@ on:
 permissions:
   contents: write
   packages: write # 允许推送 Docker 镜像到 ghcr.io（build-server-docker job）
-  actions: write # 允许在 release job 末尾删除旧 artifact（避免 500MB 配额耗尽）
+  actions: write # cleanup-artifacts 删除已发布版本的 artifact 与 tag 作用域缓存
 
 # 同一 tag 串行：补发与原流水线（或两次补发）不会并发改同一个 release。
 # 演练单独成组：不与同名 tag 的真实发布互相排队。
@@ -86,9 +91,10 @@ jobs:
   #                            agent/daemon/protocol 同时属于 GPUI 桌面客户端（app）
   #   crates/**              → GPUI 桌面客户端（app）
   #   native/engine/**       → 桌面客户端 + 服务器 + 移动端（共享下载引擎）
-  #   native/mobile/**、mobile/Android/** → 原生 Android 移动端资产
+  #   native/mobile/**       → 原生移动端（Android mobile + iOS ios，共用 UniFFI 核心）
+  #   mobile/Android/**      → 原生 Android（mobile）
   #   docker/**              → 服务器（部署文件变更需重发镜像）
-  #   mobile/FluxDown/**     → 原生 iOS（独立走 ios-testflight.yml）
+  #   mobile/FluxDown/**、.github/workflows/ios-sideload.yml → 原生 iOS 侧载 IPA（ios；商店构建另走 ios-testflight.yml）
   #   website-v2/**          → 官网（独立走 deploy-website-v2.yml 部署，不发 release）；其中 src/lib/gpui-theme/** 被 Web SPA 构建引用 → 服务器（server）
   #   website/**             → 已删除的 v1 旧站：删除提交与历史 tag 区间的 diff 仍会列出它，不触发任何构建
   #   docs/**、*.md          → 纯文档，不触发任何构建
@@ -104,6 +110,7 @@ jobs:
       extension: ${{ steps.detect.outputs.extension }}
       server: ${{ steps.detect.outputs.server }}
       mobile: ${{ steps.detect.outputs.mobile }}
+      ios: ${{ steps.detect.outputs.ios }}
       cli: ${{ steps.detect.outputs.cli }}
       engine: ${{ steps.detect.outputs.engine }}
       any: ${{ steps.detect.outputs.any }}
@@ -260,7 +267,7 @@ jobs:
               && [ "$COMPONENT" != "extension" ]; then
               ENGINE=true
             fi
-            for c in app extension server mobile cli; do
+            for c in app extension server mobile ios cli; do
               if [ "$COMPONENT" = all ] || [ "$c" = "$COMPONENT" ]; then echo "$c=true"; else echo "$c=false"; fi
             done >> "$GITHUB_OUTPUT"
             { echo "engine=$ENGINE"; echo "any=true"; } >> "$GITHUB_OUTPUT"
@@ -274,10 +281,10 @@ jobs:
 
           PREV="${{ steps.resolve.outputs.prev }}"
 
-          APP=false; EXTENSION=false; SERVER=false; MOBILE=false; CLI=false; ENGINE=false
+          APP=false; EXTENSION=false; SERVER=false; MOBILE=false; IOS=false; CLI=false; ENGINE=false
           if [ -z "$PREV" ]; then
             echo "No previous version tag found — building everything"
-            APP=true; EXTENSION=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true
+            APP=true; EXTENSION=true; SERVER=true; MOBILE=true; IOS=true; CLI=true; ENGINE=true
           else
             echo "Diff range: ${PREV}..${TAG}"
             CHANGED=$(git diff --name-only "${PREV}" "${TAG}")
@@ -289,30 +296,32 @@ jobs:
                 fluxDown/*)          EXTENSION=true ;;
                 web/*)               SERVER=true ;;
                 native/cli/*)        CLI=true ;;
-                native/api/*)        APP=true; SERVER=true; CLI=true; MOBILE=true ;;
-                native/protocol/*)   APP=true; SERVER=true; CLI=true; MOBILE=true ;;
+                native/api/*)        APP=true; SERVER=true; CLI=true; MOBILE=true; IOS=true ;;
+                native/protocol/*)   APP=true; SERVER=true; CLI=true; MOBILE=true; IOS=true ;;
                 # 原生移动端经 agent/daemon 依赖 engine-protocol
-                native/engine-protocol/*) APP=true; SERVER=true; MOBILE=true ;;
+                native/engine-protocol/*) APP=true; SERVER=true; MOBILE=true; IOS=true ;;
                 # 服务器 = fluxdown-agent --server + fluxdownd；桌面 = fluxdown-desktop + 同一对进程
-                native/daemon/*|native/agent/*) APP=true; SERVER=true; MOBILE=true ;;
-                native/link/*)       APP=true; SERVER=true; MOBILE=true ;;
-                native/mobile/*)     MOBILE=true ;;
+                native/daemon/*|native/agent/*) APP=true; SERVER=true; MOBILE=true; IOS=true ;;
+                native/link/*)       APP=true; SERVER=true; MOBILE=true; IOS=true ;;
+                native/share/*)      APP=true; SERVER=true; MOBILE=true; IOS=true ;;
+                native/mobile/*)     MOBILE=true; IOS=true ;;
                 # GPUI 桌面客户端
                 crates/*)            APP=true ;;
-                native/engine/*)     APP=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true ;;
+                native/engine/*)     APP=true; SERVER=true; MOBILE=true; IOS=true; CLI=true; ENGINE=true ;;
                 # 引擎与 agent 共用的诊断日志文件：消费者同引擎
-                native/logfile/*)    APP=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true ;;
-                Cargo.toml|Cargo.lock|.cargo/*) APP=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true ;;
+                native/logfile/*)    APP=true; SERVER=true; MOBILE=true; IOS=true; CLI=true; ENGINE=true ;;
+                Cargo.toml|Cargo.lock|.cargo/*) APP=true; SERVER=true; MOBILE=true; IOS=true; CLI=true; ENGINE=true ;;
                 .dockerignore)       SERVER=true ;;
                 docker/*)            SERVER=true ;;
                 packaging/*|installer/*) APP=true; SERVER=true ;;
                 mobile/Android/*)    MOBILE=true ;;
-                mobile/FluxDown/*) ;;
-                .github/workflows/release.yml) APP=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true ;;
+                mobile/FluxDown/*|.github/workflows/ios-sideload.yml) IOS=true ;;
+                .github/workflows/release.yml) APP=true; SERVER=true; MOBILE=true; IOS=true; CLI=true; ENGINE=true ;;
                 # Web SPA 构建期引用共享文案与 GPUI 主题解析器（web/vite.config.ts 别名）
-                assets/i18n/*)       APP=true; MOBILE=true; SERVER=true ;;
+                assets/i18n/*)       APP=true; MOBILE=true; IOS=true; SERVER=true ;;
                 website-v2/src/lib/gpui-theme/*) SERVER=true ;;
                 assets/icon-packs/*) APP=true; SERVER=true ;;
+                assets/flags/*)      APP=true; SERVER=true ;;
                 # 官网独立部署（deploy-website-v2.yml），不发 release；gpui-theme 例外已在上方先匹配。
                 # website/ 是已删除的 v1 旧站：删除提交与历史 tag 区间的 diff 仍会列出它，同样不触发构建
                 website-v2/*|website/*) ;;
@@ -326,18 +335,19 @@ jobs:
           fi
 
           ANY=false
-          if $APP || $EXTENSION || $SERVER || $MOBILE || $CLI; then ANY=true; fi
+          if $APP || $EXTENSION || $SERVER || $MOBILE || $IOS || $CLI; then ANY=true; fi
 
           {
             echo "app=$APP"
             echo "extension=$EXTENSION"
             echo "server=$SERVER"
             echo "mobile=$MOBILE"
+            echo "ios=$IOS"
             echo "cli=$CLI"
             echo "engine=$ENGINE"
             echo "any=$ANY"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::Components changed in ${PREV:-<none>}..${TAG}: app=$APP extension=$EXTENSION server=$SERVER mobile=$MOBILE cli=$CLI engine=$ENGINE"
+          echo "::notice::Components changed in ${PREV:-<none>}..${TAG}: app=$APP extension=$EXTENSION server=$SERVER mobile=$MOBILE ios=$IOS cli=$CLI engine=$ENGINE"
 
       - name: List expected components
         id: expected
@@ -347,9 +357,10 @@ jobs:
           C_SERVER: ${{ steps.detect.outputs.server }}
           C_CLI: ${{ steps.detect.outputs.cli }}
           C_MOBILE: ${{ steps.detect.outputs.mobile }}
+          C_IOS: ${{ steps.detect.outputs.ios }}
         run: |
           EXPECTED=""
-          for c in APP EXTENSION SERVER CLI MOBILE; do
+          for c in APP EXTENSION SERVER CLI MOBILE IOS; do
             v="C_$c"
             if [ "${!v}" = true ]; then EXPECTED="${EXPECTED:+${EXPECTED},}${c,,}"; fi
           done
@@ -407,9 +418,10 @@ jobs:
         if: env.RUN_GATE == 'true'
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Rust dependencies
+      - name: Restore Rust cache
+        id: engine-cache
         if: env.RUN_GATE == 'true'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -431,6 +443,16 @@ jobs:
           cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib read_buf
           cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib fresh_redial
           cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib --no-run
+
+      - name: Save Rust cache
+        if: env.RUN_GATE == 'true' && github.ref_type != 'tag' && steps.engine-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.engine-cache.outputs.cache-primary-key }}
 
   # ── 并行 Job 1: GPUI 桌面客户端 Windows（x64 + ARM64）：Inno 安装器 + 便携 zip ──
   # 四个可执行文件同目录：fluxdown-desktop（界面）→ fluxdown-agent（常驻网关/托盘）→ fluxdownd
@@ -477,6 +499,7 @@ jobs:
         with:
           key: gpui-${{ matrix.target }}
           cache-on-failure: true
+          save-if: ${{ github.ref_type != 'tag' }}
 
       # 必须 release：debug 下 GPUI Windows 着色器按构建机绝对路径运行期读取，换机即失效。
       # FLUXCLOUD_BASE_URL 为空时不导出（option_env! 会把空串当成有效地址）。
@@ -972,6 +995,7 @@ jobs:
         with:
           key: gpui-x86_64-unknown-linux-gnu
           cache-on-failure: true
+          save-if: ${{ github.ref_type != 'tag' }}
 
       - name: Build desktop, agent, daemon and browser relay
         env:
@@ -987,7 +1011,7 @@ jobs:
       - name: Download appimagetool
         run: |
           wget -qO "$RUNNER_TEMP/appimagetool" \
-            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
           chmod +x "$RUNNER_TEMP/appimagetool"
 
       - name: Package
@@ -1086,6 +1110,7 @@ jobs:
         with:
           key: gpui-macos-${{ matrix.arch }}
           cache-on-failure: true
+          save-if: ${{ github.ref_type != 'tag' }}
 
       - name: Decode signing and notarization credentials
         env:
@@ -1175,6 +1200,7 @@ jobs:
         with:
           key: android-package
           cache-on-failure: true
+          save-if: ${{ github.ref_type != 'tag' }}
 
       - uses: taiki-e/install-action@v2
         with:
@@ -1221,6 +1247,20 @@ jobs:
           name: android-apk
           path: build/android/FluxDown-*.apk
           if-no-files-found: error
+
+  # ── 并行 Job 4c: 原生 iOS 侧载 IPA（full flavor，未签名，供 AltStore / SideStore / Sideloadly 自签）──
+  # 构建逻辑在 ios-sideload.yml（workflow_call 复用，手动出测试包也走它）：产物 artifact `ios-ipa` =
+  # FluxDown-<版本>-ios-sideload-unsigned.ipa。商店（store flavor）构建另走 ios-testflight.yml，不进 release。
+  build-ios:
+    name: Build iOS IPA
+    needs: [changes]
+    if: needs.changes.outputs.ios == 'true' && !contains(format(',{0},', needs.changes.outputs.reuse), ',ios,')
+    uses: ./.github/workflows/ios-sideload.yml
+    with:
+      ref: ${{ needs.changes.outputs.source }}
+      version: ${{ needs.changes.outputs.version }}
+    secrets:
+      FLUXCLOUD_BASE_URL: ${{ secrets.FLUXCLOUD_BASE_URL }}
 
   # ── 并行 Job 5a: 构建服务器 Web SPA（一次构建，供所有平台二进制包复用）──
   build-web:
@@ -1272,8 +1312,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 钉 24.04：ubuntu-26.04 镜像启用 amd64v3 变体，gcc 默认 AVX2，C 依赖（mimalloc 等）
+          # 会编进无运行时分派的 AVX2 代码，NAS / 软路由的 J4125 等 CPU 启动即 SIGILL（0.6.4）。
           - platform: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
@@ -1310,13 +1352,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # musl-gcc：ring/bundled-sqlite/zstd 等 C 依赖静态编译所需
+      # musl-gcc：ring/bundled-sqlite/zstd 等 C 依赖静态编译所需；qemu-user 供 x86-64 基线自检
       - name: Install musl toolchain (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools ${{ matrix.platform == 'linux-x64' && 'qemu-user' || '' }}
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+      - name: Restore Rust cache
+        id: rust-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -1334,18 +1377,35 @@ jobs:
           name: server-webroot
           path: webroot
 
-      # x86_64 目标使用基线 x86-64（RUSTFLAGS 整体替换 .cargo/config.toml 的 rustflags，
-      # 该文件当前只有 target-cpu 一项）；产品版本由 FLUXDOWN_APP_VERSION 注入。
+      # 产品版本由 FLUXDOWN_APP_VERSION 注入。C 依赖经 cc 显式按 x86-64 基线编译，不随 runner
+      # 镜像的编译器默认值漂移（cc 不从 RUSTFLAGS 的 target-cpu 推导 -march）。
       - name: Build server binaries (agent + daemon)
         env:
           FLUXDOWN_ANALYTICS_APP_KEY: ${{ secrets.ANALYTICS_APP_KEY }}
           FLUXCLOUD_BASE_URL: ${{ secrets.FLUXCLOUD_BASE_URL }}
           FLUXDOWN_EMBED_WEBROOT: ${{ github.workspace }}/webroot
           FLUXDOWN_APP_VERSION: ${{ steps.version.outputs.VERSION }}
-          RUSTFLAGS: ${{ startsWith(matrix.target, 'x86_64') && '-C target-cpu=x86-64' || '' }}
+          CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
+          CXXFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
         run: |
           cargo build --release --locked -p fluxdown_agent --features web-ui --target ${{ matrix.target }}
           cargo build --release --locked -p fluxdown_daemon --target ${{ matrix.target }}
+
+      - name: Check x86-64 baseline (linux-x64)
+        if: matrix.platform == 'linux-x64'
+        run: |
+          .github/scripts/check_x86_64_baseline.sh "target/${{ matrix.target }}/release/fluxdownd"
+          .github/scripts/check_x86_64_baseline.sh "target/${{ matrix.target }}/release/fluxdown-agent" --server
+
+      - name: Save Rust cache
+        if: github.ref_type != 'tag' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
@@ -1519,8 +1579,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # 钉 24.04 的原因同 build-server-binaries（ubuntu-26.04 amd64v3 → AVX2）。
           - platform: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
           - platform: linux-arm64
             runner: ubuntu-24.04-arm
@@ -1555,13 +1616,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # musl-gcc：ring 等 C 依赖静态编译所需
+      # musl-gcc：ring 等 C 依赖静态编译所需；qemu-user 供 x86-64 基线自检
       - name: Install musl toolchain (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools ${{ matrix.platform == 'linux-x64' && 'qemu-user' || '' }}
 
-      - name: Cache Rust dependencies
-        uses: actions/cache@v4
+      - name: Restore Rust cache
+        id: rust-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -1571,13 +1633,26 @@ jobs:
           restore-keys: |
             cli-${{ matrix.platform }}-
 
-      # 服务器/NAS 常见的老 x86_64 CPU 不一定有 SSE4.2/POPCNT：x86_64 目标回退基线 x86-64
-      # （RUSTFLAGS 整体替换 .cargo/config.toml 的 rustflags，该文件当前只有 target-cpu 一项）。
       - name: Build CLI binary
         env:
           FLUXDOWN_APP_VERSION: ${{ steps.version.outputs.VERSION }}
-          RUSTFLAGS: ${{ startsWith(matrix.target, 'x86_64') && '-C target-cpu=x86-64' || '' }}
+          CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
+          CXXFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
         run: cargo build --release --locked -p fluxdown_cli --target ${{ matrix.target }}
+
+      - name: Check x86-64 baseline (linux-x64)
+        if: matrix.platform == 'linux-x64'
+        run: .github/scripts/check_x86_64_baseline.sh "target/${{ matrix.target }}/release/fluxdown" --version
+
+      - name: Save Rust cache
+        if: github.ref_type != 'tag' && steps.rust-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
@@ -1794,6 +1869,7 @@ jobs:
           C_SERVER: ${{ needs.changes.outputs.server }}
           C_CLI: ${{ needs.changes.outputs.cli }}
           C_MOBILE: ${{ needs.changes.outputs.mobile }}
+          C_IOS: ${{ needs.changes.outputs.ios }}
           C_EXTENSION: ${{ needs.changes.outputs.extension }}
           PRERELEASE: ${{ needs.changes.outputs.prerelease }}
         run: |
@@ -1803,6 +1879,7 @@ jobs:
           if [ "$C_SERVER" = true ]; then add "Headless 服务器（含 Web 控制台 / Docker / NAS 套件）"; fi
           if [ "$C_CLI" = true ]; then add "命令行工具 CLI"; fi
           if [ "$C_MOBILE" = true ]; then add "Android 移动端"; fi
+          if [ "$C_IOS" = true ]; then add "iOS 侧载包（未签名 IPA）"; fi
           if [ "$C_EXTENSION" = true ]; then
             if [ "$PRERELEASE" = true ]; then
               add "浏览器扩展预览包（Chrome / Edge 解压加载、Firefox 未签名，仅附于本 release，不推送商店）"
@@ -2132,6 +2209,55 @@ jobs:
           access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
           dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
 
+  upload-ios:
+    name: Upload iOS
+    runs-on: ubuntu-latest
+    needs: [changes, prepare-release, verify-engine, build-ios]
+    # 复用演练产物（构建被跳过）或本次构建成功；引擎门禁与草稿就绪是发布前提。
+    if: ${{ !cancelled() && needs.prepare-release.result == 'success' && needs.verify-engine.result == 'success'
+      && (contains(format(',{0},', needs.changes.outputs.reuse), ',ios,') || (needs.build-ios.result == 'success')) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download iOS IPA artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',ios,') && secrets.GITHUB_TOKEN || '' }}
+          run-id: ${{ contains(format(',{0},', needs.changes.outputs.reuse), ',ios,') && needs.changes.outputs.reuse_run || github.run_id }}
+          pattern: ios-ipa
+          path: release-assets/
+          merge-multiple: true
+
+      - name: Upload to release
+        uses: ./.github/actions/release-upload
+        with:
+          tag: ${{ needs.changes.outputs.tag }}
+          component: ios
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
+
+      - name: Keep rehearsal checksum sentinel
+        if: needs.changes.outputs.rehearsal != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          retention-days: 14
+          name: rehearsal-sums-ios
+          path: release-assets/SHA256SUMS-ios.txt
+          if-no-files-found: error
+
+      # .ipa 在桶内存为 <name>.bin（OSS 默认域名拒绝分发 .ipa），由 oss-upload 改名，对外 URL 不变。
+      - name: Upload release assets to OSS
+        continue-on-error: ${{ needs.changes.outputs.rehearsal == 'false' }}
+        uses: ./.github/actions/oss-upload
+        with:
+          tag: ${{ needs.changes.outputs.tag }}
+          access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
+
   # ── Release Job 3: 收尾发布（tag 推送与补发都跑，幂等）──
   # 汇总 SHA256SUMS.txt、刷新说明头部（已发布组件 + 服务器/CLI 安装说明 + 累计应发布组件 /
   # Docker 状态）、决定 latest（稳定版 + 桌面端完整 + 最高稳定版本）。累计应发布组件全部完成才
@@ -2152,6 +2278,7 @@ jobs:
         upload-server,
         upload-cli,
         upload-mobile,
+        upload-ios,
       ]
     if: ${{ always() && !cancelled() && needs.prepare-release.result == 'success' }}
     outputs:
@@ -2328,13 +2455,14 @@ jobs:
           gh release view "$TAG" --json isDraft,isPrerelease,name,url,body > "$RUNNER_TEMP/release.json"
           python3 .github/scripts/release_notify_qq.py "$RUNNER_TEMP/release.json"
 
-  # ── 最终 Job: 清理 GitHub Actions Artifact（实现见 .github/scripts/release_artifacts.py）──
+  # ── 最终 Job: 清理 GitHub Actions Artifact 与 tag 缓存（实现见 .github/scripts/release_artifacts.py）──
   # artifact 只是中间产物（release 资产独立存储在 GitHub Release）：tag 已正式发布的运行
   # （tag 推送 / 演练 / 补发）一律删除；未发布 tag 的演练与草稿运行保留（晋升 / Re-run 要用），
   # 进行中的运行不动。演练也执行清理（只回收已发布版本），未被发布的演练由 retention-days 兜底过期。
+  # 同时删除已发布 tag 作用域的 Actions 缓存（只有该 tag 的 Re-run 能恢复，发布后纯占额度）。
   # always()：无论哪些组件被跳过/失败都执行清理，失败不阻断（continue-on-error）。
   cleanup-artifacts:
-    name: Cleanup CI Artifacts
+    name: Cleanup CI Artifacts and Caches
     runs-on: ubuntu-latest
     needs: [changes, publish-release]
     if: ${{ always() && !cancelled() }}
@@ -2343,7 +2471,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Cleanup GitHub Actions artifacts of published releases
+      - name: Cleanup artifacts and tag caches of published releases
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -4,6 +4,7 @@ import { browser } from "wxt/browser";
 import { Button } from "@/ui/components/Button";
 import { Select } from "@/ui/components/Select";
 import { showToast } from "@/ui/components/Toast";
+import { usePlatform } from "@/ui/hooks/usePlatform";
 import { bumpLocale, useT } from "@/ui/i18n";
 import { saveTheme } from "@/ui/theme";
 import { exportConnectionDiagnostics } from "@/utils/connection-diagnostics";
@@ -22,6 +23,7 @@ export function GeneralPanel(): JSX.Element | null {
   );
   const [theme] = useLocalValue<ThemeChoice>("theme", (raw) => (raw === "light" || raw === "dark" ? raw : "system"));
   const [exporting, setExporting] = useState(false);
+  const platform = usePlatform();
   if (!s) return null;
 
   const changeLocale = async (next: LocaleChoice) => {
@@ -74,34 +76,40 @@ export function GeneralPanel(): JSX.Element | null {
         />
       </SettingRow>
 
-      <ToggleRow
-        title={t("options.general.notifyLocalTitle")}
-        desc={t("options.general.notifyLocalDesc")}
-        checked={s.notifyLocalTask}
-        onChange={(v) => void updateSettings({ notifyLocalTask: v })}
-      />
+      {platform.android ? null : (
+        <ToggleRow
+          title={t("options.general.notifyLocalTitle")}
+          desc={t("options.general.notifyLocalDesc")}
+          checked={s.notifyLocalTask}
+          onChange={(v) => void updateSettings({ notifyLocalTask: v })}
+        />
+      )}
       <ToggleRow
         title={t("options.general.notifyRemoteTitle")}
         desc={t("options.general.notifyRemoteDesc")}
         checked={s.notifyRemoteTask}
         onChange={(v) => void updateSettings({ notifyRemoteTask: v })}
       />
-      <ToggleRow
-        title={t("options.protocol.label")}
-        desc={t("options.protocol.desc")}
-        checked={s.enableFluxdownProtocol}
-        onChange={(v) => void updateSettings({ enableFluxdownProtocol: v })}
-      />
+      {platform.android ? null : (
+        <ToggleRow
+          title={t("options.protocol.label")}
+          desc={t("options.protocol.desc")}
+          checked={s.enableFluxdownProtocol}
+          onChange={(v) => void updateSettings({ enableFluxdownProtocol: v })}
+        />
+      )}
 
       <SettingRow title={t("stats.title")} desc={t("options.general.statsDesc")} inline>
         <Button onClick={() => void resetStats()}>{t("stats.reset")}</Button>
       </SettingRow>
 
-      <SettingRow title={t("diagnostics.title")} desc={t("diagnostics.description")} inline>
-        <Button disabled={exporting} onClick={() => void exportDiagnostics()}>
-          {exporting ? t("diagnostics.exporting") : t("diagnostics.export")}
-        </Button>
-      </SettingRow>
+      {platform.android ? null : (
+        <SettingRow title={t("diagnostics.title")} desc={t("diagnostics.description")} inline>
+          <Button disabled={exporting} onClick={() => void exportDiagnostics()}>
+            {exporting ? t("diagnostics.exporting") : t("diagnostics.export")}
+          </Button>
+        </SettingRow>
+      )}
     </PanelShell>
   );
 }

@@ -108,6 +108,7 @@ const title = t.hero.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</
 <style>
   .hero {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: clamp(40px, 6vw, 72px);
     align-items: end;
   }
@@ -196,6 +197,12 @@ const title = t.hero.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  @media (max-width: 479px) {
+    .meta dd {
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
   }
   :global([data-state="loading"]) .meta dd {
     color: transparent;

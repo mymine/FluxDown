@@ -2,6 +2,15 @@
 
 import type { JsonValue } from './common';
 
+/** 宿主内置跳转目标（`ctx.navigate` / `ViewEffect.navigate`）。 */
+export const NAV_BUILTIN_TARGETS = ['downloads', 'rss', 'webhooks', 'share'] as const;
+
+/** `pluginViewClosed` 的 reason：插件调用了 `ctx.close()`。 */
+export const VIEW_CLOSE_REASON_REQUESTED = 'requested';
+
+/** 帧附带的宿主副作用；navigate 的 `target` 为路由 id（内置 id 或 `plugin:<identity>:<view>`）。未知 kind 忽略。 */
+export type ViewEffect = { kind: 'navigate'; target: string } | { kind: string };
+
 /** 归一化后的视图节点；`id` 由 daemon 分配（根为 `root`，子节点 = 父 id + `/` + key 或下标）。 */
 export interface ViewNode {
   id: string;
@@ -29,6 +38,8 @@ export interface PluginViewFrameDto {
   session: string;
   seq: number;
   ops: ViewOp[];
+  /** 宿主副作用（先于 ops 执行，不受 seq 判定影响）；缺省为空。 */
+  effects?: ViewEffect[];
 }
 
 /** `daemon.plugin.view.open` 参数。 */

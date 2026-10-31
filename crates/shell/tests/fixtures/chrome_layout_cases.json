@@ -11,6 +11,11 @@
   ],
   "normalize": [
     {
+      "name": "unplaced item is inserted before later catalog items, not appended",
+      "stored": { "railTop": ["feed"], "railBottom": ["avatar", "gear"], "statusLeading": ["speed", "pause"], "statusTrailing": ["limit", "disk"] },
+      "expected": { "titleLeading": [], "titleTrailing": [], "railTop": ["home", "feed"], "railBottom": ["avatar", "gear"], "statusLeading": ["speed", "pause"], "statusTrailing": ["limit", "disk"] }
+    },
+    {
       "name": "missing preference yields the default layout",
       "stored": null,
       "expected": {
@@ -64,7 +69,7 @@
       "expected": {
         "titleLeading": [],
         "titleTrailing": [],
-        "railTop": ["feed", "home"],
+        "railTop": ["home", "feed"],
         "railBottom": ["avatar", "gear"],
         "statusLeading": ["speed", "pause"],
         "statusTrailing": ["limit", "disk"]

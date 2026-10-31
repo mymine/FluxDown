@@ -39,16 +39,20 @@ pub enum BuiltinThemeId {
     MidnightBlue,
     Nord,
     WarmLight,
+    Graphite,
+    GraphiteLight,
 }
 
 impl BuiltinThemeId {
     /// 全部内置主题，顺序即 UI 显示顺序。
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::DefaultDark,
         Self::DefaultLight,
         Self::MidnightBlue,
         Self::Nord,
         Self::WarmLight,
+        Self::Graphite,
+        Self::GraphiteLight,
     ];
 
     /// 持久化 wire 名称。
@@ -60,6 +64,8 @@ impl BuiltinThemeId {
             Self::MidnightBlue => "midnightBlue",
             Self::Nord => "nord",
             Self::WarmLight => "warmLight",
+            Self::Graphite => "graphite",
+            Self::GraphiteLight => "graphiteLight",
         }
     }
 
@@ -80,8 +86,8 @@ impl BuiltinThemeId {
     #[must_use]
     pub fn appearance(self) -> ThemeMode {
         match self {
-            Self::DefaultDark | Self::MidnightBlue | Self::Nord => ThemeMode::Dark,
-            Self::DefaultLight | Self::WarmLight => ThemeMode::Light,
+            Self::DefaultDark | Self::MidnightBlue | Self::Nord | Self::Graphite => ThemeMode::Dark,
+            Self::DefaultLight | Self::WarmLight | Self::GraphiteLight => ThemeMode::Light,
         }
     }
 
@@ -94,6 +100,8 @@ impl BuiltinThemeId {
             Self::MidnightBlue => "themeMidnightBlue",
             Self::Nord => "themeNord",
             Self::WarmLight => "themeWarmLight",
+            Self::Graphite => "themeGraphite",
+            Self::GraphiteLight => "themeGraphiteLight",
         }
     }
 
@@ -582,7 +590,11 @@ mod tests {
         }
         assert_eq!(
             BuiltinThemeId::presets_for(ThemeMode::Light).collect::<Vec<_>>(),
-            vec![BuiltinThemeId::DefaultLight, BuiltinThemeId::WarmLight]
+            vec![
+                BuiltinThemeId::DefaultLight,
+                BuiltinThemeId::WarmLight,
+                BuiltinThemeId::GraphiteLight
+            ]
         );
         for scheme in AccentScheme::ALL {
             assert_eq!(AccentScheme::parse(scheme.wire_name()), Some(scheme));

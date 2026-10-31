@@ -86,7 +86,7 @@
   z-index: 2147483646;
   display: flex;
   flex-direction: column;
-  width: 380px;
+  width: min(380px, calc(100vw - 16px));
   max-height: 460px;
   background: var(--fd-bg);
   color: var(--fd-text);
@@ -111,6 +111,34 @@
   visibility: visible;
   transform: none;
   transition: opacity 0.2s ease, transform 0.2s ease, visibility 0s;
+}
+
+/* 窄屏（手机竖屏）：面板贴视口两侧各留 8px，取代固定的 52px 偏移；
+ * 内联 style 带 left/right: 52px，需 !important 覆盖。圆点展开时沉到面板下方，避免盖住头部按钮。 */
+@media (max-width: 460px) {
+  .fluxdown-panel,
+  .fluxdown-panel.left,
+  .fluxdown-panel.right {
+    left: 8px !important;
+    right: 8px !important;
+    width: auto;
+  }
+  .fluxdown-dot.active {
+    z-index: 2147483645;
+  }
+}
+
+/* 触屏（无 hover 滑出）：圆点放大并多露出一截，常驻可点；hover 在触屏上会粘滞，故不再滑出，仅展开面板时滑出 */
+@media (pointer: coarse) {
+  .fluxdown-dot { width: 40px; height: 40px; }
+  .fluxdown-dot.right,
+  .fluxdown-dot.right:hover { left: calc(100% - 32px); }
+  .fluxdown-dot.left,
+  .fluxdown-dot.left:hover { left: -8px; }
+  .fluxdown-dot:hover { transform: none; }
+  .fluxdown-dot.right.active { left: calc(100% - 48px); }
+  .fluxdown-dot.left.active { left: 8px; }
+  .fluxdown-dot.dragging { transform: scale(1.12); }
 }
 
 .panel-header {

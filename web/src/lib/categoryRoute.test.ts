@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { CustomCategoryDto } from './rpc'
-import { autoFollowDir, matchedCategory, modeDir, pickableCategories, routeBaseDir, routeFollows, routeFromCategories, routeFromPreference, routeSaveDir } from './categoryRoute'
+import { autoFollowDir, matchedCategory, modeDir, pickableCategories, routeBaseDir, routeFollows, routeFromCategories, routeFromPreference, routeSaveDir, wildcardMatches } from './categoryRoute'
 import type { CategoryRouteDto } from './rpc'
 
 declare const Bun: { file(path: URL): { json(): Promise<unknown> } }
@@ -19,6 +19,7 @@ const cat = (id: string, patch: Partial<CustomCategoryDto> = {}): CustomCategory
   matchMode: 'extension',
   extensions: [],
   regexPattern: '',
+  urlPattern: '',
   position: 0,
   visible: true,
   isBuiltin: false,
@@ -85,6 +86,24 @@ describe('routeSaveDir (shared fixtures)', () => {
       expect(routeSaveDir(item.route, item.fileName, item.url)).toBe(item.expected)
     })
   }
+})
+
+describe('wildcardMatches / url 规则', () => {
+  test('通配符语义（* 任意串、? 单字符、不分大小写、锚定）', () => {
+    expect(wildcardMatches('https://example.com/*', 'https://example.com/a/b.zip?token=1')).toBe(true)
+    expect(wildcardMatches('HTTPS://X.TEST/file?.zip', 'https://x.test/fileA.zip')).toBe(true)
+    expect(wildcardMatches('https://x.test/file?.zip', 'https://x.test/file12.zip')).toBe(false)
+    expect(wildcardMatches('x.test/*', 'https://x.test/a')).toBe(false)
+    expect(wildcardMatches('https://*.example.com/*', 'https://example.com/a')).toBe(false)
+    expect(wildcardMatches('', 'https://x.test/a')).toBe(false)
+    expect(wildcardMatches('   ', 'https://x.test/a')).toBe(false)
+  })
+
+  test('url 模式规则随 routeFromCategories 传递并参与落点路由', () => {
+    const route = routeFromCategories([cat('site', { matchMode: 'url', urlPattern: 'https://mirror.test/*', saveDir: '/mirror' })])
+    expect(route).toEqual({ rules: [{ matchMode: 'url', urlPattern: 'https://mirror.test/*', saveDir: '/mirror' }] })
+    expect(routeSaveDir(route!, 'a.zip', 'https://mirror.test/a.zip')).toBe('/mirror')
+  })
 })
 
 describe('auto follow / mode', () => {

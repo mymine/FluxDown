@@ -6,8 +6,9 @@ use fluxdown_protocol::{
     ServiceEvent, WsServerMsg, method,
 };
 use fluxdown_ui_components::{
-    CheckState, ControlExt as _, FluxIcon, SidebarPanel, SidebarState, caption_number, check_mark,
-    nav_icon_color, tabular_numbers, toolbar_action_button, tooltip_view,
+    BusyExt as _, BusyHold, CheckState, ControlExt as _, FluxIcon, SidebarPanel, SidebarState,
+    caption_number, check_mark, nav_icon_color, tabular_numbers, toolbar_action_button,
+    tooltip_view,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -18,11 +19,12 @@ use gpui::{
     uniform_list,
 };
 use gpui_component::{
-    Disableable as _, Icon, WindowExt as _,
+    Disableable as _, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     scroll::ScrollableElement as _,
+    spinner::Spinner,
     v_flex,
 };
 use std::{
@@ -97,6 +99,10 @@ pub struct RssView {
     /// 搜索框当前 placeholder；语言切换后在 render 中同步（InputState 只在构造时取一次）。
     search_placeholder: SharedString,
     oldest_first: bool,
+    /// 手动点击的最短「进行中」保持（本机 RPC 一帧内返回时转圈也可见）。
+    refresh_hold: BusyHold,
+    read_hold: BusyHold,
+    retry_hold: BusyHold,
     last_error: Option<String>,
     feedback: Option<String>,
     load_error: bool,
@@ -137,6 +143,9 @@ impl RssView {
             search,
             search_placeholder,
             oldest_first: false,
+            refresh_hold: BusyHold::default(),
+            read_hold: BusyHold::default(),
+            retry_hold: BusyHold::default(),
             last_error: None,
             feedback: None,
             load_error: false,
@@ -908,32 +917,34 @@ impl RssView {
         )
     }
 
+    /// 工具按钮图标；进行中时换成同尺寸 spinner（toolbar_action_button 本身没有 loading）。
+    fn tool_icon(icon: FluxIcon, busy: bool, cx: &App) -> AnyElement {
+        let icon_size = active_theme(cx).extended().icon.md;
+        if busy {
+            Spinner::new().with_size(icon_size).into_any_element()
+        } else {
+            Icon::new(icon).size(icon_size).into_any_element()
+        }
+    }
+
     /// 面板头工具按钮（chrome 风格图标按钮 + 悬浮提示）。
     fn tool_button(
         id: &'static str,
         label: SharedString,
-        icon: FluxIcon,
+        icon: AnyElement,
         destructive: bool,
         disabled: bool,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let icon_size = active_theme(cx).extended().icon.md;
         let tooltip = label.clone();
         div()
             .id(SharedString::from(format!("{id}-tooltip")))
             .flex_none()
             .tooltip(move |window, cx| tooltip_view(tooltip.clone(), window, cx))
             .child(
-                toolbar_action_button(
-                    id,
-                    label,
-                    Icon::new(icon).size(icon_size),
-                    destructive,
-                    disabled,
-                    cx,
-                )
-                .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx))),
+                toolbar_action_button(id, label, icon, destructive, disabled, cx)
+                    .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx))),
             )
             .into_any_element()
     }
@@ -974,7 +985,7 @@ impl RssView {
                     .child(Self::tool_button(
                         "rss-add-source",
                         self.t("rssAddSource", cx),
-                        FluxIcon::Plus,
+                        Self::tool_icon(FluxIcon::Plus, false, cx),
                         false,
                         stale,
                         |this, window, cx| this.open_editor(None, window, cx),
@@ -1202,7 +1213,7 @@ impl Render for RssView {
                             .child(Self::tool_button(
                                 "rss-manage",
                                 self.t("rssManageTitle", cx),
-                                FluxIcon::Settings,
+                                Self::tool_icon(FluxIcon::Settings, false, cx),
                                 false,
                                 stale,
                                 move |this, window, cx| {
@@ -1213,7 +1224,7 @@ impl Render for RssView {
                             .child(Self::tool_button(
                                 "rss-delete",
                                 self.t("rssDeleteSource", cx),
-                                FluxIcon::Trash2,
+                                Self::tool_icon(FluxIcon::Trash2, self.controller.delete_busy, cx),
                                 true,
                                 stale || self.controller.delete_busy,
                                 move |this, window, cx| {
@@ -1251,15 +1262,25 @@ impl Render for RssView {
                                     .icon(FluxIcon::Check)
                                     .label(self.t("rssMarkAllRead", cx))
                                     .control(cx)
-                                    .disabled(stale || self.controller.read_busy)
-                                    .on_click(cx.listener(|this, _, _, cx| this.read_all(cx))),
+                                    .busy(self.controller.read_busy || self.read_hold.is_held())
+                                    .disabled(
+                                        stale
+                                            || self.controller.read_busy
+                                            || self.read_hold.is_held(),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.read_hold.start(cx);
+                                        this.read_all(cx)
+                                    })),
                             )
                             .child(
                                 Button::new("rss-refresh")
                                     .ghost()
                                     .icon(FluxIcon::RotateCw)
                                     .label(self.t(
-                                        if self.controller.refresh_busy {
+                                        if self.controller.refresh_busy
+                                            || self.refresh_hold.is_held()
+                                        {
                                             "rssRefreshing"
                                         } else {
                                             "rssRefreshNow"
@@ -1267,8 +1288,18 @@ impl Render for RssView {
                                         cx,
                                     ))
                                     .control(cx)
-                                    .disabled(stale || self.controller.refresh_busy)
-                                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                                    .busy(
+                                        self.controller.refresh_busy || self.refresh_hold.is_held(),
+                                    )
+                                    .disabled(
+                                        stale
+                                            || self.controller.refresh_busy
+                                            || self.refresh_hold.is_held(),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.refresh_hold.start(cx);
+                                        this.refresh(cx)
+                                    })),
                             )
                             .child(div().flex_1().min_w(tokens.spacing.sm))
                             .child(
@@ -1424,8 +1455,25 @@ impl Render for RssView {
                                         .outline()
                                         .label(self.t("rssEmptyRetry", cx))
                                         .control(cx)
-                                        .disabled(stale)
+                                        .busy(
+                                            self.retry_hold.is_held()
+                                                || if retry_fetch {
+                                                    self.controller.loading
+                                                } else {
+                                                    self.controller.refresh_busy
+                                                },
+                                        )
+                                        .disabled(
+                                            stale
+                                                || self.retry_hold.is_held()
+                                                || if retry_fetch {
+                                                    self.controller.loading
+                                                } else {
+                                                    self.controller.refresh_busy
+                                                },
+                                        )
                                         .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.retry_hold.start(cx);
                                             if retry_fetch {
                                                 this.fetch_items(cx);
                                                 cx.notify();

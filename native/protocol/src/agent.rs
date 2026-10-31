@@ -131,6 +131,41 @@ pub struct CloudPlan {
     pub campaign: Option<CloudPlanCampaign>,
     #[serde(default = "default_true")]
     pub purchasable: bool,
+    /// 产品形态：会员（永久 / 会员卡）或流量包。
+    #[serde(default)]
+    pub product_kind: CloudProductKind,
+    /// 流量包规格（`productKind = pack` 时存在）。
+    #[serde(default)]
+    pub pack: Option<CloudPack>,
+    /// 周期会员卡的周期天数；`None` = 永久套餐（或流量包）。
+    #[serde(default)]
+    pub billing_period_days: Option<u32>,
+}
+
+/// 套餐产品形态（`CloudPlan.productKind`）。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum CloudProductKind {
+    /// 会员套餐。
+    #[default]
+    Membership,
+    /// 流量包（消耗品，可重复购买、叠加）。
+    Pack,
+    /// 对端发送了本端不认识的形态。
+    #[serde(other)]
+    Unknown,
+}
+
+/// 流量包规格。
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase", default)]
+pub struct CloudPack {
+    pub kind: crate::ShareTrafficKind,
+    pub bytes: u64,
+    /// 支付后有效天数。
+    pub valid_days: u32,
 }
 
 fn default_badge_style() -> String {
@@ -162,6 +197,22 @@ pub struct CloudProfile {
     pub current_plan: Option<CloudPlan>,
     #[serde(default)]
     pub purchase_credit_minor: i64,
+    /// 当前生效的周期会员卡；没有为 `None`。
+    #[serde(default)]
+    pub active_subscription: Option<CloudSubscription>,
+}
+
+/// 生效中的周期会员卡（手动续费；到期回到永久套餐权益）。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase", default)]
+pub struct CloudSubscription {
+    pub plan_code: String,
+    pub plan_name: String,
+    /// 开始时间（RFC 3339）。
+    pub starts_at: String,
+    /// 到期时间（RFC 3339）。
+    pub ends_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -276,6 +327,9 @@ pub struct AgentSessionDto {
     pub entitlements: Entitlements,
     pub current_plan: Option<CloudPlan>,
     pub device: CloudDevice,
+    /// 当前生效的周期会员卡；没有为 `None`。
+    #[serde(default)]
+    pub active_subscription: Option<CloudSubscription>,
 }
 
 /// 邮箱或设备验证步骤的无令牌元数据。
@@ -1047,6 +1101,18 @@ pub struct PlatformOpenPathParams {
     pub reveal: bool,
 }
 
+/// `agent.platform.copyTaskFiles` 参数：要写入系统剪贴板的任务（产物必须已在磁盘上）。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformCopyTaskFilesParams {
+    /// 非空；重复 id 只计一次，上限 [`PLATFORM_COPY_TASK_FILES_MAX`]。
+    pub task_ids: Vec<String>,
+}
+
+/// 一次 `agent.platform.copyTaskFiles` 最多写入的任务数（防止整表误选拖垮 daemon 逐个查询）。
+pub const PLATFORM_COPY_TASK_FILES_MAX: usize = 1000;
+
 /// 按文件（而非扩展名）取图标的扩展名（小写）：图标内嵌在文件自身里。其余类型的图标只由
 /// 扩展名关联决定，调用方按扩展名缓存即可。`.lnk` / `.url` 故意不在内：它们的图标路径可以
 /// 指向远程共享，按文件解析会向外发起认证。
@@ -1341,13 +1407,16 @@ pub struct CustomCategoryDto {
     pub name: String,
     #[serde(default = "default_category_icon")]
     pub icon: String,
-    /// `extension` | `regex`。
+    /// `extension` | `regex` | `url`。
     #[serde(default = "default_category_match_mode")]
     pub match_mode: String,
     #[serde(default)]
     pub extensions: Vec<String>,
     #[serde(default)]
     pub regex_pattern: String,
+    /// `url` 模式的通配符模式（`*` 任意串、`?` 单字符、不分大小写、完整匹配整个网址）。
+    #[serde(default)]
+    pub url_pattern: String,
     #[serde(default)]
     pub position: i64,
     #[serde(default = "default_category_visible")]
@@ -1381,6 +1450,7 @@ impl CustomCategoryDto {
             match_mode: "extension".to_owned(),
             extensions: exts.iter().map(|ext| (*ext).to_owned()).collect(),
             regex_pattern: String::new(),
+            url_pattern: String::new(),
             position,
             visible: true,
             is_builtin: true,
@@ -1457,8 +1527,10 @@ impl CustomCategoryDto {
 /// 再按同一规则复核并把产物移入命中分类的目录。任务组成员与 BT / eD2K 任务不参与。
 ///
 /// 匹配语义（唯一事实源为 agent `category_dir.rs` 与引擎 `category_route.rs`，两端共用
-/// 夹具 `native/engine/src/fixtures/category_route_cases.json`）：按顺序取首个配置了目录
-/// 且命中的普通分类；所有普通分类都不命中时取「其他」的目录。
+/// 夹具 `native/engine/src/fixtures/category_route_cases.json`）：网址规则固定优先于
+/// 扩展名 / 正则分类（不看列表位置），网址规则之间按列表顺序取首个配置了目录且命中的；
+/// 未被网址规则认领的任务再按文件名规则取首个配置了目录且命中的普通分类；都不命中时
+/// 取「其他」的目录。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
@@ -1476,13 +1548,16 @@ pub struct CategoryRouteDto {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CategoryRuleDto {
-    /// `extension` | `regex`。
+    /// `extension` | `regex` | `url`。
     #[serde(default = "default_category_match_mode")]
     pub match_mode: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extensions: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub regex_pattern: String,
+    /// `url` 模式的通配符模式；语义与 [`CustomCategoryDto::url_pattern`] 一致。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url_pattern: String,
     /// 空 = 该分类不改变落点，只用于阻止「其他」兜底。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub save_dir: String,
@@ -1507,6 +1582,7 @@ impl CategoryRouteDto {
                 match_mode: category.match_mode.clone(),
                 extensions: category.extensions.clone(),
                 regex_pattern: category.regex_pattern.clone(),
+                url_pattern: category.url_pattern.clone(),
                 save_dir: category.save_dir.trim().to_owned(),
             })
             .collect::<Vec<_>>();
@@ -1570,6 +1646,7 @@ mod category_route_helper_tests {
                 match_mode: "extension".to_owned(),
                 extensions: vec!["jpg".to_owned()],
                 regex_pattern: String::new(),
+                url_pattern: String::new(),
                 save_dir: "/pictures".to_owned(),
             }],
             other_dir: "/other".to_owned(),

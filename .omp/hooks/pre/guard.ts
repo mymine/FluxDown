@@ -4,7 +4,9 @@
  * TTSR 规则（.omp/rules/forbidden-commands.md）只在输出流里打断并提示，模型可原样重试；
  * 这里在执行前直接拒绝，不可绕过。规则正文仍以 RULES.md / AGENTS.md 为准，本文件只做判定。
  *
- * - 推送 v* tag / --tags / --follow-tags / --mirror：触发不可逆的全平台发布，交互会话弹确认，无 UI 时拒绝。
+ * - 推送 v* tag：tag 提交上最近一次全量 CI（ci.yml）与同名演练（「Release 演练 <tag>（不发布）」）都 success 时
+ *   直接放行（用户要求发版即已授权，演练全绿不再人工确认）；任一未满足、或 --tags / --follow-tags / --mirror /
+ *   变量 refspec 无法预先解析时，交互会话弹确认并列出未满足项，无 UI 时拒绝。
  * - --no-verify：绕过 .githooks 本地门禁（AGENTS.md §2 明令禁止）。
  * - 裸 --force 推送：只允许 --force-with-lease；main / stable 一律禁止强推。
  * - 推送 stable 前校验分支模型一致性：`git log stable --not main` 必须为空。
@@ -113,7 +115,21 @@ function destination(refspec: string): string {
 	return colon >= 0 ? refspec.slice(colon + 1) : refspec;
 }
 
-function checkPush(rest: string[], stableDiverged: () => string | undefined): Verdict {
+/** 推送同名本地 tag（`vX.Y.Z` / `refs/tags/vX.Y.Z` / `vX.Y.Z:refs/tags/vX.Y.Z`）时返回 tag 名；源端另指提交则无法按 tag 校验。 */
+function releaseTagName(refspec: string): string | undefined {
+	const spec = refspec.replace(/^\+/, "");
+	const colon = spec.lastIndexOf(":");
+	const name = (ref: string) => ref.replace(/^refs\/tags\//, "");
+	const dst = name(colon >= 0 ? spec.slice(colon + 1) : spec);
+	const src = colon >= 0 ? name(spec.slice(0, colon)) : dst;
+	return src === dst ? dst : undefined;
+}
+
+function checkPush(
+	rest: string[],
+	stableDiverged: () => string | undefined,
+	releaseBlockers: (tag: string) => string[],
+): Verdict {
 	const flags = rest.filter(a => a.startsWith("-"));
 	// 位置参数：首个是远端，其余是 refspec（引号内的 refspec 照常判定）。
 	const specs = rest
@@ -133,16 +149,6 @@ function checkPush(rest: string[], stableDiverged: () => string | undefined): Ve
 	if ((force || plusForce) && !lease) {
 		return { block: true, reason: "只允许 --force-with-lease，禁止裸 --force / +refspec 强推。" };
 	}
-	if (
-		flags.some(a => a === "--tags" || a === "--follow-tags" || a === "--mirror") ||
-		refs.some(r => RELEASE_TAG.test(r)) ||
-		unresolved
-	) {
-		return {
-			confirm:
-				"推送 v* tag 会立即触发全平台发布流水线，不可逆（.omp/RULES.md）。只有用户在本会话明确要求发版时才允许。",
-		};
-	}
 	if (refs.some(r => /^(?:refs\/heads\/)?stable$/.test(r))) {
 		const diverged = stableDiverged();
 		if (diverged) {
@@ -152,14 +158,35 @@ function checkPush(rest: string[], stableDiverged: () => string | undefined): Ve
 			};
 		}
 	}
-	return undefined;
+
+	const bulk = flags.some(a => a === "--tags" || a === "--follow-tags" || a === "--mirror");
+	const tagSpecs = specs.filter(s => RELEASE_TAG.test(destination(s)));
+	if (!bulk && !unresolved && tagSpecs.length === 0) return undefined;
+	const blockers =
+		bulk || unresolved
+			? ["--tags / --follow-tags / --mirror 或变量 refspec 无法在执行前校验，改用字面 tag 名：`git push origin vX.Y.Z`"]
+			: tagSpecs.flatMap(spec => {
+					const tag = releaseTagName(spec);
+					if (!tag) return [`${spec}：只能按同名本地 tag 推送（\`git push origin vX.Y.Z\`）才能校验演练`];
+					return releaseBlockers(tag).map(b => `${tag}：${b}`);
+				});
+	if (blockers.length === 0) return undefined;
+	return {
+		confirm:
+			"推送 v* tag 会立即触发全平台发布流水线，不可逆（.omp/RULES.md）。未满足自动放行条件" +
+			`（tag 提交上全量 CI 与同名演练都 success）：\n- ${blockers.join("\n- ")}`,
+	};
 }
 
-/** 判定一条 bash 命令。`stableDiverged(dir)` 返回该仓库 `git log stable --not main --oneline` 的非空输出。 */
+/**
+ * 判定一条 bash 命令。`stableDiverged(dir)` 返回该仓库 `git log stable --not main --oneline` 的非空输出；
+ * `releaseBlockers(tag, dir)` 返回该发布 tag 未满足的自动放行条件（空 = CI 与演练全绿）。
+ */
 export function checkBash(
 	line: string,
 	caller: Caller,
 	stableDiverged: (dir?: string) => string | undefined = () => undefined,
+	releaseBlockers: (tag: string, dir?: string) => string[] = () => ["未接入演练校验"],
 ): Verdict {
 	for (const words of commands(line)) {
 		const git = gitArgs(words);
@@ -173,7 +200,11 @@ export function checkBash(
 				};
 			}
 			if (sub === "push") {
-				const verdict = checkPush(rest, () => stableDiverged(git.dir));
+				const verdict = checkPush(
+					rest,
+					() => stableDiverged(git.dir),
+					tag => releaseBlockers(tag, git.dir),
+				);
 				if (verdict) return verdict;
 			}
 			continue;
@@ -219,6 +250,83 @@ function stableDivergence(cwd: string): string | undefined {
 	}
 }
 
+interface WorkflowRun {
+	display_title: string;
+	status: string;
+	conclusion: string | null;
+	created_at: string;
+	html_url: string;
+}
+
+/** 校验 `gh api …/runs` 返回体；字段不符即抛错（按「无法查询」处理，绝不误判为全绿）。 */
+function parseRuns(json: string): WorkflowRun[] {
+	const body: unknown = JSON.parse(json);
+	if (!body || typeof body !== "object" || !("workflow_runs" in body) || !Array.isArray(body.workflow_runs)) {
+		throw new Error("返回体缺少 workflow_runs");
+	}
+	return body.workflow_runs.map((run: unknown): WorkflowRun => {
+		if (
+			run &&
+			typeof run === "object" &&
+			"display_title" in run &&
+			typeof run.display_title === "string" &&
+			"status" in run &&
+			typeof run.status === "string" &&
+			"conclusion" in run &&
+			(typeof run.conclusion === "string" || run.conclusion === null) &&
+			"created_at" in run &&
+			typeof run.created_at === "string" &&
+			"html_url" in run &&
+			typeof run.html_url === "string"
+		) {
+			return {
+				display_title: run.display_title,
+				status: run.status,
+				conclusion: run.conclusion,
+				created_at: run.created_at,
+				html_url: run.html_url,
+			};
+		}
+		throw new Error("workflow run 字段不符合预期");
+	});
+}
+
+/**
+ * 发布 tag 自动放行校验，与 `.github/scripts/release_gate.py` 同口径：tag 指向的提交上最近一次 `ci.yml`
+ * 与最近一次「Release 演练 <tag>（不发布）」都 completed + success。返回未满足项，空 = 放行。
+ */
+function releaseBlockers(cwd: string, tag: string): string[] {
+	const exec = (cmd: string, args: string[]) =>
+		execFileSync(cmd, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 20_000 }).trim();
+	let sha: string;
+	try {
+		sha = exec("git", ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}^{commit}`]);
+	} catch {
+		return ["本地不存在该 tag，先 `git tag -a` 再推送"];
+	}
+	const title = `Release 演练 ${tag}（不发布）`;
+	const latest = (workflow: string, query: string, only?: string): WorkflowRun | undefined => {
+		const out = exec("gh", ["api", `repos/{owner}/{repo}/actions/workflows/${workflow}/runs?head_sha=${sha}${query}`]);
+		const runs = parseRuns(out).filter(r => only === undefined || r.display_title === only);
+		runs.sort((a, b) => b.created_at.localeCompare(a.created_at));
+		return runs[0];
+	};
+	const unmet = (label: string, run: WorkflowRun | undefined): string | undefined => {
+		if (!run) return `${label}：提交 ${sha.slice(0, 10)} 上没有运行`;
+		if (run.status !== "completed") return `${label} 仍在运行（${run.html_url}）`;
+		if (run.conclusion !== "success") return `${label} 结论为 ${run.conclusion}（${run.html_url}）`;
+		return undefined;
+	};
+	try {
+		return [
+			unmet("全量 CI（ci.yml）", latest("ci.yml", "&per_page=20")),
+			unmet(`演练「${title}」`, latest("release.yml", "&event=workflow_dispatch&per_page=50", title)),
+		].filter((b): b is string => b !== undefined);
+	} catch (e) {
+		return [`无法查询 GitHub Actions：${e instanceof Error ? e.message : String(e)}`];
+	}
+}
+
 export default function guard(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "bash") return;
@@ -226,10 +334,15 @@ export default function guard(pi: ExtensionAPI): void {
 		if (typeof command !== "string") return;
 		const cwd = typeof event.input.cwd === "string" && event.input.cwd ? resolve(ctx.cwd, event.input.cwd) : ctx.cwd;
 		const caller: Caller = { isSub: ctx.agent?.kind === "sub", name: (ctx.agent?.name ?? "").toLowerCase() };
-		const verdict = checkBash(command, caller, dir => stableDivergence(dir ? resolve(cwd, dir) : cwd));
+		const verdict = checkBash(
+			command,
+			caller,
+			dir => stableDivergence(dir ? resolve(cwd, dir) : cwd),
+			(tag, dir) => releaseBlockers(dir ? resolve(cwd, dir) : cwd, tag),
+		);
 		if (!verdict) return;
 		if ("block" in verdict) return verdict;
 		if (ctx.hasUI && (await ctx.ui.confirm("推送发布 tag？", `${verdict.confirm}\n\n${command}`))) return;
-		return { block: true, reason: `${verdict.confirm} 未获用户确认，已拦截。` };
+		return { block: true, reason: `${verdict.confirm}\n未获用户确认，已拦截。` };
 	});
 }

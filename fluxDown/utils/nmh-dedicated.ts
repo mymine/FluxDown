@@ -1,3 +1,4 @@
+import { logError, logWarn } from "./error-log";
 /**
  * 专用 Native Messaging 端口池：为耗时请求（页面脚本 `plugin_invoke`）按 key 各开一条独立连接。
  *
@@ -119,7 +120,7 @@ export function createDedicatedPool(options: DedicatedPoolOptions): DedicatedPoo
     try {
       port = options.connect();
     } catch (e) {
-      console.error("[FluxDown NMH] dedicated connectNative() threw:", e);
+      logError("[FluxDown NMH] dedicated connectNative() threw:", e);
       return null;
     }
     lane.port = port;
@@ -167,7 +168,7 @@ export function createDedicatedPool(options: DedicatedPoolOptions): DedicatedPoo
     try {
       port.postMessage({ action: next.action, msg_id: next.msgId, ...next.payload });
     } catch (e) {
-      console.warn("[FluxDown NMH] dedicated postMessage failed:", e);
+      logWarn("[FluxDown NMH] dedicated postMessage failed:", e);
       settle(lane, next, { success: false, message: "postMessage failed" });
       closePort(lane);
       pump(key, lane);

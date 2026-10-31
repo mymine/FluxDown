@@ -88,6 +88,18 @@ export function PanelApp(props: { host: HTMLElement }): JSX.Element | null {
     return () => browser.runtime.onMessage.removeListener(onMessage);
   }, []);
 
+  // 视口变化（旋转 / 地址栏收放 / 软键盘）：重算面板与圆点位置
+  const [, setViewportTick] = useState(0);
+  useEffect(() => {
+    const bump = () => setViewportTick((n) => n + 1);
+    window.addEventListener("resize", bump);
+    window.visualViewport?.addEventListener("resize", bump);
+    return () => {
+      window.removeEventListener("resize", bump);
+      window.visualViewport?.removeEventListener("resize", bump);
+    };
+  }, []);
+
   // Esc / 点击外部（composedPath 穿透 Shadow DOM）关闭
   useEffect(() => {
     if (!open) return;
@@ -168,10 +180,17 @@ export function PanelApp(props: { host: HTMLElement }): JSX.Element | null {
     void saveSiteProfile(key, { ...profile, pageDot: false, updatedAt: Date.now() });
   };
 
+  // 面板高度不超过视口（矮视口 / 横屏）；窄屏的横向定位由 panel.css 的媒体查询覆盖
+  const panelH = Math.min(PANEL_H, window.innerHeight - 20);
   let panelTop = y - 20;
-  if (panelTop + PANEL_H > window.innerHeight - 10) panelTop = window.innerHeight - PANEL_H - 10;
+  if (panelTop + panelH > window.innerHeight - 10) panelTop = window.innerHeight - panelH - 10;
   if (panelTop < 10) panelTop = 10;
-  const panelStyle = side === "left" ? { top: `${panelTop}px`, left: "52px" } : { top: `${panelTop}px`, right: "52px" };
+  const panelStyle =
+    side === "left"
+      ? { top: `${panelTop}px`, left: "52px", maxHeight: `${panelH}px` }
+      : { top: `${panelTop}px`, right: "52px", maxHeight: `${panelH}px` };
+  // 旋转 / 缩放视口后圆点不能落到视口外
+  const dotTop = Math.max(0, Math.min(y, window.innerHeight - 56));
 
   return (
     <>
@@ -179,7 +198,7 @@ export function PanelApp(props: { host: HTMLElement }): JSX.Element | null {
         ref={dotRef}
         type="button"
         class={`fluxdown-dot ${side}${open ? " active" : ""}${dragLeft !== null ? " dragging" : ""}`}
-        style={{ top: `${y}px`, left: dragLeft !== null ? `${dragLeft}px` : undefined }}
+        style={{ top: `${dotTop}px`, left: dragLeft !== null ? `${dragLeft}px` : undefined }}
         title="FluxDown"
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}

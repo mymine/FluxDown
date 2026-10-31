@@ -78,7 +78,8 @@ private fun DrawScope.drawCardSegment(fill: Color, line: Color, first: Boolean, 
     }
 }
 
-private fun ringLabelOf(t: RowText, v: TaskVisualState): String = when (v) {
+/** [localHost] = false 时已完成行的主动作是进入任务详情（远端文件不在本机）。 */
+private fun ringLabelOf(t: RowText, v: TaskVisualState, localHost: Boolean): String = when (v) {
     TaskVisualState.Downloading, TaskVisualState.Pending, TaskVisualState.Queued,
     TaskVisualState.Preparing, TaskVisualState.Verifying,
     -> t.ringPause
@@ -86,7 +87,7 @@ private fun ringLabelOf(t: RowText, v: TaskVisualState): String = when (v) {
     TaskVisualState.Failed -> t.ringRetry
     TaskVisualState.Missing -> t.ringRedownload
     TaskVisualState.Seeding -> t.ringSeeding
-    TaskVisualState.Completed -> t.ringOpen
+    TaskVisualState.Completed -> if (localHost) t.ringOpen else t.openDetails
 }
 
 private fun primaryIconOf(v: TaskVisualState): ImageVector = when (v) {
@@ -151,10 +152,11 @@ internal fun DownloadRow(
 
     val coords = remember { arrayOfNulls<LayoutCoordinates>(1) }
 
-    val startActions = remember(item.visual, item.boosted, text, actions) {
+    val localHost = view.localHost
+    val startActions = remember(item.visual, item.boosted, text, actions, localHost) {
         buildList {
             add(
-                FluxSwipeAction(ringLabelOf(text, item.visual), primaryIconOf(item.visual), FluxSwipeTone.Accent) {
+                FluxSwipeAction(ringLabelOf(text, item.visual, localHost), primaryIconOf(item.visual), FluxSwipeTone.Accent) {
                     actions.primary(latest.task)
                 },
             )
@@ -215,7 +217,7 @@ internal fun DownloadRow(
                     categoryColor = colors.category(item.category.fileCategory()),
                     ringKind = item.visual.ringKind(),
                     ringProgress = ringProgressOf(item),
-                    ringContentDescription = ringLabelOf(text, item.visual),
+                    ringContentDescription = ringLabelOf(text, item.visual, localHost),
                     onClick = {
                         if (nav.selecting) {
                             nav.toggleSelected(id)

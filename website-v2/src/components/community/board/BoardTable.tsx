@@ -10,20 +10,26 @@ import { itemState, matchesFilter, matchesSearch, optionColor, type BoardData, t
 type SortDir = "ASC" | "DESC";
 type SortField = "number" | "title" | "status" | "createdAt" | "comments";
 
-const COLS: { key: SortField | "labels"; label: keyof (typeof feedback)["en"]["board"]["col"]; sortable: boolean }[] = [
-  { key: "number", label: "number", sortable: true },
-  { key: "title", label: "title", sortable: true },
-  { key: "status", label: "status", sortable: true },
-  { key: "labels", label: "labels", sortable: false },
-  { key: "createdAt", label: "created", sortable: true },
-  { key: "comments", label: "comments", sortable: true },
+/** `narrow: false` 的列在窄屏(< sm)隐藏:状态并入标题单元格,避免整张表横向滚出视口。 */
+const COLS: {
+  key: SortField | "labels";
+  label: keyof (typeof feedback)["en"]["board"]["col"];
+  sortable: boolean;
+  narrow: boolean;
+}[] = [
+  { key: "number", label: "number", sortable: true, narrow: false },
+  { key: "title", label: "title", sortable: true, narrow: true },
+  { key: "status", label: "status", sortable: true, narrow: false },
+  { key: "labels", label: "labels", sortable: false, narrow: false },
+  { key: "createdAt", label: "created", sortable: true, narrow: false },
+  { key: "comments", label: "comments", sortable: true, narrow: true },
 ];
 
 function Row({ item, rowNum, lang, onOpen }: { item: BoardItem; rowNum: number; lang: Lang; onOpen: (n: number) => void }) {
   return (
     <tr className="cm-row" onClick={() => onOpen(item.issueNumber)}>
-      <td className="mono num w-14 text-xs text-subtle">{rowNum}</td>
-      <td className="min-w-64">
+      <td className="mono num w-14 text-xs text-subtle max-sm:hidden">{rowNum}</td>
+      <td className="sm:min-w-64">
         <button
           type="button"
           className="cm-row-title flex items-start gap-2 text-left"
@@ -36,11 +42,12 @@ function Row({ item, rowNum, lang, onOpen }: { item: BoardItem; rowNum: number; 
           <span className="line-clamp-2 leading-snug">{item.title}</span>
           <span className="mono num shrink-0 pt-px text-xs text-subtle">#{item.issueNumber}</span>
         </button>
+        {item.statusName && <span className="cm-status mt-1.5 ml-6 sm:hidden">{item.statusName}</span>}
       </td>
-      <td className="whitespace-nowrap">
+      <td className="whitespace-nowrap max-sm:hidden">
         {item.statusName ? <span className="cm-status">{item.statusName}</span> : <span className="text-subtle">—</span>}
       </td>
-      <td>
+      <td className="max-sm:hidden">
         {item.labels.length ? (
           <div className="flex flex-wrap gap-1">
             {item.labels.map((l) => (
@@ -51,7 +58,7 @@ function Row({ item, rowNum, lang, onOpen }: { item: BoardItem; rowNum: number; 
           <span className="text-subtle">—</span>
         )}
       </td>
-      <td className="mono whitespace-nowrap text-xs text-subtle">
+      <td className="mono whitespace-nowrap text-xs text-subtle max-sm:hidden">
         <time dateTime={item.createdAt} title={formatDate(item.createdAt, lang)}>
           {timeAgo(item.createdAt, lang)}
         </time>
@@ -168,7 +175,7 @@ export default function BoardTable({
                 <th
                   key={col.key}
                   scope="col"
-                  className={cn(col.key === "comments" && "text-right")}
+                  className={cn(col.key === "comments" && "text-right", !col.narrow && "max-sm:hidden")}
                   aria-sort={active ? (sort.dir === "ASC" ? "ascending" : "descending") : undefined}
                 >
                   {col.sortable ? (

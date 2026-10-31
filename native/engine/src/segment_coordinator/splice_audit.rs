@@ -83,11 +83,12 @@ async fn fetch_window(
     let want = usize::try_from(len).ok()?;
     let range = format!("bytes={}-{}", start, start + len - 1);
     let routed = spec.route_url(url);
+    let used = spec.current();
     let request = build_request(
         client,
         routed.as_deref().unwrap_or(url),
         reqwest::Method::GET,
-        &spec.current(),
+        &used,
     )
     .header("Range", range)
     .header("Accept-Encoding", "identity");

@@ -34,7 +34,7 @@ type Provider = Arc<dyn Fn() -> Option<Arc<dyn EgressSource>> + Send + Sync>;
 /// 出口网络。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Network {
-    /// 拿不到出口方案：reqwest 默认（环境变量 / 系统代理）。
+    /// 拿不到出口方案：跟随系统代理（环境变量 / 系统设置，含 macOS 例外列表）。
     SystemDefault,
     /// 直连：不得再套用环境 / 系统代理。
     Direct,
@@ -48,7 +48,7 @@ impl Network {
         builder: reqwest::ClientBuilder,
     ) -> Result<reqwest::ClientBuilder, reqwest::Error> {
         Ok(match self {
-            Self::SystemDefault => builder,
+            Self::SystemDefault => crate::system_proxy::follow_system(builder),
             Self::Direct => builder.no_proxy(),
             Self::Proxy { url, no_proxy } => builder
                 .proxy(reqwest::Proxy::all(url)?.no_proxy(reqwest::NoProxy::from_string(no_proxy))),

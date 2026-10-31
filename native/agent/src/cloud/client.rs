@@ -25,6 +25,18 @@ use crate::state::{AgentState, CloudCredentials, StateStore};
 /// 是否允许运行期覆盖 FluxCloud 地址；仅调试构建。
 const ENDPOINT_EDITABLE: bool = cfg!(debug_assertions);
 
+/// 云端 WebSocket 接收单消息 / 单帧上限；与远程任务通道的 SSE 单行上限一致。
+const MAX_SOCKET_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// `/api/v1/tasks/ws` 握手被判定为「网络 / 中间层 / 服务端不支持 WebSocket」时 `CloudError::code` 的取值。
+pub(crate) const WEBSOCKET_UNSUPPORTED: &str = "websocket_unsupported";
+
+/// 握手等响应头超时时 `CloudError::code` 的取值（仍是 `unreachable` 网络类错误）。
+pub(crate) const WEBSOCKET_HANDSHAKE_TIMEOUT: &str = "websocket_handshake_timeout";
+
+/// 升级成功的云端 WebSocket（HTTP/1.1 Upgrade，沿用 reqwest 的 TLS / 代理栈）。
+pub(crate) type CloudSocket = tokio_tungstenite::WebSocketStream<reqwest::Upgraded>;
+
 /// 云端连接的 TCP keepalive 探测间隔。
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
@@ -37,6 +49,8 @@ pub struct CloudClient {
     base_url: Arc<RwLock<String>>,
     http: Arc<LazyHttpClient>,
     stream_http: Arc<LazyHttpClient>,
+    /// WebSocket 握手专用：Upgrade 只存在于 HTTP/1.1，禁用 ALPN 协商 h2。
+    ws_http: Arc<LazyHttpClient>,
     state: Arc<Mutex<AgentState>>,
     store: Arc<StateStore>,
     refresh: Arc<Mutex<()>>,
@@ -71,6 +85,7 @@ impl CloudClient {
                 message: "account-scoped response belongs to an ended session".to_owned(),
                 retryable: false,
                 unreachable: false,
+                details: None,
             });
         }
         Ok(state)
@@ -99,12 +114,23 @@ impl CloudClient {
                 .pool_idle_timeout(Duration::from_secs(90))
                 .tcp_keepalive(Some(TCP_KEEPALIVE))
         });
+        let ws_http = LazyHttpClient::new(|| {
+            reqwest::Client::builder()
+                .user_agent(format!("FluxDown/{}", fluxdown_protocol::APP_VERSION))
+                .connect_timeout(Duration::from_secs(10))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Some(TCP_KEEPALIVE))
+                .http1_only()
+                // 3xx 说明中间层没有透传 Upgrade：不跟随，交给握手分类归为「不支持」。
+                .redirect(reqwest::redirect::Policy::none())
+        });
         let default_base_url = normalize_base_url(&base_url);
         Ok(Self {
             base_url: Arc::new(RwLock::new(default_base_url.clone())),
             default_base_url,
             http: Arc::new(http),
             stream_http: Arc::new(stream_http),
+            ws_http: Arc::new(ws_http),
             state,
             store,
             refresh: Arc::new(Mutex::new(())),
@@ -391,6 +417,7 @@ impl CloudClient {
             session.user = profile.user;
             session.entitlements = profile.entitlements;
             session.current_plan = profile.current_plan;
+            session.active_subscription = profile.active_subscription;
             let updated = session.clone();
             if let Some(events) = &self.events {
                 events.publish(AgentEvent::SessionChanged(Box::new(Some(updated.clone()))));
@@ -672,6 +699,135 @@ impl CloudClient {
         result
     }
 
+    /// 与 [`Self::authenticated_stream_epoch`] 同构的 WebSocket 版本：401 单飞刷新后重放一次，
+    /// 升级成功后再校验会话 epoch。握手被判定为「不支持 WebSocket」时返回
+    /// `code == "websocket_unsupported"` 的错误（见 [`CloudError::is_websocket_unsupported`]）。
+    pub(crate) async fn authenticated_socket_epoch(
+        &self,
+        path: &str,
+        epoch: RequestEpoch,
+    ) -> Result<CloudSocket, CloudError> {
+        let access_token = self
+            .lock_epoch(epoch)
+            .await?
+            .credentials
+            .as_ref()
+            .map(|credentials| credentials.access_token.clone())
+            .filter(|token| !token.is_empty())
+            .ok_or_else(CloudError::unauthorized)?;
+        let socket = match self.send_socket_once(path, &access_token, epoch).await? {
+            Some(socket) => socket,
+            None => {
+                let replay_token = self.refreshed_access_token(&access_token, epoch).await?;
+                drop(self.lock_epoch(epoch).await?);
+                match self.send_socket_once(path, &replay_token, epoch).await? {
+                    Some(socket) => socket,
+                    None => {
+                        drop(self.lock_epoch(epoch).await?);
+                        return Err(CloudError::unauthorized());
+                    }
+                }
+            }
+        };
+        drop(self.lock_epoch(epoch).await?);
+        Ok(socket)
+    }
+
+    /// 一次握手：`Ok(None)` 表示 401（由调用方单飞刷新后重放）；其它非 101 响应转 `CloudError`。
+    async fn send_socket_once(
+        &self,
+        path: &str,
+        bearer: &str,
+        epoch: RequestEpoch,
+    ) -> Result<Option<CloudSocket>, CloudError> {
+        use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+        use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+        use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
+
+        let (device_id, device_name, platform) = self.device_identity().await;
+        let client = self
+            .ws_http
+            .get()
+            .await
+            .map_err(|error| CloudError::local(format!("cloud WebSocket client: {error:#}")))?;
+        drop(self.lock_epoch(epoch).await?);
+        let key = generate_key();
+        let request = client
+            .get(format!("{}{}", self.current_base_url(), path))
+            .bearer_auth(bearer)
+            .header(reqwest::header::CONNECTION, "Upgrade")
+            .header(reqwest::header::UPGRADE, "websocket")
+            .header(reqwest::header::SEC_WEBSOCKET_VERSION, "13")
+            .header(reqwest::header::SEC_WEBSOCKET_KEY, &key)
+            .header("X-FluxDown-Device-Id", device_id)
+            .header("X-FluxDown-Device-Name", device_name)
+            .header("X-FluxDown-Platform", platform)
+            .header("X-FluxDown-Version", fluxdown_protocol::APP_VERSION)
+            .send();
+        let sent_at = unix_ms();
+        let response = tokio::time::timeout(Duration::from_secs(15), request)
+            .await
+            .map_err(|_| {
+                let mut error =
+                    CloudError::network("cloud WebSocket response headers timeout".to_owned());
+                error.code = Some(WEBSOCKET_HANDSHAKE_TIMEOUT.to_owned());
+                error
+            })?
+            .map_err(|error| CloudError::network(error_chain(&error)))?;
+        self.observe_server_clock(&response, sent_at, unix_ms());
+        let status = response.status();
+        if status == StatusCode::SWITCHING_PROTOCOLS {
+            let upgrade_ok = response
+                .headers()
+                .get_all(reqwest::header::UPGRADE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .any(|token| token.trim().eq_ignore_ascii_case("websocket"));
+            let accept_ok = response
+                .headers()
+                .get(reqwest::header::SEC_WEBSOCKET_ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|accept| accept.trim() == derive_accept_key(key.as_bytes()));
+            if !upgrade_ok || !accept_ok {
+                return Err(websocket_unsupported(
+                    status,
+                    "WebSocket upgrade response failed validation",
+                ));
+            }
+            let upgraded = response
+                .upgrade()
+                .await
+                .map_err(|error| CloudError::network(error_chain(&error)))?;
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(MAX_SOCKET_MESSAGE_BYTES))
+                .max_frame_size(Some(MAX_SOCKET_MESSAGE_BYTES));
+            let socket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+                upgraded,
+                Role::Client,
+                Some(config),
+            )
+            .await;
+            return Ok(Some(socket));
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            return Ok(None);
+        }
+        // 2xx / 3xx 是中间层吞掉了 Upgrade，正文可能是任意（甚至无限）内容，不读取。
+        if status.is_success() || status.is_redirection() {
+            return Err(websocket_unsupported(
+                status,
+                "WebSocket upgrade was answered without switching protocols",
+            ));
+        }
+        let mut error = response_error(response).await;
+        if handshake_means_unsupported(status, error.code.as_deref()) {
+            error.code = Some(WEBSOCKET_UNSUPPORTED.to_owned());
+            error.retryable = false;
+        }
+        Err(error)
+    }
+
     pub(crate) fn session_changes(&self) -> watch::Receiver<u64> {
         self.session_generation.subscribe()
     }
@@ -715,6 +871,18 @@ impl CloudClient {
         body: Option<Value>,
         bearer: Option<&str>,
     ) -> Result<reqwest::Response, CloudError> {
+        self.send_request(method, path, body, bearer, None).await
+    }
+
+    /// `send_once` 加可选 `If-None-Match`（条件 GET，如 `/share/config` 的 ETag 缓存）。
+    async fn send_request(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        bearer: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<reqwest::Response, CloudError> {
         let (device_id, device_name, platform) = self.device_identity().await;
         let client = self
             .http
@@ -730,6 +898,9 @@ impl CloudClient {
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }
+        if let Some(etag) = if_none_match {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -740,6 +911,48 @@ impl CloudClient {
             .map_err(|error| CloudError::network(error_chain(&error)))?;
         self.observe_server_clock(&response, sent_at, unix_ms());
         Ok(response)
+    }
+
+    /// 带调用方自备 Bearer（FluxMesh游客会话令牌）的调用：令牌不属于账号会话，不做刷新重放。
+    pub(crate) async fn with_bearer<P: Serialize, R: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&P>,
+        token: &str,
+    ) -> Result<R, CloudError> {
+        let body = body
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| CloudError::invalid(error.to_string()))?;
+        let response = self.send_once(method, path, body, Some(token)).await?;
+        decode(response).await
+    }
+
+    /// 公开 GET + 条件请求：`304` → `Ok(None)`；`200` → 正文与新的 `ETag`。
+    pub(crate) async fn public_conditional<R: DeserializeOwned>(
+        &self,
+        path: &str,
+        etag: Option<&str>,
+    ) -> Result<Option<(R, Option<String>)>, CloudError> {
+        let response = self
+            .send_request(Method::GET, path, None, None, etag)
+            .await?;
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(None);
+        }
+        let new_etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = decode(response).await?;
+        Ok(Some((body, new_etag)))
+    }
+
+    /// 是否持有登录凭据（FluxMesh据此在账号鉴权与游客鉴权之间选择）。
+    pub(crate) async fn has_account(&self) -> bool {
+        self.is_authenticated().await
     }
 }
 
@@ -809,6 +1022,27 @@ fn revocation_reason(error: &CloudError) -> ErrorReason {
     }
 }
 
+/// WebSocket 握手响应是否说明「这条链路不支持 WebSocket」（只看响应，不看网络错误）：
+/// 404 / 405 / 426 / 501，或 400 / 403 且正文不是 FluxCloud `{code}` JSON（`code` 缺失：
+/// 中间层 / WAF 拦截 Upgrade）。FluxCloud 自己的 403（如 `online_device_limit`）带 `code`，不回退。
+/// 2xx / 3xx / 101 校验失败由调用方直接判定。
+fn handshake_means_unsupported(status: StatusCode, error_code: Option<&str>) -> bool {
+    matches!(status.as_u16(), 404 | 405 | 426 | 501)
+        || (matches!(status, StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN)
+            && error_code.is_none())
+}
+
+fn websocket_unsupported(status: StatusCode, message: &str) -> CloudError {
+    CloudError {
+        status: Some(status.as_u16()),
+        code: Some(WEBSOCKET_UNSUPPORTED.to_owned()),
+        message: message.to_owned(),
+        retryable: false,
+        unreachable: false,
+        details: None,
+    }
+}
+
 async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response, CloudError> {
     if response.status().is_success() {
         Ok(response)
@@ -843,6 +1077,7 @@ fn error_from_body(status: u16, retryable: bool, body: &[u8]) -> CloudError {
             code: parsed.code,
             retryable,
             unreachable: false,
+            details: parsed.details.map(Box::new),
         },
         _ => {
             let text = String::from_utf8_lossy(body);
@@ -858,6 +1093,7 @@ fn error_from_body(status: u16, retryable: bool, body: &[u8]) -> CloudError {
                 },
                 retryable,
                 unreachable: false,
+                details: None,
             }
         }
     }
@@ -937,9 +1173,21 @@ pub struct CloudError {
     pub retryable: bool,
     /// 网络 / TLS / DNS / 超时：请求没能到达云端或响应没能读完。
     pub unreachable: bool,
+    /// 云端错误体里的 `details`（如 `swarm_quota_exhausted` 的 `retryAfterSecs`）。
+    pub details: Option<Box<serde_json::Value>>,
 }
 
 impl CloudError {
+    /// 握手被判定为「不支持 WebSocket」：调用方据此粘性回退 SSE。
+    pub(crate) fn is_websocket_unsupported(&self) -> bool {
+        self.code.as_deref() == Some(WEBSOCKET_UNSUPPORTED)
+    }
+
+    /// 握手等响应头超时（TCP 已通但没有响应）：调用方连续多次后视为通道不可用。
+    pub(crate) fn is_websocket_handshake_timeout(&self) -> bool {
+        self.code.as_deref() == Some(WEBSOCKET_HANDSHAKE_TIMEOUT)
+    }
+
     pub(crate) fn unauthorized() -> Self {
         Self {
             status: Some(401),
@@ -947,6 +1195,7 @@ impl CloudError {
             message: "authentication required".to_owned(),
             retryable: false,
             unreachable: false,
+            details: None,
         }
     }
 
@@ -957,6 +1206,7 @@ impl CloudError {
             message: "FluxCloud endpoint is fixed in release builds".to_owned(),
             retryable: false,
             unreachable: false,
+            details: None,
         }
     }
 
@@ -968,6 +1218,7 @@ impl CloudError {
             message,
             retryable: true,
             unreachable: true,
+            details: None,
         }
     }
 
@@ -979,6 +1230,7 @@ impl CloudError {
             message,
             retryable: false,
             unreachable: false,
+            details: None,
         }
     }
 
@@ -993,6 +1245,7 @@ impl CloudError {
             message,
             retryable: false,
             unreachable: false,
+            details: None,
         }
     }
 
@@ -1035,6 +1288,7 @@ impl CloudError {
             Some("plan_already_owned") => Some(ErrorReason::PlanAlreadyOwned),
             Some("not_an_upgrade") => Some(ErrorReason::PlanNotUpgrade),
             Some("plan_tier_not_higher") => Some(ErrorReason::PlanTierNotHigher),
+            Some("subscription_conflict") => Some(ErrorReason::SubscriptionConflict),
             Some("referral_code_invalid") => Some(ErrorReason::ReferralCodeInvalid),
             Some("referral_self_use") => Some(ErrorReason::ReferralSelfUse),
             Some("referral_already_used") => Some(ErrorReason::ReferralAlreadyUsed),
@@ -1083,6 +1337,7 @@ impl CloudError {
                 | ErrorReason::PlanAlreadyOwned
                 | ErrorReason::PlanNotUpgrade
                 | ErrorReason::PlanTierNotHigher
+                | ErrorReason::SubscriptionConflict
                 | ErrorReason::ReferralCodeTaken,
             ) => (ApplicationErrorCode::Conflict, false),
             Some(
@@ -1132,7 +1387,9 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::sync::Mutex;
 
-    use super::CloudClient;
+    use fluxdown_protocol::ErrorReason;
+
+    use super::{CloudClient, CloudError, CloudSocket, handshake_means_unsupported};
     use crate::state::{AgentState, CloudCredentials, StateStore};
 
     #[derive(Clone)]
@@ -2127,6 +2384,7 @@ mod tests {
             message: String::new(),
             retryable: status == 429,
             unreachable: false,
+            details: None,
         };
         let cases = [
             (
@@ -2184,6 +2442,7 @@ mod tests {
             message: String::new(),
             retryable: false,
             unreachable: false,
+            details: None,
         };
         let cases = [
             (
@@ -2220,6 +2479,12 @@ mod tests {
                 422,
                 "plan_tier_not_higher",
                 ErrorReason::PlanTierNotHigher,
+                ApplicationErrorCode::Conflict,
+            ),
+            (
+                409,
+                "subscription_conflict",
+                ErrorReason::SubscriptionConflict,
                 ApplicationErrorCode::Conflict,
             ),
             (
@@ -2323,5 +2588,152 @@ mod tests {
         if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
             tracing::warn!(path = %dir.display(), error = %error, "could not remove clock test directory");
         }
+    }
+
+    #[test]
+    fn websocket_handshake_classification_only_trusts_the_response() {
+        for status in [404_u16, 405, 426, 501] {
+            let status = StatusCode::from_u16(status).expect("status");
+            assert!(handshake_means_unsupported(status, None), "{status}");
+        }
+        // 400：只有正文不是 FluxCloud `{code}` JSON 才算中间层问题。
+        assert!(handshake_means_unsupported(StatusCode::BAD_REQUEST, None));
+        assert!(!handshake_means_unsupported(
+            StatusCode::BAD_REQUEST,
+            Some("invalid_argument")
+        ));
+        assert!(handshake_means_unsupported(StatusCode::FORBIDDEN, None));
+        assert!(!handshake_means_unsupported(
+            StatusCode::FORBIDDEN,
+            Some("online_device_limit")
+        ));
+        for status in [429_u16, 500, 502, 503] {
+            let status = StatusCode::from_u16(status).expect("status");
+            assert!(!handshake_means_unsupported(status, None), "{status}");
+        }
+    }
+
+    /// 对任何连接读完请求头后原样回写 `response` 的最小 HTTP/1.1 服务器。
+    async fn spawn_raw_http(response: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind raw mock");
+        let address = listener.local_addr().expect("raw mock address");
+        let response: Arc<str> = Arc::from(response);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let response = response.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    if let Err(error) = stream.write_all(response.as_bytes()).await {
+                        tracing::debug!(%error, "raw mock write failed");
+                    }
+                    // 保持连接直到客户端关闭，避免过早 EOF 干扰断言。
+                    let closed = stream.read(&mut chunk).await;
+                    tracing::debug!(?closed, "raw mock connection closed");
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    async fn socket_attempt(response: &str) -> Result<CloudSocket, CloudError> {
+        let base = spawn_raw_http(response).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_cloud_ws_test_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(StateStore::open(dir.clone()).await.expect("state store"));
+        let state = Arc::new(Mutex::new(AgentState {
+            device_id: "device1".to_owned(),
+            credentials: Some(CloudCredentials {
+                access_token: "access".to_owned(),
+                refresh_token: "refresh".to_owned(),
+                expires_at_unix: i64::MAX,
+                session: None,
+            }),
+            ..AgentState::default()
+        }));
+        let client = CloudClient::new(base, state, store).expect("cloud client");
+        let result = client
+            .authenticated_socket_epoch("/api/v1/tasks/ws?deviceId=device1", client.request_epoch())
+            .await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "could not remove ws test directory");
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_failures_are_classified_from_the_response() {
+        // 中间层吞掉 Upgrade：200 / 3xx 以外的成功类。
+        let swallowed = socket_attempt("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .expect_err("200 is not an upgrade");
+        assert!(swallowed.is_websocket_unsupported());
+        assert_eq!(swallowed.status, Some(200));
+        // 101 但 Accept 不匹配。
+        let bad_accept = socket_attempt(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: bogus\r\n\r\n",
+        )
+        .await
+        .expect_err("mismatched accept key");
+        assert!(bad_accept.is_websocket_unsupported());
+        assert_eq!(bad_accept.status, Some(101));
+        // 缺路由。
+        let missing = socket_attempt("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect_err("404");
+        assert!(missing.is_websocket_unsupported());
+        assert_eq!(missing.status, Some(404));
+        // 非 FluxCloud 的 400。
+        let proxy_400 =
+            socket_attempt("HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nbad gateway")
+                .await
+                .expect_err("plain 400");
+        assert!(proxy_400.is_websocket_unsupported());
+        // 非 FluxCloud 的 403（WAF / 中间层）同样视为不支持。
+        let proxy_403 =
+            socket_attempt("HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nforbidden")
+                .await
+                .expect_err("plain 403");
+        assert!(proxy_403.is_websocket_unsupported());
+        // 3xx 不跟随（`redirect(none)`），按中间层吞掉 Upgrade 归为不支持。
+        let redirect = socket_attempt(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/elsewhere\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .expect_err("302 is not an upgrade");
+        assert!(redirect.is_websocket_unsupported());
+        assert_eq!(redirect.status, Some(302));
+        // FluxCloud 的业务错误不回退。
+        let body = r#"{"code":"online_device_limit","message":"full"}"#;
+        let limited = socket_attempt(&format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .await
+        .expect_err("403");
+        assert!(!limited.is_websocket_unsupported());
+        assert_eq!(limited.code.as_deref(), Some("online_device_limit"));
+        assert_eq!(limited.reason(), Some(ErrorReason::OnlineDeviceLimit));
+        // 5xx 同样不回退。
+        let gateway = socket_attempt("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .expect_err("502");
+        assert!(!gateway.is_websocket_unsupported());
+        assert!(gateway.retryable);
     }
 }

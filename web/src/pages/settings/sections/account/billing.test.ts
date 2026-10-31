@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import type { CloudPlan } from '../../../../lib/rpc'
 import {
+  cardPlans,
+  lifetimePlans,
   localDate,
   campaignProgress,
   effectivePriceMinor,
@@ -8,6 +10,7 @@ import {
   formatMinor,
   normalizeReferralCode,
   ownedPriceMinor,
+  packPlans,
   pageCount,
   payableMinor,
   planCardState,
@@ -195,5 +198,38 @@ describe('其它', () => {
     expect(pageCount(0, 20)).toBe(1)
     expect(pageCount(20, 20)).toBe(1)
     expect(pageCount(21, 20)).toBe(2)
+  })
+})
+
+describe('pack plans', () => {
+  const pack = (code: string, sort: number) => plan(code, 500, { productKind: 'pack', sort, pack: { kind: 'swarm', bytes: 1, validDays: 30 } })
+  test('purchasablePlans excludes packs, packPlans only packs sorted', () => {
+    const catalog = [pack('p2', 2), plan('pro', 1000), pack('p1', 1), pack('off', 0)].map((p) => (p.code === 'off' ? { ...p, purchasable: false } : p))
+    expect(purchasablePlans(catalog).map((p) => p.code)).toEqual(['pro'])
+    expect(packPlans(catalog).map((p) => p.code)).toEqual(['p1', 'p2'])
+  })
+  test('packs are always available regardless of tier or credit', () => {
+    expect(planCardState(pack('p', 1), 'p', 99999, 99999)).toBe('available')
+  })
+})
+
+describe('subscription cards', () => {
+  const card = (code: string, sort: number) => plan(code, 1000, { sort, billingPeriodDays: 30 })
+  const sub = { planCode: 'c1', planName: 'c1', startsAt: '2026-01-01T00:00:00Z', endsAt: '2026-02-01T00:00:00Z' }
+  test('same card renews, other cards blocked while active', () => {
+    expect(planCardState(card('c1', 5), 'free', 0, 0, sub, 0)).toBe('renewable')
+    expect(planCardState(card('c2', 9), 'free', 0, 0, sub, 0)).toBe('tierBlocked')
+  })
+  test('without active card, sort must exceed base plan sort', () => {
+    expect(planCardState(card('c1', 2), 'pro', 3000, 0, null, 2)).toBe('tierBlocked')
+    expect(planCardState(card('c1', 3), 'pro', 3000, 0, null, 2)).toBe('available')
+  })
+  test('cards never take credit and split from lifetime plans', () => {
+    const c = card('c1', 5)
+    expect(priceDisplay(c, 'available', 500).creditApplied).toBe(false)
+    expect(planCardState(c, 'pro', 3000, 3000)).toBe('available')
+    const list = purchasablePlans([c, plan('pro', 3000, { sort: 2 })])
+    expect(cardPlans(list).map((p) => p.code)).toEqual(['c1'])
+    expect(lifetimePlans(list).map((p) => p.code)).toEqual(['pro'])
   })
 })

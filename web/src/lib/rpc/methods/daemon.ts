@@ -5,6 +5,18 @@ import { call } from '../client';
 import { normalizeTask } from '../normalize';
 import { METHOD } from '../protocol';
 import type {
+  BtGuardEntriesAddParams,
+  BtGuardEntriesListDto,
+  BtGuardEntriesListParams,
+  BtGuardEntriesRemoveDto,
+  BtGuardEntriesRemoveParams,
+  BtGuardEntryDto,
+  BtGuardEventsListDto,
+  BtGuardEventsListParams,
+  BtGuardExportDto,
+  BtGuardExportParams,
+  BtGuardFilterSourcesRefreshDto,
+  BtGuardStateDto,
   ComponentInstallParams,
   ComponentParams,
   ComponentStatusDto,
@@ -13,6 +25,7 @@ import type {
   CreateGroupRequest,
   CreateGroupResponse,
   CreatedTask,
+  SeedLocalResult,
   DaemonConfigPatch,
   DaemonConfigSnapshot,
   DaemonCreateTasksParams,
@@ -57,6 +70,8 @@ import type {
   LinkProbeParams,
   LinkProbeResult,
   PrepareLogExportResult,
+  ProxyRouteRequest,
+  ProxyRouteResponse,
   ProxyTestRequest,
   ProxyTestResponse,
   QueueDto,
@@ -79,6 +94,7 @@ import type {
   SelectionResolutionDto,
   SetSeedLimitsParams,
   TaskVerifyResult,
+  TorrentShareDto,
   SiteAuthCredentialDto,
   SiteAuthDeleteParams,
   SiteAuthEntryDto,
@@ -90,11 +106,14 @@ import type {
   TaskActivityQuery,
   TaskSpeedHistoryDto,
   TaskSpeedHistoryQuery,
+  BtStatusDto,
   TaskDeleteManyParams,
   TaskDeleteParams,
   TaskChangeUrlParams,
   TaskSetSegmentsParams,
   TaskDtoWire,
+  DaemonSeedLocalParams,
+  DaemonTorrentShareParams,
   TaskIdParams,
   TaskIdsParams,
   TaskRenameParams,
@@ -120,6 +139,7 @@ const task = {
     call<TaskActivityPage>(METHOD.DAEMON_TASK_ACTIVITY, params),
   speedHistory: (params: TaskSpeedHistoryQuery) =>
     call<TaskSpeedHistoryDto | null>(METHOD.DAEMON_TASK_SPEED_HISTORY, params),
+  btStatus: (params: TaskIdParams) => call<BtStatusDto>(METHOD.DAEMON_TASK_BT_STATUS, params),
   create: (params: DaemonCreateTaskParams) => call<CreatedTask>(METHOD.DAEMON_TASK_CREATE, params),
   /** 批量建任务：一块（≤512 条）共享同一份选项，整块一个事务，按 `batchId` 幂等。 */
   createMany: (params: DaemonCreateTasksParams) =>
@@ -139,6 +159,12 @@ const task = {
   rescan: () => call<OkResult>(METHOD.DAEMON_TASK_RESCAN),
   setSeedLimits: (params: SetSeedLimitsParams) =>
     call<OkResult>(METHOD.DAEMON_TASK_SET_SEED_LIMITS, params),
+  /** 本机做种：生成种子并哈希校验全部数据，耗时与数据量成正比；使用 6 小时超时，创建类提交不重试。 */
+  seedLocal: (params: DaemonSeedLocalParams) =>
+    call<SeedLocalResult>(METHOD.DAEMON_TASK_SEED_LOCAL, params, { timeoutMs: VERIFY_TIMEOUT_MS }),
+  /** BT 任务的磁力链接（含 tracker）与可选 .torrent 字节（base64）。 */
+  torrentShare: (params: DaemonTorrentShareParams) =>
+    call<TorrentShareDto>(METHOD.DAEMON_TASK_TORRENT_SHARE, params),
   /** BT 完整性校验：耗时与数据量成正比，使用 6 小时超时。 */
   verify: (params: TaskIdParams) =>
     call<TaskVerifyResult>(METHOD.DAEMON_TASK_VERIFY, params, { timeoutMs: VERIFY_TIMEOUT_MS }),
@@ -189,6 +215,8 @@ const config = {
     call<DaemonConfigSnapshot>(METHOD.DAEMON_CONFIG_PATCH, params),
   proxyTest: (params: ProxyTestRequest) =>
     call<ProxyTestResponse>(METHOD.DAEMON_CONFIG_PROXY_TEST, params),
+  proxyRoute: (params: ProxyRouteRequest) =>
+    call<ProxyRouteResponse>(METHOD.DAEMON_CONFIG_PROXY_ROUTE, params),
   connPolicy: () => call<ConnPolicySummaryDto>(METHOD.DAEMON_CONFIG_CONN_POLICY),
   clearConnPolicy: () => call<ConnPolicySummaryDto>(METHOD.DAEMON_CONFIG_CLEAR_CONN_POLICY),
   systemProxy: () => call<SystemProxyDto>(METHOD.DAEMON_CONFIG_SYSTEM_PROXY),
@@ -332,6 +360,22 @@ const bt = {
   trackerSubscription: {
     refresh: () =>
       call<TrackerSubRefreshResponse>(METHOD.DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
+  },
+  /** 防吸血。`cloud.apply` / `evidence.drain` 是 agent 内部方法，这里刻意不封装。 */
+  guard: {
+    state: () => call<BtGuardStateDto>(METHOD.DAEMON_BT_GUARD_STATE),
+    entries: {
+      list: (params: BtGuardEntriesListParams) => call<BtGuardEntriesListDto>(METHOD.DAEMON_BT_GUARD_ENTRIES_LIST, params),
+      add: (params: BtGuardEntriesAddParams) => call<BtGuardEntryDto>(METHOD.DAEMON_BT_GUARD_ENTRIES_ADD, params),
+      remove: (params: BtGuardEntriesRemoveParams) => call<BtGuardEntriesRemoveDto>(METHOD.DAEMON_BT_GUARD_ENTRIES_REMOVE, params),
+    },
+    events: {
+      list: (params: BtGuardEventsListParams) => call<BtGuardEventsListDto>(METHOD.DAEMON_BT_GUARD_EVENTS_LIST, params),
+    },
+    export: (params: BtGuardExportParams) => call<BtGuardExportDto>(METHOD.DAEMON_BT_GUARD_EXPORT, params),
+    /** 立即抓取全部过滤文件订阅（逐个 HTTP 拉取，可能较慢）。 */
+    filterSourcesRefresh: () =>
+      call<BtGuardFilterSourcesRefreshDto>(METHOD.DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
   },
 };
 

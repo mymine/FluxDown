@@ -9,6 +9,7 @@ const zhTW = {
   "header.languageSwitch": "切換至 {language}",
   "header.checking": "偵測中...",
   "header.connected": "已連線",
+  "header.androidHandoff": "交給 FluxDown App",
   "header.disconnected": "未連線",
 
   // Main switch
@@ -147,6 +148,8 @@ const zhTW = {
   "notify.batchSentDetail": "{count} 個任務已傳送到 FluxDown",
   "notify.sendFailed": "傳送失敗",
   "notify.connectionFailed": "無法連線至 FluxDown 應用程式：{message}",
+  "notify.androidUnsupported": "此下載無法交給 FluxDown Android 應用程式（影音分軌、表單提交與 FTP 連結需要桌面或遠端通道）",
+  "notify.androidHandoffFailed": "瀏覽器拒絕啟動 FluxDown Android 應用程式",
   "notify.fallbackBrowser": "已改用瀏覽器下載",
   "notify.fallbackBrowserDetail":
     "無法傳送到 FluxDown，已交由瀏覽器繼續下載：{url}",
@@ -285,6 +288,8 @@ const zhTW = {
   // 彈窗 / 側邊欄
   "popup.viewAll": "在側邊欄查看全部（{count}）",
   "popup.sidePanel": "側邊欄",
+  "popup.bypassHint": "{key}+點擊略過接管",
+  "popup.bypassHintTip": "按住 {key} 點擊連結，本次下載交給瀏覽器而不是 FluxDown（磁力連結交給系統預設程式）；網頁以腳本觸發下載的按鈕同樣有效。可在「設定 → 下載攔截」更換按鍵。",
   "sidepanel.tab.resources": "資源",
   "sidepanel.tab.links": "連結",
   "sidepanel.tab.tasks": "任務",
@@ -315,6 +320,19 @@ const zhTW = {
   "sidepanel.diag.unnamed": "（未命名）",
   "sidepanel.diag.exportLog": "匯出資源除錯日誌",
   "sidepanel.diag.exportConn": "匯出連線診斷",
+  "sidepanel.diag.errorLog": "擴充功能錯誤",
+  "sidepanel.diag.errorLogEmpty": "尚無錯誤記錄",
+  "sidepanel.diag.errorLogClear": "清除",
+  "sidepanel.diag.errorLogCleared": "錯誤記錄已清除",
+  "sidepanel.diag.errorLogClearFailed": "清除錯誤記錄失敗",
+  "sidepanel.diag.errorLogHint": "擴充功能各處的錯誤都記在這裡，保留 7 天（最近 100 筆），匯出連線診斷時一併附上",
+  "sidepanel.diag.errorLevel.error": "錯誤",
+  "sidepanel.diag.errorLevel.warn": "警告",
+  "sidepanel.diag.errorSource.background": "背景",
+  "sidepanel.diag.errorSource.popup": "彈出視窗",
+  "sidepanel.diag.errorSource.options": "設定頁",
+  "sidepanel.diag.errorSource.sidepanel": "側邊欄",
+  "sidepanel.diag.errorSource.content": "網頁",
 
   // Options 迁移项补充说明
   "options.general.statsDesc": "重置彈出視窗中顯示的已下載/失敗計數",
@@ -324,7 +342,7 @@ const zhTW = {
   "options.protocol.label": "FluxDown 自訂通訊協定",
   "options.protocol.enabled": "已啟用，透過 fluxdown:// 啟動應用程式",
   "options.protocol.disabled": "關閉（預設）",
-  "options.protocol.desc": "透過 fluxdown:// 通訊協定啟動應用程式進行下載，Windows / macOS / Linux / Android 均支援。本機通道的功能較完整，建議僅在無法使用本機通道時開啟",
+  "options.protocol.desc": "透過 fluxdown:// 通訊協定啟動應用程式進行下載，Windows / macOS / Linux 均支援（Android 版瀏覽器會自動把下載交給 FluxDown 應用程式，無需開啟）。本機通道的功能較完整，建議僅在無法使用本機通道時開啟",
 
   // 任务完成通知（任务面板）
   "notify.taskCompletedTitle": "下載完成",
@@ -501,6 +519,10 @@ const zhTW = {
   "options.intercept.localDownloadHint": "網頁本機產生的 blob:/data: 檔案不支援接管，將由瀏覽器下載",
   "options.intercept.magnet": "接管磁力連結",
   "options.intercept.magnetHint": "關閉後點擊磁力連結會交給系統預設程式（如 qBittorrent）",
+  "options.intercept.bypassKey": "略過接管按鍵",
+  "options.intercept.bypassKeyDesc": "按住此鍵點擊連結，本次下載交給瀏覽器（磁力連結交給系統預設程式）",
+  "options.intercept.bypassKeyAlt": "Alt（Mac 為 Option）",
+  "options.intercept.bypassKeyOff": "關閉",
   "options.intercept.minSize": "最小檔案大小",
   "options.intercept.sizeNoLimit": "不限",
   "options.intercept.fallbackReject": "桌面端拒絕時回退瀏覽器下載",
@@ -531,6 +553,8 @@ const zhTW = {
   "options.sniff.imagesDesc": "偵測網頁中的大型圖片資源（>100KB）",
   "options.sniff.lowConfidence": "顯示低可信度資源",
   "options.sniff.lowConfidenceDesc": "在資源清單中同時顯示判斷把握較低的項目",
+  "options.sniff.maxResources": "單頁嗅探上限",
+  "options.sniff.maxResourcesDesc": "頁面連結掃描到這麼多筆後停止（1–{max}）。數值過大時長清單頁可能變慢；網路請求中嗅探到的媒體不計入。",
   "options.sites.desc": "為單一站點覆寫全域行為：是否接管下載、是否嗅探、懸浮球與浮鈕，以及儲存目錄。站點設定對其子網域同樣生效。",
   "options.sites.colHost": "站點",
   "options.sites.colIntercept": "接管",

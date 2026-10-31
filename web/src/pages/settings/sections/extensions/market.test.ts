@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { MarketEntryDto, PluginDto } from '../../../../lib/rpc/protocol'
-import { installedVersionYanked, latestPerPlugin, marketAction, permissionsToConfirm, versionNewer } from './logic'
+import { MARKET_MAX_AGE_MS, installedVersionYanked, latestPerPlugin, marketAction, marketNeedsLoad, permissionsToConfirm, versionNewer } from './logic'
 
 function entry(pluginId: string, version: string, sequence: number, yanked = 'none', permissions: string[] = []): MarketEntryDto {
   return { pluginId, version, sequence, yanked, permissions, name: pluginId, tags: [] } as unknown as MarketEntryDto
@@ -51,5 +51,15 @@ describe('market logic', () => {
     expect(installedVersionYanked(entries, plugin('a', '1.0.0'))).toBe('vulnerable')
     expect(installedVersionYanked(entries, plugin('a', '1.0.0', true))).toBeNull()
     expect(installedVersionYanked(entries, plugin('b', '1.0.0'))).toBeNull()
+  })
+
+  test('marketNeedsLoad：从未请求 / 断连重试 / 过期才加载，失败态不自动重试', () => {
+    const loaded = { requested: true, retryOnReconnect: false, failed: false, loadedAt: 1_000 }
+    expect(marketNeedsLoad({ requested: false, retryOnReconnect: false, failed: false, loadedAt: null }, 1_000)).toBe(true)
+    expect(marketNeedsLoad({ ...loaded, retryOnReconnect: true, failed: true }, 1_000)).toBe(true)
+    expect(marketNeedsLoad(loaded, 1_000 + MARKET_MAX_AGE_MS - 1)).toBe(false)
+    expect(marketNeedsLoad(loaded, 1_000 + MARKET_MAX_AGE_MS)).toBe(true)
+    expect(marketNeedsLoad({ ...loaded, failed: true }, 1_000 + MARKET_MAX_AGE_MS)).toBe(false)
+    expect(marketNeedsLoad({ ...loaded, loadedAt: null, failed: true }, 5_000)).toBe(false)
   })
 })

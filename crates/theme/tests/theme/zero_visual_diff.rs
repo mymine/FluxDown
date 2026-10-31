@@ -213,9 +213,13 @@ fn legacy_tokens(id: BuiltinThemeId, accent: Hsla, scale: f32) -> SemanticThemeT
     tokens
 }
 
+/// 旧版运行时只有调色板预设；石墨等带整套形状 / 密度的预设不在对比范围内。
 #[test]
 fn builtin_runtime_tokens_equal_legacy_for_every_preset_accent_and_scale() {
-    for id in BuiltinThemeId::ALL {
+    for id in BuiltinThemeId::ALL
+        .into_iter()
+        .filter(|id| !matches!(id, BuiltinThemeId::Graphite | BuiltinThemeId::GraphiteLight))
+    {
         for scheme in AccentScheme::ALL {
             let accent = scheme.color(0xFFFA_FAFA);
             for scale in [0.8, 1., 1.5] {

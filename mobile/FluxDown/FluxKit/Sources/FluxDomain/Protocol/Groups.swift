@@ -100,15 +100,18 @@ public struct ResolvePreviewResponse: Codable, Sendable, Hashable {
     public var sourceUrl: String
     public var error: String
     public var items: [PreviewItemDto]
+    /// 产出清单的插件 id；无清单时为空。建组时回填 `CreateGroupRequest.resolverPluginId`。
+    public var pluginId: String
 
-    public init(name: String = "", sourceUrl: String = "", error: String = "", items: [PreviewItemDto] = []) {
+    public init(name: String = "", sourceUrl: String = "", error: String = "", items: [PreviewItemDto] = [], pluginId: String = "") {
         self.name = name
         self.sourceUrl = sourceUrl
         self.error = error
         self.items = items
+        self.pluginId = pluginId
     }
 
-    private enum CodingKeys: String, CodingKey { case name, sourceUrl, error, items }
+    private enum CodingKeys: String, CodingKey { case name, sourceUrl, error, items, pluginId }
 
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -116,6 +119,7 @@ public struct ResolvePreviewResponse: Codable, Sendable, Hashable {
         sourceUrl = try c.decodeIfPresent(String.self, forKey: .sourceUrl) ?? ""
         error = try c.decodeIfPresent(String.self, forKey: .error) ?? ""
         items = try c.decodeIfPresent([PreviewItemDto].self, forKey: .items) ?? []
+        pluginId = try c.decodeIfPresent(String.self, forKey: .pluginId) ?? ""
     }
 
     /// 命中清单：无错误且有条目。
@@ -153,6 +157,8 @@ public struct CreateGroupRequest: Codable, Sendable, Hashable {
     public var ignoreTlsErrors: Bool
     public var startPaused: Bool
     public var items: [GroupItemRequest]
+    /// 预览清单的产出插件（`ResolvePreviewResponse.pluginId`）；空 = 引擎按预览同规则自选。
+    public var resolverPluginId: String
 
     public init(
         sourceUrl: String = "",
@@ -167,7 +173,8 @@ public struct CreateGroupRequest: Codable, Sendable, Hashable {
         extraHeaders: [String: String] = [:],
         ignoreTlsErrors: Bool = false,
         startPaused: Bool = false,
-        items: [GroupItemRequest]
+        items: [GroupItemRequest],
+        resolverPluginId: String = ""
     ) {
         self.sourceUrl = sourceUrl
         self.groupName = groupName
@@ -182,6 +189,7 @@ public struct CreateGroupRequest: Codable, Sendable, Hashable {
         self.ignoreTlsErrors = ignoreTlsErrors
         self.startPaused = startPaused
         self.items = items
+        self.resolverPluginId = resolverPluginId
     }
 }
 

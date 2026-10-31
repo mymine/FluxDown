@@ -5,7 +5,7 @@ import { LATER_QUEUE_ID, MAIN_QUEUE_ID, RpcError, errorMessage } from '../../../
 import type { QueueDto } from '../../../lib/rpc'
 import type { TFunction } from '../../../i18n'
 
-const UNITS = ['B', 'KB', 'MB', 'GB', 'TB'] as const
+const UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'] as const
 
 /** 字节数 → `1.5 MB`；0 或负值显示 `0 B`。 */
 export function formatBytes(bytes: number): string {

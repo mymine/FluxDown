@@ -11,7 +11,7 @@ use gpui::{
 use gpui_component::{Icon, TitleBar, h_flex, menu::AppMenuBar, v_flex};
 use serde_json::Value;
 
-use crate::assets::APP_LOGO_PATH;
+use crate::assets::app_logo_source;
 use crate::chrome::{ACTIVITY_BUTTON_SIZE, LayoutChangeHandler, ShellChrome, ShellWidget};
 use crate::window_controls::FixedSizeTitleBar;
 use crate::{ChromeFamilies, ChromeItemSpec, ChromeLayout, ChromeZone};
@@ -403,6 +403,9 @@ impl ShellView {
     ) -> Self {
         let active_route = routes.first().map(|route| route.id.clone());
         cx.observe(&translator, |_, _, cx| cx.notify()).detach();
+        // 标题栏 logo 可在运行期更换（应用图标设置）；retained 渲染必须显式通知。
+        cx.observe_global::<crate::assets::AppLogo>(|_, cx| cx.notify())
+            .detach();
         for route in &routes {
             Self::observe_sidebar(route, cx);
         }
@@ -437,6 +440,11 @@ impl ShellView {
         self.active_route = Some(route.clone());
         self.activate(&route, cx);
         cx.notify();
+    }
+
+    /// 当前激活的路由。
+    pub fn active_route(&self) -> Option<&RouteId> {
+        self.active_route.as_ref()
     }
 
     /// 路由被激活：经 `cx.defer` 调用其 `on_activate`（避免重入 shell）；窗口句柄在首帧渲染时补记。
@@ -566,7 +574,7 @@ impl ShellView {
                 .flex_none()
                 .items_center()
                 .gap(spacing.sm)
-                .child(img(APP_LOGO_PATH).size(px(16.)))
+                .child(img(app_logo_source(cx)).size(px(16.)))
                 .children(self.menu_bar.clone().map(|menu_bar| {
                     h_flex()
                         .h_full()

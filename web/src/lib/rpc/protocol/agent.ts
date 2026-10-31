@@ -4,6 +4,7 @@
 import type { JsonValue } from './common';
 import type { ErrorReason } from './error';
 import type { CreateGroupRequest } from './queue';
+import type { ShareTrafficKind } from './share';
 import type { CreateTaskRequest } from './task';
 
 // ── 账号 ──
@@ -55,6 +56,15 @@ export interface CloudPlanCampaign {
   effectivePriceMinor: number;
 }
 
+export type CloudProductKind = 'membership' | 'pack' | 'unknown';
+
+/** 流量包规格（`productKind = 'pack'`）。 */
+export interface CloudPack {
+  kind: ShareTrafficKind;
+  bytes: number;
+  validDays: number;
+}
+
 /** 套餐（`agent.plan.list` 元素）。金额单位为「分」（`*Minor`）。 */
 export interface CloudPlan {
   code: string;
@@ -75,6 +85,11 @@ export interface CloudPlan {
   sort: number;
   campaign: CloudPlanCampaign | null;
   purchasable: boolean;
+  /** 旧服务端缺失视为 `membership`。 */
+  productKind?: CloudProductKind;
+  pack?: CloudPack | null;
+  /** 周期会员卡周期天数；null / 缺失 = 永久套餐。 */
+  billingPeriodDays?: number | null;
 }
 
 /** 当前账户资料：用户字段平铺在顶层，与 `entitlements` / `currentPlan` 同级。 */
@@ -82,7 +97,16 @@ export type CloudProfile = CloudUser & {
   entitlements: Entitlements;
   currentPlan: CloudPlan | null;
   purchaseCreditMinor: number;
+  activeSubscription?: CloudSubscription | null;
 };
+
+/** 生效中的周期会员卡。 */
+export interface CloudSubscription {
+  planCode: string;
+  planName: string;
+  startsAt: string;
+  endsAt: string;
+}
 
 export interface OriginIdCheckResult {
   available: boolean;
@@ -157,6 +181,7 @@ export interface AgentSessionDto {
   user: CloudUser;
   entitlements: Entitlements;
   currentPlan: CloudPlan | null;
+  activeSubscription?: CloudSubscription | null;
   device: CloudDevice;
 }
 
@@ -472,10 +497,12 @@ export interface CustomCategoryDto {
   id: string;
   name: string;
   icon: string;
-  /** `extension` | `regex`。 */
+  /** `extension` | `regex` | `url`。 */
   matchMode: string;
   extensions: string[];
   regexPattern: string;
+  /** `url` 模式的通配符模式（`*` 任意串、`?` 单字符、不分大小写、完整匹配整个网址）。 */
+  urlPattern: string;
   position: number;
   visible: boolean;
   isBuiltin: boolean;
@@ -493,10 +520,12 @@ export interface CategoryRouteDto {
 
 /** `CategoryRouteDto.rules` 的单条普通分类。 */
 export interface CategoryRuleDto {
-  /** `extension` | `regex`。 */
+  /** `extension` | `regex` | `url`。 */
   matchMode: string;
   extensions?: string[];
   regexPattern?: string;
+  /** `url` 模式的通配符模式。 */
+  urlPattern?: string;
   /** 缺省 = 不改变落点，只阻止「其他」兜底。 */
   saveDir?: string;
 }

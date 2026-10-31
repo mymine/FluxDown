@@ -258,6 +258,72 @@ fn authenticated_shutdown_exits_cleanly_and_releases_the_data_dir() {
     std::fs::remove_dir_all(&data_dir).expect("remove daemon test data dir");
 }
 
+/// 站点代理规则写入前被严格校验（非法规则不落库，revision 不变），合法规则可被 proxyRoute 解释。
+#[test]
+fn proxy_rules_patch_is_validated() {
+    let address = reserve_loopback_address();
+    let data_dir = unique_temp_dir("fluxdown-daemon-proxy-rules-contract");
+    std::fs::create_dir_all(&data_dir).expect("create daemon test data dir");
+    std::fs::write(data_dir.join("daemon.token"), format!("{TOKEN}\n"))
+        .expect("write daemon test token");
+    let mut daemon = ProcessGuard::spawn(address, &data_dir);
+    wait_until_listening(address, Duration::from_secs(30));
+
+    let mut socket = open_websocket(address);
+    authenticate(&mut socket, TOKEN);
+    let hello = rpc_call(
+        &mut socket,
+        2,
+        method::SYSTEM_HELLO,
+        Some(hello_params("daemon")),
+    );
+    assert_eq!(hello["result"]["role"], json!("daemon"));
+    let config = rpc_call(&mut socket, 3, method::DAEMON_CONFIG_GET, None);
+    let revision = config["result"]["revision"]
+        .as_u64()
+        .expect("config revision");
+
+    let bad = r#"[{"id":"a","match":"regex","pattern":"(","action":"direct"}]"#;
+    let rejected = rpc_call(
+        &mut socket,
+        4,
+        method::DAEMON_CONFIG_PATCH,
+        Some(json!({"expectedRevision": revision, "values": {"proxy_rules": bad}})),
+    );
+    assert!(rejected.get("error").is_some(), "{rejected}");
+    assert_eq!(
+        rejected["error"]["data"]["code"],
+        json!("invalidArgument"),
+        "{rejected}"
+    );
+    let unchanged = rpc_call(&mut socket, 5, method::DAEMON_CONFIG_GET, None);
+    assert_eq!(unchanged["result"]["revision"], json!(revision));
+
+    let good = r#"[{"id":"a","match":"domain","pattern":"github.com","action":"direct"}]"#;
+    let patched = rpc_call(
+        &mut socket,
+        6,
+        method::DAEMON_CONFIG_PATCH,
+        Some(json!({"expectedRevision": revision, "values": {"proxy_rules": good}})),
+    );
+    assert_eq!(
+        patched["result"]["revision"],
+        json!(revision + 1),
+        "{patched}"
+    );
+    let routed = rpc_call(
+        &mut socket,
+        7,
+        method::DAEMON_CONFIG_PROXY_ROUTE,
+        Some(json!({"url": "https://x.github.com/a"})),
+    );
+    assert_eq!(routed["result"]["matched"]["index"], json!(0), "{routed}");
+
+    drop(socket);
+    daemon.terminate(Duration::from_secs(10));
+    std::fs::remove_dir_all(&data_dir).expect("remove daemon test data dir");
+}
+
 /// 运行中的 daemon 在数据目录发布实际监听地址，优雅退出后删除该文件。
 #[test]
 fn running_daemon_publishes_its_endpoint_and_removes_it_on_shutdown() {

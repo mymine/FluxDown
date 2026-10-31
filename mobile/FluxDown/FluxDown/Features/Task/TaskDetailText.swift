@@ -86,8 +86,15 @@ enum TaskDetailText {
         }
     }
 
-    /// Auto 代理链路 wire 标签 → 文案；未知值原样返回。
+    /// Auto 路由或站点规则 wire 标签 → 文案；未知值原样返回。
     static func routeLabel(_ route: String) -> String {
+        switch route {
+        case "rule:direct": return L("taskRouteRuleDirect")
+        case "rule:system": return L("taskRouteRuleSystem")
+        case "rule:manual": return L("taskRouteRuleManual")
+        case "rule:custom": return L("taskRouteRuleCustom")
+        default: break
+        }
         var base = route
         var via: String?
         if route.hasSuffix(":system") {

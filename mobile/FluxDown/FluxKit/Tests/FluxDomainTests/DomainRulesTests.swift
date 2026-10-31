@@ -22,6 +22,77 @@ struct DomainRulesTests {
         #expect(!index.matches(broken, "(["))
     }
 
+    @Test func urlRulesWinOverExtensionAndRegexRegardlessOfListPosition() {
+        let zip = TaskCategory(id: "zip", name: "zip", icon: "file", extensions: ["zip"], position: 1)
+        let regex = TaskCategory(id: "rx", name: "rx", icon: "file", extensions: [], regexPattern: "\\.iso$", position: 2)
+        let first = TaskCategory(id: "first", name: "first", icon: "file", extensions: [], urlPattern: "https://mirror.test/*", position: 3)
+        let second = TaskCategory(id: "second", name: "second", icon: "file", extensions: [], urlPattern: "https://mirror.test/iso/*", position: 4)
+        let other = TaskCategory.builtin.first { $0.isOther }!
+        let index = CategoryIndex([zip, regex, first, second, other])
+        #expect(index.categoryOf("a.zip", url: "https://mirror.test/a.zip")?.id == "first")
+        #expect(index.categoryOf("a.zip", url: "https://x.test/a.zip")?.id == "zip")
+        #expect(index.categoryOf("ubuntu.iso", url: "https://mirror.test/iso/ubuntu.iso")?.id == "first")
+        #expect(index.categoryOf("ubuntu.iso", url: "https://x.test/ubuntu.iso")?.id == "rx")
+        #expect(index.categoryOf("a.exe", url: "https://x.test/a.exe")?.isOther == true)
+        // 不带网址的老调用方式只看文件名规则。
+        #expect(index.categoryOf("a.zip")?.id == "zip")
+    }
+
+    @Test func wildcardIsAnchoredCaseInsensitiveAndLiteralOutsideStarAndQuestion() {
+        let site = TaskCategory(id: "site", name: "site", icon: "file", extensions: [], urlPattern: "HTTPS://Example.com/file?.zip", position: 1)
+        let dotted = TaskCategory(id: "dot", name: "dot", icon: "file", extensions: [], urlPattern: "https://a.test/v1.0/*", position: 2)
+        let other = TaskCategory.builtin.first { $0.isOther }!
+        let index = CategoryIndex([site, dotted, other])
+        #expect(index.categoryOf("x", url: "https://example.com/file1.zip")?.id == "site")
+        #expect(index.categoryOf("x", url: "https://example.com/file12.zip")?.isOther == true)
+        #expect(index.categoryOf("x", url: "https://example.com/file1.zip?x=1")?.isOther == true)
+        #expect(index.categoryOf("x", url: "see https://example.com/file1.zip")?.isOther == true)
+        #expect(index.categoryOf("x", url: "https://a.test/v1x0/f")?.isOther == true)
+        #expect(index.categoryOf("x", url: "https://a.test/v1.0/f")?.id == "dot")
+    }
+
+    @Test func unknownFileNameOnlyLetsUrlRulesParticipate() {
+        let wild = TaskCategory(id: "rx", name: "rx", icon: "file", extensions: [], regexPattern: ".*", position: 1)
+        let site = TaskCategory(id: "site", name: "site", icon: "file", extensions: [], urlPattern: "https://mirror.test/*", position: 2)
+        let blank = TaskCategory(id: "blank", name: "blank", icon: "file", extensions: [], urlPattern: "   ", position: 3)
+        let other = TaskCategory.builtin.first { $0.isOther }!
+        let index = CategoryIndex([wild, site, blank, other])
+        #expect(index.categoryOf("", url: "https://mirror.test/download")?.id == "site")
+        #expect(index.categoryOf("", url: "https://x.test/download")?.isOther == true)
+        #expect(!index.matches(blank, "a.zip", url: "   "))
+        #expect(UrlWildcard.compile("   ") == nil)
+    }
+
+    @Test func matchesHonorsUrlRulesForCategoryFilters() {
+        let zip = TaskCategory(id: "zip", name: "zip", icon: "file", extensions: ["zip"], position: 1)
+        let site = TaskCategory(id: "site", name: "site", icon: "file", extensions: [], urlPattern: "https://mirror.test/*", position: 2)
+        let other = TaskCategory.builtin.first { $0.isOther }!
+        let all = TaskCategory.builtin.first { $0.isAll }!
+        let index = CategoryIndex([all, zip, site, other])
+        let url = "https://mirror.test/a.zip"
+        #expect(index.matches(all, "a.zip", url: url))
+        #expect(index.matches(site, "a.zip", url: url))
+        #expect(index.matches(zip, "a.zip", url: url))
+        #expect(!index.matches(other, "a.zip", url: url))
+        #expect(index.matches(site, "blob", url: url))
+        #expect(!index.matches(zip, "blob", url: url))
+        #expect(!index.matches(other, "blob", url: url))
+        #expect(index.matches(other, "blob", url: "https://x.test/blob"))
+    }
+
+    @Test func shareUrlPrefersOriginUrlOverTaskUrl() {
+        let site = TaskCategory(id: "site", name: "site", icon: "file", extensions: [], urlPattern: "https://origin.test/*", position: 1)
+        let other = TaskCategory.builtin.first { $0.isOther }!
+        let index = CategoryIndex([site, other])
+        func task(origin: String, url: String) -> DownloadTask {
+            DownloadTask(taskId: "t", url: url, originUrl: origin, fileName: "a.bin", status: .completed)
+        }
+        let withOrigin = task(origin: "https://origin.test/page", url: "https://cdn.test/a.bin")
+        let withoutOrigin = task(origin: "", url: "https://cdn.test/a.bin")
+        #expect(index.categoryOf(withOrigin.fileName, url: withOrigin.shareUrl)?.id == "site")
+        #expect(index.categoryOf(withoutOrigin.fileName, url: withoutOrigin.shareUrl)?.isOther == true)
+    }
+
     @Test func bytesUseBinaryUnitsWithMagnitudeDependentDigits() {
         #expect(Format.bytes(0).description == "0 B")
         #expect(Format.bytes(1023).description == "1023 B")

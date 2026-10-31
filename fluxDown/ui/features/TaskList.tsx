@@ -10,8 +10,8 @@ import { Button } from "@/ui/components/Button";
 import { EmptyState } from "@/ui/components/EmptyState";
 import { Icon } from "@/ui/components/Icon";
 import { IconButton } from "@/ui/components/IconButton";
-import { TextInput } from "@/ui/components/TextInput";
 import { showToast } from "@/ui/components/Toast";
+import { QuickDownload } from "./QuickDownload";
 import { formatBytes, formatSpeed, progressPercent } from "@/ui/format";
 import { useT } from "@/ui/i18n";
 import "./features.css";
@@ -71,8 +71,6 @@ export function TaskList(props: Props): JSX.Element {
   const t = useT();
   const [state, setState] = useState<NmhTasksResponse | null>(null);
   const [starting, setStarting] = useState(false);
-  const [quickUrl, setQuickUrl] = useState("");
-  const [quickBusy, setQuickBusy] = useState(false);
   const inFlight = useRef(false);
   const startTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
@@ -137,47 +135,9 @@ export function TaskList(props: Props): JSX.Element {
     startTimer.current = setTimeout(() => setStarting(false), 8000);
   };
 
-  const submitQuick = async () => {
-    const url = quickUrl.trim();
-    if (!url) return;
-    try {
-      new URL(url);
-    } catch {
-      showToast(t("popup.quickDownload.invalidUrl"), "error");
-      return;
-    }
-    setQuickBusy(true);
-    try {
-      const res = await sendAction<"downloadUrls">({ action: "downloadUrls", urls: [url] });
-      if (res?.success) {
-        showToast(t("popup.quickDownload.sent"), "success");
-        setQuickUrl("");
-        void poll();
-      } else {
-        showToast(res?.message || t("popup.quickDownload.failed"), "error");
-      }
-    } catch {
-      showToast(t("popup.quickDownload.failed"), "error");
-    } finally {
-      setQuickBusy(false);
-    }
-  };
-
   if (!state) return <div class="fd-empty">{t("header.checking")}</div>;
 
-  const quick = props.quickDownload && state.connected ? (
-    <div class="fd-quick">
-      <TextInput
-        value={quickUrl}
-        placeholder={t("popup.quickDownload.placeholder")}
-        onInput={setQuickUrl}
-        onCommit={() => void submitQuick()}
-      />
-      <Button size="sm" variant="primary" disabled={quickBusy} onClick={() => void submitQuick()}>
-        {t("popup.quickDownload.button")}
-      </Button>
-    </div>
-  ) : null;
+  const quick = props.quickDownload && state.connected ? <QuickDownload onSent={() => void poll()} /> : null;
 
   if (!state.connected) {
     return (

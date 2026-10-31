@@ -234,7 +234,7 @@ hooks 在下载生命周期事件发生时运行你的代码。
 |---|---|---|
 | `id` | 是 | 匹配 `^[a-z][a-z0-9-]{0,31}$`，在视图间唯一。 |
 | `title` | 是 | 1–40 个字符。 |
-| `location` | 是 | `activity`、`settings`、`taskDetail` 或 `window`；`settings` 至多一个视图使用。 |
+| `location` | 是 | `activity`、`settings`、`taskDetail`、`window` 或 `auth`；`settings` 至多一个视图使用，`auth` 也至多一个。`auth` 视图要求顶层声明 `auth`（`auth.entry`，后者又要求 `auth` 权限），否则 manifest 报错 `location 为 auth 的 view 要求声明 auth`。它会替换桌面端（GPUI）与 Web 端插件**登录**对话框的内容（Web 端只显示可移植实现）；移动端不渲染它，仍用默认登录流程。见[自定义登录界面](/docs/zh/plugins/auth-guide/#自定义登录界面)。不认识该 location 的旧版本应用会拒绝加载此插件，请把 `minAppVersion` 设为下一个版本或更高。 |
 | `desktop` | 否 | 桌面原生实现，见下。**没有** `desktop` 的视图是可移植视图，要求声明 `main`。 |
 | `portable` | 否 | 布尔值，默认 `false`。仅允许与 `desktop` 同时声明。`true` 表示 `main` 也通过 `flux.ui.view` 实现了该视图，让不能运行桌面脚本的客户端也能显示；要求声明 `main`。 |
 | `icon` | 否 | `.svg` 文件的包内相对路径（任何 `location` 都允许，目前仅活动栏 `activity` 使用）。至多 16 KiB（16384 字节），合法 UTF-8，且是 SVG 文档（以 `<svg` 或 `<?xml` 开头并包含 `<svg`）。宿主把它当作**单色蒙版**按主题色着色，只使用 alpha 通道，因此建议 24×24 的 `viewBox`，并使用 `stroke="currentColor"` 或 `fill="currentColor"`（lucide 风格）；彩色会被压成单色。不声明则使用默认图标。 |

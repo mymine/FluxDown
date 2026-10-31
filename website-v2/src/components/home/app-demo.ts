@@ -7,11 +7,12 @@
  *
  * 模拟以固定步长推进(与帧率无关);默认仅在可见且标签页激活时自动播放。
  * `external: true` 时不自动播放,由调用方(/film/ 短片舞台)用自己的时钟调用 `advance()`。
+ * 容器缩放不在这里:调用方须先同步调用 app-fit.ts 的 `fitApp()`(首屏布局不等演示挂载)。
  */
 import { DEMO_NEW, DEMO_TASKS, DEMO_URL, type DemoTask } from "./demo-data";
+import { DESIGN_WIDTH } from "./app-fit";
 import { SegmentSim, formatBytes, formatEta } from "./segment-sim";
 
-const DESIGN_WIDTH = 1120;
 const LOOP = 17;
 const STEP = 1 / 60;
 
@@ -60,7 +61,6 @@ export interface DemoController {
 export const DEMO_LOOP = LOOP;
 
 export function mountAppDemo(root: HTMLElement, options: { external?: boolean } = {}): DemoController | null {
-  const fit = root.closest<HTMLElement>("[data-app-fit]");
   const rowsEl = root.querySelector<HTMLElement>("[data-rows]");
   const cursor = root.querySelector<SVGElement>("[data-cursor]");
   const click = root.querySelector<HTMLElement>("[data-click]");
@@ -75,13 +75,8 @@ export function mountAppDemo(root: HTMLElement, options: { external?: boolean } 
   const totalSpeed = root.querySelector<HTMLElement>("[data-total-speed]");
   const spark = root.querySelector<SVGPathElement>("[data-spark]");
   const queueCount = root.querySelector<HTMLElement>("[data-queue-count]");
-  if (!fit || !rowsEl || !cursor || !click || !dialog || !typed || !newButton || !startButton) return null;
+  if (!rowsEl || !cursor || !click || !dialog || !typed || !newButton || !startButton) return null;
   const labels = JSON.parse(root.dataset.labels ?? "{}") as Labels;
-
-  /* ── Scale to container ── */
-  const resize = () => root.style.setProperty("--app-scale", String(fit.clientWidth / DESIGN_WIDTH));
-  resize();
-  new ResizeObserver(resize).observe(fit);
 
   const icon = (name: string) =>
     (root.querySelector<HTMLTemplateElement>(`template[data-icon="${name}"]`)?.content.cloneNode(true) ??

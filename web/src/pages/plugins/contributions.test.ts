@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import type { PluginDto } from '../../lib/rpc'
 import {
+  activeAuthViewOf,
+  authViewOf,
   deriveActivityEntries,
   deriveChromeSpecs,
   deriveDetailTabs,
@@ -135,5 +137,18 @@ describe('plugin contributions', () => {
     expect(hasPluginSettings(plugin({ identity: 'f@x', settings: [field] }))).toBe(true)
     expect(hasPluginSettings(disabled)).toBe(false) // 视图不可运行且无字段
     expect(hasPluginSettings(plugin({ ...disabled, settings: [field] }))).toBe(true)
+  })
+
+  test('auth view: portable auth location, usable plugin only', () => {
+    const withAuth = plugin({
+      identity: 'g@x',
+      contributions: { views: [view('login', 'auth'), view('deskLogin', 'auth', false)], commands: [], sniffRules: false, pageScripts: [] },
+    })
+    expect(authViewOf(withAuth)?.id).toBe('login')
+    expect(activeAuthViewOf(withAuth)?.id).toBe('login')
+    expect(activeAuthViewOf(plugin({ ...withAuth, enabled: false }))).toBeUndefined()
+    expect(activeAuthViewOf(plugin({ ...withAuth, consentPending: ['tasks'] }))).toBeUndefined()
+    expect(authViewOf(good)).toBeUndefined()
+    expect(authViewOf(plugin({ identity: 'h@x', contributions: { views: [view('login', 'auth', false)], commands: [], sniffRules: false, pageScripts: [] } }))).toBeUndefined()
   })
 })

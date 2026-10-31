@@ -1,13 +1,14 @@
 //! 代理：模式、手动服务器、连通性测试、站点凭据。
 
 use fluxdown_protocol::method;
+use fluxdown_protocol::proxy_rules::{PROXY_RULES_KEY, enabled_proxy_rule_count};
 use fluxdown_ui_components::{ButtonVariant, FluxIcon, loading_button};
 use fluxdown_ui_theme::active_theme;
 use gpui::{App, ParentElement, SharedString, Styled};
 use gpui_component::{Icon, h_flex};
 use serde_json::json;
 
-use super::{SectionContext, site_auth};
+use super::{SectionContext, proxy_rules, site_auth};
 use crate::store::rpc_error_text;
 use crate::ui::{Control, SettingsPage, SettingsRow, SettingsSection, body_text, meta_text};
 
@@ -23,13 +24,15 @@ pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
         ctx.store
             .update(cx, |store, cx| store.load_system_proxy(cx));
     }
-    let mut sections = vec![mode_section(ctx)];
+    let rule_count = enabled_proxy_rule_count(&ctx.store.read(cx).daemon_str(PROXY_RULES_KEY));
+    let mut sections = vec![mode_section(ctx, rule_count)];
     match mode.as_str() {
         "auto" => sections.push(auto_desc_section(ctx)),
         "system" => sections.push(system_section(ctx, cx)),
         "manual" => sections.push(manual_section(ctx)),
         _ => {}
     }
+    sections.push(proxy_rules::group(ctx, cx));
     sections.push(site_auth::group(ctx, cx));
     SettingsPage::new(
         "proxy",
@@ -40,7 +43,7 @@ pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
     .sections(sections)
 }
 
-fn mode_section(ctx: &SectionContext) -> SettingsSection {
+fn mode_section(ctx: &SectionContext, rule_count: usize) -> SettingsSection {
     let options = vec![
         (SharedString::from("none"), ctx.t("proxyModeNone")),
         (SharedString::from("system"), ctx.t("proxyModeSystem")),
@@ -56,16 +59,26 @@ fn mode_section(ctx: &SectionContext) -> SettingsSection {
             set.update(cx, |store, cx| {
                 store.set_daemon("proxy_mode", value.to_string(), cx);
                 // 切到系统代理模式时立即重新检测（系统设置可能在两次切换之间变化）。
-                if value.as_ref() == "system" && !store.is_busy("systemProxy") {
+                if value.as_ref() == "system" && !store.in_flight("systemProxy") {
                     store.load_system_proxy(cx);
                 }
             });
         },
     );
-    SettingsSection::new()
+    let mut section = SettingsSection::new()
         .title(ctx.t("proxySettings"))
         .subtitle(ctx.t("proxyBtNote"))
-        .row(ctx.item("proxySettings", Some("proxySettingsDesc"), control))
+        .row(ctx.item("proxySettings", Some("proxySettingsDesc"), control));
+    if rule_count > 0 {
+        let hint = SharedString::from(ctx.translator.text_with(
+            "proxyRulesActiveHint",
+            &[("count", &rule_count.to_string())],
+        ));
+        section = section.row(SettingsRow::custom(move |_, _, _, cx: &mut App| {
+            info_line(hint.clone(), cx)
+        }));
+    }
+    section
 }
 
 /// `auto` 模式：只读说明行，无可编辑表单。
@@ -206,7 +219,7 @@ fn readonly_control(value: SharedString) -> Control {
 }
 
 /// info 图标 + 说明文字的整行（无标题/控件结构）。
-fn info_line(text: SharedString, cx: &mut App) -> gpui::Div {
+pub(super) fn info_line(text: SharedString, cx: &mut App) -> gpui::Div {
     let theme = active_theme(cx);
     let tokens = theme.tokens();
     let extended = theme.extended();

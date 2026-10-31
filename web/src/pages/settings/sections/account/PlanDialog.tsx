@@ -7,17 +7,23 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useT } from '../../../../i18n'
 import { cn } from '../../../../lib/cn'
 import { copyText } from '../../../../lib/copy'
+import { formatQuotaBytes, trafficKindKey } from '../../../share/model'
 import { RpcError, rpc } from '../../../../lib/rpc'
-import type { AgentSessionDto, CloudOrder, CloudPlan } from '../../../../lib/rpc'
-import { Badge, Button, ConfirmFooter, Dialog, DialogFooter, Icon, Input, ProgressBar, Spinner } from '../../../../ui'
+import type { AgentSessionDto, CloudOrder, CloudPlan, CloudSubscription } from '../../../../lib/rpc'
+import { Badge, Button, ConfirmFooter, Dialog, DialogFooter, Icon, Input, ProgressBar, SegmentedTabs, Spinner } from '../../../../ui'
 import {
   localDate,
   campaignProgress,
   formatCountdown,
   formatMinor,
   normalizeReferralCode,
+  packPlans,
   ownedPriceMinor,
   payableMinor,
+  baseSortOf,
+  cardPlans,
+  isSubscriptionPlan,
+  lifetimePlans,
   planCardState,
   planIconName,
   priceDisplay,
@@ -28,6 +34,7 @@ import {
 import type { PlanCardState, PlanIconName } from './billing'
 import { accountErrorKey } from './errorText'
 import { PlanBadge } from './PlanBadge'
+import type { PlanDialogTab } from './planRequest'
 import { parseBadgeColor } from './planBadgeText'
 import { encodeQrChallengeImage } from '../extensions/challengeImage'
 
@@ -38,9 +45,9 @@ const FALLBACK_COLOR = 'var(--fx-colors-accent-foreground, currentColor)'
 type Load =
   | { status: 'loading' }
   | { status: 'error' }
-  | { status: 'ready'; catalog: CloudPlan[]; credit: number; currentCode: string | null }
+  | { status: 'ready'; catalog: CloudPlan[]; credit: number; currentCode: string | null; subscription: CloudSubscription | null }
 
-type Step = { kind: 'select' } | { kind: 'paying'; order: CloudOrder; plan: CloudPlan } | { kind: 'success'; planName: string }
+type Step = { kind: 'select' } | { kind: 'paying'; order: CloudOrder; plan: CloudPlan } | { kind: 'success'; planName: string; pack: boolean }
 
 /** 传输层瞬断 / 服务端声明可重试的错误：轮询继续下一轮。 */
 function pollRetryable(error: unknown): boolean {
@@ -75,13 +82,13 @@ function Banner({ tone, children }: { tone: 'danger' | 'info'; children: string 
   )
 }
 
-function PlanCard({ plan, state, credit, selected, onSelect, ordinal }: { plan: CloudPlan; state: PlanCardState; credit: number; selected: boolean; onSelect: () => void; ordinal: number | null }) {
+function PlanCard({ plan, state, credit, selected, onSelect, ordinal, conflict }: { plan: CloudPlan; state: PlanCardState; credit: number; selected: boolean; onSelect: () => void; ordinal: number | null; conflict: boolean }) {
   const t = useT()
   const color = planColor(plan)
   const price = priceDisplay(plan, state, credit)
   const progress = campaignProgress(plan)
   const endDate = localDate(plan.campaign?.endAt)
-  const available = state === 'available'
+  const available = state === 'available' || state === 'renewable'
   const Glyph = ICONS[planIconName(plan.icon)]
   return (
     <button
@@ -95,6 +102,7 @@ function PlanCard({ plan, state, credit, selected, onSelect, ordinal }: { plan: 
         selected ? 'border-accent-text bg-accent-text/8' : 'border-hairline bg-surface hover:bg-nav-hover',
         !available && 'cursor-not-allowed opacity-60 hover:bg-surface',
       )}
+      title={conflict ? t('errReasonSubscriptionConflict') : undefined}
     >
       <span className="flex size-10 shrink-0 items-center justify-center rounded-lg" style={{ background: `color-mix(in srgb, ${color} 14%, transparent)`, color }}>
         <Glyph className="size-5" strokeWidth={1.75} />
@@ -103,9 +111,18 @@ function PlanCard({ plan, state, credit, selected, onSelect, ordinal }: { plan: 
         <span className="flex flex-wrap items-center gap-2">
           <span className="text-sm font-semibold text-foreground">{plan.name}</span>
           <PlanBadge plan={plan} ordinal={ordinal} />
-          {state === 'current' ? <Badge tone="accent">{t('accountPlanCurrent')}</Badge> : null}
+          {state === 'current' || state === 'renewable' ? <Badge tone="accent">{t('accountPlanCurrent')}</Badge> : null}
           {state === 'tierBlocked' || state === 'creditBlocked' ? <Badge>{t('accountPlanLowerTier')}</Badge> : null}
         </span>
+        {plan.pack ? (
+          <span className="flex flex-col gap-0.5 text-xs text-foreground">
+            <span className="tabular">
+              {t('accountPackCapacity', { bytes: formatQuotaBytes(plan.pack.bytes), kind: trafficKindKey(plan.pack.kind) ? t(trafficKindKey(plan.pack.kind) ?? '') : '' })}
+            </span>
+            <span className="text-muted-foreground">{t('accountPackValidity', { days: plan.pack.validDays })}</span>
+          </span>
+        ) : null}
+        {isSubscriptionPlan(plan) ? <span className="text-xs text-muted-foreground tabular">{t('accountPeriodDays', { days: plan.billingPeriodDays ?? 0 })}</span> : null}
         {plan.description ? <span className="text-xs text-muted-foreground">{plan.description}</span> : null}
         {plan.highlights.length > 0 ? (
           <ul className="mt-0.5 flex flex-col gap-0.5">
@@ -250,8 +267,9 @@ function PayingStep({ order, plan, onPaid, onBack }: { order: CloudOrder; plan: 
   )
 }
 
-export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onClose: () => void }) {
+export function PlanDialog({ session, initialTab = 'membership', onClose }: { session: AgentSessionDto; initialTab?: PlanDialogTab; onClose: () => void }) {
   const t = useT()
+  const [requestedTab, setTab] = useState<PlanDialogTab>(initialTab)
   const [load, setLoad] = useState<Load>({ status: 'loading' })
   const [step, setStep] = useState<Step>({ kind: 'select' })
   const [selected, setSelected] = useState<string | null>(null)
@@ -288,7 +306,7 @@ export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onC
       if (profile.status === 'rejected') console.warn('[plan] refreshProfile failed; credit treated as 0', profile.reason)
       const credit = profile.status === 'fulfilled' ? Math.max(0, profile.value.purchaseCreditMinor) : 0
       const currentCode = profile.status === 'fulfilled' ? profile.value.plan || null : sessionPlanCode.current
-      setLoad({ status: 'ready', catalog: catalog.value, credit, currentCode })
+      setLoad({ status: 'ready', catalog: catalog.value, credit, currentCode, subscription: profile.status === 'fulfilled' ? (profile.value.activeSubscription ?? null) : null })
     })()
     return () => {
       alive = false
@@ -331,13 +349,22 @@ export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onC
     [reload, t],
   )
 
-  const onPaid = useCallback((order: CloudOrder) => setStep({ kind: 'success', planName: order.planName }), [])
+  const onPaid = useCallback(
+    (order: CloudOrder) => setStep((prev) => ({ kind: 'success', planName: order.planName, pack: prev.kind === 'paying' && prev.plan.productKind === 'pack' })),
+    [],
+  )
 
   const ready = load.status === 'ready' ? load : null
-  const plans = ready ? purchasablePlans(ready.catalog) : []
+  // 云端没有上架流量包：页签整体隐藏，落回会员页。
+  const hasPacks = ready !== null && packPlans(ready.catalog).length > 0
+  const tab: PlanDialogTab = hasPacks ? requestedTab : 'membership'
+  const plans = ready ? (tab === 'packs' ? packPlans(ready.catalog) : purchasablePlans(ready.catalog)) : []
   const owned = ready ? ownedPriceMinor(ready.catalog, ready.currentCode) : 0
+  const baseSort = ready ? baseSortOf(ready.catalog, ready.currentCode) : null
+  const stateOf = (plan: CloudPlan, r: NonNullable<typeof ready>): PlanCardState => planCardState(plan, r.currentCode, owned, r.credit, r.subscription, baseSort)
   const chosen = ready && selected ? plans.find((plan) => plan.code === selected) : undefined
-  const chosenAvailable = chosen !== undefined && ready !== null && planCardState(chosen, ready.currentCode, owned, ready.credit) === 'available'
+  const chosenState = chosen && ready ? stateOf(chosen, ready) : null
+  const chosenAvailable = chosenState === 'available' || chosenState === 'renewable'
 
   let title = t('accountPlanDialogTitle')
   let footer = null
@@ -365,7 +392,7 @@ export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onC
         <div className="flex size-16 items-center justify-center rounded-full bg-success/15 text-success">
           <CheckCheck className="size-8" strokeWidth={1.75} />
         </div>
-        <div className="text-title font-semibold text-foreground">{t('accountPlanPaidSuccess')}</div>
+        <div className="text-title font-semibold text-foreground">{t(step.pack ? 'accountPackPaid' : 'accountPlanPaidSuccess')}</div>
         {step.planName ? <div className="text-sm text-muted-foreground">{step.planName}</div> : null}
       </div>
     )
@@ -373,7 +400,7 @@ export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onC
     footer = (
       <ConfirmFooter
         cancelLabel={t('cancel')}
-        okLabel={chosen && chosenAvailable && ready ? `${t('accountPlanBuy')} ${formatMinor(payableMinor(chosen, ready.credit), chosen.currency)}` : t('accountPlanBuy')}
+        okLabel={chosen && chosenAvailable && ready ? `${t(chosenState === 'renewable' ? 'accountRenew' : 'accountPlanBuy')} ${formatMinor(payableMinor(chosen, tab === 'packs' || isSubscriptionPlan(chosen) ? 0 : ready.credit), chosen.currency)}` : t('accountPlanBuy')}
         onCancel={onClose}
         onOk={() => chosen && void buy(chosen)}
         okDisabled={!chosenAvailable}
@@ -383,6 +410,22 @@ export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onC
     )
     body = (
       <div className="flex flex-col gap-3">
+        {hasPacks ? (
+          <SegmentedTabs
+            aria-label={t('accountPlanDialogTitle')}
+            value={tab}
+            onValueChange={(next) => {
+              setTab(next)
+              setSelected(null)
+              setNotice(null)
+            }}
+            className="self-start"
+            items={[
+              { value: 'membership', label: t('accountPurchaseTabMembership') },
+              { value: 'packs', label: t('accountPurchaseTabPacks') },
+            ]}
+          />
+        ) : null}
         {load.status === 'loading' ? <SkeletonCards /> : null}
         {load.status === 'error' ? (
           <div className="flex flex-col items-center gap-2 py-8 text-center">
@@ -393,23 +436,34 @@ export function PlanDialog({ session, onClose }: { session: AgentSessionDto; onC
         {ready && plans.length === 0 ? <div className="py-8 text-center text-sm text-muted-foreground">{t('accountPlanEmpty')}</div> : null}
         {ready && plans.length > 0 ? (
           <div role="radiogroup" className="flex flex-col gap-2">
-            {plans.map((plan) => {
-              const state = planCardState(plan, ready.currentCode, owned, ready.credit)
-              return (
-                <PlanCard
-                  key={plan.code}
-                  plan={plan}
-                  state={state}
-                  credit={ready.credit}
-                  selected={selected === plan.code}
-                  ordinal={state === 'current' ? session.user.membershipOrdinal : null}
-                  onSelect={() => {
-                    setSelected(plan.code)
-                    setNotice(null)
-                  }}
-                />
-              )
-            })}
+            {(tab === 'packs' ? [{ key: 'packs', title: null, items: plans }] : [
+              { key: 'lifetime', title: t('accountPurchaseGroupLifetime'), items: lifetimePlans(plans) },
+              { key: 'cards', title: t('accountPurchaseGroupCards'), items: cardPlans(plans) },
+            ]).map((group) =>
+              group.items.length === 0 ? null : (
+                <div key={group.key} className="flex flex-col gap-2">
+                  {group.title && cardPlans(plans).length > 0 ? <div className="text-xs font-medium text-muted-foreground">{group.title}</div> : null}
+                  {group.items.map((plan) => {
+                    const state = stateOf(plan, ready)
+                    return (
+                      <PlanCard
+                        key={plan.code}
+                        plan={plan}
+                        state={state}
+                        credit={tab === 'packs' ? 0 : ready.credit}
+                        selected={selected === plan.code}
+                        ordinal={state === 'current' ? session.user.membershipOrdinal : null}
+                        conflict={state === 'tierBlocked' && isSubscriptionPlan(plan) && ready.subscription !== null}
+                        onSelect={() => {
+                          setSelected(plan.code)
+                          setNotice(null)
+                        }}
+                      />
+                    )
+                  })}
+                </div>
+              ),
+            )}
           </div>
         ) : null}
         {ready && plans.length > 0 ? (

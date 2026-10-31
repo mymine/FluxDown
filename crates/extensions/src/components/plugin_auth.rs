@@ -42,6 +42,9 @@ pub struct PluginAuthDialog {
     busy: bool,
     poll_task_active: bool,
     logout_pending: bool,
+    /// 用户点击发起、仍在途的动作（`logout` / `poll` / `begin`）；只有对应按钮转圈，
+    /// 状态刷新与自动轮询只置 `busy`（禁用按钮，不转圈）。
+    action: Option<&'static str>,
 }
 
 impl PluginAuthDialog {
@@ -89,6 +92,7 @@ impl PluginAuthDialog {
             busy: true,
             poll_task_active: false,
             logout_pending: false,
+            action: None,
         };
         let status_future =
             plugin_auth_call(&dialog.port, &dialog.identity, "status", "", "", "", "");
@@ -149,12 +153,14 @@ impl PluginAuthDialog {
             &input,
         );
         self.logout_pending = action == "logout";
+        self.action = Some(action);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
 
             let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
+                this.action = None;
                 this.apply_result(result, notify_success, window, cx);
                 cx.notify();
             }) else {
@@ -501,7 +507,7 @@ impl Render for PluginAuthDialog {
                                         .outline()
                                         .control(cx)
                                         .label(logout_label)
-                                        .busy(self.busy)
+                                        .busy(self.action == Some("logout"))
                                         .disabled(self.busy)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.call("logout", window, cx);
@@ -515,7 +521,7 @@ impl Render for PluginAuthDialog {
                                         .primary()
                                         .control(cx)
                                         .label(poll)
-                                        .busy(self.busy)
+                                        .busy(self.action == Some("poll"))
                                         .disabled(self.busy)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.call("poll", window, cx);
@@ -530,7 +536,7 @@ impl Render for PluginAuthDialog {
                                         .primary()
                                         .control(cx)
                                         .label(begin)
-                                        .busy(self.busy)
+                                        .busy(self.action == Some("begin"))
                                         .disabled(self.busy)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.call("begin", window, cx);

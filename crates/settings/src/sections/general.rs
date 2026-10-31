@@ -19,7 +19,7 @@ pub(crate) fn page(
     let store = ctx.store.read(cx);
     if store.integration().is_none()
         && !store.is_read_only()
-        && !store.is_busy("integration")
+        && !store.in_flight("integration")
         && !store.load_attempted("integration")
         && ctx
             .store

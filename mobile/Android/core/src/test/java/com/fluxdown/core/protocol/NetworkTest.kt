@@ -99,7 +99,10 @@ class NetworkTest {
         assertEquals(siteAuth, NetworkRow.visible(NetworkProxyMode.None, false))
 
         val none = NetworkRow.visible(NetworkProxyMode.None, true)
-        assertEquals(listOf(NetworkRow.Mode) + siteAuth, none)
+        assertEquals(
+            listOf(NetworkRow.Mode, NetworkRow.Rules, NetworkRow.RulesAdd, NetworkRow.RulesTest) + siteAuth,
+            none,
+        )
         assertEquals(none, NetworkRow.visible(NetworkProxyMode.System, true))
         assertEquals(none, NetworkRow.visible(NetworkProxyMode.Auto, true))
 

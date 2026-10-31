@@ -14,7 +14,7 @@ use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement, Render, SharedString,
-    Styled, Window, prelude::FluentBuilder as _,
+    Styled, Subscription, Window, prelude::FluentBuilder as _,
 };
 use gpui_component::{
     Disableable as _, WindowExt as _,
@@ -23,7 +23,10 @@ use gpui_component::{
     v_flex,
 };
 
-use super::plugin_detail::{page_script_rows, permission_label};
+use super::{
+    plugin_detail::{page_script_rows, permission_label},
+    plugin_live::LivePlugins,
+};
 use crate::{ExtensionsPort, controller::grant_plugin_consent, error_text, pages::Frame, ui};
 
 /// 对话框展示内容。
@@ -61,10 +64,11 @@ pub type ConfirmCallback = Rc<dyn Fn(&mut Window, &mut App) -> bool>;
 
 /// 点击确定后的动作。
 pub enum ConsentAction {
-    /// 调用 `daemon.plugin.consent`（参数为插件当前完整请求集合）。
+    /// 调用 `daemon.plugin.consent`（参数为插件当前完整请求集合）；`live` 让对话框跟随最新列表。
     Grant {
         port: Arc<dyn ExtensionsPort>,
         plugin: Box<PluginDto>,
+        live: Entity<LivePlugins>,
     },
     /// 交给调用方继续（如市场安装）。
     Confirm(ConfirmCallback),
@@ -81,7 +85,25 @@ struct ConsentDialog {
     action: ConsentAction,
     acknowledged: bool,
     granting: bool,
+    /// 已被跟随逻辑关闭；异步结果不得再关一次（会误关下面的对话框）。
+    closed: bool,
     error: Option<SharedString>,
+    _live: Option<Subscription>,
+}
+
+/// 两份插件快照展示给用户、并由 daemon 按「完整集合相等」校验的授权请求是否一致。
+fn same_request(a: &PluginDto, b: &PluginDto) -> bool {
+    a.risk == b.risk
+        && a.permissions == b.permissions
+        && a.network_hosts == b.network_hosts
+        && a.consent_pending == b.consent_pending
+        && a.consent_pending_hosts == b.consent_pending_hosts
+        && a.contributions.page_scripts == b.contributions.page_scripts
+}
+
+/// 授权请求是否还有待授权项。
+fn has_pending(plugin: &PluginDto) -> bool {
+    !plugin.consent_pending.is_empty() || !plugin.consent_pending_hosts.is_empty()
 }
 
 impl ConsentDialog {
@@ -89,28 +111,69 @@ impl ConsentDialog {
         !self.granting && (!needs_acknowledge(&self.request.risk) || self.acknowledged)
     }
 
+    /// 跟随实时列表：插件已卸载 / 已无待授权项 → 关闭；请求集合变化 → 刷新展示并重置勾选
+    /// （daemon 只接受与当前请求完全相等的集合，旧快照提交必被拒绝）。自己的授权请求在途时
+    /// 不处理，由请求结果决定关闭或展示错误。
+    fn follow_live(
+        &mut self,
+        live: &Entity<LivePlugins>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.granting || self.closed {
+            return;
+        }
+        let ConsentAction::Grant { plugin, .. } = &mut self.action else {
+            return;
+        };
+        let Some(current) = live
+            .read(cx)
+            .plugin(&plugin.identity)
+            .filter(|current| has_pending(current))
+            .cloned()
+        else {
+            self.closed = true;
+            window.close_dialog(cx);
+            return;
+        };
+        if same_request(plugin, &current) {
+            return;
+        }
+        self.request = ConsentRequest::for_plugin(&current, self.translator.read(cx));
+        **plugin = current;
+        self.acknowledged = false;
+        self.error = None;
+        cx.notify();
+    }
+
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_confirm() {
+        if !self.can_confirm() || self.closed {
             return;
         }
         match &self.action {
             ConsentAction::Confirm(on_confirm) => {
                 if on_confirm(window, cx) {
+                    self.closed = true;
                     window.close_dialog(cx);
                 }
             }
-            ConsentAction::Grant { port, plugin } => {
+            ConsentAction::Grant { port, plugin, live } => {
                 self.granting = true;
                 self.error = None;
                 cx.notify();
                 let future = grant_plugin_consent(port, plugin);
+                let live = live.clone();
                 cx.spawn_in(window, async move |this, cx| {
                     let result = future.await;
 
                     let Ok(()) = this.update_in(cx, |this, window, cx| {
                         this.granting = false;
                         match result {
-                            Ok(_) => window.close_dialog(cx),
+                            Ok(_) if !this.closed => {
+                                this.closed = true;
+                                window.close_dialog(cx);
+                            }
+                            Ok(_) => {}
                             Err(error) => {
                                 let translator = this.translator.read(cx);
                                 let message = error_text(translator, &error);
@@ -119,6 +182,8 @@ impl ConsentDialog {
                                         .text_with("pluginConsentFailed", &[("message", &message)])
                                         .into(),
                                 );
+                                // 期间列表可能已变（授权集合被改 / 已在别处授权 / 已卸载）。
+                                this.follow_live(&live, window, cx);
                             }
                         }
                         cx.notify();
@@ -227,7 +292,7 @@ impl Render for ConsentDialog {
     }
 }
 
-/// 打开授权对话框。
+/// 打开授权对话框。`Grant` 动作的对话框跟随实时插件列表（见 `ConsentDialog::follow_live`）。
 pub fn open_consent_dialog(
     request: ConsentRequest,
     action: ConsentAction,
@@ -236,25 +301,41 @@ pub fn open_consent_dialog(
     cx: &mut App,
 ) {
     let cancel = SharedString::from(translator.read(cx).text("cancel").to_owned());
-    let title = request.title.clone();
     let ok_label = request.ok_label.clone();
+    let live = match &action {
+        ConsentAction::Grant { live, .. } => Some(live.clone()),
+        ConsentAction::Confirm(_) => None,
+    };
     let state = cx.new(|_| ConsentDialog {
         translator,
         request,
         action,
         acknowledged: false,
         granting: false,
+        closed: false,
         error: None,
+        _live: None,
     });
+    if let Some(live) = live {
+        state.update(cx, |this, cx| {
+            this._live = Some(cx.observe_in(&live, window, |this, live, window, cx| {
+                this.follow_live(&live, window, cx);
+            }));
+        });
+    }
     window.open_dialog(cx, move |dialog, _, cx| {
-        let (granting, can_confirm) = {
+        let (granting, can_confirm, title) = {
             let state = state.read(cx);
-            (state.granting, state.can_confirm())
+            (
+                state.granting,
+                state.can_confirm(),
+                state.request.title.clone(),
+            )
         };
         let content = state.clone();
         let confirm = state.clone();
         dialog
-            .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
+            .title(fluxdown_ui_components::dialog_title(title, cx))
             .w(active_theme(cx).text_extent(520.))
             .overlay_closable(!granting)
             .content(move |root, _, cx| {
@@ -293,7 +374,25 @@ pub fn open_consent_dialog(
 
 #[cfg(test)]
 mod tests {
-    use super::needs_acknowledge;
+    use fluxdown_protocol::PluginDto;
+
+    use super::{has_pending, needs_acknowledge, same_request};
+
+    fn plugin() -> PluginDto {
+        serde_json::from_value(serde_json::json!({
+            "identity": "demo@1",
+            "name": "Demo",
+            "version": "1.0.0",
+            "enabled": true,
+            "devMode": false,
+            "disabledReason": "None",
+            "settings": [],
+            "settingsValues": {},
+            "permissions": ["tasks"],
+            "consentPending": ["tasks"],
+        }))
+        .expect("plugin fixture")
+    }
 
     #[test]
     fn only_full_trust_requires_acknowledgement() {
@@ -301,5 +400,39 @@ mod tests {
         assert!(!needs_acknowledge("elevated"));
         assert!(!needs_acknowledge("standard"));
         assert!(!needs_acknowledge(""));
+    }
+
+    #[test]
+    fn request_identity_covers_everything_the_daemon_checks() {
+        let base = plugin();
+        assert!(same_request(&base, &base.clone()));
+
+        let mut renamed = base.clone();
+        renamed.name = "Other".to_owned();
+        assert!(same_request(&base, &renamed));
+
+        let mut more_permissions = base.clone();
+        more_permissions.permissions.push("ytdlp".to_owned());
+        assert!(!same_request(&base, &more_permissions));
+
+        let mut more_hosts = base.clone();
+        more_hosts.network_hosts.push("example.test".to_owned());
+        assert!(!same_request(&base, &more_hosts));
+
+        let mut pending_changed = base.clone();
+        pending_changed
+            .consent_pending_hosts
+            .push("example.test".to_owned());
+        assert!(!same_request(&base, &pending_changed));
+    }
+
+    #[test]
+    fn pending_means_permissions_or_hosts_outstanding() {
+        let mut plugin = plugin();
+        assert!(has_pending(&plugin));
+        plugin.consent_pending.clear();
+        assert!(!has_pending(&plugin));
+        plugin.consent_pending_hosts.push("example.test".to_owned());
+        assert!(has_pending(&plugin));
     }
 }

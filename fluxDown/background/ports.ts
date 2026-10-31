@@ -16,6 +16,7 @@ import { updateBadgeForTab } from "./toolbar";
 import { TAB_VIEW_PORT } from "./protocol";
 import type { TabViewPush, TabViewSubscribe } from "./protocol";
 import { badgeCount } from "./view-model";
+import { logWarn } from "@/utils/error-log";
 
 const COALESCE_MS = 150;
 
@@ -47,7 +48,7 @@ function schedule(tabId: number): void {
     tabId,
     setTimeout(() => {
       timers.delete(tabId);
-      publish(tabId).catch((e) => console.warn("[FluxDown] tab view publish failed:", e));
+      publish(tabId).catch((e) => logWarn("[FluxDown] tab view publish failed:", e));
     }, COALESCE_MS),
   );
 }
@@ -111,8 +112,12 @@ export function installPorts(): void {
       // 打开面板 / 侧边栏是用户正要看这个页面：页面缺少 sensor 时立即开始恢复
       scheduleProbeCheck(tabId, 0);
       // 订阅时立即推送一次，不等合并窗口。
-      publish(tabId).catch((e) => console.warn("[FluxDown] tab view publish failed:", e));
+      publish(tabId).catch((e) => logWarn("[FluxDown] tab view publish failed:", e));
     });
-    port.onDisconnect.addListener(() => unsubscribe(port, subscribed));
+    port.onDisconnect.addListener(() => {
+      // 页面进入 bfcache / 帧销毁时由浏览器关闭端口，原因在 runtime.lastError；不读会被记为 Unchecked 错误。
+      void browser.runtime.lastError;
+      unsubscribe(port, subscribed);
+    });
   });
 }

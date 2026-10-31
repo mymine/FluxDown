@@ -171,6 +171,12 @@ pub enum EngineEvent {
         reason: String,
     },
 
+    /// 插件状态（列表 / 设置 / 站点默认）发生变化，携带最新完整列表。
+    /// 客户端整体替换插件列表并重新拉取插件相关查询。
+    /// 仅 `plugins` feature 下由 `PluginManager::publish_state` 发出。
+    #[cfg(feature = "plugins")]
+    PluginsChanged(Vec<crate::plugin::PluginInfo>),
+
     /// BT 重复添加检测：新任务的 info-hash 已被另一任务持有（下载或做种），
     /// 引擎已删除新建的占位任务行（不产生失败任务）。宿主据此提示用户并
     /// 可跳转已有任务（兼容 WebSocket 事件为 `duplicateTorrent`）。
@@ -204,8 +210,12 @@ pub enum EngineEvent {
     },
     /// 可移植视图渲染 / 事件处理失败（会话仍保持打开，下一次渲染可恢复）。
     PluginViewFailed { session: String, message: String },
-    /// 可移植视图会话已结束（`reason`：`closed` / `expired` / `pluginUnloaded`）。
+    /// 可移植视图会话已结束（`reason`：`closed` / `expired` / `pluginUnloaded` /
+    /// `requested`——插件经 `ctx.close()` 请求关闭承载容器）。
     PluginViewClosed { session: String, reason: String },
+    /// 插件经 `ctx.navigate()` 请求主界面跳转；`target` 为已校验的路由 id
+    /// （内置 `downloads` / `rss` / `webhooks` / `share`，或 `plugin:<identity>:<view>`）。
+    PluginViewNavigate { session: String, target: String },
     /// 插件经 `flux.ui.toast` 请求的提示（`level`：info/success/warning/error）。
     PluginToast {
         identity: String,
@@ -329,6 +339,21 @@ pub enum EngineEvent {
     /// 与毫秒时间戳；daemon 映射为 `DaemonEvent::TaskNotice`，只由 agent 消费，
     /// 不转发给任何 UI。不关心的宿主直接忽略。
     TaskNotice(crate::webhook::TaskNotice),
+
+    /// BT 防吸血的条目 / 状态发生变化（条目增删、云名单 / 订阅应用、新的观察或处置记录）。
+    /// daemon 映射为 `DaemonEvent::BtGuardChanged`，UI 据此重新拉取 `daemon.bt.guard.*`。
+    /// 引擎侧已合并防抖，不会逐个对端事件各发一条。
+    BtGuardChanged,
+
+    /// BT 会话启动时与存活期间每 6 小时发出：请 agent 刷新云名单。`have_sequence` 为当前
+    /// 已应用文档的序号（0 = 无）。云名单关闭（`bt_guard_cloud_enabled=false` /
+    /// `bt_guard_cloud_mode=off`）或防吸血关闭时不发。daemon 映射为
+    /// `DaemonEvent::BtGuardCloudRefreshWanted`，只供 agent 消费。
+    BtGuardCloudRefreshWanted { have_sequence: u64 },
+
+    /// 待上报证据队列有新增（仅 `bt_guard_report_enabled` 时累积）。`count` 为队列当前条数。
+    /// daemon 映射为 `DaemonEvent::BtGuardEvidenceReady`，只供 agent 消费。
+    BtGuardEvidenceReady { count: u32 },
 }
 
 /// 引擎事件的接收端,由宿主实现并注入 [`crate::Engine`]。

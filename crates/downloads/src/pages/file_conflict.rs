@@ -21,7 +21,7 @@ use fluxdown_protocol::{
     AgentEvent, AgentSnapshot, ApplicationErrorCode, DaemonEvent, FileExistsAction,
     SelectionOutcome, SelectionResolutionDto, ServiceEvent,
 };
-use fluxdown_ui_components::{ControlExt as _, field_hint, tabular_numbers};
+use fluxdown_ui_components::{BusyExt as _, ControlExt as _, field_hint, tabular_numbers};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -53,6 +53,15 @@ pub enum FileConflictEvent {
     Close,
 }
 
+/// 在途答复对应的按钮。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Answering {
+    Skip,
+    Overwrite,
+    Rename,
+    Cancel,
+}
+
 /// 一次答复的回执归类。
 enum Verdict {
     /// daemon 已接受。
@@ -73,6 +82,8 @@ pub struct FileConflictView {
     stale: bool,
     closed: bool,
     focus_handle: FocusHandle,
+    /// 最近一次发出答复的选项，仅用于在途时标出被点击的按钮。
+    answering: Option<Answering>,
 }
 
 impl EventEmitter<FileConflictEvent> for FileConflictView {}
@@ -112,6 +123,7 @@ impl FileConflictView {
             stale: false,
             closed: false,
             focus_handle,
+            answering: None,
         }
     }
 
@@ -181,6 +193,11 @@ impl FileConflictView {
 
     fn any_busy(&self) -> bool {
         self.stale || !self.inflight.is_empty()
+    }
+
+    /// 该选项是用户刚点的、且答复仍在途：其按钮显示转圈（其余选项只是禁用）。
+    fn is_answering(&self, answer: Answering) -> bool {
+        self.answering == Some(answer) && !self.inflight.is_empty()
     }
 
     fn answer_all(
@@ -290,6 +307,7 @@ impl FileConflictView {
             "escape" => self.close(cx),
             // 焦点在按钮上时回车由按钮自己处理，这里只接管焦点在窗口根上的回车。
             "enter" if self.focus_handle.is_focused(window) && !self.any_busy() => {
+                self.answering = Some(Answering::Rename);
                 self.answer_all(FileExistsAction::Rename, window, cx);
             }
             _ => {}
@@ -355,8 +373,10 @@ impl FileConflictView {
                             .outline()
                             .control(cx)
                             .label(self.strings.skip_all.clone())
+                            .busy(self.is_answering(Answering::Skip))
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, window, cx| {
+                                this.answering = Some(Answering::Skip);
                                 this.answer_all(FileExistsAction::Skip, window, cx);
                             })),
                     )
@@ -367,8 +387,10 @@ impl FileConflictView {
                             .outline()
                             .control(cx)
                             .label(self.strings.overwrite_all.clone())
+                            .busy(self.is_answering(Answering::Overwrite))
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, window, cx| {
+                                this.answering = Some(Answering::Overwrite);
                                 this.answer_all(FileExistsAction::Overwrite, window, cx);
                             })),
                     )
@@ -378,8 +400,10 @@ impl FileConflictView {
                         .primary()
                         .control(cx)
                         .label(self.strings.rename_all.clone())
+                        .busy(self.is_answering(Answering::Rename))
                         .disabled(busy)
                         .on_click(cx.listener(|this, _, window, cx| {
+                            this.answering = Some(Answering::Rename);
                             this.answer_all(FileExistsAction::Rename, window, cx);
                         })),
                 )
@@ -407,8 +431,10 @@ impl FileConflictView {
                             .control(cx)
                             .label(cancel_label)
                             .tooltip(self.strings.cancel_hint.clone())
+                            .busy(self.is_answering(Answering::Cancel))
                             .disabled(busy)
                             .on_click(cx.listener(|this, _, window, cx| {
+                                this.answering = Some(Answering::Cancel);
                                 this.cancel_all(window, cx);
                             })),
                     )

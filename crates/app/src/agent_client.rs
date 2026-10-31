@@ -111,6 +111,7 @@ impl ClientCommand {
         match self.method.as_str() {
             method::DAEMON_TASK_CREATE
             | method::DAEMON_TASK_CREATE_MANY
+            | method::DAEMON_TASK_SEED_LOCAL
             | method::DAEMON_GROUP_CREATE
             | method::AGENT_CAPTURE_CREATE_GROUP
             | method::AGENT_CAPTURE_SUBMIT_TORRENT_FILE => true,
@@ -239,6 +240,9 @@ async fn run_client(
     let mut attempt = 0_usize;
     // 每个桌面进程只尝试替换一次协议不兼容的 agent，避免同目录二进制错配时反复互杀。
     let mut replaced_incompatible = false;
+    // 同理只替换一次「应用版本旧于本桌面」的 agent：例如 macOS App Translocation 只读副本里
+    // 残留的旧版 agent，被 /Applications 里的新桌面复用会显示错误的更新状态、无法拉起界面。
+    let mut replaced_outdated = false;
     let mut link_log = ConnectionLog::default();
     let mut submission_transport = SubmissionTransport::new(submissions.clone());
     let mut connect_timeout = ConnectTimeout::new();
@@ -271,6 +275,7 @@ async fn run_client(
             &rpc_url,
             connect_timeout.current(),
             HANDSHAKE_TIMEOUT,
+            !replaced_outdated,
         )
         .await;
         connect_timeout.observe(result.as_ref().err());
@@ -375,6 +380,20 @@ async fn run_client(
                 {
                     return;
                 }
+            }
+            Err(ConnectError::Outdated(version)) => {
+                replaced_outdated = true;
+                log::warn!(
+                    "running agent is v{version}, older than this desktop (v{}); asking it to shut down",
+                    fluxdown_protocol::APP_VERSION
+                );
+                if request_shutdown(&config, &rpc_url).await {
+                    crate::service_bootstrap::wait_until_stopped(&rpc_url, Duration::from_secs(30))
+                        .await;
+                }
+                // 关停失败也照常重连：下一轮不再比较版本，沿用正在运行的 agent。
+                attempt = 0;
+                continue;
             }
             Err(ConnectError::Incompatible) if !replaced_incompatible => {
                 replaced_incompatible = true;
@@ -667,9 +686,15 @@ async fn connect(
     rpc_url: &str,
     connect_timeout: Duration,
     handshake_timeout: Duration,
+    reject_outdated: bool,
 ) -> Result<(Socket, Snapshot, Vec<EventFrame>), ConnectError> {
     let (request, stream) = dial(config, rpc_url, connect_timeout).await?;
-    match tokio::time::timeout(handshake_timeout, handshake(request, stream)).await {
+    match tokio::time::timeout(
+        handshake_timeout,
+        handshake(request, stream, reject_outdated),
+    )
+    .await
+    {
         Ok(result) => result,
         Err(_) => Err(ConnectError::Transient(format!(
             "handshake timed out after {handshake_timeout:?} (agent accepted the connection but did not complete the handshake)"
@@ -681,6 +706,7 @@ async fn connect(
 async fn handshake(
     request: Request,
     stream: TcpStream,
+    reject_outdated: bool,
 ) -> Result<(Socket, Snapshot, Vec<EventFrame>), ConnectError> {
     let mut socket = upgrade(request, stream).await?;
     let mut buffered = Vec::new();
@@ -713,6 +739,14 @@ async fn handshake(
     }
     if service.protocol_version != fluxdown_protocol::PROTOCOL_VERSION {
         return Err(ConnectError::Incompatible);
+    }
+    if reject_outdated
+        && fluxdown_protocol::is_older_app_version(
+            &service.service_version,
+            fluxdown_protocol::APP_VERSION,
+        )
+    {
+        return Err(ConnectError::Outdated(service.service_version));
     }
     let snapshot_value =
         call_on_socket(&mut socket, 2, method::SYSTEM_SNAPSHOT, None, &mut buffered).await?;
@@ -1167,6 +1201,8 @@ enum ConnectError {
     Transient(String),
     /// 对端协议版本不兼容：可尝试让旧 agent 退出后由 bootstrap 拉起同级新版本。
     Incompatible,
+    /// 对端协议兼容但应用版本旧于本桌面：让它退出，由 bootstrap 拉起同级（同版本）agent。
+    Outdated(String),
     Fatal(RpcErrorData),
 }
 
@@ -1187,6 +1223,7 @@ impl ConnectError {
             }
             Self::Transient(reason) => reason.clone(),
             Self::Incompatible => "incompatible protocol version".to_owned(),
+            Self::Outdated(version) => format!("agent v{version} is older than this desktop"),
             Self::Fatal(error) => format!("fatal: {:?}", error.code),
         }
     }

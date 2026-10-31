@@ -30,7 +30,7 @@ use crate::events::EventSink;
 use crate::logger::log_info;
 use crate::naming::{extract_from_url, sanitize_filename};
 use crate::output;
-use crate::proxy_config::{self, ProxyConfig};
+use crate::proxy_config::{self, ProxyConfig, host_matches_no_proxy};
 use crate::speed_limiter::SpeedLimiter;
 use crate::transfer_activity::{TaskRuntime, TaskSegment, TransferTracker};
 
@@ -220,56 +220,6 @@ fn set_control_timeouts(tcp: &std::net::TcpStream) -> std::io::Result<()> {
     tcp.set_read_timeout(Some(FTP_CONTROL_READ_TIMEOUT))?;
     tcp.set_write_timeout(Some(FTP_CONTROL_READ_TIMEOUT))?;
     Ok(())
-}
-
-/// no_proxy 匹配（逗号/分号分隔）：`*`、精确主机、域后缀（`.x` / `*.x` / `x`）、
-/// 精确 IP 与 CIDR，语义对齐 reqwest::NoProxy。
-fn host_matches_no_proxy(host: &str, list: &str) -> bool {
-    use std::net::IpAddr;
-    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
-    let host_ip = host.parse::<IpAddr>().ok();
-    for raw in list.split([',', ';']) {
-        let entry = raw.trim().to_ascii_lowercase();
-        if entry.is_empty() {
-            continue;
-        }
-        if entry == "*" {
-            return true;
-        }
-        if let Some((net, bits)) = entry.split_once('/')
-            && let (Ok(net), Ok(bits), Some(ip)) =
-                (net.parse::<IpAddr>(), bits.parse::<u32>(), host_ip)
-        {
-            let in_net = match (net, ip) {
-                (IpAddr::V4(n), IpAddr::V4(h)) if bits <= 32 => {
-                    let mask = if bits == 0 {
-                        0
-                    } else {
-                        u32::MAX << (32 - bits)
-                    };
-                    u32::from(n) & mask == u32::from(h) & mask
-                }
-                (IpAddr::V6(n), IpAddr::V6(h)) if bits <= 128 => {
-                    let mask = if bits == 0 {
-                        0
-                    } else {
-                        u128::MAX << (128 - bits)
-                    };
-                    u128::from(n) & mask == u128::from(h) & mask
-                }
-                _ => false,
-            };
-            if in_net {
-                return true;
-            }
-            continue;
-        }
-        let suffix = entry.trim_start_matches("*.").trim_start_matches('.');
-        if host == suffix || host.ends_with(&format!(".{suffix}")) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Connect to an FTP server, optionally through a proxy.
@@ -2726,6 +2676,7 @@ mod tests {
             username: String::new(),
             password: String::new(),
             no_proxy_list: "*.local".to_string(),
+            rules: None,
         };
         assert!(!super::connects_via_proxy(&url, Some(&proxy)));
         let remote = super::FtpUrl {

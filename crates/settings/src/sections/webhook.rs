@@ -725,13 +725,18 @@ pub(crate) fn delivery_log_group(ctx: &SectionContext, _cx: &mut App) -> Setting
                         }),
                     )
                     .child(
-                        button(
+                        loading_button(
                             "webhook-clear-log",
                             clear.clone(),
                             ButtonVariant::Secondary,
+                            clear_store.read(cx).is_busy("webhookClear"),
                             cx,
                         )
-                        .disabled(disabled || deliveries.is_empty())
+                        .disabled(
+                            disabled
+                                || deliveries.is_empty()
+                                || clear_store.read(cx).is_busy("webhookClear"),
+                        )
                         .on_click(move |_, _, cx| {
                             clear_store.update(cx, |store, cx| {
                                 store.call_simple(

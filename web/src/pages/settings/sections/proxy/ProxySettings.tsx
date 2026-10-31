@@ -1,15 +1,14 @@
 // 代理（crates/settings/src/sections/proxy.rs）：模式 / 系统代理只读信息 / 手动服务器 / 连通性测试 / 站点凭据。
 
-import { Info } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useT } from '../../../../i18n'
 import { RpcError, errorMessage, rpc } from '../../../../lib/rpc'
 import type { ProxyTestRequest, SystemProxyDto } from '../../../../lib/rpc'
-import { Button, Icon } from '../../../../ui'
+import { enabledRuleCount } from '../../../../lib/proxyRules'
+import { Button } from '../../../../ui'
 import {
   DaemonTextRow,
   DropdownField,
-  SettingsCustomRow,
   SettingsPage,
   SettingsRow,
   SettingsSection,
@@ -17,6 +16,8 @@ import {
   setDaemon,
   useDaemonValue,
 } from '../../kit'
+import { InfoLine } from './InfoLine'
+import { ProxyRulesGroup } from './ProxyRulesGroup'
 import { SiteAuthGroup } from './SiteAuthGroup'
 
 const MODES = ['none', 'system', 'manual', 'auto'] as const
@@ -36,16 +37,6 @@ function ReadonlyRow({ titleKey, value }: { titleKey: string; value: string }) {
     <SettingsRow title={t(titleKey)}>
       <span className="break-all text-sm text-muted-foreground">{value}</span>
     </SettingsRow>
-  )
-}
-
-/** info 图标 + 说明文字的整行。 */
-function InfoLine({ text }: { text: string }) {
-  return (
-    <SettingsCustomRow className="flex items-start gap-2">
-      <Icon icon={Info} size="md" className="mt-0.5 shrink-0 text-text-tertiary" />
-      <span className="min-w-0 flex-1 text-xs text-muted-foreground">{text}</span>
-    </SettingsCustomRow>
   )
 }
 
@@ -182,6 +173,7 @@ function PasswordRow() {
 export function ProxySettings() {
   const t = useT()
   const mode = useDaemonValue('proxy_mode')
+  const ruleCount = enabledRuleCount(useDaemonValue('proxy_rules'))
   // 快照未就绪前 useDaemonValue 回落到目录默认值（none），无需额外判空。
   const current = (MODES as readonly string[]).includes(mode) ? (mode as ProxyMode) : 'none'
   return (
@@ -200,6 +192,7 @@ export function ProxySettings() {
             onValueChange={(next) => setDaemon('proxy_mode', next)}
           />
         </SettingsRow>
+        {ruleCount > 0 ? <InfoLine text={t('proxyRulesActiveHint', { count: ruleCount })} /> : null}
       </SettingsSection>
       {current === 'auto' ? (
         <SettingsSection>
@@ -208,6 +201,7 @@ export function ProxySettings() {
       ) : null}
       {current === 'system' ? <SystemSection /> : null}
       {current === 'manual' ? <ManualSection /> : null}
+      <ProxyRulesGroup />
       <SiteAuthGroup />
     </SettingsPage>
   )

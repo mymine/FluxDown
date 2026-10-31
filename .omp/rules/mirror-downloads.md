@@ -3,7 +3,7 @@ description: GPUI 下载页纯模型（新建/菜单/排序/任务组/来源构�
 condition: '[\s\S]'
 scope: "tool:edit, tool:write"
 globs:
-  - '**/crates/downloads/src/model/{new_download,aria2c,save_dir_history,speed_limit_recent,dispatch,mod,view_prefs,row_order,group_tree,source_composition,devices,file_rescan}.rs'
+  - '**/crates/downloads/src/model/{new_download,aria2c,save_dir_history,speed_limit_recent,dispatch,mod,view_prefs,row_order,group_tree,source_composition,devices,file_rescan,bt_trackers}.rs'
   - '**/crates/downloads/src/components/{task_table,task_table_groups}.rs'
   - '**/crates/downloads/src/pages/{task_edit,task_verify,task_detail}.rs'
   - '**/crates/downloads/tests/fixtures/**'
@@ -12,9 +12,14 @@ globs:
   - '**/mobile/Android/core/src/main/java/com/fluxdown/core/model/Models.kt'
   - '**/mobile/Android/core/src/main/java/com/fluxdown/core/protocol/Devices.kt'
   - '**/mobile/Android/app/src/main/java/com/fluxdown/app/feature/downloads/DownloadsModel.kt'
+  - '**/mobile/Android/app/src/main/java/com/fluxdown/app/actions/TaskActions.kt'
   - '**/mobile/FluxDown/FluxKit/Sources/FluxDomain/Model/Models.swift'
   - '**/mobile/FluxDown/FluxKit/Sources/FluxDomain/Protocol/Devices.swift'
   - '**/mobile/FluxDown/FluxDown/Features/Downloads/DownloadsModel.swift'
+  - '**/mobile/FluxDown/FluxDown/Actions/TaskMenu.swift'
+  - '**/fluxDown/utils/android-intent{,.test}.ts'
+  - '**/mobile/Android/app/src/main/java/com/fluxdown/app/ExternalDownloadActivity.kt'
+  - '**/mobile/Android/core/src/main/java/com/fluxdown/core/capture/ExternalDownload.kt'
 interruptMode: never
 ---
 
@@ -36,9 +41,9 @@ interruptMode: never
 
 → `web/src/pages/downloads/dialogs/model.ts::parseEntries` + `aria2c.ts`（`parseCommand` / `joinContinuations` / `planFieldFill`）逐条对齐，`aria2c.test.ts` 覆盖同组行为；TXT 导入两端都用「原文保留、按 URL 去重追加」（`append_entries` ↔ `appendEntries`）
 
-## `crates/downloads/src/components/task_table.rs::TaskMenuFacts::{can_change_url, can_change_segments, can_verify_integrity}`（`task_menu_facts_for` 为右键 / 应用菜单与详情常规页按钮共用事实源）+ `pages/task_edit.rs`（`open_change_url_dialog` / `open_change_segments_dialog`，下载页与 `task_detail.rs` 常规页共用；失败任务换链 / 改线程数成功后串行 Resume）+ `pages/task_verify.rs`（BT 完整性校验结果通知：损坏文件列前 3 个、其余折叠计数，`conflict` = 已在校验）
+## `crates/downloads/src/components/task_table.rs::TaskMenuFacts::{can_rename, can_change_url, can_change_segments, can_verify_integrity}`（`task_menu_facts_for` 为右键 / 应用菜单与详情常规页按钮共用事实源；应用菜单项不置灰，`on_rename_selected` 等入口按同一事实源再判）+ `pages/task_edit.rs`（`open_change_url_dialog` / `open_change_segments_dialog`，下载页与 `task_detail.rs` 常规页共用；失败任务换链 / 改线程数成功后串行 Resume）+ `pages/task_verify.rs`（BT 完整性校验结果通知：损坏文件列前 3 个、其余折叠计数，`conflict` = 已在校验）
 
-→ `web/src/pages/downloads/model/taskEdit.ts::{canChangeUrl, canChangeSegments, canVerifyIntegrity, parseTaskSegments}` + `table/menus.ts` 与 `detail/GeneralTab.tsx` 两处入口 + `dialogs/TaskEditDialogs.tsx`（`resumeIfFailed`）+ `model/actions.ts::verifyTaskIntegrity`；换链源仅 http(s)/ftp（对齐引擎 `change_task_url`）
+→ `web/src/pages/downloads/model/taskEdit.ts::{canRename, canChangeUrl, canChangeSegments, canVerifyIntegrity, parseTaskSegments}` + `table/menus.ts` 与 `detail/GeneralTab.tsx` 两处入口 + `dialogs/TaskEditDialogs.tsx`（`resumeIfFailed`）+ `model/actions.ts::verifyTaskIntegrity`；换链源仅 http(s)/ftp（对齐引擎 `change_task_url`）；重命名 = 本地非 BT 且非下载 / 准备中（对齐引擎 `rename_task`），Android `actions/TaskActions.kt` 与 iOS `Actions/TaskMenu.swift` 同条件（`!status.isActive && protocol != Bt`）
 
 ## `crates/downloads/src/model/dispatch.rs::remote_action_applies`（远程命令适用状态）
 
@@ -71,3 +76,11 @@ interruptMode: never
 ## 文件跟踪重扫节流（`crates/downloads/src/model/file_rescan.rs::RescanThrottle`）
 
 → `web/src/lib/rescanThrottle.ts`（`RescanThrottle`）：逐条对齐 10s 冷却 / 尾沿排队 / 合并 / 尾沿后重计冷却；测试复用同组用例（`rescanThrottle.test.ts`）
+
+## `crates/downloads/src/model/bt_trackers.rs`（详情 Tracker 页：状态筛选标签 + 计数、表头三态排序，DHT 伪行固定不参与；稳定排序、缺省值垫底）
+
+→ `web/src/pages/downloads/detail/btStatus.ts::{trackerCounts, trackerView, nextTrackerSort}`：逐条对齐，两端测试共用 `crates/downloads/tests/fixtures/bt_tracker_view_cases.json`（改规则先改用例）；两端列表都虚拟化（GPUI `ListState` 可变行高、Web `useVirtualizer` + `measureElement`）
+
+## 扩展 → Android App 的外部唤起载荷（`fluxDown/utils/android-intent.ts`：包名 `ANDROID_PACKAGE`、extra 键 `ANDROID_EXTRA`、Intent URI 编码；`fluxdown://download?url=&filename=&cookies=&referrer=&headers=` 协议参数同理）
+
+→ `mobile/Android/app/.../ExternalDownloadActivity.kt`（`EXTRA_*` 常量）+ `mobile/Android/core/.../capture/ExternalDownload.kt::ExternalIntake.fromView`：键名逐字一致，两侧测试（`android-intent.test.ts` / `ExternalDownloadTest`）都跑；改包名同步 `mobile/Android/app/build.gradle.kts::applicationId`

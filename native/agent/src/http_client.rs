@@ -3,6 +3,7 @@
 //! `reqwest` 构建客户端时同步加载系统根证书（macOS 走钥匙串，release 实测每个约 70ms）。
 //! 装配期逐个构建会把 UI Gateway 开始服务整体推迟，冷启动时界面一直等着；这里把构建推迟到
 //! 首个请求、放进阻塞线程池，同时到达的首批请求共享同一次构建，失败的构建下次请求重试。
+//! 代理一律跟随系统设置（含 macOS 例外列表，见 [`crate::system_proxy`]），`configure` 不得自设代理。
 
 use std::sync::Arc;
 
@@ -38,7 +39,10 @@ impl LazyHttpClient {
         self.client
             .get_or_try_init(|| async {
                 let configure = Arc::clone(&self.configure);
-                Ok(tokio::task::spawn_blocking(move || configure().build()).await??)
+                Ok(tokio::task::spawn_blocking(move || {
+                    crate::system_proxy::follow_system(configure()).build()
+                })
+                .await??)
             })
             .await
     }

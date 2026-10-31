@@ -14,6 +14,7 @@ import { loadSettings } from "@/utils/settings";
 import type { FluxDownSettings } from "@/utils/settings";
 import { SITE_PROFILES_KEY, loadSiteProfiles } from "@/utils/site-profiles";
 import type { SiteProfile } from "@/utils/site-profiles";
+import { logWarn } from "@/utils/error-log";
 
 let settingsCache: FluxDownSettings | null = null;
 // 用 inflight Promise 防止并发调用时发起多次 loadSettings。
@@ -96,7 +97,7 @@ export function installSettingsCacheListener(): void {
       try {
         listener();
       } catch (e) {
-        console.warn("[FluxDown] settings listener failed:", e);
+        logWarn("[FluxDown] settings listener failed:", e);
       }
     }
   });

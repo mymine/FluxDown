@@ -143,6 +143,45 @@ pub(crate) async fn load_flutter_identity(
     None
 }
 
+#[cfg(feature = "desktop")]
+/// 读取 Flutter 时代遗留的字符串偏好 `key`（定位规则同 [`load_flutter_identity`]）；找不到 / 不可读 /
+/// 不是非空字符串返回 `None`。
+pub(crate) async fn load_flutter_preference(
+    engine_data_dir: &Path,
+    key: &str,
+    include_installed: bool,
+) -> Option<String> {
+    let mut files = vec![engine_data_dir.join("settings.json")];
+    if include_installed {
+        files.extend(installed_preference_files());
+    }
+    for path in files {
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        if let Some(value) = preference_string(&text, key) {
+            return Some(value);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if include_installed {
+        return defaults_read(key).await;
+    }
+    None
+}
+
+#[cfg(feature = "desktop")]
+/// 从 `settings.json`（键无前缀）或 `shared_preferences.json`（`flutter.` 前缀）取非空字符串值。
+fn preference_string(text: &str, key: &str) -> Option<String> {
+    let root = serde_json::from_str::<Value>(text).ok()?;
+    root.get(format!("flutter.{key}"))
+        .or_else(|| root.get(key))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(target_os = "windows")]
 fn installed_preference_files() -> Vec<PathBuf> {
     std::env::var_os("APPDATA")
@@ -260,6 +299,30 @@ mod tests {
         assert_eq!(parse_preferences_json(r#"{"cloud_device_id":""}"#), None);
         assert_eq!(parse_preferences_json(r#"{"other":1}"#), None);
         assert_eq!(parse_preferences_json("not json"), None);
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn string_preferences_accept_both_key_styles_and_ignore_blank_or_non_strings() {
+        use super::preference_string;
+
+        assert_eq!(
+            preference_string(r#"{"flutter.app_icon_choice":" bolt "}"#, "app_icon_choice"),
+            Some("bolt".to_owned())
+        );
+        assert_eq!(
+            preference_string(r#"{"app_icon_choice":"custom"}"#, "app_icon_choice"),
+            Some("custom".to_owned())
+        );
+        assert_eq!(
+            preference_string(r#"{"app_icon_choice":"  "}"#, "app_icon_choice"),
+            None
+        );
+        assert_eq!(
+            preference_string(r#"{"app_icon_choice":3}"#, "app_icon_choice"),
+            None
+        );
+        assert_eq!(preference_string("not json", "app_icon_choice"), None);
     }
 
     #[test]

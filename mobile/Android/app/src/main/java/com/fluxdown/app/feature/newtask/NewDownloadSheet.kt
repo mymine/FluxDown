@@ -526,7 +526,7 @@ private fun NewDownloadContent(
                     row(hasIcon = true) {
                         val name = inferName(e)
                         val proto = protocolOf(e.url)
-                        val cat = index.categoryOf(name).fileCategory()
+                        val cat = index.categoryOf(name, e.url).fileCategory()
                         FluxListRow(
                             title = name,
                             subtitle = hostOrNull(e.url) ?: proto.previewTag(),

@@ -35,6 +35,7 @@ struct CategoryEditorSheet: View {
     private var showsRules: Bool { existing?.hasMatchRules ?? true }
     private var showsSaveDir: Bool { !(existing?.isAll ?? false) }
     private var isRegex: Bool { draft.matchMode == "regex" }
+    private var isUrl: Bool { draft.matchMode == "url" }
 
     var body: some View {
         NavigationStack {
@@ -86,7 +87,7 @@ struct CategoryEditorSheet: View {
                     Button(L("confirm"), action: save)
                 }
             }
-            .fluxAnimation(.smooth, value: isRegex)
+            .fluxAnimation(.smooth, value: draft.matchMode)
             .fluxAnimation(.smooth, value: error)
             .onChange(of: draft) { error = nil }
             .sheet(isPresented: $showDirectoryPicker) {
@@ -134,6 +135,7 @@ struct CategoryEditorSheet: View {
             Picker(L("matchMode"), selection: $draft.matchMode) {
                 Text(L("matchByExtension")).tag("extension")
                 Text(L("matchByRegex")).tag("regex")
+                Text(L("matchByUrl")).tag("url")
             }
             .pickerStyle(.segmented)
             .accessibilityLabel(L("matchMode"))
@@ -145,6 +147,18 @@ struct CategoryEditorSheet: View {
                         .font(.fluxMono)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
+                        .submitLabel(.done)
+                        .frame(minHeight: 44)
+                }
+                .transition(.opacity)
+            } else if isUrl {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(L("urlPatternLabel")).font(.subheadline.weight(.medium))
+                    TextField(L("urlPatternLabel"), text: $draft.urlText, prompt: Text(L("urlPatternHint")))
+                        .font(.fluxMono)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
                         .submitLabel(.done)
                         .frame(minHeight: 44)
                 }
@@ -178,8 +192,15 @@ struct CategoryEditorSheet: View {
             Text(L("matchMode"))
         } footer: {
             VStack(alignment: .leading, spacing: 6) {
+                if isUrl {
+                    Text(L("urlPatternDesc"))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 errorLabel(for: .extensionsRequired)
                 errorLabel(for: .regexInvalid)
+                errorLabel(for: .urlPatternRequired)
             }
         }
     }

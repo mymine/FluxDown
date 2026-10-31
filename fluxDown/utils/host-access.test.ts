@@ -41,16 +41,10 @@ describe("全站访问权限检测", () => {
   });
 
   test("API 调用失败按已授权处理，避免误报", async () => {
-    const warn = console.warn;
-    console.warn = () => {};
-    try {
-      const { api } = fakeApi(async () => {
-        throw new Error("boom");
-      });
-      expect(await hasHostAccess(api, true)).toBe(true);
-    } finally {
-      console.warn = warn;
-    }
+    const { api } = fakeApi(async () => {
+      throw new Error("boom");
+    });
+    expect(await hasHostAccess(api, true)).toBe(true);
   });
 });
 
@@ -65,18 +59,12 @@ describe("全站访问权限申请", () => {
   });
 
   test("申请被浏览器拒绝（reject）时返回 false", async () => {
-    const warn = console.warn;
-    console.warn = () => {};
-    try {
-      const { api } = fakeApi(
-        async () => false,
-        async () => {
-          throw new Error("may only be called from a user input handler");
-        },
-      );
-      expect(await requestHostAccess(api)).toBe(false);
-    } finally {
-      console.warn = warn;
-    }
+    const { api } = fakeApi(
+      async () => false,
+      async () => {
+        throw new Error("may only be called from a user input handler");
+      },
+    );
+    expect(await requestHostAccess(api)).toBe(false);
   });
 });

@@ -16,6 +16,7 @@ import { useT } from "@/ui/i18n";
 import { sendAction } from "@/utils/messaging";
 import { ERROR_LABEL, extensionDetailsUrl, STATE_LABEL, STATE_TONE, switchGuide } from "../lib/page-scripts";
 import { ConfirmModal, PanelShell } from "../parts";
+import { logError } from "@/utils/error-log";
 
 /** 需要浏览器侧配合（权限 / 开关）才能工作的状态：回到本页时自动重新检查。 */
 function needsBrowserSetup(status: PageScriptsStatus | null): boolean {
@@ -35,7 +36,7 @@ function usePageScriptsStatus(): {
     try {
       setStatus(await sendAction<"pageScriptsStatus">({ action: "pageScriptsStatus", refresh: "force" }));
     } catch (e) {
-      console.error("[FluxDown Options] pageScriptsStatus failed:", e);
+      logError("[FluxDown Options] pageScriptsStatus failed:", e);
     }
   }, []);
 

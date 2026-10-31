@@ -5,9 +5,14 @@
 
 pub(crate) mod about;
 pub(crate) mod api;
+mod app_icon;
 pub(crate) mod appearance;
 mod auto_quantity;
 pub(crate) mod bt;
+mod bt_guard;
+mod bt_guard_add_dialog;
+mod bt_guard_bans;
+mod bt_guard_events;
 pub(crate) mod categories;
 pub(crate) mod category_dialog;
 pub(crate) mod cloud_channel_dialog;
@@ -21,6 +26,8 @@ pub(crate) mod general;
 mod icon_pack;
 pub(crate) mod notify;
 pub(crate) mod proxy;
+pub(crate) mod proxy_rule_dialog;
+pub(crate) mod proxy_rules;
 pub(crate) mod rate_limit;
 mod retention;
 pub(crate) mod shortcuts;
@@ -32,6 +39,7 @@ pub(crate) mod webhook;
 pub(crate) mod webhook_dialog;
 
 use fluxdown_protocol::{DaemonConfigKind, daemon_config_field};
+use fluxdown_ui_components::FluxIcon;
 use fluxdown_ui_i18n::Translator;
 use gpui::{AnyView, App, Entity, ParentElement as _, SharedString};
 use gpui_component::Icon;
@@ -246,5 +254,39 @@ pub(crate) fn slot_page(
                 move |_, _, _, cx: &mut App| meta_text(cx).child(description.clone()),
             ))])
         }
+    }
+}
+
+/// FluxMesh 页的两个注入 Tab：「常规」（随页滚动）与「网络诊断」（自管滚动）。
+/// 槽位为空的 Tab 显示分类描述（仅搜索索引与未注入时出现）。
+pub(crate) fn share_page(
+    ctx: &SectionContext,
+    general: Option<AnyView>,
+    network: Option<AnyView>,
+    network_visible: bool,
+) -> SettingsPage {
+    let page = SettingsPage::new(
+        "share",
+        ctx.t("settingsCatShare"),
+        ctx.t("settingsCatShareDesc"),
+        FluxIcon::Share2,
+    );
+    let slot_tab = |id: &'static str, label_key: &str, view: Option<AnyView>| {
+        let tab = SettingsTab::new(id, ctx.t(label_key));
+        match view {
+            Some(view) => tab.view(view),
+            None => {
+                let description = ctx.t("settingsCatShareDesc");
+                tab.section(SettingsSection::new().row(SettingsRow::custom(
+                    move |_, _, _, cx: &mut App| meta_text(cx).child(description.clone()),
+                )))
+            }
+        }
+    };
+    let page = page.tab(slot_tab("", "settingsTabGeneral", general));
+    if network_visible {
+        page.tab(slot_tab("network", "shareTabNetwork", network).fill_height())
+    } else {
+        page
     }
 }

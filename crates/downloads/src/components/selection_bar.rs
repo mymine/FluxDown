@@ -98,7 +98,7 @@ impl DownloadView {
 
     /// [`Self::icon_action`] 的可禁用版本：`disabled` 时保留悬浮提示但不响应点击。
     #[allow(clippy::too_many_arguments)]
-    fn icon_action_with_state(
+    pub(crate) fn icon_action_with_state(
         &self,
         id: &'static str,
         label: SharedString,
@@ -286,6 +286,15 @@ impl DownloadView {
                 |this, _, cx| this.execute_toolbar(ToolbarCommand::Reveal, cx),
                 cx,
             ));
+        }
+        if let Some(button) = self.share_button(
+            "download-selection-share",
+            self.selected_share_control(cx),
+            icon_size,
+            |this, window, cx| this.share_selected(window, cx),
+            cx,
+        ) {
+            actions.push(button);
         }
         actions.push(self.selection_delete_menu(cx));
         let clear = self.icon_action(

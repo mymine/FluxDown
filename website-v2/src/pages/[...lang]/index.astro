@@ -38,8 +38,11 @@ const t = home[lang];
 </Layout>
 
 <script>
-  import { mountCircuits } from "@/components/home/grid-circuit";
+  import { whenIdle } from "@/scripts/idle";
 
-  // 首页各 1px 缝隙网格(一览 / 引擎要点 / 原生要点 / 扩展)上的电路粒子层
-  mountCircuits();
+  // 首页各 1px 缝隙网格(一览 / 引擎要点 / 原生要点 / 扩展)上的电路粒子层:首屏绘制后的空闲时段再加载
+  whenIdle(async () => {
+    const { mountCircuits } = await import("@/components/home/grid-circuit");
+    mountCircuits();
+  });
 </script>

@@ -8,6 +8,7 @@ import { useT } from "@/ui/i18n";
 import type { MessageKey } from "@/utils/i18n";
 import { captureShortcut, shortcutId, shortcutKeys, shortcutSettingsUrl } from "../lib/shortcuts";
 import { PanelShell, SettingRow } from "../parts";
+import { hasCommandsApi } from "@/utils/platform";
 
 /** Firefox 独有的可写 commands API；Chromium 系只能在浏览器自带的快捷键页修改。 */
 interface CommandsWriteApi {
@@ -16,7 +17,10 @@ interface CommandsWriteApi {
   onChanged?: { addListener(cb: () => void): void; removeListener(cb: () => void): void };
 }
 
-const commandsApi = browser.commands as unknown as Partial<CommandsWriteApi>;
+// 移动端浏览器没有 commands API：按空对象处理，面板显示为空列表。
+const commandsApi: Partial<CommandsWriteApi> = hasCommandsApi()
+  ? (browser.commands as unknown as Partial<CommandsWriteApi>)
+  : {};
 const WRITABLE: CommandsWriteApi | null =
   typeof commandsApi.update === "function" && typeof commandsApi.reset === "function"
     ? (commandsApi as CommandsWriteApi)
@@ -53,7 +57,10 @@ interface Snapshot {
 }
 
 async function loadSnapshot(): Promise<Snapshot> {
-  const [platform, all] = await Promise.all([browser.runtime.getPlatformInfo(), browser.commands.getAll()]);
+  const [platform, all] = await Promise.all([
+    browser.runtime.getPlatformInfo(),
+    hasCommandsApi() ? browser.commands.getAll() : Promise.resolve([]),
+  ]);
   const commands = all
     .filter((c): c is typeof c & { name: string } => typeof c.name === "string" && c.name !== "")
     .map((c) => ({ name: c.name, shortcut: c.shortcut ?? "", description: c.description ?? "" }));

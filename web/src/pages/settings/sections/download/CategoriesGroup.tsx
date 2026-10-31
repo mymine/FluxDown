@@ -61,7 +61,9 @@ export function CategoriesGroup({ disabled }: { disabled: boolean }) {
           const details =
             entry.matchMode === 'regex'
               ? `${t('regexLabel')}: ${entry.regexPattern}`
-              : entry.extensions.map((ext) => `.${ext}`).join(', ')
+              : entry.matchMode === 'url'
+                ? `${t('urlPatternLabel')}: ${entry.urlPattern}`
+                : entry.extensions.map((ext) => `.${ext}`).join(', ')
           return (
             <div key={entry.id} className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md px-2 py-1.5 hover:bg-row-hover">
               <Icon icon={categoryIconByKey(entry.icon)} size="lg" className="shrink-0 text-muted-foreground" />

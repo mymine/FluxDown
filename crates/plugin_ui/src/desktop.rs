@@ -10,6 +10,7 @@
 
 use std::{rc::Rc, sync::Arc};
 
+use fluxdown_protocol::{NAV_BUILTIN_TARGETS, plugin_route_id};
 use gpui::{
     AnyView, App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render,
     Styled as _, Window, div,
@@ -21,7 +22,7 @@ use gpui_shell::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-    PluginScriptHost, PluginUiError, PluginUiPort, PluginWindowSpec,
+    PluginScriptHost, PluginUiError, PluginUiPort, PluginWindowSpec, ViewContainer,
     audit::{self, AuditEntry},
     grant, host_value,
 };
@@ -35,10 +36,11 @@ pub(crate) struct RuntimeEntry {
 /// 加载独立窗口的桌面脚本视图。失败时 app 以 [`load_failure_view`] 代替。
 pub fn load_desktop_view(
     spec: &PluginWindowSpec,
+    container: ViewContainer,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<Entity<ScriptView>, PluginUiError> {
-    load(spec, None, window, cx)
+    load(spec, None, container, window, cx)
 }
 
 /// 嵌入式桌面脚本视图（活动栏页 / 设置 / 任务详情）。`task_id` 经 `fluxdown.taskId()`
@@ -48,10 +50,11 @@ pub fn load_desktop_view(
 pub fn desktop_view(
     spec: PluginWindowSpec,
     task_id: Option<String>,
+    container: ViewContainer,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyView {
-    match load(&spec, task_id, window, cx) {
+    match load(&spec, task_id, container, window, cx) {
         Ok(view) => cx.new(|_| DesktopViewHost { view }).into(),
         Err(error) => load_failure_view(&error, cx),
     }
@@ -105,10 +108,11 @@ impl Render for LoadFailure {
 fn load(
     spec: &PluginWindowSpec,
     task_id: Option<String>,
+    container: ViewContainer,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<Entity<ScriptView>, PluginUiError> {
-    let result = load_inner(spec, task_id, window, cx);
+    let result = load_inner(spec, task_id, container, window, cx);
     let summary = grant::summary(&spec.entry.network_hosts);
     let target = format!("{}/{}", spec.view_id, spec.entry.entry);
     match &result {
@@ -136,6 +140,7 @@ fn load(
 fn load_inner(
     spec: &PluginWindowSpec,
     task_id: Option<String>,
+    container: ViewContainer,
     window: &mut Window,
     cx: &mut App,
 ) -> Result<Entity<ScriptView>, PluginUiError> {
@@ -164,7 +169,7 @@ fn load_inner(
         .with_capabilities(grant::full_trust(&spec.entry.network_hosts))
         .with_data_dir(data_dir.clone())
         .with_storage_path(data_dir.join("store.json"))
-        .with_host_module(fluxdown_module(&spec.identity, task_id, port))
+        .with_host_module(fluxdown_module(&spec.identity, task_id, container, port))
         .map_err(|error| load_error(error.message().to_owned()))?;
     // gpui-shell 在加载 / 实例化时把「当前默认策略」冻结进视图：逐插件替换默认策略，
     // 授权与 HostModule 就随该视图走，后续加载的其他插件不受影响。
@@ -267,7 +272,11 @@ export function theme(): { revision: number; tokens: Record<string, string | num
 /** 当前界面语言（如 `zh-CN`、`en`）。 */
 export function locale(): string;
 /** 在当前活动窗口弹出一条通知（嵌入式视图没有 `ShellRoot`，请用它代替 `window.push_toast`）。 */
-export function toast(level: \"info\" | \"success\" | \"warning\" | \"error\", text: string): void;";
+export function toast(level: \"info\" | \"success\" | \"warning\" | \"error\", text: string): void;
+/** 关闭承载本视图的容器（登录弹窗、设置弹窗或独立窗口）并返回 `true`；活动栏页 / 任务详情 tab 等无法关闭的嵌入页返回 `false`。关闭在当前事件处理结束后执行。 */
+export function close(): boolean;
+/** 切到 FluxDown 主界面的某个页面并把主窗口带到前台：`\"downloads\" | \"rss\" | \"webhooks\" | \"share\"` 为内置页，`{ view }` 为本插件 `location` 为 `activity` 的视图 id。目标形状非法或页面不存在时同步抛错。 */
+export function navigate(target: \"downloads\" | \"rss\" | \"webhooks\" | \"share\" | { view: string }): void;";
 
 /// 与原生移动端通用通道同规则（`native/mobile` `HostSession.call`）。
 pub(crate) fn is_allowed_method(method: &str) -> bool {
@@ -278,11 +287,13 @@ pub(crate) fn is_allowed_method(method: &str) -> bool {
 pub(crate) fn fluxdown_module(
     identity: &str,
     task_id: Option<String>,
+    container: ViewContainer,
     port: Arc<dyn PluginUiPort>,
 ) -> HostModule {
     let id_identity = identity.to_owned();
     let id_call = identity.to_owned();
     let id_invoke = identity.to_owned();
+    let id_navigate = identity.to_owned();
     let invoke_port = port.clone();
     HostModule::new("fluxdown")
         .declarations(FLUXDOWN_DECLARATIONS)
@@ -378,6 +389,22 @@ pub(crate) fn fluxdown_module(
             }
             Ok(HostValue::Null)
         })
+        .function("close", move |_| {
+            let closed = with_current_app(|cx| container.close(cx));
+            closed
+                .map(HostValue::Bool)
+                .ok_or_else(|| HostError::new("fluxdown.close: no active application scope"))
+        })
+        .function("navigate", move |arguments| {
+            let route = navigation_route(&id_navigate, arguments.get(0))?;
+            match with_current_app(|cx| crate::navigate(cx, &id_navigate, &route)) {
+                Some(Ok(())) => Ok(HostValue::Null),
+                Some(Err(message)) => Err(HostError::new(format!("fluxdown.navigate: {message}"))),
+                None => Err(HostError::new(
+                    "fluxdown.navigate: no active application scope",
+                )),
+            }
+        })
 }
 
 async fn rpc_future(call: crate::PortFuture<Value>) -> Result<HostValue, HostError> {
@@ -386,4 +413,75 @@ async fn rpc_future(call: crate::PortFuture<Value>) -> Result<HostValue, HostErr
             serde_json::to_string(&error).unwrap_or_else(|_| format!("{:?}", error.code)),
         )
     })
+}
+
+/// `fluxdown.navigate(target)` 的 target → 路由 id：内置页 id 原样，`{ view }` 解析为本插件的
+/// 活动栏路由。形状非法同步报错；页面是否存在由跳转器校验。
+fn navigation_route(identity: &str, target: Option<&HostValue>) -> Result<String, HostError> {
+    let unknown = || {
+        let json = target.map_or(Value::Null, host_value::host_to_json);
+        HostError::new(format!("fluxdown.navigate: unknown target {json}"))
+    };
+    match target {
+        Some(HostValue::Str(id)) if NAV_BUILTIN_TARGETS.contains(&id.as_str()) => Ok(id.clone()),
+        Some(HostValue::Object(fields)) => fields
+            .iter()
+            .find_map(|(key, value)| match value {
+                HostValue::Str(view) if key == "view" && !view.is_empty() => Some(view),
+                _ => None,
+            })
+            .map(|view| plugin_route_id(identity, view))
+            .ok_or_else(unknown),
+        _ => Err(unknown()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(error: &HostError) -> String {
+        error.message().to_owned()
+    }
+
+    #[test]
+    fn builtin_targets_pass_through_and_views_resolve_to_plugin_routes() {
+        for id in NAV_BUILTIN_TARGETS {
+            let target = HostValue::Str(id.to_owned());
+            assert_eq!(
+                navigation_route("a@b", Some(&target)).ok().as_deref(),
+                Some(id)
+            );
+        }
+        let view = HostValue::Object(vec![("view".into(), HostValue::Str("dash".into()))]);
+        assert_eq!(
+            navigation_route("a@b", Some(&view)).ok().as_deref(),
+            Some("plugin:a@b:dash")
+        );
+    }
+
+    #[test]
+    fn malformed_targets_are_rejected_with_their_json() {
+        let cases = [
+            (Some(HostValue::Str("settings".into())), "\"settings\""),
+            (Some(HostValue::Number(3.0)), "3"),
+            (
+                Some(HostValue::Object(vec![(
+                    "view".into(),
+                    HostValue::Str(String::new()),
+                )])),
+                "{\"view\":\"\"}",
+            ),
+            (None, "null"),
+        ];
+        for (target, json) in cases {
+            let Err(error) = navigation_route("a@b", target.as_ref()) else {
+                panic!("target should be rejected: {json}");
+            };
+            assert_eq!(
+                message(&error),
+                format!("fluxdown.navigate: unknown target {json}")
+            );
+        }
+    }
 }

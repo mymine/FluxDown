@@ -13,6 +13,7 @@ mod json;
 
 mod appearance;
 mod builtin;
+mod cjk;
 mod document;
 mod extended;
 mod flutter;
@@ -29,6 +30,7 @@ pub use appearance::*;
 pub use builtin::{
     ACCENT_TOKEN_PATHS, BuiltinBase, MONO_FONT_SENTINEL, SANS_FONT_SENTINEL, foreground_for,
 };
+pub use cjk::{HanFontPreference, HanScript, set_han_font_preference};
 pub use document::{
     Diagnostic, DiagnosticKind, ExportMode, THEME_FORMAT, THEME_SCHEMA_URL, THEME_SCHEMA_VERSION,
     ThemeDocument, ThemeMeta, ThemeParseError, TokenLayer,

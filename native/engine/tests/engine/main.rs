@@ -2,6 +2,7 @@
 
 mod auto_multipath;
 mod bt_file_selection;
+mod bt_guard;
 mod bt_parts_reseed;
 mod bt_sparse_add;
 mod change_url_resume;
@@ -27,12 +28,15 @@ mod plugin_manifest_flow;
 mod plugin_market;
 mod plugin_purge_auth_flow;
 mod plugin_reload_dev;
+mod plugin_resolve_egress;
 mod plugin_resolve_memory;
 mod plugin_resolver_choice;
+mod plugin_state_freshness;
 mod plugin_variant_cancel;
 mod plugin_ytdlp;
 mod plugin_ytdlp_ffmpeg;
 mod post_only;
+mod proxy_rules;
 mod realtest;
 mod rss_pipeline;
 mod site_auth_flow;

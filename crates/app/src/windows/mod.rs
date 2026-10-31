@@ -32,6 +32,8 @@ pub mod progress;
 pub mod queue_manager;
 pub mod selection;
 pub mod settings;
+pub mod share;
+pub mod share_receive;
 pub mod task_detail;
 pub mod update_prompt;
 
@@ -58,6 +60,10 @@ pub enum WindowKey {
     UpdatePrompt,
     /// 插件桌面界面（contributes.views 的 desktop 入口，gpui-shell 运行），key 为 `<identity>/<viewId>`。
     Plugin(String),
+    /// FluxMesh分享面板：key 是任务集（`tasks:<排序后的 id>`）或 `share:<分享 id>`，同一组任务只开一个。
+    Share(String),
+    /// FluxMesh接收确认窗口（单例：取件码 / 链接 / 深链 / 剪贴板打开的分享都进这一个）。
+    ShareReceive,
 }
 
 pub struct WindowRegistry {
@@ -155,7 +161,7 @@ impl WindowRegistry {
         }
         let label = format!("{key:?}");
         let opened_at = std::time::Instant::now();
-        let options = crate::app_icon::window_options(options);
+        let options = crate::app_icon::window_options(options, cx);
         let result = cx.open_window(options, move |window, cx| {
             crate::logging::observe_new_window(label, opened_at, window, cx);
             // 「跟随系统」主题：系统明暗切换时重新解析；外观变化不会触发整窗刷新，必须显式订阅。
@@ -170,6 +176,9 @@ impl WindowRegistry {
                 let registry = cx.global_mut::<Self>();
                 registry.ids.insert(any.window_id(), key.clone());
                 registry.open.insert(key, any);
+                // 窗口类图标来自 exe 资源；非默认应用图标要请 agent 给新窗口补设（日志即可，不阻塞开窗）。
+                #[cfg(windows)]
+                crate::app_icon::sync_window_icons(cx);
                 Some(handle)
             }
             Err(error) => {

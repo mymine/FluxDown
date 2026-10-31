@@ -6,8 +6,8 @@ use fluxdown_protocol::{
     DaemonConfigSnapshot, RpcErrorData,
 };
 use fluxdown_ui_components::{
-    BusyExt as _, ControlExt as _, FluxIcon, IconControlExt as _, card, input_with_action,
-    tabular_numbers,
+    BusyExt as _, BusyHold, ControlExt as _, FluxIcon, IconControlExt as _, card,
+    input_with_action, tabular_numbers,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -104,6 +104,10 @@ pub(crate) struct ComponentUi {
     pub install_pending: bool,
     pub uninstalling: bool,
     pub saving_path: bool,
+    /// 在途的路径写入由「清除」按钮发起（Save 按钮不转圈）。
+    pub clearing_path: bool,
+    /// 点击「获取版本 / 重试」后的最短转圈保持（渲染时自动拉取不启动）。
+    pub versions_hold: BusyHold,
     pub downloaded_bytes: i64,
     pub total_bytes: i64,
     /// 引擎推送的最近一次安装结果（携带服务端 message，RPC 错误不透传）。
@@ -381,7 +385,7 @@ impl ExtensionsView {
                             .outline()
                             .control(cx)
                             .label(translator.text("componentsManualPathSave").to_owned())
-                            .busy(ui.saving_path)
+                            .busy(ui.saving_path && !ui.clearing_path)
                             .disabled(busy)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.save_manual_path_from_input(kind, window, cx);
@@ -393,6 +397,7 @@ impl ExtensionsView {
                             .control_icon(cx)
                             .icon(FluxIcon::X)
                             .tooltip(translator.text("componentsManualPathClear").to_owned())
+                            .busy(ui.clearing_path)
                             .disabled(busy)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.clear_manual_path(kind, window, cx);
@@ -431,6 +436,7 @@ impl ExtensionsView {
         let has_managed = status.is_some_and(|status| status.has_managed());
         let managed_version = status.map(|status| status.managed_version.to_owned());
         let busy = stale || ui.installing || ui.install_pending || ui.uninstalling;
+        let versions_busy = ui.versions_loading || ui.versions_hold.is_held();
         let version_label = ui.selected_version.clone().unwrap_or_else(|| {
             translator
                 .text(if ui.versions_loading {
@@ -461,9 +467,10 @@ impl ExtensionsView {
                             .ghost()
                             .control(cx)
                             .label(translator.text("componentsFetchVersionsButton").to_owned())
-                            .busy(ui.versions_loading)
-                            .disabled(ui.versions_loading || stale)
+                            .busy(versions_busy)
+                            .disabled(versions_busy || stale)
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                this.components[slot].versions_hold.start(cx);
                                 this.fetch_versions(kind, window, cx);
                             })),
                     ),
@@ -501,9 +508,10 @@ impl ExtensionsView {
                                 .outline()
                                 .control(cx)
                                 .label(translator.text("componentsRetryVersions").to_owned())
-                                .busy(ui.versions_loading)
-                                .disabled(ui.versions_loading || stale)
+                                .busy(versions_busy)
+                                .disabled(versions_busy || stale)
                                 .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.components[slot].versions_hold.start(cx);
                                     this.fetch_versions(kind, window, cx);
                                 })),
                         ),
@@ -831,7 +839,12 @@ impl ExtensionsView {
         if let Some(input) = &self.components[slot].path_input {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
+        let was_saving = self.components[slot].saving_path;
         self.save_manual_path(kind, String::new(), window, cx);
+        let ui = &mut self.components[slot];
+        if !was_saving && ui.saving_path {
+            ui.clearing_path = true;
+        }
     }
 
     /// 写手动路径（空串 = 清除）；成功后用新配置修订号更新控制器并重新探测组件状态。
@@ -861,6 +874,7 @@ impl ExtensionsView {
 
             let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.components[slot].saving_path = false;
+                this.components[slot].clearing_path = false;
                 match result {
                     Ok(config) => {
                         this.controller.apply_config(&config);

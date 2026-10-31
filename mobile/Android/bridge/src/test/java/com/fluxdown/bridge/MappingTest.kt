@@ -299,6 +299,18 @@ class MappingTest {
         assertEquals(listOf("t1"), done.tasks.map { it.taskId })
     }
 
+    @Test
+    fun categoryMappingCarriesUrlPattern() {
+        val dto = CategoryDto(
+            id = "site", name = "Site", icon = "globe", extensions = emptyList(),
+            regexPattern = "", urlPattern = "https://*.example.com/*", position = 2, visible = true, builtinType = null,
+        )
+        val core = dto.toCore()
+        assertEquals("https://*.example.com/*", core.urlPattern)
+        assertEquals("", core.regexPattern)
+        assertEquals("site", core.id)
+    }
+
     private fun snapshot(tasksLoading: Boolean, taskTotal: ULong, tasks: List<TaskDto>) = HostSnapshotDto(
         info = HostInfoDto("fluxdown-agent", "1.0.0", 17u, emptyList()),
         daemonConnected = true,

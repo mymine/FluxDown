@@ -15,6 +15,7 @@
 //!   一样只放行 `daemon.*` / `agent.*`。
 
 mod audit;
+mod container;
 pub mod contrib;
 mod desktop;
 mod grant;
@@ -23,6 +24,7 @@ pub mod portable;
 #[cfg(test)]
 mod tests;
 
+pub use container::{CloseHandler, Navigator, ViewContainer, navigate, set_navigator};
 pub use desktop::{desktop_view, load_desktop_view, load_failure_view};
 
 /// 为独立窗口包一层脚本浮层宿主 `ShellRoot`。窗口根须是 `Root(ShellRoot(…))`
@@ -236,7 +238,7 @@ impl PluginUiPort for NullPort {
 /// 只含声明与空实现的 `fluxdown` 模块，供 SDK 类型生成器用（与运行时模块同一份声明）。
 #[must_use]
 pub fn fluxdown_module_declarations_only() -> HostModule {
-    desktop::fluxdown_module("", None, Arc::new(NullPort))
+    desktop::fluxdown_module("", None, ViewContainer::default(), Arc::new(NullPort))
 }
 
 /// 插件包目录是否就是本机可读路径（远端主机的插件目录在本机不存在）。

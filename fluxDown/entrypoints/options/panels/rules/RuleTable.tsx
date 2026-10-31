@@ -12,6 +12,7 @@ import { Modal } from "@/ui/components/Modal";
 import { Select } from "@/ui/components/Select";
 import { TextInput } from "@/ui/components/TextInput";
 import { Toggle } from "@/ui/components/Toggle";
+import { usePlatform } from "@/ui/hooks/usePlatform";
 import { useT } from "@/ui/i18n";
 import { sendAction } from "@/utils/messaging";
 import { BUILTIN_RULE_PREVIEW } from "@/utils/rule-preview";
@@ -86,6 +87,7 @@ export function RuleTable(props: RuleTableProps): JSX.Element {
   const t = useT();
   const { local } = props;
   const [tier, setTier] = useState<TierFilter>("all");
+  const platform = usePlatform();
   const [query, setQuery] = useState("");
   const [sort, setSort] = useState<SortMode>("default");
   const [page, setPage] = useState(1);
@@ -183,9 +185,14 @@ export function RuleTable(props: RuleTableProps): JSX.Element {
             options={[
               { value: "all", label: t("rules.table.allTiers") },
               { value: "builtin", label: tierLabels.builtin },
-              { value: "official", label: tierLabels.official },
-              { value: "plugin", label: tierLabels.plugin },
-              { value: "community", label: tierLabels.community },
+              // 官方 / 插件 / 社区规则包都来自桌面 App 的缓存，没有桌面通道时不会有这几类。
+              ...(platform.desktopApp
+                ? [
+                    { value: "official" as const, label: tierLabels.official },
+                    { value: "plugin" as const, label: tierLabels.plugin },
+                    { value: "community" as const, label: tierLabels.community },
+                  ]
+                : []),
               { value: "local", label: tierLabels.local },
             ]}
           />

@@ -55,6 +55,7 @@ const ERROR_KEYS: Record<string, keyof Errors> = {
   plan_already_owned: "alreadyOwned",
   not_an_upgrade: "notAnUpgrade",
   plan_tier_not_higher: "tierNotHigher",
+  subscription_conflict: "subscriptionConflict",
   gateway_error: "gateway",
   upstream_unreachable: "gateway",
   referral_code_invalid: "referralInvalid",

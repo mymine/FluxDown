@@ -93,10 +93,12 @@ public struct CustomCategoryDto: Sendable, Hashable, Identifiable, Codable {
     public var id: String
     public var name: String
     public var icon: String
-    /// `extension` | `regex`。
+    /// `extension` | `regex` | `url`。
     public var matchMode: String
     public var extensions: [String]
     public var regexPattern: String
+    /// `url` 模式的通配符模式（`*` 任意串、`?` 单字符、不分大小写、锚定完整匹配整个网址）。
+    public var urlPattern: String
     public var position: Int64
     public var visible: Bool
     public var isBuiltin: Bool
@@ -110,6 +112,7 @@ public struct CustomCategoryDto: Sendable, Hashable, Identifiable, Codable {
         matchMode: String = "extension",
         extensions: [String] = [],
         regexPattern: String = "",
+        urlPattern: String = "",
         position: Int64 = 0,
         visible: Bool = true,
         isBuiltin: Bool = false,
@@ -122,6 +125,7 @@ public struct CustomCategoryDto: Sendable, Hashable, Identifiable, Codable {
         self.matchMode = matchMode
         self.extensions = extensions
         self.regexPattern = regexPattern
+        self.urlPattern = urlPattern
         self.position = position
         self.visible = visible
         self.isBuiltin = isBuiltin
@@ -130,7 +134,7 @@ public struct CustomCategoryDto: Sendable, Hashable, Identifiable, Codable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, icon, matchMode, extensions, regexPattern, position, visible, isBuiltin, builtinType, saveDir
+        case id, name, icon, matchMode, extensions, regexPattern, urlPattern, position, visible, isBuiltin, builtinType, saveDir
     }
 
     /// 宽松解码（serde `#[serde(default)]`）：缺失字段取默认值；`id` / `name` 缺失视为损坏。
@@ -142,6 +146,7 @@ public struct CustomCategoryDto: Sendable, Hashable, Identifiable, Codable {
         matchMode = try c.decodeIfPresent(String.self, forKey: .matchMode) ?? "extension"
         extensions = try c.decodeIfPresent([String].self, forKey: .extensions) ?? []
         regexPattern = try c.decodeIfPresent(String.self, forKey: .regexPattern) ?? ""
+        urlPattern = try c.decodeIfPresent(String.self, forKey: .urlPattern) ?? ""
         position = try c.decodeIfPresent(Int64.self, forKey: .position) ?? 0
         visible = try c.decodeIfPresent(Bool.self, forKey: .visible) ?? true
         isBuiltin = try c.decodeIfPresent(Bool.self, forKey: .isBuiltin) ?? false
@@ -158,6 +163,7 @@ public struct CustomCategoryDto: Sendable, Hashable, Identifiable, Codable {
         try c.encode(matchMode, forKey: .matchMode)
         try c.encode(extensions, forKey: .extensions)
         try c.encode(regexPattern, forKey: .regexPattern)
+        try c.encode(urlPattern, forKey: .urlPattern)
         try c.encode(position, forKey: .position)
         try c.encode(visible, forKey: .visible)
         try c.encode(isBuiltin, forKey: .isBuiltin)
@@ -170,6 +176,7 @@ public struct CustomCategoryDto: Sendable, Hashable, Identifiable, Codable {
     /// `all` 完全锁定；`other` 用排除逻辑匹配——两者都不展示匹配规则区。
     public var hasMatchRules: Bool { !(isAll || isOther) }
     public var isRegex: Bool { matchMode == "regex" }
+    public var isUrl: Bool { matchMode == "url" }
 
     /// 内置分类基线（与 `CustomCategoryDto::builtin_defaults` 同序同扩展名）。
     public static var builtinDefaults: [CustomCategoryDto] {
@@ -227,12 +234,14 @@ public enum CategoryValidationError: Error, Sendable, Hashable {
     case nameRequired
     case extensionsRequired
     case regexInvalid
+    case urlPatternRequired
 
     public var i18nKey: String {
         switch self {
         case .nameRequired: "categoryNameRequired"
         case .extensionsRequired: "extensionsRequired"
         case .regexInvalid: "regexInvalid"
+        case .urlPatternRequired: "urlPatternRequired"
         }
     }
 }
@@ -243,19 +252,21 @@ public struct CategoryDraft: Sendable, Hashable {
     public var existing: CustomCategoryDto?
     public var name: String
     public var icon: String
-    /// `extension` | `regex`。
+    /// `extension` | `regex` | `url`。
     public var matchMode: String
     public var extensionsText: String
     public var regexText: String
+    public var urlText: String
     public var saveDir: String
 
     public init(existing: CustomCategoryDto?) {
         self.existing = existing
         name = existing?.name ?? ""
         icon = existing?.icon ?? "file"
-        matchMode = existing?.matchMode == "regex" ? "regex" : "extension"
+        matchMode = existing?.matchMode == "regex" ? "regex" : (existing?.matchMode == "url" ? "url" : "extension")
         extensionsText = existing?.extensions.joined(separator: ", ") ?? ""
         regexText = existing?.regexPattern ?? ""
+        urlText = existing?.urlPattern ?? ""
         saveDir = existing?.saveDir ?? ""
     }
 }
@@ -428,16 +439,25 @@ public enum CategoryRules {
         if name.isEmpty, !isBuiltin { return .failure(.nameRequired) }
         var extensions = draft.existing?.extensions ?? []
         var regex = draft.existing?.regexPattern ?? ""
-        let mode = draft.matchMode == "regex" ? "regex" : "extension"
+        var urlPattern = draft.existing?.urlPattern ?? ""
+        let mode = draft.matchMode == "regex" ? "regex" : (draft.matchMode == "url" ? "url" : "extension")
         if draft.existing?.hasMatchRules ?? true {
-            if mode == "extension" {
+            switch mode {
+            case "extension":
                 extensions = parseExtensions(draft.extensionsText)
                 if extensions.isEmpty, !isBuiltin { return .failure(.extensionsRequired) }
                 regex = ""
-            } else {
+                urlPattern = ""
+            case "regex":
                 regex = draft.regexText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !regex.isEmpty, !regexLooksValid(regex) { return .failure(.regexInvalid) }
                 extensions = []
+                urlPattern = ""
+            default:
+                urlPattern = draft.urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if urlPattern.isEmpty, !isBuiltin { return .failure(.urlPatternRequired) }
+                extensions = []
+                regex = ""
             }
         }
         let saveDir = draft.saveDir.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -447,12 +467,13 @@ public enum CategoryRules {
             entry.matchMode = mode
             entry.extensions = extensions
             entry.regexPattern = regex
+            entry.urlPattern = urlPattern
             entry.saveDir = saveDir
             return .success(entry)
         }
         return .success(CustomCategoryDto(
             id: newID(nowMs: nowMs), name: name, icon: draft.icon, matchMode: mode, extensions: extensions,
-            regexPattern: regex, position: newPosition, visible: true, isBuiltin: false, builtinType: nil, saveDir: saveDir
+            regexPattern: regex, urlPattern: urlPattern, position: newPosition, visible: true, isBuiltin: false, builtinType: nil, saveDir: saveDir
         ))
     }
 
@@ -477,6 +498,85 @@ public struct DaemonConfigSnapshotDto: Sendable, Hashable, Codable {
     public init(revision: UInt64 = 0, values: [String: String] = [:]) {
         self.revision = revision
         self.values = values
+    }
+}
+
+/// 列表型配置键写入依赖的主机端口（生产实现读 `HostStore` + `HostSession`；测试用假实现）。
+@MainActor
+public protocol DaemonConfigPort: AnyObject {
+    /// 快照里的最新配置；未连接为 nil。
+    var cachedConfig: DaemonConfigSnapshotDto? { get }
+    /// `daemon.config.get`。
+    func fetchConfig() async throws(HostError) -> DaemonConfigSnapshotDto
+    /// `daemon.config.patch`：revision 不符抛 `.conflict`。
+    func patchConfig(expectedRevision: UInt64, values: [String: String]) async throws(HostError)
+}
+
+/// 读-改-写 JSON 数组型配置键（AGENTS.md §5：写入始终基于最新配置重算，冲突时重读并重放）。
+///
+/// - 每次都基于最新快照重新计算；`expectedRevision` 冲突时重新 `daemon.config.get` 后再算一遍（最多 3 次）。
+/// - 写入串行化：连续操作不会互相制造冲突，也不会基于过期数组回写。
+@MainActor
+public final class DaemonConfigListWriter<Element> {
+    /// 与 GPUI `MAX_CONFLICT_RETRIES` 一致。
+    public static var maxConflictRetries: Int { 3 }
+
+    private let port: any DaemonConfigPort
+    private let key: String
+    private let parse: @MainActor (String?) -> [Element]
+    private let encode: @MainActor ([Element]) throws(HostError) -> String
+    private var tail: Task<Void, Never>?
+
+    public init(
+        port: any DaemonConfigPort,
+        key: String,
+        parse: @escaping @MainActor (String?) -> [Element],
+        encode: @escaping @MainActor ([Element]) throws(HostError) -> String
+    ) {
+        self.port = port
+        self.key = key
+        self.parse = parse
+        self.encode = encode
+    }
+
+    /// `transform` 返回 nil 表示无需写入。
+    public func mutate(_ transform: @escaping @MainActor ([Element]) -> [Element]?) async throws(HostError) {
+        let previous = tail
+        let run = Task { @MainActor [self] () async -> Result<Void, HostError> in
+            await previous?.value
+            return await perform(transform)
+        }
+        tail = Task { _ = await run.value }
+        try await run.value.get()
+    }
+
+    private func perform(_ transform: @MainActor ([Element]) -> [Element]?) async -> Result<Void, HostError> {
+        do throws(HostError) {
+            var config = port.cachedConfig
+            var attempt = 0
+            while true {
+                let current: DaemonConfigSnapshotDto
+                if let config {
+                    current = config
+                } else {
+                    current = try await port.fetchConfig()
+                }
+                guard let next = transform(parse(current.values[key])) else {
+                    return .success(())
+                }
+                let encoded = try encode(next)
+                do throws(HostError) {
+                    try await port.patchConfig(expectedRevision: current.revision, values: [key: encoded])
+                    return .success(())
+                } catch {
+                    guard error.code == .conflict, attempt < Self.maxConflictRetries else { throw error }
+                    attempt += 1
+                    config = try await port.fetchConfig()
+                }
+            }
+        } catch {
+            return .failure(error)
+        }
     }
 }
 

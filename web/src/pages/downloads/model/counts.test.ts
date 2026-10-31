@@ -19,6 +19,7 @@ const custom = (
   matchMode: 'extension',
   extensions: [],
   regexPattern: '',
+  urlPattern: '',
   position: 100,
   visible: true,
   isBuiltin: false,

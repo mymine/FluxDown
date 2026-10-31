@@ -2,6 +2,7 @@
  * 下载页客户端逻辑(由 download.astro 的 <script> 引入,仅在存在 [data-dl-root] 时运行)。
  *
  * - 拉取 /api/release(?channel=frontier),主链接走 /api/download(大陆访客 dl-cn 镜像,其余 GitHub),提供 GitHub 备用直链;
+ *   大陆浏览器拿镜像前先过 ESA AI 验证码(download-captcha.ts);
  *   失败时保留服务端渲染的 GitHub Releases 回退链接并显示错误条。
  * - 识别访客 OS / CPU 架构,决定首屏主按钮;`D` 键在本页直接触发主按钮。
  * - 复制按钮、邮件订阅表单。
@@ -11,6 +12,7 @@ import type { Lang } from "@/i18n/config";
 import { formatSize, pickPath, versionAnchor, type ReleaseAsset, type ReleaseInfo } from "@/lib/release-format";
 import { withBase } from "@/lib/base";
 import { assetDownloadUrl } from "@/lib/download-source";
+import { installDownloadCaptcha } from "@/lib/download-captcha";
 import { TESTFLIGHT_URL } from "@/lib/site-nav";
 
 type Channel = "stable" | "frontier";
@@ -77,6 +79,7 @@ function init(root: HTMLElement) {
   const $$ = <T extends Element = HTMLElement>(sel: string) => Array.from(root.querySelectorAll<T>(sel));
 
   $$("[data-js]").forEach((el) => (el.hidden = false));
+  installDownloadCaptcha(lang);
   const status = $("[data-hero-status]");
   if (status) status.textContent = t.hero.detecting;
 
@@ -233,6 +236,9 @@ function init(root: HTMLElement) {
           date: null,
         };
       }
+      case "ios":
+        // 主按钮恒为 TestFlight 公测(renderHero 的 iOS 分支);未签名侧载 IPA 作为备选下载。
+        return { ...base, asset: null, label: t.ios.join, alt: alt(data?.ios?.assets.sideload_ipa, t.ios.sideloadAlt) };
       default:
         return { ...base, asset: null, label: t.hero.allPlatforms, alt: null };
     }

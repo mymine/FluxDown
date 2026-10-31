@@ -107,7 +107,7 @@ export default function ReleaseEntry({ release, lang, dateLabel, relativeLabel }
             {groups.map(({ group, items }) => (
               <div key={group}>
                 <p className="eyebrow-plain mb-2">{groupName(group)}</p>
-                <ul className="grid gap-x-6 sm:grid-cols-2">
+                <ul className="grid grid-cols-1 gap-x-6 sm:grid-cols-2">
                   {items.map(({ asset, sub }) => (
                     <li key={asset.name}>
                       <a

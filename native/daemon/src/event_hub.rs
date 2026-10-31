@@ -764,6 +764,19 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
                 ));
                 return;
             }
+            EngineEvent::BtGuardChanged => {
+                self.0.publish(DaemonEvent::BtGuardChanged);
+                return;
+            }
+            EngineEvent::BtGuardCloudRefreshWanted { have_sequence } => {
+                self.0
+                    .publish(DaemonEvent::BtGuardCloudRefreshWanted { have_sequence });
+                return;
+            }
+            EngineEvent::BtGuardEvidenceReady { count } => {
+                self.0.publish(DaemonEvent::BtGuardEvidenceReady { count });
+                return;
+            }
             _ => {}
         }
 
@@ -925,6 +938,14 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
                     .publish(DaemonEvent::PluginViewClosed { session, reason });
                 return;
             }
+            EngineEvent::PluginViewNavigate { session, target } => {
+                let frame = self
+                    .0
+                    .plugin_views
+                    .effect(&session, fluxdown_protocol::ViewEffect::Navigate { target });
+                self.0.publish(DaemonEvent::PluginViewFrame(frame));
+                return;
+            }
             EngineEvent::PluginToast {
                 identity,
                 level,
@@ -935,6 +956,16 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
                     level,
                     text,
                 });
+                return;
+            }
+            #[cfg(feature = "plugins")]
+            EngineEvent::PluginsChanged(plugins) => {
+                self.0.publish(DaemonEvent::PluginsChanged(
+                    plugins
+                        .into_iter()
+                        .map(fluxdown_engine_protocol::plugin_info_to_dto)
+                        .collect(),
+                ));
                 return;
             }
             EngineEvent::PluginAutoDisabled { identity, reason } => {

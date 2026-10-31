@@ -67,6 +67,7 @@ private fun CategoryValidationError.message(): Int = when (this) {
     CategoryValidationError.NameRequired -> R.string.categoryNameRequired
     CategoryValidationError.ExtensionsRequired -> R.string.extensionsRequired
     CategoryValidationError.RegexInvalid -> R.string.regexInvalid
+    CategoryValidationError.UrlPatternRequired -> R.string.urlPatternRequired
 }
 
 /**
@@ -236,7 +237,11 @@ private fun ColumnScope.EditorBody(
     val context = LocalContext.current
     val showsRules = existing?.hasMatchRules ?: true
     val showsSaveDir = existing?.isAll != true
-    val isRegex = draft.matchMode == "regex"
+    val mode = when (draft.matchMode) {
+        "regex" -> "regex"
+        "url" -> "url"
+        else -> "extension"
+    }
     val namePrompt = if (existing != null && existing.isBuiltin) categoryDisplayName(context, existing) else str(R.string.categoryNameHint)
 
     androidx.compose.foundation.layout.Column(
@@ -275,11 +280,12 @@ private fun ColumnScope.EditorBody(
                     options = listOf(
                         SegOption("extension", str(R.string.matchByExtension)),
                         SegOption("regex", str(R.string.matchByRegex)),
+                        SegOption("url", str(R.string.matchByUrl)),
                     ),
-                    selected = if (isRegex) "regex" else "extension",
+                    selected = mode,
                     onSelect = { onChange(draft.copy(matchMode = it)) },
                 )
-                if (isRegex) {
+                if (mode == "regex") {
                     FluxField(
                         value = draft.regexText,
                         onValueChange = { onChange(draft.copy(regexText = it)) },
@@ -287,6 +293,16 @@ private fun ColumnScope.EditorBody(
                         placeholder = str(R.string.regexHint),
                         mono = true,
                         error = error?.takeIf { it == CategoryValidationError.RegexInvalid }?.let { str(it.message()) },
+                    )
+                } else if (mode == "url") {
+                    FluxField(
+                        value = draft.urlText,
+                        onValueChange = { onChange(draft.copy(urlText = it)) },
+                        label = str(R.string.urlPatternLabel),
+                        placeholder = str(R.string.urlPatternHint),
+                        hint = str(R.string.urlPatternDesc),
+                        mono = true,
+                        error = error?.takeIf { it == CategoryValidationError.UrlPatternRequired }?.let { str(it.message()) },
                     )
                 } else {
                     FluxField(

@@ -418,7 +418,7 @@ fn is_secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     matches!(
         key.as_str(),
-        "proxy_username" | "proxy_password" | "webhook.endpoints"
+        "proxy_username" | "proxy_password" | "proxy_rules" | "webhook.endpoints"
     ) || ["password", "secret", "token", "authorization", "cookie"]
         .iter()
         .any(|needle| key.contains(needle))
@@ -478,6 +478,34 @@ mod tests {
         assert!(cleaned.contains("api.telegram.org"));
         assert!(cleaned.contains("push.example.com"));
         assert!(cleaned.contains("proxy.local:8080"));
+    }
+
+    #[test]
+    fn share_secrets_are_masked_but_context_is_kept() {
+        let log = "join ticket=eyJhbGciOiJ9.c2lnbmF0dXJl&x=1\n\
+                   body {\"ticket\":\"AbC_-123.dEf_-456\",\"guestToken\":\"gt-secret-1\"}\n\
+                   bare eyJwYXlsb2Fk.c2ln leaked?\n\
+                   adapter http://127.0.0.1:51234/0123456789abcdef0123456789abcdef/3 ready\n\
+                   pickupCode=123456 pickup_code: 654321 guest_token=zzz9\n\
+                   share code=777777 stays\n";
+        let cleaned = String::from_utf8(sanitize_text(log.as_bytes())).expect("utf8");
+        for leaked in [
+            "eyJhbGciOiJ9",
+            "c2lnbmF0dXJl",
+            "AbC_-123",
+            "gt-secret-1",
+            "eyJwYXlsb2Fk",
+            "0123456789abcdef0123456789abcdef",
+            "123456 ",
+            "654321",
+            "zzz9",
+        ] {
+            assert!(!cleaned.contains(leaked), "{leaked} leaked: {cleaned}");
+        }
+        assert!(cleaned.contains("http://127.0.0.1:51234/[REDACTED]/3 ready"));
+        assert!(cleaned.contains("x=1"));
+        // 无键名的 `code=` 不是取件码规则的目标。
+        assert!(cleaned.contains("code=777777"));
     }
 
     #[test]

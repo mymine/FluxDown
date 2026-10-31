@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use fluxdown_protocol::PluginDto;
-use fluxdown_ui_plugin_ui::PluginWindowSpec;
+use fluxdown_ui_plugin_ui::{PluginWindowSpec, ViewContainer};
 use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_window_options};
 use gpui::{
     AnyView, App, AppContext as _, Bounds, Context, Global, IntoElement, ParentElement as _,
@@ -52,7 +52,9 @@ struct PluginWindows(HashMap<String, OpenPluginWindow>);
 impl Global for PluginWindows {}
 
 fn load_content(spec: &PluginWindowSpec, window: &mut Window, cx: &mut App) -> AnyView {
-    match fluxdown_ui_plugin_ui::load_desktop_view(spec, window, cx) {
+    // 脚本经 `fluxdown.close()` 关闭的是整个插件窗口。
+    let container = ViewContainer::window(window);
+    match fluxdown_ui_plugin_ui::load_desktop_view(spec, container, window, cx) {
         Ok(view) => view.into(),
         Err(error) => fluxdown_ui_plugin_ui::load_failure_view(&error, cx),
     }

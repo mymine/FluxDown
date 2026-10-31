@@ -163,7 +163,7 @@ fn port_field(ctx: &SectionContext) -> Control {
                     window,
                     move |slot: &mut PortSlot, input, event: &InputEvent, window, cx| {
                         if !matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. })
-                            || store.read(cx).is_busy("gateway")
+                            || store.read(cx).in_flight("gateway")
                             || !store.read(cx).gateway().port_editable
                         {
                             return;

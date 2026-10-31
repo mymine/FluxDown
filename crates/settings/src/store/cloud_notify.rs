@@ -92,8 +92,7 @@ impl SettingsStore {
         if self.stale {
             return;
         }
-        self.busy.insert(action);
-        self.busy_tags.remove(action);
+        self.begin_busy(action, cx);
         cx.notify();
         let future = self.port.call(method, params);
         cx.spawn(async move |this, cx| {
@@ -127,7 +126,7 @@ impl SettingsStore {
 
     /// 拉取概览：`force = false` 读 agent 缓存（过期时 agent 后台刷新并推送），`true` 立即向云端拉取。
     pub(crate) fn refresh_cloud_notify(&mut self, force: bool, cx: &mut Context<Self>) {
-        if self.is_busy(ACTION_REFRESH) {
+        if self.in_flight(ACTION_REFRESH) {
             return;
         }
         self.cloud_call(
@@ -182,7 +181,7 @@ impl SettingsStore {
     /// 投递记录第一页以 agent 状态投影里的 `recent_deliveries` 为准（实时更新，不在这里拉取）；
     /// 这里只负责「加载更多」：按游标追加更早的记录，已出现在快照里的按 id 去重。
     pub(crate) fn load_more_cloud_deliveries(&mut self, cx: &mut Context<Self>) {
-        if self.stale || self.is_busy(ACTION_DELIVERIES) {
+        if self.stale || self.in_flight(ACTION_DELIVERIES) {
             return;
         }
         let Some(cursor) = self.cloud_deliveries_next_cursor().map(str::to_owned) else {

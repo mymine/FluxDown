@@ -35,6 +35,12 @@ const jsonLdNodes = [
   </section>
 </Layout>
 
+<script>
+  // 更新日志里的 /api/download 链接同样先过验证码才拿大陆镜像（见 src/lib/download-captcha.ts）。
+  import { installDownloadCaptcha } from "@/lib/download-captcha";
+  installDownloadCaptcha(document.documentElement.lang.startsWith("zh") ? "zh" : "en");
+</script>
+
 <style is:global>
   @layer components {
     .cl-layout {

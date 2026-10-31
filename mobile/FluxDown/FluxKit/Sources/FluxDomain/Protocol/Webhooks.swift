@@ -322,53 +322,26 @@ public func latestWebhookDelivery(_ deliveries: [WebhookDelivery], endpointId: S
 
 // MARK: - 读-改-写
 
-/// `daemon.config.get` 结果（`DaemonConfigSnapshot`）。
-public struct WebhookConfigSnapshot: Codable, Sendable, Hashable {
-    public var revision: UInt64
-    public var values: [String: String]
-
-    public init(revision: UInt64, values: [String: String]) {
-        self.revision = revision
-        self.values = values
-    }
-}
-
-/// 端点写入依赖的主机端口（生产实现读 `HostStore` + `HostSession`；测试用假实现）。
-@MainActor
-public protocol WebhookConfigPort: AnyObject {
-    /// 快照里的最新配置；未连接为 nil。
-    var cachedConfig: WebhookConfigSnapshot? { get }
-    /// `daemon.config.get`。
-    func fetchConfig() async throws(HostError) -> WebhookConfigSnapshot
-    /// `daemon.config.patch`：revision 不符抛 `.conflict`。
-    func patchConfig(expectedRevision: UInt64, values: [String: String]) async throws(HostError)
-}
-
-/// 读-改-写端点列表（AGENTS.md §5：写入始终基于最新配置重算，冲突时重读并重放）。
-///
-/// - 每次都基于最新快照重新计算；`expectedRevision` 冲突时重新 `daemon.config.get` 后再算一遍（最多 3 次）。
-/// - 写入串行化：连续操作不会互相制造冲突，也不会基于过期数组回写。
+/// 读-改-写端点列表（AGENTS.md §5）：委托给通用 `DaemonConfigListWriter`（`Preferences.swift`）。
 @MainActor
 public final class WebhookEndpointWriter {
     /// 与 GPUI `MAX_CONFLICT_RETRIES` 一致。
-    public static let maxConflictRetries = 3
+    public static let maxConflictRetries = DaemonConfigListWriter<WebhookEndpoint>.maxConflictRetries
 
-    private let port: any WebhookConfigPort
-    private var tail: Task<Void, Never>?
+    private let writer: DaemonConfigListWriter<WebhookEndpoint>
 
-    public init(port: any WebhookConfigPort) {
-        self.port = port
+    public init(port: any DaemonConfigPort) {
+        writer = DaemonConfigListWriter(
+            port: port,
+            key: WebhookEndpoint.configKey,
+            parse: { WebhookEndpoint.parseList($0) },
+            encode: { list throws(HostError) in try WebhookEndpoint.encodeList(list) }
+        )
     }
 
     /// `transform` 返回 nil 表示无需写入。
     public func mutate(_ transform: @escaping @MainActor ([WebhookEndpoint]) -> [WebhookEndpoint]?) async throws(HostError) {
-        let previous = tail
-        let run = Task { @MainActor [self] () async -> Result<Void, HostError> in
-            await previous?.value
-            return await perform(transform)
-        }
-        tail = Task { _ = await run.value }
-        try await run.value.get()
+        try await writer.mutate(transform)
     }
 
     /// 新增或按 id 覆盖。
@@ -394,34 +367,5 @@ public final class WebhookEndpointWriter {
 
     public func remove(id: String) async throws(HostError) {
         try await mutate { list in list.filter { $0.id != id } }
-    }
-
-    private func perform(_ transform: @MainActor ([WebhookEndpoint]) -> [WebhookEndpoint]?) async -> Result<Void, HostError> {
-        do throws(HostError) {
-            var config = port.cachedConfig
-            var attempt = 0
-            while true {
-                let current: WebhookConfigSnapshot
-                if let config {
-                    current = config
-                } else {
-                    current = try await port.fetchConfig()
-                }
-                guard let next = transform(WebhookEndpoint.parseList(current.values[WebhookEndpoint.configKey])) else {
-                    return .success(())
-                }
-                let encoded = try WebhookEndpoint.encodeList(next)
-                do throws(HostError) {
-                    try await port.patchConfig(expectedRevision: current.revision, values: [WebhookEndpoint.configKey: encoded])
-                    return .success(())
-                } catch {
-                    guard error.code == .conflict, attempt < Self.maxConflictRetries else { throw error }
-                    attempt += 1
-                    config = try await port.fetchConfig()
-                }
-            }
-        } catch {
-            return .failure(error)
-        }
     }
 }

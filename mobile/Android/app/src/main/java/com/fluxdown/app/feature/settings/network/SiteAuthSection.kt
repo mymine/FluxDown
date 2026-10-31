@@ -192,7 +192,7 @@ internal fun SiteAuthSection(
 }
 
 @Composable
-private fun EmptyNote(text: String) {
+internal fun EmptyNote(text: String) {
     Box(Modifier.fillMaxWidth().padding(vertical = 16.dp), contentAlignment = Alignment.Center) {
         FluxText(
             text,

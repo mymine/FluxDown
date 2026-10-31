@@ -82,9 +82,16 @@ internal fun durationText(totalSeconds: Long): String {
     return parts.joinToString(" ")
 }
 
-/** Auto 代理链路 wire 标签 → 文案；未知值原样返回。 */
+/** Auto 路由或站点规则 wire 标签 → 文案；未知值原样返回。 */
 @Composable
 internal fun routeLabel(route: String): String {
+    // `rule:system` / `rule:manual` 必须整串精确匹配，不能走下面的后缀拆分。
+    when (route) {
+        "rule:direct" -> return str(R.string.taskRouteRuleDirect)
+        "rule:system" -> return str(R.string.taskRouteRuleSystem)
+        "rule:manual" -> return str(R.string.taskRouteRuleManual)
+        "rule:custom" -> return str(R.string.taskRouteRuleCustom)
+    }
     var base = route
     var via: String? = null
     if (route.endsWith(":system")) {

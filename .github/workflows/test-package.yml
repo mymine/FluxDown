@@ -187,7 +187,7 @@ jobs:
           BIN_DIR: target/release
           OUT_DIR: build/installer
         run: |
-          wget -qO "$RUNNER_TEMP/appimagetool" https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          wget -qO "$RUNNER_TEMP/appimagetool" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x "$RUNNER_TEMP/appimagetool"
           APPIMAGETOOL="$RUNNER_TEMP/appimagetool" scripts/package_gpui_linux.sh
       - name: Upload Linux test artifacts

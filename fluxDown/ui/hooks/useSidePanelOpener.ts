@@ -8,6 +8,7 @@
  */
 import { useEffect, useState } from "preact/hooks";
 import { browser } from "wxt/browser";
+import { logWarn } from "@/utils/error-log";
 
 /** Firefox 的 sidebarAction 不在 @wxt-dev/browser 的类型里，只声明用到的部分。 */
 interface FirefoxExtras {
@@ -62,7 +63,7 @@ export function useSidePanelOpener(closeAfterOpen: boolean): SidePanelOpener {
       .then(() => {
         if (closeAfterOpen) window.close();
       })
-      .catch((e) => console.warn("[FluxDown] open side panel failed:", e));
+      .catch((e) => logWarn("[FluxDown] open side panel failed:", e));
   };
 
   return { available: sidebar !== null || chromePanel, open };

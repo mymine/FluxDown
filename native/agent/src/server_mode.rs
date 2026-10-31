@@ -47,8 +47,9 @@ pub const TOKEN_SUBPROTOCOL_PREFIX: &str = "fluxdown.token.";
 pub const ACCESS_KEY_MIN_LEN: usize = 8;
 /// 访问密钥最长长度：既防误粘整段文本，也保证能原样塞进 HTTP 头。
 pub const ACCESS_KEY_MAX_LEN: usize = 128;
-/// 默认监听地址。
-pub const DEFAULT_BIND: &str = "0.0.0.0:17800";
+/// 默认监听地址：IPv4 + IPv6 双栈（飞牛 DDNS / FN Connect 等走 IPv6 访问）；本机不支持 IPv6
+/// 时网关退回 `0.0.0.0`（`runtime::bind_gateway_socket`）。
+pub const DEFAULT_BIND: &str = "[::]:17800";
 /// daemon `/blobs/*` 请求体上限（与 `fluxdown_daemon::http::REQUEST_BODY_LIMIT` 一致）。
 const BLOB_UPLOAD_LIMIT: usize = 4 * 1024 * 1024;
 /// 初始化请求体上限：只含一个密钥。
@@ -101,7 +102,7 @@ impl ServerConfig {
     ///
     /// | 变量 | 语义 |
     /// |---|---|
-    /// | `FLUXDOWN_BIND` | 监听地址，缺省 `0.0.0.0:17800`，允许非回环 |
+    /// | `FLUXDOWN_BIND` | 监听地址，缺省 `[::]:17800`（双栈，无 IPv6 时退回 `0.0.0.0`），允许非回环 |
     /// | `FLUXDOWN_TOKEN` / `FLUXDOWN_TOKEN_FORCE` | 预置访问密钥 / 是否每次启动覆盖；不合规则忽略并告警 |
     /// | `FLUXDOWN_WEBROOT` | 磁盘托管 SPA |
     /// | `FLUXDOWN_LANG` | `/ping` 语言回退，`zh-CN` → `zh` |
@@ -289,13 +290,18 @@ pub struct ServerRuntime {
 
 /// 阻塞运行 server 模式直到退出。
 pub fn run_blocking(host: crate::shell::ShellHost) -> AgentResult {
-    if let Err(error) = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init()
-    {
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let fmt_layer = tracing_subscriber::fmt::layer().with_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+    );
+    let subscriber = tracing_subscriber::registry().with(fmt_layer);
+    // iroh / FluxMesh tracing 另走内存环形缓冲（诊断页）。
+    #[cfg(feature = "share-p2p")]
+    let subscriber = subscriber.with(crate::share::logs::layer());
+    if let Err(error) = subscriber.try_init() {
         // 嵌入式宿主可能已经设置订阅者；保留它，同时让 stderr 可观察未安装的原因。
         tracing::warn!(error = %error, "server tracing subscriber was not installed");
         eprintln!("server tracing subscriber was not installed: {error}");
@@ -1262,7 +1268,7 @@ mod tests {
 
     #[test]
     fn bind_defaults_to_all_interfaces_and_accepts_non_loopback() {
-        assert_eq!(config_from(&[]).unwrap().bind.to_string(), "0.0.0.0:17800");
+        assert_eq!(config_from(&[]).unwrap().bind.to_string(), "[::]:17800");
         assert_eq!(
             config_from(&[("FLUXDOWN_BIND", " 192.168.1.10:9000 ")])
                 .unwrap()

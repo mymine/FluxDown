@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use fluxdown_protocol::{
@@ -19,13 +19,16 @@ use fluxdown_protocol::{
     RemoteDispatchParams, RemoteDispatchResult, RemoteTaskDto, RemoteTaskStatus, RpcErrorData,
     ServiceEvent, WsServerMsg,
 };
-use futures_util::StreamExt;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::cloud::{CloudApi, CloudError};
+use tokio_tungstenite::tungstenite::Message;
+
+use crate::cloud::{CloudApi, CloudError, CloudSocket};
 use crate::daemon_client::DaemonClient;
 use crate::event_hub::AgentEventHub;
 use crate::link::{resolve_receive_dir, valid_file_name};
@@ -37,6 +40,14 @@ const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// WebSocket 握手被判定「不支持」后，直接走 SSE 的粘性时长。
+const WS_FALLBACK_STICKY: Duration = Duration::from_secs(60 * 60);
+/// 连续这么多次「握手成功但通道不可用」后进入粘性回退。
+const WS_UNUSABLE_THRESHOLD: usize = 3;
+/// 客户端 → 服务端心跳帧（线协议 `{"type":"ping"}`）。
+const SOCKET_PING_FRAME: &str = r#"{"type":"ping"}"#;
+/// 服务端 `error` 帧里 message 的展示上限。
+const MAX_SOCKET_ERROR_CHARS: usize = 200;
 /// 周期性重试接单：daemon 暂时不可用时任务保持 pending，就绪后自动接上。
 const ACCEPT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const RETRY_DELAYS: [Duration; 3] = [
@@ -72,6 +83,15 @@ enum SseEnd {
     /// 本机被同账号的另一台设备手动下线（`presence.kicked`）：断开 SSE，进入在线名额受限的等待。
     Kicked,
 }
+
+/// 一条已建立的任务实时通道：优先 WebSocket（心跳在连接内），回退 SSE + HTTP 心跳。
+enum EventChannel {
+    Socket(Box<CloudSocket>),
+    Stream(reqwest::Response),
+}
+
+type TransportFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<SseEnd, RemoteError>> + Send + 'a>>;
 
 /// 有界 FIFO 去重集合。
 #[derive(Default)]
@@ -122,8 +142,18 @@ pub struct RemoteTaskService {
     sse_connect_timeout: Duration,
     heartbeat_interval: Duration,
     reconnect: Notify,
+    /// WebSocket 握手被判定「不支持」后的粘性回退截止时刻；锁中毒时沿用内部值（只是个时间戳）。
+    ws_fallback_until: std::sync::Mutex<Option<Instant>>,
+    /// 连续「握手可达但通道不可用」的次数；收到 pong 清零，达到阈值进入粘性回退。
+    ws_unusable_streak: AtomicUsize,
+    /// 当前 WebSocket 会话是否已收到过 pong。
+    ws_pong_seen: AtomicBool,
+    /// 正处于 WebSocket 握手阶段（整体握手超时据此判断超时落在哪一段）。
+    ws_handshaking: AtomicBool,
     /// 云端 SSE 里推送相关的事件（`notify.changed` / `notify.delivery` / 重连 / `resync`）转交云端推送模块。
     notify_feed: Option<crate::cloud_notify::NotifyFeed>,
+    /// FluxMesh事件（`share.claimed` / `share.sessionKill` / `share.changed`）原样转交FluxMesh服务；未编入FluxMesh时为空。
+    share_feed: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     runtime: Mutex<Runtime>,
 }
 
@@ -146,7 +176,12 @@ impl RemoteTaskService {
             sse_connect_timeout: SSE_CONNECT_TIMEOUT,
             heartbeat_interval: HEARTBEAT_INTERVAL,
             reconnect: Notify::new(),
+            ws_fallback_until: std::sync::Mutex::new(None),
+            ws_unusable_streak: AtomicUsize::new(0),
+            ws_pong_seen: AtomicBool::new(false),
+            ws_handshaking: AtomicBool::new(false),
             notify_feed: None,
+            share_feed: None,
             runtime: Mutex::new(Runtime::default()),
         }
     }
@@ -155,6 +190,13 @@ impl RemoteTaskService {
     #[must_use]
     pub fn with_notify_feed(mut self, feed: crate::cloud_notify::NotifyFeed) -> Self {
         self.notify_feed = Some(feed);
+        self
+    }
+
+    /// 接入FluxMesh服务：SSE 里的FluxMesh事件转交给它处理。
+    #[must_use]
+    pub fn with_share_feed(mut self, feed: tokio::sync::mpsc::UnboundedSender<Value>) -> Self {
+        self.share_feed = Some(feed);
         self
     }
 
@@ -214,21 +256,38 @@ impl RemoteTaskService {
             // 外层监督覆盖请求响应头、业务 await 与退避；退出即丢弃所有借用 future，
             // 不遗留跨账号回写的 detached task。
             let attempt = async {
-                let response = tokio::time::timeout(
+                let channel = tokio::time::timeout(
                     self.sse_connect_timeout,
-                    self.cloud.at_epoch(epoch).remote_events(&device_id),
+                    self.open_event_channel(epoch, &device_id),
                 )
                 .await
                 .map_err(|_| {
-                    RemoteError::Protocol("remote SSE response headers timeout".to_owned())
+                    // 整体握手超时发生在 WebSocket 探测阶段：算一次「握手成功路径不可用」。
+                    if self.ws_handshaking.swap(false, Ordering::Relaxed) {
+                        self.note_ws_unusable("handshake response headers timed out");
+                    }
+                    RemoteError::Protocol(
+                        "remote event channel response headers timeout".to_owned(),
+                    )
                 })??;
-                // 流已建立：重连期间错过的投递变化由第一页全量拉取纠正。
+                // 通道已建立：重连期间错过的投递变化由第一页全量拉取纠正。
                 if let Some(feed) = &self.notify_feed {
                     feed.connected();
                 }
+                let is_socket = matches!(channel, EventChannel::Socket(_));
                 let (mut events, _) = self.events.subscribe_and_snapshot();
-                self.consume_events_epoch(response, &cancel, &mut events, epoch)
-                    .await
+                let result = self
+                    .consume_events_epoch(channel, &cancel, &mut events, epoch)
+                    .await;
+                // 101 成功却在收到第一个 pong 前就以读错误 / Close / 空闲超时结束：握手能通但通道不可用。
+                // 服务端 error 帧、kicked、resync 等是有效应答，不算。
+                if is_socket
+                    && matches!(result, Err(RemoteError::Protocol(_)))
+                    && !self.ws_pong_seen.load(Ordering::Relaxed)
+                {
+                    self.note_ws_unusable("session ended before the first pong");
+                }
+                result
             };
             let result = tokio::select! {
                 biased;
@@ -311,6 +370,82 @@ impl RemoteTaskService {
         self.connection(CloudConnectionState::Disconnected, None);
     }
 
+    /// 回退期内为 `true`；过期顺手清除。
+    fn ws_fallback_active(&self) -> bool {
+        let mut until = self
+            .ws_fallback_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *until {
+            Some(deadline) if Instant::now() < deadline => true,
+            Some(_) => {
+                *until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// 进入 1 小时粘性回退（SSE + HTTP 心跳）。
+    fn start_ws_fallback(&self) {
+        *self
+            .ws_fallback_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Instant::now() + WS_FALLBACK_STICKY);
+        self.ws_unusable_streak.store(0, Ordering::Relaxed);
+    }
+
+    /// 记一次「握手可达但通道不可用」；连续 `WS_UNUSABLE_THRESHOLD` 次进入粘性回退，收到 pong 清零。
+    /// 网络连接错误与 401 / 403 / 429 / 5xx 不计入（这些 SSE 也会失败）。
+    fn note_ws_unusable(&self, why: &str) {
+        let streak = self.ws_unusable_streak.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(streak, why, "remote task WebSocket unusable");
+        if streak >= WS_UNUSABLE_THRESHOLD {
+            self.start_ws_fallback();
+            tracing::info!(
+                "remote task WebSocket repeatedly unusable on this network path; falling back to SSE for 1h"
+            );
+        }
+    }
+
+    /// 建立任务实时通道：未处于回退期先试 WebSocket；握手被判定「不支持」则记录粘性回退并在
+    /// 同一次尝试内改走 SSE。其它错误（含 403 / 429 / 5xx / 网络错误）原样返回，不回退；
+    /// 握手等响应头超时另记一次「不可用」。
+    async fn open_event_channel(
+        &self,
+        epoch: crate::cloud::RequestEpoch,
+        device_id: &str,
+    ) -> Result<EventChannel, RemoteError> {
+        let api = self.cloud.at_epoch(epoch);
+        if !self.ws_fallback_active() {
+            self.ws_handshaking.store(true, Ordering::Relaxed);
+            let opened = api.remote_socket(device_id).await;
+            self.ws_handshaking.store(false, Ordering::Relaxed);
+            match opened {
+                Ok(socket) => {
+                    self.ws_pong_seen.store(false, Ordering::Relaxed);
+                    return Ok(EventChannel::Socket(Box::new(socket)));
+                }
+                Err(error) if error.is_websocket_unsupported() => {
+                    self.start_ws_fallback();
+                    tracing::info!(
+                        status = ?error.status,
+                        reason = %error.message,
+                        "remote task WebSocket unsupported on this network path; falling back to SSE for 1h"
+                    );
+                }
+                Err(error) => {
+                    if error.is_websocket_handshake_timeout() {
+                        self.note_ws_unusable("handshake response headers timed out");
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        Ok(EventChannel::Stream(api.remote_events(device_id).await?))
+    }
+
     pub fn request_reconnect(&self) {
         self.reconnect.notify_one();
     }
@@ -374,13 +509,18 @@ impl RemoteTaskService {
         cancel: &CancellationToken,
         agent_events: &mut broadcast::Receiver<fluxdown_protocol::EventFrame>,
     ) -> Result<SseEnd, RemoteError> {
-        self.consume_events_epoch(response, cancel, agent_events, self.cloud.request_epoch())
-            .await
+        self.consume_events_epoch(
+            EventChannel::Stream(response),
+            cancel,
+            agent_events,
+            self.cloud.request_epoch(),
+        )
+        .await
     }
 
     async fn consume_events_epoch(
         &self,
-        response: reqwest::Response,
+        channel: EventChannel,
         cancel: &CancellationToken,
         agent_events: &mut broadcast::Receiver<fluxdown_protocol::EventFrame>,
         epoch: crate::cloud::RequestEpoch,
@@ -401,12 +541,35 @@ impl RemoteTaskService {
             self.business_loop(receiver, &roster, &presence_ready, epoch, &transport_alive);
         tokio::pin!(business);
         let stop_reading = CancellationToken::new();
+        let fallback_until = *self
+            .ws_fallback_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let transport = async {
-            let reader = self.read_stream(response, sender, &roster, epoch, &stop_reading);
-            tokio::pin!(reader);
+            let (mut reader, heartbeat): (TransportFuture<'_>, TransportFuture<'_>) = match channel
+            {
+                EventChannel::Socket(socket) => {
+                    let (sink, stream) = (*socket).split();
+                    (
+                        Box::pin(self.read_socket(
+                            stream,
+                            sender,
+                            &roster,
+                            &presence_ready,
+                            epoch,
+                            &stop_reading,
+                        )),
+                        Box::pin(self.socket_heartbeat_loop(sink)),
+                    )
+                }
+                EventChannel::Stream(response) => (
+                    Box::pin(self.read_stream(response, sender, &roster, epoch, &stop_reading)),
+                    Box::pin(self.heartbeat_loop(&presence_ready, epoch, fallback_until)),
+                ),
+            };
             tokio::select! {
                 result = &mut reader => result,
-                result = self.heartbeat_loop(&roster, &presence_ready, epoch) => {
+                result = heartbeat => {
                     transport_alive.store(false, Ordering::Relaxed);
                     {
                         let _state = self.cloud.lock_epoch(epoch).await?;
@@ -460,11 +623,14 @@ impl RemoteTaskService {
         }
     }
 
+    /// SSE 回退路径的 HTTP 心跳。名册不在此刷新：只在首次 presence 建立、`presence` /
+    /// `device.updated` 事件与失败重试 tick 时拉取。`fallback_until` 是本连接建立时的
+    /// WebSocket 粘性回退截止时刻：心跳成功后若已过期则返回 `Resync`，重连并重新探测 WebSocket。
     async fn heartbeat_loop(
         &self,
-        roster: &Notify,
         ready: &Notify,
         epoch: crate::cloud::RequestEpoch,
+        fallback_until: Option<Instant>,
     ) -> Result<SseEnd, RemoteError> {
         let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -482,13 +648,36 @@ impl RemoteTaskService {
                 }
             }
             ready.notify_one();
-            roster.notify_one();
+            if fallback_until.is_some_and(|deadline| Instant::now() >= deadline) {
+                tracing::info!(
+                    "WebSocket fallback period elapsed; reconnecting to probe WebSocket again"
+                );
+                return Ok(SseEnd::Resync);
+            }
+        }
+    }
+
+    /// WebSocket 心跳：写半边独立循环，第一个 `ping` 立即发出，之后每 `heartbeat_interval` 一个。
+    /// 应答 `pong` 由读半边转成 presence 就绪信号。
+    async fn socket_heartbeat_loop(
+        &self,
+        mut sink: SplitSink<CloudSocket, Message>,
+    ) -> Result<SseEnd, RemoteError> {
+        let mut heartbeat = tokio::time::interval(self.heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            heartbeat.tick().await;
+            sink.send(Message::text(SOCKET_PING_FRAME))
+                .await
+                .map_err(|error| {
+                    RemoteError::Protocol(format!("remote socket ping failed: {error}"))
+                })?;
         }
     }
 
     async fn business_loop(
         &self,
-        mut lines: mpsc::Receiver<Vec<u8>>,
+        mut payloads: mpsc::Receiver<Vec<u8>>,
         roster: &Notify,
         presence_ready: &Notify,
         epoch: crate::cloud::RequestEpoch,
@@ -531,9 +720,9 @@ impl RemoteTaskService {
                         tracing::warn!(error = %format!("{error:#}"), "remote progress report failed");
                     }
                 }
-                line = lines.recv() => {
-                    let Some(line) = line else { return Ok(SseEnd::Drained); };
-                    if let Some(end) = self.handle_sse_line(&line, epoch).await {
+                payload = payloads.recv() => {
+                    let Some(payload) = payload else { return Ok(SseEnd::Drained); };
+                    if let Some(end) = self.handle_event_payload(&payload, epoch).await {
                         return Ok(end);
                     }
                 }
@@ -605,34 +794,120 @@ impl RemoteTaskService {
                             continue;
                         }
                         let line = std::mem::take(&mut buffer);
-                        if let Some(payload) = line.strip_prefix(b"data:")
-                            && let Ok(event) = serde_json::from_slice::<Value>(payload)
-                            && matches!(event.get("type").and_then(Value::as_str), Some("presence" | "device.updated"))
-                        {
-                            roster.notify_one();
+                        let Some(payload) = line.strip_prefix(b"data:") else {
                             continue;
-                        }
-                        if let Some(payload) = line.strip_prefix(b"data:")
-                            && let Ok(event) = serde_json::from_slice::<Value>(payload)
-                            && matches!(event.get("type").and_then(Value::as_str), Some("session.revoked" | "presence.kicked"))
-                            && let Some(end) = self.apply_remote_event_epoch(event, epoch).await?
+                        };
+                        let payload = payload.trim_ascii().to_vec();
+                        let event = serde_json::from_slice::<Value>(&payload).ok();
+                        if let Some(end) = self
+                            .route_event_payload(payload, event, &sender, roster, epoch)
+                            .await?
                         {
                             return Ok(end);
                         }
-                        if line.starts_with(b"data:") {
-                            // Pause reads while the bounded business queue drains. In particular,
-                            // pause/resume commands cannot be reconstructed by the task snapshot.
-                            // Heartbeat and session cancellation remain independently polled.
-                            if sender.send(line).await.is_err() {
-                                return Ok(SseEnd::Resync);
-                            }
-                            // Time spent intentionally applying backpressure is not network silence.
-                            idle.as_mut().reset(tokio::time::Instant::now() + self.sse_idle_timeout);
-                        }
+                        // Time spent intentionally applying backpressure is not network silence.
+                        idle.as_mut().reset(tokio::time::Instant::now() + self.sse_idle_timeout);
                     }
                 }
             }
         }
+    }
+
+    /// WebSocket 读半边：空闲看门狗、背压与 `stop_reading` 语义与 [`Self::read_stream`] 一致。
+    /// `pong` 即 presence 就绪；`error` 帧等价原 HTTP 心跳的 403 / 409。
+    async fn read_socket(
+        &self,
+        mut stream: SplitStream<CloudSocket>,
+        sender: mpsc::Sender<Vec<u8>>,
+        roster: &Notify,
+        ready: &Notify,
+        epoch: crate::cloud::RequestEpoch,
+        stop_reading: &CancellationToken,
+    ) -> Result<SseEnd, RemoteError> {
+        let idle = tokio::time::sleep(self.sse_idle_timeout);
+        tokio::pin!(idle);
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop_reading.cancelled() => return Ok(SseEnd::Resync),
+                () = &mut idle => {
+                    return Err(RemoteError::Protocol("remote socket idle timeout".to_owned()));
+                }
+                frame = stream.next() => {
+                    let message = frame
+                        .ok_or_else(|| RemoteError::Protocol("remote socket closed".to_owned()))?
+                        .map_err(|error| RemoteError::Protocol(format!("remote socket read failed: {error}")))?;
+                    idle.as_mut().reset(tokio::time::Instant::now() + self.sse_idle_timeout);
+                    match message {
+                        Message::Text(text) => {
+                            let payload = text.as_str().as_bytes().to_vec();
+                            let event = serde_json::from_slice::<Value>(&payload).ok();
+                            let kind = event
+                                .as_ref()
+                                .and_then(|event| event.get("type"))
+                                .and_then(Value::as_str);
+                            if kind == Some("pong") {
+                                self.ws_pong_seen.store(true, Ordering::Relaxed);
+                                self.ws_unusable_streak.store(0, Ordering::Relaxed);
+                                ready.notify_one();
+                                continue;
+                            }
+                            if kind == Some("error")
+                                && let Some(frame) = &event
+                            {
+                                return socket_error_end(frame);
+                            }
+                            if let Some(end) = self
+                                .route_event_payload(payload, event, &sender, roster, epoch)
+                                .await?
+                            {
+                                return Ok(end);
+                            }
+                            // Time spent intentionally applying backpressure is not network silence.
+                            idle.as_mut().reset(tokio::time::Instant::now() + self.sse_idle_timeout);
+                        }
+                        Message::Close(frame) => {
+                            return Err(RemoteError::Protocol(format!(
+                                "remote socket closed by server: {frame:?}"
+                            )));
+                        }
+                        // 二进制帧忽略；协议层 Ping / Pong 由库自动处理。
+                        Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// 一条 JSON 事件的入口，SSE 与 WebSocket 共用（读取侧只解析一次，`event` 为已解析结果）：
+    /// `presence` / `device.updated` 只触发名册刷新；`session.revoked` / `presence.kicked` 立即应用
+    /// （可能直接结束连接）；其余事件把原始 `payload` 入业务队列。
+    /// 业务队列满时读取在此暂停——pause / resume 等命令无法由任务快照重建，所以背压而不丢弃；
+    /// 心跳与会话取消由调用方独立轮询。队列接收端已关闭返回 `Resync`。
+    async fn route_event_payload(
+        &self,
+        payload: Vec<u8>,
+        event: Option<Value>,
+        sender: &mpsc::Sender<Vec<u8>>,
+        roster: &Notify,
+        epoch: crate::cloud::RequestEpoch,
+    ) -> Result<Option<SseEnd>, RemoteError> {
+        if let Some(event) = event {
+            let kind = event.get("type").and_then(Value::as_str);
+            let roster_only = matches!(kind, Some("presence" | "device.updated"));
+            let apply_now = matches!(kind, Some("session.revoked" | "presence.kicked"));
+            if roster_only {
+                roster.notify_one();
+                return Ok(None);
+            }
+            if apply_now && let Some(end) = self.apply_remote_event_epoch(event, epoch).await? {
+                return Ok(Some(end));
+            }
+        }
+        if sender.send(payload).await.is_err() {
+            return Ok(Some(SseEnd::Resync));
+        }
+        Ok(None)
     }
 
     /// 观察 agent 事件：跟踪 daemon 任务的实时速度；返回 `true` 表示会话已结束或换成了别的账号。
@@ -686,24 +961,17 @@ impl RemoteTaskService {
         }
     }
 
-    /// 单行 SSE 数据的容错处理：坏行 / 单个事件处理失败只记录，不拆整条流。
-    async fn handle_sse_line(
+    /// 单个 JSON 事件的容错处理（SSE `data:` 与 WebSocket 文本帧共用）：
+    /// 坏 UTF-8 / 非 JSON / 单个事件处理失败只记录，不拆整条通道。
+    async fn handle_event_payload(
         &self,
-        line: &[u8],
+        payload: &[u8],
         epoch: crate::cloud::RequestEpoch,
     ) -> Option<SseEnd> {
-        let line = match std::str::from_utf8(line) {
-            Ok(line) => line.trim(),
-            Err(error) => {
-                tracing::warn!(error = %error, "remote SSE line is not UTF-8; skipped");
-                return None;
-            }
-        };
-        let payload = line.strip_prefix("data:")?.trim();
-        let event = match serde_json::from_str::<Value>(payload) {
+        let event = match serde_json::from_slice::<Value>(payload) {
             Ok(event) => event,
             Err(error) => {
-                tracing::warn!(error = %error, "remote SSE event is not JSON; skipped");
+                tracing::warn!(error = %error, "remote event is not JSON; skipped");
                 return None;
             }
         };
@@ -715,7 +983,7 @@ impl RemoteTaskService {
         match self.apply_remote_event_epoch(event, epoch).await {
             Ok(end) => end,
             Err(error) => {
-                tracing::warn!(event = %kind, error = %error, "remote SSE event handling failed");
+                tracing::warn!(event = %kind, error = %error, "remote event handling failed");
                 None
             }
         }
@@ -839,6 +1107,13 @@ impl RemoteTaskService {
                     feed.resync();
                 }
                 return Ok(Some(SseEnd::Resync));
+            }
+            "share.claimed" | "share.sessionKill" | "share.changed" | "share.usage" => {
+                if let Some(feed) = &self.share_feed
+                    && feed.send(event.clone()).is_err()
+                {
+                    tracing::debug!("share service is gone; share event dropped");
+                }
             }
             _ => {}
         }
@@ -2197,6 +2472,40 @@ impl RemoteError {
     }
 }
 
+/// 服务端 `error` 帧 → 连接结果：`online_device_limit` 等价原心跳 403（走 30s 名额等待），
+/// `presence_connection_missing` 等价原 409（快速重连），其它码是协议错误。
+fn socket_error_end(event: &Value) -> Result<SseEnd, RemoteError> {
+    let code = event
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = event
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_SOCKET_ERROR_CHARS)
+        .collect::<String>();
+    match code {
+        "online_device_limit" => Err(RemoteError::Cloud(CloudError {
+            status: Some(403),
+            code: Some(code.to_owned()),
+            message: if message.is_empty() {
+                "online device limit reached".to_owned()
+            } else {
+                message
+            },
+            retryable: false,
+            unreachable: false,
+            details: None,
+        })),
+        "presence_connection_missing" => Ok(SseEnd::Resync),
+        other => Err(RemoteError::Protocol(format!(
+            "remote socket error {other}: {message}"
+        ))),
+    }
+}
+
 /// 等到下一条 `SessionChanged(Some)`；接收端 lag 时也返回，由调用方重新检查登录态。
 async fn wait_for_session(events: &mut broadcast::Receiver<fluxdown_protocol::EventFrame>) {
     loop {
@@ -2514,6 +2823,42 @@ mod tests {
         presence_ready: tokio::sync::Notify,
         commands: Mutex<Vec<Value>>,
         statuses: Mutex<Vec<(String, Value)>>,
+        /// `/api/v1/tasks/ws` 握手（鉴权通过后）的次数与请求信息 `(Authorization, deviceId)`。
+        ws_connects: AtomicUsize,
+        ws_requests: Mutex<Vec<(Option<String>, Option<String>)>>,
+        /// 服务端收到的 `ping` 帧数。
+        ws_pings: AtomicUsize,
+        ws_unauthorized: AtomicUsize,
+        refreshes: AtomicUsize,
+        /// 通知 mock 连接向客户端推一条 `presence` 帧。
+        ws_release: tokio::sync::Notify,
+        ws_mode: std::sync::Mutex<WsMode>,
+    }
+
+    /// mock WebSocket 服务端的行为脚本。
+    #[derive(Clone, Copy, Default, Eq, PartialEq)]
+    enum WsMode {
+        /// 每个 `ping` 回 `pong`。
+        #[default]
+        Healthy,
+        /// 第一个 `ping` 回 `online_device_limit` error 帧后关闭。
+        LimitOnPing,
+        /// 第一个 `ping` 回 `presence_connection_missing` error 帧后关闭。
+        MissingOnPing,
+        /// 建连后立刻推本机的 `presence.kicked`。
+        KickedOnConnect,
+        /// 回第一个 `pong` 后服务端主动 Close。
+        CloseAfterFirstPong,
+        /// 从不应答。
+        Silent,
+        /// 一帧二进制 + 三条命令，然后 Close。
+        CommandsThenClose,
+        /// 一帧二进制 + 三条命令 + `resync`，然后 Close。
+        CommandsThenResync,
+        /// 建连后立刻 Close，不发 pong。
+        CloseBeforePong,
+        /// 突发超过队列容量的 pause / resume 命令，之后只回 pong。
+        Burst,
     }
 
     async fn mock_remote_snapshot(State(state): State<Arc<RemoteMockState>>) -> impl IntoResponse {
@@ -2724,7 +3069,7 @@ mod tests {
             if let Some(idle_timeout) = idle_timeout {
                 service.sse_idle_timeout = idle_timeout;
             }
-            service.sse_connect_timeout = std::time::Duration::from_millis(500);
+            service.sse_connect_timeout = std::time::Duration::from_secs(2);
             service.heartbeat_interval = std::time::Duration::from_millis(100);
             let service = Arc::new(service);
             Self {
@@ -2941,6 +3286,13 @@ mod tests {
             router.route("/api/v1/tasks/events", get(no_headers))
         })
         .await;
+        // 本用例只测 SSE 响应头超时：预先进入 WebSocket 回退期，不探测 ws。
+        *harness
+            .service
+            .ws_fallback_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::time::Instant::now() + super::WS_FALLBACK_STICKY);
         let cancel = CancellationToken::new();
         let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
         wait_until(|| connection_state(&harness.service).last_error.is_some()).await;
@@ -2991,8 +3343,8 @@ mod tests {
             .service
             .heartbeat_loop(
                 &tokio::sync::Notify::new(),
-                &tokio::sync::Notify::new(),
                 harness.service.cloud.request_epoch(),
+                None,
             )
             .await;
         assert!(matches!(result, Ok(SseEnd::Resync)));
@@ -3071,8 +3423,7 @@ mod tests {
             .await
             .expect("business queue drains");
             if index >= super::SSE_QUEUE_CAPACITY {
-                let command: Value =
-                    serde_json::from_slice(&line[b"data:".len()..]).expect("command");
+                let command: Value = serde_json::from_slice(&line).expect("command");
                 let action = ["pause", "resume", "delete"][index - super::SSE_QUEUE_CAPACITY];
                 assert_eq!(command["commandId"], action);
                 assert_eq!(command["action"], action);
@@ -3144,6 +3495,716 @@ mod tests {
             assert_eq!(daemon_deletes(&harness).await, [("l1".to_owned(), true)]);
             harness.finish().await;
         }
+    }
+
+    fn ws_text(value: Value) -> axum::extract::ws::Message {
+        axum::extract::ws::Message::text(value.to_string())
+    }
+
+    async fn mock_ws(
+        State(state): State<Arc<RemoteMockState>>,
+        headers: HeaderMap,
+        axum::extract::Query(query): axum::extract::Query<
+            std::collections::HashMap<String, String>,
+        >,
+        ws: axum::extract::ws::WebSocketUpgrade,
+    ) -> axum::response::Response {
+        state.ws_connects.fetch_add(1, Ordering::SeqCst);
+        let bearer = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        state
+            .ws_requests
+            .lock()
+            .await
+            .push((bearer, query.get("deviceId").cloned()));
+        let mode = *state
+            .ws_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ws.on_upgrade(move |socket| run_mock_socket(socket, state, mode))
+    }
+
+    /// 旧令牌 401，刷新后的令牌 `fresh` 才升级。
+    async fn mock_ws_fresh_only(
+        State(state): State<Arc<RemoteMockState>>,
+        headers: HeaderMap,
+        query: axum::extract::Query<std::collections::HashMap<String, String>>,
+        ws: axum::extract::ws::WebSocketUpgrade,
+    ) -> axum::response::Response {
+        let fresh = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some("Bearer fresh");
+        if !fresh {
+            state.ws_unauthorized.fetch_add(1, Ordering::SeqCst);
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        mock_ws(State(state), headers, query, ws).await
+    }
+
+    async fn mock_ws_missing(State(state): State<Arc<RemoteMockState>>) -> StatusCode {
+        state.ws_connects.fetch_add(1, Ordering::SeqCst);
+        StatusCode::NOT_FOUND
+    }
+
+    async fn mock_refresh(State(state): State<Arc<RemoteMockState>>) -> impl IntoResponse {
+        state.refreshes.fetch_add(1, Ordering::SeqCst);
+        axum::Json(json!({
+            "accessToken": "fresh",
+            "refreshToken": "fresh-refresh",
+            "expiresIn": 3600,
+            "user": {
+                "id": "u1", "email": "user@example.com", "nickname": "User",
+                "plan": "free", "status": "active", "createdAt": ""
+            },
+            "entitlements": {},
+            "device": {
+                "id": "row1", "deviceId": "device-1", "name": "Desktop",
+                "createdAt": "", "lastSeenAt": ""
+            }
+        }))
+    }
+
+    /// 发完 Close 后与真实服务端一样等对端 Close 或短超时再丢弃 socket，避免提前 RST。
+    async fn linger_until_peer_closes(socket: &mut axum::extract::ws::WebSocket) {
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while let Some(Ok(_)) = socket.recv().await {}
+        })
+        .await;
+        tracing::debug!(timed_out = drained.is_err(), "mock socket linger finished");
+    }
+
+    async fn mock_ws_hang(State(state): State<Arc<RemoteMockState>>) -> StatusCode {
+        state.ws_connects.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        StatusCode::OK
+    }
+
+    async fn run_mock_socket(
+        mut socket: axum::extract::ws::WebSocket,
+        state: Arc<RemoteMockState>,
+        mode: WsMode,
+    ) {
+        use axum::extract::ws::Message as WsMessage;
+        let mut opening = Vec::new();
+        match mode {
+            WsMode::KickedOnConnect => opening.push(ws_text(
+                json!({"type": "presence.kicked", "deviceId": "device-1"}),
+            )),
+            WsMode::CommandsThenClose | WsMode::CommandsThenResync => {
+                opening.push(WsMessage::Binary(vec![1, 2, 3].into()));
+                for action in ["pause", "resume", "delete"] {
+                    opening.push(ws_text(json!({
+                        "type": "task.command", "action": action, "taskId": "r1",
+                        "toDevice": "device-1", "commandId": action, "deleteFiles": true
+                    })));
+                }
+                if mode == WsMode::CommandsThenResync {
+                    opening.push(ws_text(json!({"type": "resync"})));
+                }
+                opening.push(WsMessage::Close(None));
+            }
+            WsMode::CloseBeforePong => opening.push(WsMessage::Close(None)),
+            WsMode::Burst => {
+                for index in 0..super::SSE_QUEUE_CAPACITY + 8 {
+                    opening.push(ws_text(json!({
+                        "type": "task.command",
+                        "action": if index % 2 == 0 { "pause" } else { "resume" },
+                        "taskId": "r1", "toDevice": "device-1",
+                        "commandId": format!("burst-{index}")
+                    })));
+                }
+            }
+            _ => {}
+        }
+        for message in opening {
+            if socket.send(message).await.is_err() {
+                return;
+            }
+        }
+        if matches!(
+            mode,
+            WsMode::CommandsThenClose | WsMode::CommandsThenResync | WsMode::CloseBeforePong
+        ) {
+            linger_until_peer_closes(&mut socket).await;
+            return;
+        }
+        let mut pings_on_connection = 0_usize;
+        loop {
+            tokio::select! {
+                () = state.ws_release.notified() => {
+                    let presence = ws_text(json!({"type": "presence", "deviceId": "device-2", "online": true}));
+                    if socket.send(presence).await.is_err() {
+                        return;
+                    }
+                }
+                message = socket.recv() => {
+                    let Some(Ok(WsMessage::Text(text))) = message else {
+                        if matches!(message, Some(Ok(_))) {
+                            continue;
+                        }
+                        return;
+                    };
+                    let is_ping = serde_json::from_str::<Value>(text.as_str())
+                        .is_ok_and(|frame| frame["type"] == "ping");
+                    if !is_ping {
+                        continue;
+                    }
+                    state.ws_pings.fetch_add(1, Ordering::SeqCst);
+                    pings_on_connection += 1;
+                    let pong = ws_text(json!({"type": "pong"}));
+                    let (replies, finished) = match mode {
+                        WsMode::Silent => (Vec::new(), false),
+                        WsMode::LimitOnPing => (
+                            vec![
+                                ws_text(json!({"type": "error", "code": "online_device_limit", "message": "too many online devices"})),
+                                WsMessage::Close(None),
+                            ],
+                            true,
+                        ),
+                        WsMode::MissingOnPing => (
+                            vec![
+                                ws_text(json!({"type": "error", "code": "presence_connection_missing", "message": "reconnect"})),
+                                WsMessage::Close(None),
+                            ],
+                            true,
+                        ),
+                        WsMode::CloseAfterFirstPong if pings_on_connection == 1 => {
+                            (vec![pong, WsMessage::Close(None)], true)
+                        }
+                        _ => (vec![pong], false),
+                    };
+                    for reply in replies {
+                        if socket.send(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                    if finished {
+                        linger_until_peer_closes(&mut socket).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 除 `/tasks/ws` 外的共用路由；`events` / `presence` 是回退通道的探针，WebSocket 可用时不应被触碰。
+    fn ws_probes(router: Router<Arc<RemoteMockState>>) -> Router<Arc<RemoteMockState>> {
+        router
+            .route("/api/v1/tasks/remote", get(mock_remote_snapshot))
+            .route("/api/v1/devices", get(online_roster))
+            .route("/api/v1/tasks/events", get(live_events))
+            .route("/api/v1/tasks/presence", post(mock_presence))
+    }
+
+    fn ws_mock(router: Router<Arc<RemoteMockState>>) -> Router<Arc<RemoteMockState>> {
+        ws_probes(router).route("/api/v1/tasks/ws", get(mock_ws))
+    }
+
+    fn set_ws_mode(harness: &Harness, mode: WsMode) {
+        *harness
+            .mock
+            .ws_mode
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+    }
+
+    async fn wait_connected(harness: &Harness) {
+        wait_until(|| {
+            connection_state(&harness.service).state
+                == fluxdown_protocol::CloudConnectionState::Connected
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn socket_channel_heartbeats_inside_the_connection_without_http_requests() {
+        let harness = Harness::new("ws_healthy", ws_mock).await;
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        wait_connected(&harness).await;
+        // 心跳间隔 100ms：多个周期内全部走连接内的 ping / pong。
+        wait_until(|| harness.mock.ws_pings.load(Ordering::SeqCst) >= 4).await;
+        let mock = &harness.mock;
+        assert_eq!(mock.ws_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.events.load(Ordering::SeqCst), 0, "no SSE fallback");
+        assert_eq!(mock.presence.load(Ordering::SeqCst), 0, "no HTTP heartbeat");
+        assert_eq!(
+            mock.rosters.load(Ordering::SeqCst),
+            1,
+            "roster is fetched once when presence is established, not per heartbeat"
+        );
+        assert_eq!(
+            *mock.ws_requests.lock().await,
+            [(
+                Some("Bearer access".to_owned()),
+                Some("device-1".to_owned())
+            )]
+        );
+        // `presence` 事件帧才会再触发名册刷新。
+        mock.ws_release.notify_one();
+        wait_until(|| mock.rosters.load(Ordering::SeqCst) >= 2).await;
+        assert_eq!(mock.presence.load(Ordering::SeqCst), 0);
+        assert_eq!(mock.events.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            harness.service.ws_unusable_streak.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(mock.ws_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            connection_state(&harness.service).state,
+            fluxdown_protocol::CloudConnectionState::Connected
+        );
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn socket_online_device_limit_frame_waits_for_a_free_slot() {
+        let harness = Harness::new("ws_limit", ws_mock).await;
+        set_ws_mode(&harness, WsMode::LimitOnPing);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        wait_until(|| {
+            connection_state(&harness.service).last_error_reason
+                == Some(fluxdown_protocol::ErrorReason::OnlineDeviceLimit)
+        })
+        .await;
+        assert_eq!(
+            connection_state(&harness.service).state,
+            fluxdown_protocol::CloudConnectionState::Reconnecting
+        );
+        // 固定 30 秒等待，不指数退避；手动重连才提前重试。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(harness.mock.ws_connects.load(Ordering::SeqCst), 1);
+        harness.service.request_reconnect();
+        wait_until(|| harness.mock.ws_connects.load(Ordering::SeqCst) >= 2).await;
+        assert_eq!(harness.mock.events.load(Ordering::SeqCst), 0);
+        // 服务端 error 帧是有效应答，不计入「通道不可用」。
+        assert_eq!(
+            harness.service.ws_unusable_streak.load(Ordering::Relaxed),
+            0
+        );
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn socket_presence_missing_frame_reconnects_quickly_without_error() {
+        let harness = Harness::new("ws_missing", ws_mock).await;
+        set_ws_mode(&harness, WsMode::MissingOnPing);
+        let (mut frames, _) = harness.service.events.subscribe_and_snapshot();
+        let started = std::time::Instant::now();
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        // RESYNC_PAUSE（1s）后自动重连，无需手动唤醒，更不能走 RETRY_DELAYS[0]（5s）。
+        wait_until(|| harness.mock.ws_connects.load(Ordering::SeqCst) >= 2).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "reconnected after {:?}",
+            started.elapsed()
+        );
+        // 窗口内从未投影过带错误的连接状态。
+        let mut projected = 0_usize;
+        loop {
+            match frames.try_recv() {
+                Ok(frame) => {
+                    if let fluxdown_protocol::ServiceEvent::Agent(
+                        AgentEvent::CloudConnectionChanged(connection),
+                    ) = &frame.event
+                    {
+                        projected += 1;
+                        assert_eq!(connection.last_error, None, "{connection:?}");
+                        assert_eq!(connection.last_error_reason, None, "{connection:?}");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(projected >= 1, "connection states were projected");
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn expired_sse_fallback_reconnects_and_probes_websocket_again() {
+        let harness = Harness::new("ws_fallback_expiry", ws_mock).await;
+        // 注入很短的回退期：先走 SSE，到期后的下一次心跳成功即 Resync 并重新探测 WebSocket。
+        *harness
+            .service
+            .ws_fallback_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        wait_until(|| harness.mock.events.load(Ordering::SeqCst) >= 1).await;
+        assert_eq!(harness.mock.ws_connects.load(Ordering::SeqCst), 0);
+        wait_until(|| harness.mock.ws_connects.load(Ordering::SeqCst) >= 1).await;
+        wait_connected(&harness).await;
+        wait_until(|| harness.mock.ws_pings.load(Ordering::SeqCst) >= 1).await;
+        assert_eq!(harness.mock.events.load(Ordering::SeqCst), 1);
+        assert!(!harness.service.ws_fallback_active());
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    /// 逐次等到第 `failures` 次「通道不可用」被记账后手动重连（避免退避等待），直到进入粘性回退。
+    async fn drive_to_unusable_fallback(harness: &Harness) {
+        for failure in 1..super::WS_UNUSABLE_THRESHOLD {
+            wait_until(|| harness.mock.ws_connects.load(Ordering::SeqCst) >= failure).await;
+            wait_until(|| harness.service.ws_unusable_streak.load(Ordering::Relaxed) >= failure)
+                .await;
+            harness.service.request_reconnect();
+        }
+        wait_until(|| {
+            harness.mock.ws_connects.load(Ordering::SeqCst) >= super::WS_UNUSABLE_THRESHOLD
+        })
+        .await;
+        wait_until(|| harness.service.ws_fallback_active()).await;
+        assert_eq!(
+            harness.service.ws_unusable_streak.load(Ordering::Relaxed),
+            0,
+            "entering fallback resets the streak"
+        );
+        harness.service.request_reconnect();
+        wait_until(|| harness.mock.events.load(Ordering::SeqCst) >= 1).await;
+        assert_eq!(
+            harness.mock.ws_connects.load(Ordering::SeqCst),
+            super::WS_UNUSABLE_THRESHOLD,
+            "sticky fallback stops probing WebSocket"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_socket_sessions_ending_before_a_pong_fall_back_to_sse() {
+        let harness = Harness::new("ws_unusable_close", ws_mock).await;
+        set_ws_mode(&harness, WsMode::CloseBeforePong);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        drive_to_unusable_fallback(&harness).await;
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn repeated_handshake_header_timeouts_fall_back_to_sse() {
+        let mut harness = Harness::new("ws_unusable_timeout", |router| {
+            ws_probes(router).route("/api/v1/tasks/ws", get(mock_ws_hang))
+        })
+        .await;
+        Arc::get_mut(&mut harness.service)
+            .expect("unshared service")
+            .sse_connect_timeout = std::time::Duration::from_millis(300);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        drive_to_unusable_fallback(&harness).await;
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn unusable_streak_needs_consecutive_failures_and_resets_on_pong() {
+        let harness = Harness::new("ws_streak_unit", |router| router).await;
+        let service = &harness.service;
+        service.note_ws_unusable("test");
+        service.note_ws_unusable("test");
+        assert!(!service.ws_fallback_active());
+        // 收到 pong 把连续计数清零（read_socket 里的同一操作）。
+        service.ws_unusable_streak.store(0, Ordering::Relaxed);
+        service.note_ws_unusable("test");
+        service.note_ws_unusable("test");
+        assert!(!service.ws_fallback_active());
+        service.note_ws_unusable("test");
+        assert!(service.ws_fallback_active());
+        assert_eq!(service.ws_unusable_streak.load(Ordering::Relaxed), 0);
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn socket_backpressure_keeps_every_command_without_tripping_the_idle_watchdog() {
+        let total = super::SSE_QUEUE_CAPACITY + 8;
+        // 云端快照里要有这条任务，否则业务循环的首次快照对账会清掉绑定、后续命令就无处执行。
+        async fn snapshot_with_task() -> impl IntoResponse {
+            axum::Json(json!({"tasks": [{
+                "id": "r1", "toDevice": "device-1", "fromDevice": "device-2", "status": "downloading"
+            }]}))
+        }
+        let mut harness = Harness::with_daemon("ws_burst", |router| {
+            command_mock(router)
+                .route("/api/v1/tasks/ws", get(mock_ws))
+                .route("/api/v1/tasks/remote", get(snapshot_with_task))
+                .route("/api/v1/devices", get(online_roster))
+        })
+        .await;
+        Arc::get_mut(&mut harness.service)
+            .expect("unshared service")
+            .sse_idle_timeout = std::time::Duration::from_millis(300);
+        set_ws_mode(&harness, WsMode::Burst);
+        seed_daemon_tasks(&harness, vec![local_task("l1", 1)]);
+        bind(&harness, "r1", "l1").await;
+        let socket = harness
+            .service
+            .cloud
+            .remote_socket("device-1")
+            .await
+            .expect("WebSocket handshake");
+        let cancel = CancellationToken::new();
+        let (mut events, _) = harness.service.events.subscribe_and_snapshot();
+        let controls = |calls: &[(String, Option<Value>)]| {
+            calls
+                .iter()
+                .filter(|(method, _)| {
+                    method == fluxdown_protocol::method::DAEMON_TASK_PAUSE
+                        || method == fluxdown_protocol::method::DAEMON_TASK_RESUME
+                })
+                .map(|(method, _)| method.clone())
+                .collect::<Vec<_>>()
+        };
+        {
+            let consume = harness.service.consume_events_epoch(
+                super::EventChannel::Socket(Box::new(socket)),
+                &cancel,
+                &mut events,
+                harness.service.cloud.request_epoch(),
+            );
+            tokio::pin!(consume);
+            let all_applied = async {
+                loop {
+                    if controls(&harness.daemon_calls.lock().await).len() >= total {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut consume => panic!("channel ended while draining the burst: {result:?}"),
+                applied = tokio::time::timeout(std::time::Duration::from_secs(5), all_applied) => {
+                    applied.expect("every command is applied");
+                }
+            }
+            // 突发之后只剩 pong：空闲看门狗（300ms）不能被背压期间的停读触发。
+            tokio::select! {
+                result = &mut consume => panic!("idle watchdog fired after the burst: {result:?}"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(900)) => {}
+            }
+            cancel.cancel();
+            assert!(matches!(consume.await, Ok(SseEnd::Cancelled)));
+        }
+        let methods = controls(&harness.daemon_calls.lock().await);
+        let expected: Vec<String> = (0..total)
+            .map(|index| {
+                if index % 2 == 0 {
+                    fluxdown_protocol::method::DAEMON_TASK_PAUSE
+                } else {
+                    fluxdown_protocol::method::DAEMON_TASK_RESUME
+                }
+                .to_owned()
+            })
+            .collect();
+        assert_eq!(methods, expected, "FIFO order, nothing dropped");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn socket_presence_kicked_frame_waits_for_a_free_slot() {
+        let harness = Harness::new("ws_kicked", ws_mock).await;
+        set_ws_mode(&harness, WsMode::KickedOnConnect);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        wait_until(|| {
+            connection_state(&harness.service).last_error_reason
+                == Some(fluxdown_protocol::ErrorReason::OnlineDeviceLimit)
+        })
+        .await;
+        assert_eq!(
+            connection_state(&harness.service).state,
+            fluxdown_protocol::CloudConnectionState::Reconnecting
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(harness.mock.ws_connects.load(Ordering::SeqCst), 1);
+        harness.service.request_reconnect();
+        wait_until(|| harness.mock.ws_connects.load(Ordering::SeqCst) >= 2).await;
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn socket_handshake_401_refreshes_once_and_replays() {
+        let harness = Harness::new("ws_refresh", |router| {
+            ws_probes(router)
+                .route("/api/v1/tasks/ws", get(mock_ws_fresh_only))
+                .route("/api/v1/auth/refresh", post(mock_refresh))
+        })
+        .await;
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        wait_connected(&harness).await;
+        let mock = &harness.mock;
+        assert_eq!(mock.ws_unauthorized.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.ws_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mock.ws_requests.lock().await[0].0.as_deref(),
+            Some("Bearer fresh")
+        );
+        assert_eq!(mock.events.load(Ordering::SeqCst), 0);
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn socket_404_falls_back_to_sse_stickily_without_per_heartbeat_roster_fetches() {
+        let harness = Harness::new("ws_fallback", |router| {
+            ws_probes(router).route("/api/v1/tasks/ws", get(mock_ws_missing))
+        })
+        .await;
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        wait_connected(&harness).await;
+        // SSE 回退的 HTTP 心跳多轮成功，名册仍只在 presence 建立时拉了一次。
+        wait_until(|| harness.mock.presence.load(Ordering::SeqCst) >= 4).await;
+        let mock = &harness.mock;
+        assert_eq!(mock.ws_connects.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.events.load(Ordering::SeqCst), 1);
+        assert_eq!(mock.rosters.load(Ordering::SeqCst), 1);
+        // 下一次重连直接走 SSE，不再探测 WebSocket。
+        harness.service.request_reconnect();
+        wait_until(|| mock.events.load(Ordering::SeqCst) >= 2).await;
+        assert_eq!(mock.ws_connects.load(Ordering::SeqCst), 1);
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn socket_server_close_reconnects() {
+        let harness = Harness::new("ws_close", ws_mock).await;
+        set_ws_mode(&harness, WsMode::CloseAfterFirstPong);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        wait_until(|| {
+            connection_state(&harness.service)
+                .last_error
+                .is_some_and(|error| error.contains("closed"))
+        })
+        .await;
+        assert_eq!(
+            connection_state(&harness.service).state,
+            fluxdown_protocol::CloudConnectionState::Reconnecting
+        );
+        harness.service.request_reconnect();
+        wait_until(|| harness.mock.ws_connects.load(Ordering::SeqCst) >= 2).await;
+        assert_eq!(harness.mock.events.load(Ordering::SeqCst), 0);
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn silent_socket_hits_the_idle_watchdog() {
+        let harness = Harness::with_idle_timeout(
+            "ws_idle",
+            Some(std::time::Duration::from_millis(400)),
+            ws_mock,
+        )
+        .await;
+        set_ws_mode(&harness, WsMode::Silent);
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
+        wait_until(|| {
+            connection_state(&harness.service)
+                .last_error
+                .is_some_and(|error| error.contains("idle timeout"))
+        })
+        .await;
+        assert!(harness.mock.ws_pings.load(Ordering::SeqCst) >= 1);
+        cancel.cancel();
+        worker.await.expect("joined worker");
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn socket_consume_drains_commands_before_resync_or_close() {
+        for mode in [WsMode::CommandsThenClose, WsMode::CommandsThenResync] {
+            let harness =
+                Harness::with_daemon("ws_terminal_fifo", |router| command_mock(ws_mock(router)))
+                    .await;
+            set_ws_mode(&harness, mode);
+            seed_daemon_tasks(&harness, vec![local_task("l1", 1)]);
+            bind(&harness, "r1", "l1").await;
+            let socket = harness
+                .service
+                .cloud
+                .remote_socket("device-1")
+                .await
+                .expect("WebSocket handshake");
+            let cancel = CancellationToken::new();
+            let (mut events, _) = harness.service.events.subscribe_and_snapshot();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                harness.service.consume_events_epoch(
+                    super::EventChannel::Socket(Box::new(socket)),
+                    &cancel,
+                    &mut events,
+                    harness.service.cloud.request_epoch(),
+                ),
+            )
+            .await
+            .expect("accepted commands drain before reconnect");
+            if mode == WsMode::CommandsThenClose {
+                assert!(matches!(result, Err(RemoteError::Protocol(_))));
+            } else {
+                assert!(matches!(result, Ok(SseEnd::Resync)));
+            }
+            let calls = harness.daemon_calls.lock().await.clone();
+            let methods: Vec<_> = calls.iter().map(|(method, _)| method.as_str()).collect();
+            assert_eq!(
+                methods,
+                [
+                    fluxdown_protocol::method::DAEMON_TASK_PAUSE,
+                    fluxdown_protocol::method::DAEMON_TASK_RESUME,
+                    fluxdown_protocol::method::DAEMON_TASK_DELETE,
+                ]
+            );
+            assert_eq!(daemon_deletes(&harness).await, [("l1".to_owned(), true)]);
+            harness.finish().await;
+        }
+    }
+
+    #[test]
+    fn socket_error_frames_map_to_the_http_heartbeat_outcomes() {
+        let limit = super::socket_error_end(
+            &json!({"type": "error", "code": "online_device_limit", "message": "full"}),
+        )
+        .expect_err("limit is an error");
+        assert!(limit.is_online_limit());
+        let RemoteError::Cloud(cloud) = &limit else {
+            panic!("online limit must be a cloud error");
+        };
+        assert_eq!(cloud.status, Some(403));
+        assert_eq!(cloud.message, "full");
+        assert!(matches!(
+            super::socket_error_end(
+                &json!({"type": "error", "code": "presence_connection_missing"})
+            ),
+            Ok(SseEnd::Resync)
+        ));
+        assert!(matches!(
+            super::socket_error_end(&json!({"type": "error", "code": "boom"})),
+            Err(RemoteError::Protocol(_))
+        ));
     }
 
     #[tokio::test]
@@ -3302,7 +4363,7 @@ mod tests {
         async fn flaky_roster(
             State(state): State<Arc<RemoteMockState>>,
         ) -> axum::response::Response {
-            if state.rosters.fetch_add(1, Ordering::SeqCst) < 2 {
+            if state.rosters.fetch_add(1, Ordering::SeqCst) < 1 {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
             axum::Json(json!({"devices": [{"id": "d1", "deviceId": "device-1", "isCurrent": true, "isOnline": true}]})).into_response()
@@ -3320,7 +4381,7 @@ mod tests {
             .heartbeat_interval = std::time::Duration::from_secs(60);
         let cancel = CancellationToken::new();
         let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
-        wait_until(|| harness.mock.rosters.load(Ordering::SeqCst) >= 2).await;
+        wait_until(|| harness.mock.rosters.load(Ordering::SeqCst) >= 1).await;
         assert_ne!(
             connection_state(&harness.service).state,
             fluxdown_protocol::CloudConnectionState::Connected

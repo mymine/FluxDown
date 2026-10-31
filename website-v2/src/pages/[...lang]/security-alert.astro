@@ -18,7 +18,7 @@ const n = (i: number) => String(i + 1).padStart(2, "0");
   <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede} />
 
   <section class="frame">
-    <div class="cells grid md:grid-cols-2">
+    <div class="cells grid grid-cols-1 md:grid-cols-2">
       <div class="cell domain domain-bad">
         <p class="domain-label mono">
           <span class="dot" aria-hidden="true"></span>
@@ -53,7 +53,7 @@ const n = (i: number) => String(i + 1).padStart(2, "0");
 
     <div class="rule"></div>
 
-    <div class="section-tight grid gap-12 lg:grid-cols-2 lg:gap-16">
+    <div class="section-tight grid grid-cols-1 gap-12 lg:grid-cols-2 lg:gap-16">
       <section aria-labelledby="advice-h">
         <h2 id="advice-h" class="h3">{t.adviceTitle}</h2>
         <ol class="list mt-6">

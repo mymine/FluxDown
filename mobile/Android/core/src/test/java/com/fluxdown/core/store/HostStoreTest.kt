@@ -1,6 +1,9 @@
 package com.fluxdown.core.store
 
 import com.fluxdown.core.host.HostEvent
+import com.fluxdown.core.host.HostErrorCode
+import com.fluxdown.core.host.HostException
+import com.fluxdown.core.host.HostSession
 import com.fluxdown.core.host.HostSignal
 import com.fluxdown.core.host.HostSnapshot
 import com.fluxdown.core.model.HostInfo
@@ -11,6 +14,10 @@ import com.fluxdown.core.model.Task
 import com.fluxdown.core.model.TaskRuntime
 import com.fluxdown.core.model.TaskStatus
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
@@ -19,6 +26,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.lang.reflect.Proxy
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class HostStoreTest {
@@ -296,5 +304,55 @@ class HostStoreTest {
         s.apply(loadingSnapshot(1))
         s.apply(snapshot(task("b", TaskStatus.Downloading)))
         assertFalse("a" in s.state.value.taskSpeedHistory)
+    }
+
+    private fun session(signals: Flow<HostSignal>): HostSession {
+        val unused = Proxy.newProxyInstance(HostSession::class.java.classLoader, arrayOf(HostSession::class.java)) { _, method, _ ->
+            throw UnsupportedOperationException(method.name)
+        } as HostSession
+        return object : HostSession by unused {
+            override val signals: Flow<HostSignal> = signals
+        }
+    }
+
+    @Test
+    fun signalStreamEndingWithoutFatalSurfacesAFailureInsteadOfFreezingOnLoading() = runTest {
+        val s = store()
+        s.attach(session(flowOf(loadingSnapshot(1))))
+        advanceUntilIdle()
+        val failed = s.state.value.connection
+        assertTrue("会话意外结束必须进入失败态（断连横幅），不能停在加载态 Live", failed is Connection.Failed)
+        assertEquals(HostErrorCode.Unavailable, (failed as Connection.Failed).error.code)
+    }
+
+    @Test
+    fun fatalBeforeStreamEndKeepsTheRealReason() = runTest {
+        val s = store()
+        val fatal = HostException(HostErrorCode.Unauthorized, message = "revoked")
+        s.attach(session(flowOf(snapshot(), HostSignal.Fatal(fatal))))
+        advanceUntilIdle()
+        assertEquals(Connection.Failed(fatal), s.state.value.connection)
+    }
+
+    @Test
+    fun detachDoesNotReportTheCancelledStreamAsFailure() = runTest {
+        val s = store()
+        val signals = MutableSharedFlow<HostSignal>(replay = 1)
+        signals.emit(snapshot())
+        s.attach(session(signals))
+        advanceUntilIdle()
+        s.detach()
+        advanceUntilIdle()
+        assertEquals(Connection.Live, s.state.value.connection)
+    }
+
+    @Test
+    fun checkedExceptionFromTheBindingBecomesFailureNotACrash() = runTest {
+        val s = store()
+        s.attach(session(flow { emit(snapshot()); throw Exception("uniffi internal") }))
+        advanceUntilIdle()
+        val failed = s.state.value.connection
+        assertTrue(failed is Connection.Failed)
+        assertEquals(HostErrorCode.Internal, (failed as Connection.Failed).error.code)
     }
 }

@@ -134,10 +134,16 @@ public final class HostStore {
         notices = []
         let signals = session.signals
         sessionTask = Task { [weak self] in
+            var fatalSeen = false
             for await signal in signals {
                 guard let self, !Task.isCancelled else { return }
+                if case .fatal = signal { fatalSeen = true }
                 self.apply(signal)
             }
+            // 信号流结束：被 detach 取消时不改状态；Rust 先发 fatal 再结束则保持该原因。
+            // 其余（会话驱动意外退出）不能停在最后一帧不报错——那可能是加载态骨架，界面会一直转圈。
+            guard let self, !Task.isCancelled, !fatalSeen else { return }
+            self.apply(.fatal(HostError(.unavailable, message: "host session ended unexpectedly")))
         }
     }
 

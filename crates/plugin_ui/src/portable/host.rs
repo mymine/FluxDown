@@ -6,7 +6,8 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use fluxdown_protocol::{
     PluginViewEventParams, PluginViewFrameDto, PluginViewOpenParams, PluginViewOpenedDto,
-    PluginViewSnapshotDto, ViewEventDto, ViewNode, apply_view_ops,
+    PluginViewSnapshotDto, VIEW_CLOSE_REASON_REQUESTED, ViewEffect, ViewEventDto, ViewNode,
+    apply_view_ops,
 };
 use fluxdown_ui_i18n::Translator;
 use gpui::{
@@ -22,7 +23,7 @@ use gpui_component::{
 use serde_json::{Value, json};
 
 use super::{PortableSessions, render};
-use crate::{PluginUiPort, PortFuture};
+use crate::{PluginUiPort, PortFuture, ViewContainer};
 
 /// 输入框 `change` 事件的去抖间隔（与 schema `debounceMs` 一致）。
 pub(super) const INPUT_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -54,6 +55,7 @@ pub struct PluginViewHost {
     identity: String,
     view: String,
     task_id: Option<String>,
+    container: ViewContainer,
     port: Arc<dyn PluginUiPort>,
     translator: Entity<Translator>,
     phase: Phase,
@@ -74,6 +76,7 @@ impl PluginViewHost {
         identity: String,
         view: String,
         task_id: Option<String>,
+        container: ViewContainer,
         port: Arc<dyn PluginUiPort>,
         translator: Entity<Translator>,
         cx: &mut Context<Self>,
@@ -81,6 +84,7 @@ impl PluginViewHost {
         cx.on_release(|host: &mut Self, cx: &mut App| host.release(cx))
             .detach();
         Self {
+            container,
             identity,
             view,
             task_id,
@@ -141,6 +145,8 @@ impl PluginViewHost {
             locale: (!locale.is_empty()).then_some(locale),
         };
         let call = self.call("daemon.plugin.view.open", serde_json::to_value(&params));
+        // open 进行中缓存未知会话的动作：插件在 init 里 close / navigate 的事件可能先于应答到达。
+        PortableSessions::begin_open(cx);
         cx.spawn(async move |this, cx| {
             let result = decode!(call.await, PluginViewOpenedDto);
             if this
@@ -149,6 +155,7 @@ impl PluginViewHost {
             {
                 log::debug!("plugin view host released before open finished");
             }
+            cx.update(PortableSessions::end_open);
         })
         .detach();
         cx.notify();
@@ -162,7 +169,10 @@ impl PluginViewHost {
                 self.seq = opened.seq;
                 self.tree = Some(opened.tree);
                 self.revision += 1;
-                PortableSessions::register(opened.session, cx.weak_entity(), cx);
+                let early = PortableSessions::register(opened.session, cx.weak_entity(), cx);
+                if let Some(early) = early {
+                    self.apply_early(early, cx);
+                }
             }
             Err(message) => {
                 self.phase = Phase::Closed;
@@ -172,10 +182,24 @@ impl PluginViewHost {
         cx.notify();
     }
 
+    /// 执行 open 应答前已到达的动作：先动作、后关闭（与 daemon 发出的先后一致）。
+    fn apply_early(&mut self, early: super::EarlyActions, cx: &mut Context<Self>) {
+        for effect in &early.effects {
+            self.run_effect(effect, cx);
+        }
+        if let Some(reason) = early.closed {
+            self.mark_closed(&reason, cx);
+        }
+    }
+
     /// 应用 daemon 推来的帧。
     pub(super) fn apply_frame(&mut self, frame: PluginViewFrameDto, cx: &mut Context<Self>) {
         if self.session.as_deref() != Some(frame.session.as_str()) || self.tree.is_none() {
             return;
+        }
+        // 动作先于 ops 执行，且不受序号判定影响：动作帧沿用会话当前序号。
+        for effect in &frame.effects {
+            self.run_effect(effect, cx);
         }
         if frame.seq <= self.seq {
             return;
@@ -198,6 +222,27 @@ impl PluginViewHost {
                 log::warn!("plugin view frame rejected: {error}");
                 self.resync(false, cx);
             }
+        }
+    }
+
+    /// 执行 daemon 随帧下发的宿主动作。
+    fn run_effect(&self, effect: &ViewEffect, cx: &mut App) {
+        match effect {
+            ViewEffect::Navigate { target } => {
+                // 插件那边 `ctx.navigate()` 已成功返回，这里失败只能留在日志里，用 warn 便于诊断。
+                if let Err(message) = crate::navigate(cx, &self.identity, target) {
+                    log::warn!(
+                        "plugin view {}/{} navigate to {target} ignored: {message}",
+                        self.identity,
+                        self.view
+                    );
+                }
+            }
+            ViewEffect::Unknown => log::debug!(
+                "plugin view {}/{} sent an action this client does not support",
+                self.identity,
+                self.view
+            ),
         }
     }
 
@@ -252,13 +297,17 @@ impl PluginViewHost {
     /// daemon 宣布会话结束：显示「已结束」与重新打开按钮。
     pub(super) fn mark_closed(&mut self, reason: &str, cx: &mut Context<Self>) {
         self.forget_session(cx);
-        self.phase = Phase::Closed;
-        self.error = None;
         log::debug!(
             "plugin view {}/{} closed: {reason}",
             self.identity,
             self.view
         );
+        // 插件主动请求关闭（`ctx.close()`）且承载容器可关闭：直接关容器，不显示「已结束」。
+        if reason == VIEW_CLOSE_REASON_REQUESTED && self.container.close(cx) {
+            return;
+        }
+        self.phase = Phase::Closed;
+        self.error = None;
         cx.notify();
     }
 

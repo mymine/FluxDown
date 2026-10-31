@@ -2,6 +2,7 @@ use std::borrow::Cow;
 
 use fluxdown_ui_account::AccountAssets;
 use fluxdown_ui_components::ComponentAssets;
+use fluxdown_ui_downloads::FlagAssets;
 use fluxdown_ui_icon_pack::IconPackAssets;
 use fluxdown_ui_rss::RssAssets;
 use fluxdown_ui_shell::ShellAssets;
@@ -24,6 +25,9 @@ impl AssetSource for DesktopAssets {
         if let Some(asset) = AccountAssets.load(path)? {
             return Ok(Some(asset));
         }
+        if let Some(asset) = FlagAssets.load(path)? {
+            return Ok(Some(asset));
+        }
         if let Some(asset) = IconPackAssets.load(path)? {
             return Ok(Some(asset));
         }
@@ -36,6 +40,7 @@ impl AssetSource for DesktopAssets {
         assets.extend(ComponentAssets.list(path)?);
         assets.extend(RssAssets.list(path)?);
         assets.extend(AccountAssets.list(path)?);
+        assets.extend(FlagAssets.list(path)?);
         assets.extend(IconPackAssets.list(path)?);
         Ok(assets)
     }
@@ -65,6 +70,17 @@ mod tests {
             .matched_icon("a.mp4", fluxdown_ui_icon_pack::FileKind::Video)
             .expect("video icon");
         assert!(assets.load(&icon.svg.path)?.is_some());
+        for code in fluxdown_ui_downloads::flag_codes() {
+            let path = fluxdown_ui_downloads::flag_asset_path(code);
+            let bytes = match path {
+                Some(path) => assets.load(path)?,
+                None => None,
+            };
+            assert!(
+                bytes.is_some_and(|bytes| bytes.starts_with(b"<svg")),
+                "flag {code} does not resolve through DesktopAssets"
+            );
+        }
         Ok(())
     }
 }

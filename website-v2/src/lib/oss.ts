@@ -20,8 +20,8 @@ import {
 import { ossStorageKey } from "@/lib/oss-storage";
 
 /**
- * 官网签发的下载链接有效期（秒）。镜像侧有效时长须为同一值（Worker `DOWNLOAD_URL_TTL_SEC`，
- * 或阿里云 CDN「URL 鉴权 → 鉴权 URL 有效时长」）：A 方式的过期时间 = 签发时刻 + 镜像侧有效时长。
+ * 官网签发的下载链接有效期（秒）。镜像侧有效时长须为同一值（ESA 边缘函数变量 `DOWNLOAD_URL_TTL_SEC`，
+ * 见 cdn/esa-dl-cn.js）：A 方式的过期时间 = 签发时刻 + 镜像侧有效时长。
  * 分段下载在过期前发起的请求不受影响，过期后客户端重新请求 `/api/download` 即拿到新链接。
  */
 export const DOWNLOAD_URL_TTL_SEC = 3 * 3600;
@@ -34,7 +34,8 @@ export const ossConfigured = !!(OSS_ACCESS_KEY_ID && OSS_ACCESS_KEY_SECRET);
  * 目录由 release tag 推导：`v0.4.8` → `v0.4.8/app/`（历史目录名；统一 release 起
  * 该目录承载这个 vX.Y.Z release 的全部组件资产），历史组件 release `extension-v…` /
  * `server-v…` / `cli-v…` / `mobile-v…` → 同名组件目录；版本目录保留 `v` 前缀。
- * 同一套规则在 .github/actions/oss-upload/action.yml 的 bash 里复刻，改一处须同步另一处。
+ * 同一套规则在 .github/actions/oss-upload 与 .github/scripts/pan123_mirror.sh 的 bash 里各复刻一份
+ * （123 云盘用同一对象键），改一处须同步另外两处。
  */
 export function releaseObjectKey(tag: string, filename: string): string {
   const m = /^(?:([a-z]+)-)?(v.+)$/.exec(tag);
@@ -53,10 +54,9 @@ const CDN_BASE = (CN_CDN_BASE ?? "").replace(/\/+$/, "");
 export const cdnConfigured = !!(CDN_BASE && CN_CDN_AUTH_KEY);
 
 /**
- * dl-cn 镜像下载链接（阿里云 CDN URL 鉴权 A 方式：`auth_key=<签发时间>-<rand>-0-<md5>`，
- * md5 串为 `<编码后路径>-<签发时间>-<rand>-0-<密钥>`）。现由 Cloudflare Worker（cdn/oss-proxy.js）
- * 校验，备案后改回阿里云 CDN 也无需改签名；两者都去掉 auth_key 再算缓存键，签名不影响命中率。
- * `.apk` / `.ipa` 由镜像回源时换成桶内 `.bin` 对象。
+ * dl-cn 镜像下载链接（阿里云 URL 鉴权 A 方式：`auth_key=<签发时间>-<rand>-0-<md5>`，
+ * md5 串为 `<编码后路径>-<签发时间>-<rand>-0-<密钥>`）。由 ESA 边缘函数（cdn/esa-dl-cn.js）校验，
+ * 缓存键忽略查询串，签名不影响命中率。`.apk` / `.ipa` 由镜像回源时换成桶内 `.bin` 对象。
  * 调用前须保证 `cdnConfigured`。https://help.aliyun.com/zh/cdn/user-guide/type-a-signing
  */
 export function cdnDownloadUrl(key: string): string {

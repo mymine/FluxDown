@@ -15,24 +15,33 @@ use fluxdown_ui_components::segmented_tabs;
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    AnyView, App, Context, Entity, EventEmitter, IntoElement, ParentElement, Render, SharedString,
-    Styled, Window, div, prelude::FluentBuilder as _,
+    AnyView, App, AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement,
+    Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{WindowExt as _, h_flex, notification::Notification, v_flex};
 
+use components::plugin_live::LivePlugins;
 use controller::{COMPONENT_KINDS, component_slot};
 pub use controller::{ExtensionsController, ExtensionsSignal};
 use pages::{managed_components::ComponentUi, plugins::PluginsUi};
 
 pub type PortFuture<T> = Pin<Box<dyn Future<Output = Result<T, RpcErrorData>> + Send + 'static>>;
 
-/// 由 app 注入的插件视图工厂：`(插件, 视图声明, 任务 id, window, cx)` → 视图。
-/// 扩展页的插件设置对话框用它渲染 `location == "settings"` 的视图。
+/// 插件视图的承载位置：宿主（app）据此决定视图的 `ViewContainer`（能否关闭承载它的容器）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PluginViewSlot {
+    /// 当前窗口里最上层的对话框；插件请求关闭（`ctx.close()` / `fluxdown.close()`）即关闭它。
+    Dialog,
+}
+
+/// 由 app 注入的插件视图工厂：`(插件, 视图声明, 任务 id, 承载位置, window, cx)` → 视图。
+/// 扩展页的插件设置对话框与登录对话框用它渲染 `location == "settings"` / `"auth"` 的视图。
 pub type PluginViewFactory = Rc<
     dyn Fn(
         &fluxdown_protocol::PluginDto,
         &fluxdown_protocol::PluginViewDeclDto,
         Option<String>,
+        PluginViewSlot,
         &mut Window,
         &mut App,
     ) -> AnyView,
@@ -72,6 +81,8 @@ pub struct ExtensionsView {
     plugins: PluginsUi,
     components: [ComponentUi; 2],
     plugin_view_factory: Option<PluginViewFactory>,
+    /// 打开中的插件对话框跟随的实时插件列表。
+    live_plugins: Entity<LivePlugins>,
 }
 
 /// 需要宿主（app）完成的动作：capability 不直接开窗。
@@ -101,7 +112,17 @@ impl ExtensionsView {
             plugins: PluginsUi::default(),
             components: [ComponentUi::default(), ComponentUi::default()],
             plugin_view_factory: None,
+            live_plugins: cx.new(|_| LivePlugins::default()),
         }
+    }
+
+    /// 把控制器的最新插件列表推给已打开的对话框；断连期间列表不可信，保持上一份已知状态。
+    fn sync_live_plugins(&self, cx: &mut Context<Self>) {
+        if self.controller.is_stale() {
+            return;
+        }
+        self.live_plugins
+            .update(cx, |live, cx| live.replace(self.controller.plugins(), cx));
     }
 
     /// 注入插件视图工厂（app 在装配时调用）。
@@ -114,6 +135,8 @@ impl ExtensionsView {
         self.last_error = None;
         self.controller.replace_snapshot(snapshot);
         self.prune_awaiting_consent();
+        self.invalidate_site_defaults();
+        self.sync_live_plugins(cx);
         self.plugins
             .market
             .favorites
@@ -143,7 +166,7 @@ impl ExtensionsView {
                 }
             }
             // 熔断提示由 app 层全局弹出；本视图只刷新列表（控制器已更新本地状态）。
-            Some(ExtensionsSignal::PluginAutoDisabled { .. }) => {}
+            Some(ExtensionsSignal::PluginAutoDisabled { .. }) => self.sync_live_plugins(cx),
             None => {}
         }
         // 登录 / 登出以增量事件到达：刷新收藏（星标、「我的收藏」）无需重进设置页。
@@ -157,6 +180,8 @@ impl ExtensionsView {
         };
         if ExtensionsController::replaces_plugins(event) {
             self.prune_awaiting_consent();
+            self.invalidate_site_defaults();
+            self.sync_live_plugins(cx);
         }
         let cleared_error = !self.controller.is_stale() && self.last_error.take().is_some();
         // 无关事件（如下载进度帧）不重绘，保住 retained 渲染的复用。

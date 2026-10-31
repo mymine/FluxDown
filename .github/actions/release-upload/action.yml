@@ -16,7 +16,7 @@ inputs:
     description: 目标 release tag（vX.Y.Z / vX.Y.Z-rc.N，release 须已存在，可为草稿）
     required: true
   component:
-    description: 组件名（app / extension / server / cli / mobile）
+    description: 组件名（app / extension / server / cli / mobile / ios）
     required: true
   dir:
     description: 本地产物目录
@@ -44,7 +44,7 @@ runs:
         DRY_RUN: ${{ inputs.dry-run }}
       run: |
         set -euo pipefail
-        case "$COMPONENT" in app|extension|server|cli|mobile) ;; *)
+        case "$COMPONENT" in app|extension|server|cli|mobile|ios) ;; *)
           echo "::error::unknown component '$COMPONENT'"; exit 1 ;;
         esac
         SENTINEL="SHA256SUMS-${COMPONENT}.txt"

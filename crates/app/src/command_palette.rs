@@ -12,6 +12,7 @@ use fluxdown_ui_downloads::PageCommand;
 use fluxdown_ui_downloads::actions as dl;
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_settings::search_index;
+use fluxdown_ui_share::ReceiveSource;
 use fluxdown_ui_shell::RouteId;
 use gpui::{Action, App, SharedString, Window};
 use gpui_component::{Icon, WindowExt as _};
@@ -108,6 +109,7 @@ fn command_shortcut_id(command_id: &str) -> Option<&'static str> {
         "cmd.cycle_group_by" => "cycle_group",
         "cmd.cycle_sort" => "cycle_sort",
         "cmd.toggle_detail_panel" => "toggle_detail",
+        "cmd.share_selected" => "share_selected",
         "cmd.open_settings" => "open_settings",
         "cmd.quit" => "quit",
         _ => return None,
@@ -172,6 +174,12 @@ fn commands(labels: &Labels, cx: &App) -> Vec<PaletteItem> {
             FluxIcon::Magnet,
             |_, cx| run_in_downloads(cx, PageCommand::OpenTorrentFile),
         ),
+        labels.command(
+            "cmd.seed_local",
+            "seedLocalTitle",
+            FluxIcon::HardDrive,
+            |_, cx| run_in_downloads(cx, PageCommand::SeedLocal),
+        ),
         labels
             .command("cmd.pause_all", "pauseAll", FluxIcon::Pause, |_, cx| {
                 run_in_downloads(cx, PageCommand::PauseAll);
@@ -234,10 +242,30 @@ fn commands(labels: &Labels, cx: &App) -> Vec<PaletteItem> {
         ),
     ];
 
+    if Desktop::global(cx).share_hub.read(cx).available() {
+        items.push(labels.command(
+            "cmd.share_selected",
+            "shareCmdShareSelected",
+            FluxIcon::Share2,
+            |_, cx| run_in_downloads(cx, PageCommand::ShareSelected),
+        ));
+        items.push(labels.command(
+            "cmd.share_receive",
+            "shareCmdReceive",
+            FluxIcon::Link,
+            |_, cx| {
+                crate::windows::share_receive::open(cx, ReceiveSource::Input(String::new()));
+            },
+        ));
+    }
+
     for entry in ActivityEntry::ALL {
         let label_key = entry.label_key();
         match entry {
-            ActivityEntry::Downloads | ActivityEntry::Rss | ActivityEntry::Webhooks => {
+            ActivityEntry::Downloads
+            | ActivityEntry::Rss
+            | ActivityEntry::Webhooks
+            | ActivityEntry::Share => {
                 let Some(route) = entry.route() else {
                     continue;
                 };
@@ -246,17 +274,21 @@ fn commands(labels: &Labels, cx: &App) -> Vec<PaletteItem> {
                         .and_then(|value| value.as_bool())
                         .unwrap_or(true)
                 });
-                if !visible {
+                let available = entry != ActivityEntry::Share
+                    || Desktop::global(cx).share_hub.read(cx).available();
+                if !visible || !available {
                     continue;
                 }
                 let id: &'static str = match entry {
                     ActivityEntry::Downloads => "cmd.go_downloads",
                     ActivityEntry::Rss => "cmd.go_rss",
+                    ActivityEntry::Share => "cmd.go_share",
                     _ => "cmd.go_webhooks",
                 };
                 let icon = match entry {
                     ActivityEntry::Downloads => FluxIcon::Download,
                     ActivityEntry::Rss => FluxIcon::Rss,
+                    ActivityEntry::Share => FluxIcon::Share2,
                     _ => FluxIcon::Webhook,
                 };
                 let page = labels.current.text(label_key);
@@ -340,11 +372,13 @@ fn settings_items(labels: &Labels, cx: &mut App) -> Vec<PaletteItem> {
     let translator = desktop.translator.clone();
     let store = desktop.settings_store.clone();
     let referral_visible = desktop.referral_visibility.read(cx).visible();
+    let share_network_visible = desktop.share_network_visibility.read(cx).visible();
     let entries = search_index(
         &translator,
         &store,
         &crate::activity::toggles(),
         referral_visible,
+        share_network_visible,
         cx,
     );
     let root = labels.title(fluxdown_ui_i18n::keys::SETTINGS);
@@ -414,7 +448,7 @@ fn navigate(cx: &mut App, route: RouteId) {
     cx.defer(move |cx| navigate_now(cx, route));
 }
 
-fn navigate_now(cx: &mut App, route: RouteId) {
+pub(crate) fn navigate_now(cx: &mut App, route: RouteId) {
     crate::windows::main::reveal(cx);
     if let Some(shell) = Desktop::global(cx)
         .main_shell

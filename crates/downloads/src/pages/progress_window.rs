@@ -118,6 +118,8 @@ pub struct ProgressWindowView {
     hand_off_task: Option<Task<()>>,
     /// 删除确认框里「同时删除已下载的文件」的勾选状态（每次打开确认框重置为不删）。
     delete_files: bool,
+    /// 刚把产物复制到剪贴板的任务（按钮显示已复制）；完成集合切到下一项后自然失效。
+    copied_task: Option<String>,
     last_error: Option<SharedString>,
 }
 
@@ -153,6 +155,7 @@ impl ProgressWindowView {
             hand_off_task: None,
             delete_files: false,
             last_error: None,
+            copied_task: None,
         }
     }
 
@@ -496,6 +499,39 @@ impl ProgressWindowView {
             task_id,
             cx,
         );
+    }
+
+    /// 产物以文件 / 文件夹写入系统剪贴板（经 agent，见 `pages/task_copy.rs`）；不关窗，按钮改为已复制。
+    fn copy_to_clipboard(&mut self, task_id: String, cx: &mut Context<Self>) {
+        let future = self.port.execute(DownloadsCommand::CopyTaskFiles {
+            task_ids: vec![task_id.clone()],
+        });
+        cx.spawn(async move |this, cx| {
+            let result = future.await;
+            let Ok(()) = this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => {
+                        this.copied_task = Some(task_id);
+                        this.last_error = None;
+                    }
+                    Err(error) => {
+                        this.copied_task = None;
+                        let key = if error.code == fluxdown_protocol::ApplicationErrorCode::NotFound
+                        {
+                            "copyFileErrNotFound"
+                        } else {
+                            "copyFileFailed"
+                        };
+                        this.last_error = Some(this.t(cx, key));
+                    }
+                }
+                cx.notify();
+            }) else {
+                // 视图已释放，结束回调而不再更新状态。
+                return;
+            };
+        })
+        .detach();
     }
 
     fn toggle_show_completion(&mut self, value: bool, cx: &mut Context<Self>) {
@@ -1187,12 +1223,42 @@ impl ProgressWindowView {
     fn render_completed_footer(&self, missing: bool, cx: &mut Context<Self>) -> AnyElement {
         let folder_id = self.task_id.clone();
         let file_id = self.task_id.clone();
+        let copy_id = self.task_id.clone();
+        // 多文件 BT 产物是目录：图标与提示随之变为「复制文件夹」。
+        let is_folder = !missing
+            && self
+                .row()
+                .and_then(|row| row.local_file_path())
+                .is_some_and(|path| path.is_dir());
+        let copied = self.copied_task.as_deref() == Some(self.task_id.as_str());
+        let copy_tooltip = match (copied, is_folder) {
+            (true, true) => self.t(cx, "folderCopiedToClipboard"),
+            (true, false) => self.t(cx, "fileCopiedToClipboard"),
+            (false, true) => self.t(cx, "copyFolderAction"),
+            (false, false) => self.t(cx, "copyFileAction"),
+        };
+        let copy_icon = match (copied, is_folder) {
+            (true, _) => FluxIcon::Check,
+            (false, true) => FluxIcon::Folders,
+            (false, false) => FluxIcon::Copy,
+        };
         // 被点的按钮转圈表示正在打开（进行中本身拦截点击，不再置灰），另一个禁用。
         let busy = |kind| self.handing_off == Some(kind);
         let blocked = |kind| self.handing_off.is_some_and(|current| current != kind);
         Self::footer(cx)
             .justify_end()
             .child(div().flex_1().child(self.render_delete_button(cx)))
+            .child(
+                Button::new("progress-copy-file")
+                    .outline()
+                    .control_icon(cx)
+                    .icon(copy_icon)
+                    .tooltip(copy_tooltip)
+                    .disabled(missing)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.copy_to_clipboard(copy_id.clone(), cx);
+                    })),
+            )
             .child(self.render_open_main_button(cx))
             .child(
                 Button::new("progress-open-folder")

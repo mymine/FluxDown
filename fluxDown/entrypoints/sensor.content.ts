@@ -38,13 +38,13 @@ import { createFloatButton, type FloatButtonController } from "@/ui/features/Flo
 import { createDownloadNotice } from "@/ui/features/DownloadNotice";
 import { normalizeDashManifest, parseDashManifestText } from "@/utils/dash-manifest";
 import { isHttpUrl } from "@/utils/media-sniff";
+import { installErrorCapture } from "@/utils/error-log";
 import { sendAction } from "@/utils/messaging";
 import { isPageChange } from "@/utils/page-nav";
 import { normalizeHlsPlaylist } from "@/utils/hls-playlist";
 import type { ResourceMessagePayload } from "@/utils/resource-types";
+import { normalizeSniffMaxResources } from "@/utils/sniff-limit";
 
-/** #288：单页面已上报资源数上限——长列表页无节制上报 / 扫描会导致页面卡顿。 */
-const MAX_RESOURCES_PER_PAGE = 200;
 const REPORT_BATCH_MS = 200;
 const MUTATION_FLUSH_DELAY_MS = 200;
 const DOM_RULE_THROTTLE_MS = 1000;
@@ -88,8 +88,8 @@ export default defineContentScript({
   matches: ["<all_urls>"],
   runAt: "document_start",
   allFrames: true,
-  // 浮钮样式只进 Shadow DOM（createShadowRootUi），不得注入页面
-  cssInjectionMode: "ui",
+  // 浮钮 / 下载提示样式构建期内联进脚本（ui/content-css.ts），只进 Shadow DOM，不得注入页面
+  cssInjectionMode: "manual",
   matchAboutBlank: true,
 
   async main(ctx) {
@@ -100,6 +100,7 @@ export default defineContentScript({
     const shared = globalThis as { __fluxdownSensorAlive?: () => boolean };
     if (!top && shared.__fluxdownSensorAlive?.() === true) return;
     shared.__fluxdownSensorAlive = () => !ctx.isInvalid;
+    installErrorCapture("content");
     // 收到 PageConfig 前用随包规则；之后换成用户实际生效的 classifier。
     let classify = compileBundled().classify;
 
@@ -117,6 +118,8 @@ export default defineContentScript({
     };
 
     const sniffActive = (): boolean => config?.sniff !== false;
+    /** 单页 DOM 上报上限（#288）；收到配置前 / 旧 background 未下发时用默认值。 */
+    const resourceLimit = (): number => normalizeSniffMaxResources(config?.sniffMaxResources);
 
     // ===== 媒体元素跟踪 =====
     const tracker = new MediaTracker({
@@ -147,7 +150,8 @@ export default defineContentScript({
     // ===== 资源上报（合批 + 单页上限） =====
     const reportedUrls = new Set<string>();
     let reportedCount = 0;
-    let capReached = false;
+    /** 上限随配置变化：调高后 applyConfig → refreshSniffState 重新扫描并接上观察。 */
+    const capReached = (): boolean => reportedCount >= resourceLimit();
     let queue: ResourceMessagePayload[] = [];
     let flushTimer: number | undefined;
 
@@ -162,21 +166,22 @@ export default defineContentScript({
     function reportResources(list: ResourceMessagePayload[]): void {
       if (!sniffActive()) return;
       for (const r of list) {
-        // 200 条上限只计 DOM 来源；fetch/XHR 嗅探到的媒体不应被首屏 a[href] 挤掉
+        // 上限只计 DOM 来源；fetch/XHR 嗅探到的媒体不应被首屏 a[href] 挤掉
         const fromHook = r.detectedBy === "fetch-intercept" || r.detectedBy === "xhr-intercept";
-        if (!fromHook && capReached) continue;
+        if (!fromHook && capReached()) continue;
         if (reportedUrls.has(r.url)) continue;
         reportedUrls.add(r.url);
-        // 整体清空防 SPA 长时间运行内存增长；background 有基于 dedupeKey 的去重兜底
-        if (reportedUrls.size > 500) reportedUrls.clear();
+        // 整体清空防 SPA 长时间运行内存增长；background 有基于 dedupeKey 的去重兜底。
+        // 阈值须高于上限，否则清空后重扫到的同一批链接会被重复计数、提前触顶。
+        if (reportedUrls.size > Math.max(500, resourceLimit() * 2)) reportedUrls.clear();
         r.pageUrl ||= location.href;
         queue.push(r);
-        if (!fromHook && ++reportedCount >= MAX_RESOURCES_PER_PAGE) capReached = true;
+        if (!fromHook) reportedCount++;
       }
       if (queue.length > 0 && flushTimer === undefined) {
         flushTimer = window.setTimeout(flushReports, REPORT_BATCH_MS);
       }
-      if (capReached) domSniff.disconnect();
+      if (capReached()) domSniff.disconnect();
     }
 
     // ===== DOM 嗅探（扫描 + MutationObserver + dom 规则 + 内嵌 DASH） =====
@@ -194,7 +199,7 @@ export default defineContentScript({
       let domRuleLast = 0;
 
       const observer = new MutationObserver((mutations) => {
-        if (capReached) return;
+        if (capReached()) return;
         for (const m of mutations) {
           for (const node of m.addedNodes) if (node.nodeType === 1) pendingAdded.add(node as Element);
           if (m.type === "attributes" && m.target.nodeType === 1 && isMediaishElement(m.target as Element)) {
@@ -224,7 +229,7 @@ export default defineContentScript({
 
       function flush(): void {
         handle = undefined;
-        if (capReached || !sniffActive()) {
+        if (capReached() || !sniffActive()) {
           pendingAdded.clear();
           pendingAttr.clear();
           return;
@@ -309,7 +314,7 @@ export default defineContentScript({
       }
 
       function connect(): void {
-        if (observing || capReached) return;
+        if (observing || capReached()) return;
         observing = true;
         observer.observe(document.documentElement, MUTATION_OBSERVER_OPTIONS);
       }
@@ -335,10 +340,9 @@ export default defineContentScript({
           observer.disconnect();
           observing = false;
         },
-        /** SPA 路由切换：重置单页上限，必要时重新连接观察（新页面重新计数）。 */
+        /** SPA 路由切换：重置单页计数，必要时重新连接观察（新页面重新计数）。 */
         resetForNavigation(): void {
           reportedCount = 0;
-          capReached = false;
           seenDomHits.clear();
           inlineDashSignature = "";
           reportedUrls.clear();
@@ -381,6 +385,8 @@ export default defineContentScript({
 
     function applyConfig(next: PageConfig): void {
       config = next;
+      // 设置改为关闭时本帧可能还报着「按住」：立即撤销，别让后台继续放行
+      if (bypassModifier() === null) reportBypassKey(false);
       if (Array.isArray(next.classify)) {
         try {
           classify = createClassifier(next.classify);
@@ -574,11 +580,87 @@ export default defineContentScript({
     };
     browser.runtime.onMessage.addListener(onMessage);
 
+    // ===== 跳过接管修饰键（IDM 式 Alt+点击）=====
+    // 只上报状态变化；后台全局记一份并在请求发起时快照成放行令牌（background/breaker.ts）。
+    // 失焦 / 隐藏视为松开（keyup 会丢在别的窗口里）；pointerdown 按事件自带的修饰键位校正，
+    // 覆盖「在别的帧按下、焦点移进本帧后点击」这类本帧收不到 keydown 的情况。
+    let bypassKeyHeld = false;
+
+    function bypassModifier(): "Alt" | "Shift" | null {
+      if (config?.bypassKey === "alt") return "Alt";
+      if (config?.bypassKey === "shift") return "Shift";
+      return null;
+    }
+
+    function reportBypassKey(held: boolean): void {
+      if (held === bypassKeyHeld) return;
+      bypassKeyHeld = held;
+      swallow(sendAction({ action: "bypassKey", held }));
+    }
+
+    function onBypassKey(e: KeyboardEvent): void {
+      if (e.repeat || e.key !== bypassModifier()) return;
+      reportBypassKey(e.type === "keydown");
+    }
+
+    function onBypassPointer(e: PointerEvent): void {
+      const key = bypassModifier();
+      if (key === null) return;
+      const held = key === "Alt" ? e.altKey : e.shiftKey;
+      if (!held) {
+        reportBypassKey(false);
+        return;
+      }
+      // 本帧以为已按住时也重发：别的帧失焦已让后台撤销，本地去重会吞掉这次点击
+      bypassKeyHeld = true;
+      swallow(sendAction({ action: "bypassKey", held: true }));
+      // 左 / 中键的真实按下：把放行意图绑定到这次点击（链接 href 立即领令牌，本 tab 随后一小段时间的
+      // 请求也领），不依赖请求发起时键是否还按着——页面 JS 常先 await 再程序化跳转。
+      // 在 pointerdown 而非 click 上报：最早的信号，且有些站点在 mousedown 上就发起下载。
+      if (!e.isTrusted || e.button > 1) return;
+      const origin = e.composedPath()[0];
+      const link = origin instanceof Element ? origin.closest("a[href]") : null;
+      const href = link instanceof HTMLAnchorElement ? link.href : undefined;
+      swallow(sendAction({ action: "bypassClick", href }));
+    }
+
+    function onBypassRelease(): void {
+      reportBypassKey(false);
+    }
+
+    // ===== 链接按下预热 =====
+    // 浏览器要等对方响应头才把点击变成下载（标签页转圈），之后才轮到拦截层投递；按下时就请
+    // background 判断并预热 NMH，让 App 冷启动与这段等待并行。pointerdown 是最早的点击信号。
+    function onLinkPress(e: PointerEvent): void {
+      if (config?.warmOnLinkPress !== true || !e.isTrusted || e.button > 1) return;
+      const key = bypassModifier();
+      if ((key === "Alt" && e.altKey) || (key === "Shift" && e.shiftKey)) return;
+      const origin = e.composedPath()[0];
+      const link = origin instanceof Element ? origin.closest("a[href]") : null;
+      if (!(link instanceof HTMLAnchorElement)) return;
+      const href = link.href;
+      if (!href.startsWith("http:") && !href.startsWith("https:")) return;
+      swallow(sendAction({ action: "linkPress", href, download: link.hasAttribute("download") }));
+    }
+
+    function onVisibility(): void {
+      if (document.visibilityState === "hidden") reportBypassKey(false);
+    }
+
+    window.addEventListener("keydown", onBypassKey, true);
+    window.addEventListener("keyup", onBypassKey, true);
+    window.addEventListener("pointerdown", onBypassPointer, true);
+    window.addEventListener("pointerdown", onLinkPress, true);
+    window.addEventListener("blur", onBypassRelease);
+    document.addEventListener("visibilitychange", onVisibility);
+
     // ===== 磁力链接点击接管 =====
     // 阻止浏览器弹出 OS 应用选择框，改由 FluxDown 接管；捕获阶段早于页面自身处理器。
-    // interceptMagnet 关闭时放行，交还系统默认磁力处理程序。
+    // interceptMagnet 关闭或按住跳过接管修饰键时放行，交还系统默认磁力处理程序。
     function onClick(e: MouseEvent): void {
       if (config?.interceptMagnet !== true) return;
+      const key = bypassModifier();
+      if ((key === "Alt" && e.altKey) || (key === "Shift" && e.shiftKey)) return;
       const target = e.target;
       if (!(target instanceof Element)) return;
       const link = target.closest<HTMLAnchorElement>("a[href]");
@@ -611,6 +693,12 @@ export default defineContentScript({
       document.removeEventListener(EV_SHADOW, onShadow, true);
       document.removeEventListener("contextmenu", onContextMenu, true);
       document.removeEventListener("click", onClick, true);
+      window.removeEventListener("keydown", onBypassKey, true);
+      window.removeEventListener("keyup", onBypassKey, true);
+      window.removeEventListener("pointerdown", onBypassPointer, true);
+      window.removeEventListener("pointerdown", onLinkPress, true);
+      window.removeEventListener("blur", onBypassRelease);
+      document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("pageshow", onPageShow);
       browser.runtime.onMessage.removeListener(onMessage);
       domSniff.stop();

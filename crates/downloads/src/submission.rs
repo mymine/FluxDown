@@ -354,6 +354,7 @@ fn creates_local_task(command: &DownloadsCommand) -> bool {
         DownloadsCommand::Create(_)
             | DownloadsCommand::CaptureResolve(_)
             | DownloadsCommand::SubmitTorrentFile { .. }
+            | DownloadsCommand::SeedLocal { .. }
     )
 }
 

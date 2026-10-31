@@ -11,6 +11,7 @@ import { showToast } from "@/ui/components/Toast";
 import { t } from "@/utils/i18n";
 import { REMOTE_SETTINGS_KEY } from "@/utils/remote-settings";
 import { loadSettings, saveSettings, type FluxDownSettings } from "@/utils/settings";
+import { logError } from "@/utils/error-log";
 
 export const settings = signal<FluxDownSettings | null>(null);
 
@@ -27,7 +28,7 @@ export function updateSettings(patch: Partial<FluxDownSettings>): Promise<void> 
     .then(() => saveSettings(patch))
     .then(refreshSettings)
     .catch(async (e) => {
-      console.error("[FluxDown Options] saveSettings failed:", e);
+      logError("[FluxDown Options] saveSettings failed:", e);
       showToast(t("options.saveFailed"), "error");
       await refreshSettings().catch(() => {});
     });
@@ -36,7 +37,7 @@ export function updateSettings(patch: Partial<FluxDownSettings>): Promise<void> 
 
 /** 启动设置同步：首次加载 + 监听 sync/local 变更；返回取消函数。 */
 export function startSettingsSync(): () => void {
-  refreshSettings().catch((e) => console.error("[FluxDown Options] loadSettings failed:", e));
+  refreshSettings().catch((e) => logError("[FluxDown Options] loadSettings failed:", e));
   const onChanged = (changes: Record<string, unknown>, area: string) => {
     if ((area === "sync" && "settings" in changes) || (area === "local" && REMOTE_SETTINGS_KEY in changes)) {
       refreshSettings().catch(() => {});
@@ -77,7 +78,7 @@ export function useLocalValue<T>(key: string, parse: (raw: unknown) => T): [T, (
     try {
       await browser.storage.local.set({ [key]: next });
     } catch (e) {
-      console.error(`[FluxDown Options] storage.local.set(${key}) failed:`, e);
+      logError(`[FluxDown Options] storage.local.set(${key}) failed:`, e);
       latest.current = previous;
       setValue(previous);
       showToast(t("options.saveFailed"), "error");

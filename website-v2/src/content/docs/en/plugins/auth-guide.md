@@ -53,6 +53,61 @@ The dialog drives your plugin like this:
 
 The same actions are available without the UI: `daemon.plugin.auth` over `/rpc`, or `POST /api/v1/plugins/{identity}/auth` on the management API, with body `{ "action", "site", "authRef", "sessionId", "input" }`. That is how you log in on a headless server, or script a test. A plugin that is disabled cannot log in: the call fails with `插件 <identity> 未启用` (“plugin is not enabled”).
 
+## Custom login UI
+
+By default the **Log in** button opens the fixed dialog described above. A plugin can replace the whole dialog content with its own view by declaring a view with `location: "auth"`:
+
+```json
+{
+  "permissions": ["auth"],
+  "auth": { "entry": "auth.js" },
+  "main": { "entry": "main.js" },
+  "contributes": {
+    "views": [{ "id": "login", "title": "Log in", "location": "auth" }]
+  }
+}
+```
+
+- At most one `auth` view per plugin, and it requires the top-level `auth` declaration (and therefore the `auth` permission). The view is portable (rendered from `main` with `flux.ui.view`) or a [desktop script](/docs/en/plugins/desktop-ui-guide/); the desktop app prefers the desktop script and the Web UI shows portable views only.
+- When the plugin is enabled, loaded and has no pending consent, the dialog hosts only your view. The title stays "Log in <plugin>"; the site / login-info form and the fixed buttons are not shown. Otherwise, and in the mobile apps, the default dialog is used. The desktop app also falls back to the default dialog when the view only has a desktop script and the plugin package is not on this machine (a remote host). The button is still shown whenever the plugin has `auth.entry`.
+- Drive the login from the view: call your own `flux.rpc.handle` handlers or run the flow in `main`, store the result with `flux.auth.save`, then call `ctx.close()` to dismiss the dialog (desktop scripts: `fluxdown.close()`). If the user is already logged in you can call `ctx.close()` straight from `init`.
+- Apps that predate this location reject the manifest, so set `minAppVersion` to the next release or later.
+
+```js
+// main.js — QR login drawn by the plugin
+const { h } = flux.ui;
+
+flux.ui.view("login", {
+  async init(ctx) {
+    const res = await flux.fetch({ url: "https://passport.example.com/qr/generate" });
+    const data = JSON.parse(res.body); // { key, url, image: "data:image/png;base64,…" }
+    const state = { ctx, key: data.key, image: data.image, message: "Scan with the Example app", timer: 0 };
+    state.timer = flux.timers.setInterval(async () => {
+      const poll = JSON.parse((await flux.fetch({ url: "https://passport.example.com/qr/poll?key=" + encodeURIComponent(state.key) })).body);
+      if (poll.state === "scanned") state.message = "Scanned, confirm on your phone";
+      if (poll.state === "expired") state.message = "The QR code expired, reopen this dialog";
+      if (poll.state === "confirmed") {
+        flux.timers.clear(state.timer);
+        await flux.auth.save({ site: "https://www.example.com", kind: "cookie", cookies: poll.cookies });
+        state.ctx.close();
+        return;
+      }
+      state.ctx.refresh();
+    }, 2000);
+    return state;
+  },
+  render: (state) =>
+    h("stack", { gap: "md", padding: "md", align: "center" },
+      h("image", { src: state.image, alt: "QR code", width: 200, height: 200 }),
+      h("text", { text: state.message })),
+  dispose(state) {
+    flux.timers.clear(state.timer);
+  },
+});
+```
+
+The example assumes the login service returns the QR image and the confirmed cookies directly; adapt the requests to your site (cookies from `Set-Cookie` are read as in the [complete example](#complete-example-qr-code-login)). Without an `auth` view nothing changes: the default form dialog and the `authenticate` actions behave exactly as before.
+
 ## The `authenticate` entry point
 
 `authenticate(ctx)` is one global function that handles all five actions. **Every call runs in a fresh script context**, so nothing survives between `begin` and `poll` unless you store it in `flux.storage` (keyed by the `sessionId` you hand out).

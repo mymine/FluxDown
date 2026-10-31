@@ -33,6 +33,7 @@ export interface DialogsState {
   rename: string | null
   changeUrl: string | null
   changeSegments: string | null
+  seedLocal: boolean
 }
 
 let state: DialogsState = {
@@ -42,6 +43,7 @@ let state: DialogsState = {
   rename: null,
   changeUrl: null,
   changeSegments: null,
+  seedLocal: false,
 }
 let counter = 0
 const listeners = new Set<() => void>()
@@ -133,4 +135,12 @@ export function openChangeSegments(taskId: string): void {
 
 export function closeChangeSegments(): void {
   publish({ changeSegments: null })
+}
+
+export function openSeedLocal(): void {
+  publish({ seedLocal: true })
+}
+
+export function closeSeedLocal(): void {
+  publish({ seedLocal: false })
 }

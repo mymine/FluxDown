@@ -23,6 +23,7 @@ import { planSync, registrationsOfPlugin } from "./plan";
 import type { PluginPlan } from "./plan";
 import { buildRegistration, fingerprintOf, registrationId, worldIdOf, worldProperties } from "./registration";
 import type { PageScriptStore } from "./store";
+import { logWarn } from "@/utils/error-log";
 
 /** 触发来源：用户操作与定时 / 启动优先于能力探测（后者只在序号 / epoch 变化时才真正跑）。 */
 export type SyncTrigger = "capabilities" | "startup" | "installed" | "permission" | "alarm" | "user" | "view";
@@ -159,7 +160,7 @@ export function createPageScriptSync(deps: SyncDeps): PageScriptSync {
         try {
           await scripts.update(toUpdate);
         } catch (e) {
-          console.warn("[FluxDown] userScripts.update failed, re-registering:", e);
+          logWarn("[FluxDown] userScripts.update failed, re-registering:", e);
           await scripts.unregister(toUpdate.map((s) => s.id));
           await scripts.register(toUpdate);
         }
@@ -214,7 +215,7 @@ export function createPageScriptSync(deps: SyncDeps): PageScriptSync {
     try {
       registeredIds = await scripts.getIds();
     } catch (e) {
-      console.warn("[FluxDown] userScripts.getScripts failed:", e);
+      logWarn("[FluxDown] userScripts.getScripts failed:", e);
       return finish("browser-unavailable", (state) => {
         state.index = index.scripts;
       });
@@ -236,7 +237,7 @@ export function createPageScriptSync(deps: SyncDeps): PageScriptSync {
       try {
         await scripts.unregister(plan.orphans);
       } catch (e) {
-        console.warn("[FluxDown] userScripts.unregister failed:", e);
+        logWarn("[FluxDown] userScripts.unregister failed:", e);
       }
     }
 

@@ -187,6 +187,16 @@ impl DetailPlacement {
     }
 }
 
+/// 任务表表头文字对齐（视图菜单 › 显示）；默认左对齐，单元格内容对齐不受影响。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HeaderAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ColumnPref {
     /// 列键（`DownloadColumnKind::key`）。
@@ -199,6 +209,7 @@ pub(crate) struct ColumnPref {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ViewPrefs {
     pub(crate) density: ViewDensity,
+    pub(crate) header_align: HeaderAlign,
     pub(crate) group_by: ViewGroupBy,
     pub(crate) sort_key: ViewSortKey,
     pub(crate) sort_dir: SortDir,
@@ -218,6 +229,7 @@ impl Default for ViewPrefs {
     fn default() -> Self {
         Self {
             density: ViewDensity::default(),
+            header_align: HeaderAlign::default(),
             group_by: ViewGroupBy::default(),
             sort_key: ViewSortKey::default(),
             sort_dir: SortDir::default(),
@@ -242,6 +254,7 @@ impl ViewPrefs {
             return prefs;
         };
         read_field(map, "density", &mut prefs.density);
+        read_field(map, "header_align", &mut prefs.header_align);
         read_field(map, "group_by", &mut prefs.group_by);
         read_field(map, "sort_key", &mut prefs.sort_key);
         read_field(map, "sort_dir", &mut prefs.sort_dir);

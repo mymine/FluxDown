@@ -307,4 +307,78 @@ struct HostStoreTests {
         #expect(s.notices.last?.name == "captureTasksStarted")
         #expect(s.state.sections == before, "notices never touch published state")
     }
+
+    // MARK: 会话信号流结束（与 Android `HostStoreTest` 同组）
+
+    private final class Scripted: HostSession, @unchecked Sendable {
+        let signals: AsyncStream<HostSignal>
+        init(_ signals: AsyncStream<HostSignal>) { self.signals = signals }
+        func call(_: String, params _: Data?) async throws(HostError) -> Data { Data("null".utf8) }
+        func close() {}
+        func categorySaveDir(fileName _: String, url _: String) -> String? { nil }
+        func createTask(_: CreateTaskRequest) async throws(HostError) -> String { "" }
+        func pause(_: String) async throws(HostError) {}
+        func resume(_: String) async throws(HostError) {}
+        func delete(_: String, deleteFiles _: Bool) async throws(HostError) {}
+        func pauseMany(_: [String]) async throws(HostError) {}
+        func resumeMany(_: [String]) async throws(HostError) {}
+        func deleteMany(_: [String], deleteFiles _: Bool) async throws(HostError) {}
+        func pauseAll() async throws(HostError) {}
+        func resumeAll() async throws(HostError) {}
+        func rename(_: String, fileName _: String) async throws(HostError) {}
+        func changeUrl(_: String, url _: String) async throws(HostError) {}
+        func rescan() async throws(HostError) {}
+        func moveToQueue(_: String, queueId _: String) async throws(HostError) {}
+        func boost(_: String) async throws(HostError) {}
+        func resolveSelection(_: String, outcome _: SelectionOutcome) async throws(HostError) {}
+        func patchConfig(expectedRevision _: UInt64, values _: [String: String]) async throws(HostError) {}
+        func refreshRssSource(_: String) async throws(HostError) {}
+        func setRssSourceEnabled(_: String, enabled _: Bool) async throws(HostError) {}
+    }
+
+    private func finished(_ signals: [HostSignal]) -> AsyncStream<HostSignal> {
+        AsyncStream { continuation in
+            for signal in signals { continuation.yield(signal) }
+            continuation.finish()
+        }
+    }
+
+    private func failure(_ s: HostStore) async -> HostError? {
+        for _ in 0..<200 {
+            if case let .failed(error) = s.state.connection { return error }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return nil
+    }
+
+    @Test func signalStreamEndingWithoutFatalSurfacesAFailureInsteadOfFreezingOnLoading() async {
+        let s = store()
+        s.attach(Scripted(finished([loadingSnapshot(total: 1)])))
+        defer { s.detach() }
+        #expect(await failure(s)?.code == .unavailable)
+    }
+
+    @Test func fatalBeforeStreamEndKeepsTheRealReason() async {
+        let s = store()
+        let fatal = HostError(.unauthorized, message: "revoked")
+        s.attach(Scripted(finished([snapshot([]), .fatal(fatal)])))
+        defer { s.detach() }
+        #expect(await failure(s) == fatal)
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(s.state.connection == .failed(fatal))
+    }
+
+    @Test func detachDoesNotReportTheCancelledStreamAsFailure() async {
+        let s = store()
+        let (stream, continuation) = AsyncStream<HostSignal>.makeStream()
+        continuation.yield(snapshot([]))
+        s.attach(Scripted(stream))
+        for _ in 0..<200 where s.state.connection != .live {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        s.detach()
+        continuation.finish()
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(s.state.connection == .live)
+    }
 }

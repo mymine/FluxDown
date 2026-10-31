@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 
 use fluxdown_protocol::{PluginAuditEntryDto, PluginAuditListDto};
 use fluxdown_ui_components::{
-    BusyExt as _, ControlExt as _, FluxIcon, dialog_scroll_body, tabular_numbers,
+    BusyExt as _, BusyHold, ControlExt as _, FluxIcon, dialog_scroll_body, tabular_numbers,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -56,6 +56,12 @@ struct PluginAuditDialog {
     copied: bool,
     /// 筛选 / 清空会让在途翻页作废。
     generation: u64,
+    /// 清空请求在途（「清空」按钮转圈）。
+    clearing: bool,
+    /// 点击「清空」后的最短转圈保持。
+    clear_hold: BusyHold,
+    /// 点击「加载更多」后的最短转圈保持（初始加载不启动）。
+    more_hold: BusyHold,
 }
 
 impl PluginAuditDialog {
@@ -132,11 +138,14 @@ impl PluginAuditDialog {
             return;
         }
         self.clear_armed = false;
+        self.clearing = true;
+        self.clear_hold.start(cx);
         let future = clear_plugin_audit(&self.port, self.filter.as_deref());
         cx.spawn(async move |this, cx| {
             let result = future.await;
 
             let Ok(()) = this.update(cx, |this, cx| {
+                this.clearing = false;
                 match result {
                     // 清空本身会记一条 `audit.clear`，重新拉取以呈现它。
                     Ok(_) => this.load(true, cx),
@@ -204,6 +213,7 @@ const COL_OUTCOME: f32 = 64.;
 
 impl Render for PluginAuditDialog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let more_busy = self.loading || self.more_hold.is_held();
         let theme = active_theme(cx);
         let translator = self.translator.read(cx);
         let frame = Frame {
@@ -351,6 +361,7 @@ impl Render for PluginAuditDialog {
             )
             .child({
                 let armed = self.clear_armed;
+                let clear_busy = self.clearing || self.clear_hold.is_held();
                 let button = Button::new("plugin-audit-clear")
                     .control(cx)
                     .label(if armed {
@@ -358,7 +369,8 @@ impl Render for PluginAuditDialog {
                     } else {
                         text("pluginAuditClear")
                     })
-                    .disabled(self.entries.is_empty() && !armed)
+                    .busy(clear_busy)
+                    .disabled((self.entries.is_empty() && !armed) || clear_busy)
                     .on_click(cx.listener(|this, _, _, cx| this.clear(cx)));
                 if armed {
                     button.danger()
@@ -395,9 +407,12 @@ impl Render for PluginAuditDialog {
                             .ghost()
                             .control(cx)
                             .label(text("pluginAuditLoadMore"))
-                            .busy(self.loading)
-                            .disabled(self.loading)
-                            .on_click(cx.listener(|this, _, _, cx| this.load(false, cx))),
+                            .busy(more_busy)
+                            .disabled(more_busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.more_hold.start(cx);
+                                this.load(false, cx);
+                            })),
                     ),
                 )
             })
@@ -426,6 +441,9 @@ pub fn open_plugin_audit(
         clear_armed: false,
         copied: false,
         generation: 0,
+        clearing: false,
+        clear_hold: BusyHold::default(),
+        more_hold: BusyHold::default(),
     });
     state.update(cx, |this, cx| this.load(true, cx));
     window.open_dialog(cx, move |dialog, _, cx| {

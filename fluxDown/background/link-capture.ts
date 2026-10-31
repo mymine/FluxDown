@@ -3,6 +3,7 @@
  */
 import { browser } from "wxt/browser";
 import { LinkCaptureRegistry } from "@/utils/link-capture";
+import { hasDownloadsApi } from "@/utils/platform";
 import type { SendChannel } from "./protocol";
 
 export const linkCapture = new LinkCaptureRegistry<SendChannel>({
@@ -11,8 +12,12 @@ export const linkCapture = new LinkCaptureRegistry<SendChannel>({
   erase: (downloadId) => browser.downloads.erase({ id: downloadId }),
 });
 
-/** 认领前中断的浏览器下载交还直接发送；MV3 要求监听器在 SW 首次执行时同步注册。 */
+/**
+ * 认领前中断的浏览器下载交还直接发送；MV3 要求监听器在 SW 首次执行时同步注册。
+ * 没有 downloads API（Firefox for Android）时不走浏览器捕获，无需监听。
+ */
 export function installLinkCapture(): void {
+  if (!hasDownloadsApi()) return;
   browser.downloads.onChanged.addListener((delta) => {
     if (delta.state?.current !== "interrupted") return;
     browser.downloads

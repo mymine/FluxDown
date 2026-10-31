@@ -113,7 +113,7 @@ private struct TaskDetailPage: View {
     #if FULL_FLAVOR
     /// 失败且错误以插件前缀开头：提供「忽略插件重试」。
     private var isPluginFailure: Bool {
-        PluginFailure.isIgnorable(status: task.status, errorMessage: task.errorMessage)
+        PluginFailure.isIgnorable(status: task.status, errorMessage: task.errorMessage, groupId: task.groupId)
     }
     #endif
 

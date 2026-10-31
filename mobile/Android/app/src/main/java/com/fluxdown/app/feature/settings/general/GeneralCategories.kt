@@ -136,11 +136,14 @@ internal fun categoryDisplayName(context: Context, entry: CustomCategoryDto): St
     return if (entry.isBuiltin && type != null) context.str(builtinLabelRes(type)) else entry.name
 }
 
-/** 详情行：`.ext, .ext` 或 `正则表达式: pattern`；无规则（全部 / 其他）为 null。 */
+/** 详情行：`.ext, .ext` / `正则表达式: pattern` / `网址模式: pattern`；无规则（全部 / 其他）为 null。 */
 internal fun categoryDetail(context: Context, entry: CustomCategoryDto): String? {
     if (!entry.hasMatchRules) return null
     if (entry.isRegex) {
         return entry.regexPattern.takeIf { it.isNotEmpty() }?.let { "${context.str(R.string.regexLabel)}: $it" }
+    }
+    if (entry.isUrl) {
+        return entry.urlPattern.takeIf { it.isNotEmpty() }?.let { "${context.str(R.string.urlPatternLabel)}: $it" }
     }
     return entry.extensions.takeIf { it.isNotEmpty() }?.joinToString(", ") { ".$it" }
 }

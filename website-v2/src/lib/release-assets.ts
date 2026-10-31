@@ -26,7 +26,10 @@ export interface GitHubRelease {
   assets: GitHubAsset[];
 }
 
-export type ReleaseComponent = "app" | "extension" | "server" | "cli" | "mobile";
+export type ReleaseComponent = "app" | "extension" | "server" | "cli" | "mobile" | "ios";
+
+/** iOS 侧载 IPA 的资产名后缀（.github/workflows/ios-sideload.yml 产出，改名须同步）。 */
+export const IOS_SIDELOAD_SUFFIX = "-ios-sideload-unsigned.ipa";
 
 /**
  * 统一 release 说明的机器头部（已发布组件清单 + 服务器 / CLI 安装说明），由
@@ -43,7 +46,7 @@ export function stripReleaseHeader(body: string): string {
 /** 统一 release 的组件完成哨兵 `SHA256SUMS-<组件>.txt`（与 .github/actions/release-upload 一致）。 */
 const SENTINEL_RE = /^SHA256SUMS-[a-z]+\.txt$/;
 
-/** 历史拆分 release 的资产归属判定（无哨兵时使用）。 */
+/** 按资产名的组件归属判定：历史拆分 release（无哨兵）与下方 NAME_FALLBACK 组件使用。 */
 const LEGACY_MATCHERS: Record<ReleaseComponent, (name: string) => boolean> = {
   app: (n) => n.endsWith("-setup.exe") || n.endsWith("-portable.zip"),
   extension: (n) =>
@@ -53,16 +56,25 @@ const LEGACY_MATCHERS: Record<ReleaseComponent, (name: string) => boolean> = {
   server: (n) => n.startsWith("FluxDown-Server-"),
   cli: (n) => n.startsWith("FluxDown-CLI-"),
   mobile: (n) => n.includes("-android-") && n.endsWith(".apk"),
+  ios: (n) => n.endsWith(IOS_SIDELOAD_SUFFIX),
 };
 
-/** 该 release 是否完整包含某组件：有哨兵的统一 release 只认哨兵，否则按资产名。 */
+/**
+ * 组件接入哨兵之前就附在统一 release 上的资产：iOS 侧载 IPA 在并入 release.yml 之前由独立
+ * workflow 直接挂到 release（没有 SHA256SUMS-ios.txt）。它是单文件资产，不存在「半套」，
+ * 统一 release 缺该组件哨兵时仍按资产名识别；有哨兵时以哨兵为准。
+ */
+const NAME_FALLBACK: Partial<Record<ReleaseComponent, true>> = { ios: true };
+
+/** 该 release 是否完整包含某组件：有该组件哨兵即包含；统一 release 缺哨兵时只有 NAME_FALLBACK 组件按资产名判定。 */
 export function hasComponent(
   release: GitHubRelease,
   component: ReleaseComponent,
 ): boolean {
   const names = release.assets.map((a) => a.name);
-  if (names.some((n) => SENTINEL_RE.test(n))) {
-    return names.includes(`SHA256SUMS-${component}.txt`);
+  if (names.includes(`SHA256SUMS-${component}.txt`)) return true;
+  if (names.some((n) => SENTINEL_RE.test(n)) && !NAME_FALLBACK[component]) {
+    return false;
   }
   return names.some(LEGACY_MATCHERS[component]);
 }

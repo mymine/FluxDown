@@ -8,6 +8,7 @@ import { extractCleanFilename } from "@/utils/filename";
 import { t } from "@/utils/i18n";
 import { candidateFilename, defaultCandidateVariant } from "@/utils/media-candidates";
 import type { BatchDownloadItem } from "@/utils/native-messaging";
+import { isAndroidPlatform } from "@/utils/platform";
 import { getCachedSettings } from "./settings-cache";
 import { notify, sleep } from "./notify";
 import type { SendChannel, SendResult } from "./protocol";
@@ -142,9 +143,9 @@ async function sendBatch(
     }));
   if (items.length === 0) return { success: false, message: "No valid items" };
 
-  // === fluxdown:// 协议模式：逐条唤起（认证信息无法携带；带音频轨的必须走 NMH/远程） ===
+  // === fluxdown:// 协议模式（仅桌面；Android 由 Intent 交接取代）：逐条唤起（认证信息无法携带；带音频轨的必须走 NMH/远程） ===
   const settings = await getCachedSettings();
-  if (settings.enableFluxdownProtocol && !channel && !items.some((item) => item.audioUrl)) {
+  if (settings.enableFluxdownProtocol && !channel && !items.some((item) => item.audioUrl) && !(await isAndroidPlatform())) {
     let sent = 0;
     for (const item of items) {
       if (await openProtocolUrl(item.url, item.filename)) sent++;

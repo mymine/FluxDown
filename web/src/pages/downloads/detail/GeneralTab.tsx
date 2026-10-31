@@ -11,6 +11,7 @@ import { localizeTaskError } from '../model/taskError'
 import type { DownloadTaskView, TaskState } from '../model/task'
 import { canChangeSegments, canChangeUrl } from '../model/taskEdit'
 import { openChangeSegments, openChangeUrl, openGroupDetail } from '../dialogs'
+import { routeLabel } from '../../../lib/taskRoute'
 import { DetailRow } from './DetailRow'
 import { SourcesSection } from './SourcesSection'
 
@@ -106,6 +107,7 @@ export function GeneralTab({ view }: { view: DownloadTaskView }) {
         <DetailRow label={t('taskQueueLabel')}>{queueLabel}</DetailRow>
         <DetailRow label={t('taskChecksum')}>{checksum}</DetailRow>
         <DetailRow label={t('taskProxy')}>{proxy}</DetailRow>
+        {dto && dto.autoRoute !== '' ? <DetailRow label={t('taskRoute')}>{routeLabel(t, dto.autoRoute)}</DetailRow> : null}
         {dto?.ignoreTlsErrors ? <DetailRow label={t('taskIgnoreTlsErrors')}>✓</DetailRow> : null}
         {view.errorMessage !== '' ? (
           <DetailRow label={t('infoError')}>

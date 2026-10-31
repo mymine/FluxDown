@@ -6,6 +6,7 @@
  */
 import { browser } from "wxt/browser";
 import type { Browser } from "wxt/browser";
+import { logWarn } from "./error-log";
 
 export const ALL_URLS_PERMISSION: Browser.permissions.Permissions = { origins: ["<all_urls>"] };
 
@@ -30,7 +31,7 @@ export async function hasHostAccess(
   try {
     return await api.contains(ALL_URLS_PERMISSION);
   } catch (e) {
-    console.warn("[FluxDown] host access check failed:", e);
+    logWarn("[FluxDown] host access check failed:", e);
     return true;
   }
 }
@@ -41,7 +42,7 @@ export async function hasHostAccess(
  */
 export function requestHostAccess(api: HostAccessApi = browser.permissions): Promise<boolean> {
   return api.request(ALL_URLS_PERMISSION).catch((e) => {
-    console.warn("[FluxDown] host access request failed:", e);
+    logWarn("[FluxDown] host access request failed:", e);
     return false;
   });
 }

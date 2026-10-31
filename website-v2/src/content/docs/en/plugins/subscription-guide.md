@@ -53,7 +53,7 @@ Behaviour of the schedule that your provider should know about:
 - **First round never downloads.** The first successful fetch only records the current items as already seen (marked read). Only items that appear in later fetches become downloads. To see items in the list without downloading anything, create the source with `"autoDownload": false` (collect mode).
 - **Interval.** Default 30 minutes, minimum 1 minute. After a failure the interval doubles for each consecutive failure up to 6 hours (never shorter than the configured interval); it resets after a success.
 - **De-duplication is by `guid`** within a source. Per fetch at most `maxPerFetch` (default 20, 1–100) new items become tasks, oldest first by `pubDate`. FluxDown keeps the 500 newest entries per source.
-- A per-source proxy setting does **not** apply to plugin providers; `flux.fetch` uses the application's global proxy settings.
+- `flux.fetch` and `flux.ytdlp` follow the source's own proxy setting when it has one; otherwise site rules matching the source URL and the application's global proxy settings (including Auto switching to a proxy when the direct route fails) apply.
 
 ## Declare the provider
 

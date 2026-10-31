@@ -375,6 +375,9 @@ pub struct AgentSnapshot {
     /// 云端推送状态（未登录时只保留本机上报开关与隐私字段，`overview` 为空）。
     #[serde(default)]
     pub cloud_notify: crate::CloudNotifyStateDto,
+    /// FluxMesh分区（本构建未编入FluxMesh时保持默认：`available == false`）。
+    #[serde(default)]
+    pub share: crate::ShareStateDto,
 }
 
 impl AgentSnapshot {
@@ -400,6 +403,7 @@ impl AgentSnapshot {
             power: self.power,
             update: self.update.clone(),
             cloud_notify: self.cloud_notify.clone(),
+            share: self.share.clone(),
         }
     }
 }
@@ -485,8 +489,9 @@ pub enum DaemonEvent {
     /// 常驻插件宿主的可移植视图增量帧。不改变 daemon 快照；agent 原样转发给全部 UI
     /// 连接，客户端按 `session` 过滤、忽略未知会话。
     PluginViewFrame(crate::PluginViewFrameDto),
-    /// 可移植视图会话已结束（`reason`：`closed` / `expired` / `pluginUnloaded`）。
-    /// 不改变 daemon 快照；agent 原样转发。
+    /// 可移植视图会话已结束（`reason`：`closed` / `expired` / `pluginUnloaded` /
+    /// `requested`——插件经 `ctx.close()` 请求关闭承载它的容器，见
+    /// [`crate::VIEW_CLOSE_REASON_REQUESTED`]）。不改变 daemon 快照；agent 原样转发。
     PluginViewClosed {
         session: String,
         reason: String,
@@ -497,6 +502,18 @@ pub enum DaemonEvent {
         identity: String,
         level: String,
         text: String,
+    },
+    /// BT 防吸血的条目 / 状态发生变化（UI 据此重新拉取 `daemon.bt.guard.*`）。不改变 daemon 快照。
+    BtGuardChanged,
+    /// daemon 请求 agent 刷新云名单（BT 会话启动时 + 会话存活期间每 6 小时）。`have_sequence` 为
+    /// daemon 当前持有的文档序号（0 = 无）。只供 agent 消费，不转发给 UI；不改变 daemon 快照。
+    BtGuardCloudRefreshWanted {
+        have_sequence: u64,
+    },
+    /// 待上报证据已累积（仅 `bt_guard_report_enabled` 时产生）。`count` 为队列当前条数。
+    /// 只供 agent 消费；不改变 daemon 快照。
+    BtGuardEvidenceReady {
+        count: u32,
     },
 }
 
@@ -540,6 +557,11 @@ pub enum AgentEvent {
     /// `sessionExpired`；账号停用 → `accountDisabled`）。一次性通知，不进快照；紧随其后会有
     /// `SessionChanged(None)`。用户主动登出 / 删除本设备不发送。
     SessionRevoked(crate::ErrorReason),
+    /// FluxMesh分区整体替换（`AgentSnapshot.share`）。
+    ShareChanged(crate::ShareStateDto),
+    /// 单个FluxMesh会话的进度 / 路径刷新，高频；同一 `sessionId` 的后帧完整取代前帧（见
+    /// [`crate::coalesce::FrameQueue`]）。
+    ShareProgress(crate::ShareProgressDto),
 }
 
 /// `service.event` notification 的事件主体。
@@ -791,6 +813,8 @@ pub fn apply_agent_event(snapshot: &mut AgentSnapshot, event: &AgentEvent) {
         AgentEvent::PowerChanged(power) => snapshot.power = *power,
         AgentEvent::UpdateChanged(update) => snapshot.update.clone_from(update),
         AgentEvent::CloudNotifyChanged(state) => snapshot.cloud_notify.clone_from(state),
+        AgentEvent::ShareChanged(state) => snapshot.share.clone_from(state),
+        AgentEvent::ShareProgress(progress) => snapshot.share.apply_progress(progress),
         AgentEvent::CaptureTasksStarted(_)
         | AgentEvent::CaptureTasksResumed(_)
         | AgentEvent::SessionRevoked(_) => {}
@@ -855,7 +879,10 @@ pub fn apply_daemon_event(snapshot: &mut DaemonSnapshot, event: &DaemonEvent) {
         | DaemonEvent::TaskNotice(_)
         | DaemonEvent::PluginViewFrame(_)
         | DaemonEvent::PluginViewClosed { .. }
-        | DaemonEvent::PluginToast { .. } => {}
+        | DaemonEvent::PluginToast { .. }
+        | DaemonEvent::BtGuardChanged
+        | DaemonEvent::BtGuardCloudRefreshWanted { .. }
+        | DaemonEvent::BtGuardEvidenceReady { .. } => {}
         DaemonEvent::SnapshotReplaced(replacement) => snapshot.clone_from(replacement),
         DaemonEvent::TablesReloading { tasks, queue } => snapshot.begin_reload(*tasks, *queue),
         DaemonEvent::Engine(message) => apply_engine_message(snapshot, message),

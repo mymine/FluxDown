@@ -8,10 +8,14 @@
  * 休眠后由事件唤醒重新执行本入口；跨休眠的状态落 storage.session，见各模块）。
  */
 import { browser } from "wxt/browser";
+import type { Browser } from "wxt/browser";
 import { initI18n, t } from "@/utils/i18n";
+import { logWarn } from "@/utils/error-log";
+import { hasCommandsApi } from "@/utils/platform";
+import { installBackgroundErrorLog } from "@/utils/error-log-background";
 import { loadSettings, persistSettings } from "@/utils/settings";
 import type { ContentMessage } from "./protocol";
-import { restoreBreakerState } from "./breaker";
+import { installBypassKey, restoreBreakerState } from "./breaker";
 import { installBrowserDownloadNotices } from "./browser-downloads";
 import { installCaptureTracker } from "./capture-tracker";
 import {
@@ -36,13 +40,13 @@ import {
 } from "./settings-cache";
 import { installSniff } from "./sniff";
 import { loadServiceWorkerScopes } from "./sw-scopes";
-import { allFrames, installTabState } from "./tab-state";
+import { allFrames, installTabState, setSniffLimit } from "./tab-state";
 import { installTaskListeners } from "./tasks";
 import { updateIcon } from "./toolbar";
 
 const LEGACY_PENDING_QUEUE_KEY = "pendingDownloadQueue";
 
-/** 设置变化 / 启动预热：图标、下载栏隐藏、拦截监听的注册状态。 */
+/** 设置变化 / 启动预热：图标、下载栏隐藏、拦截监听的注册状态、每 tab 资源上限。 */
 function applyInterceptState(): void {
   getCachedSettings()
     .then((s) => {
@@ -50,9 +54,10 @@ function applyInterceptState(): void {
       // 同类产品（IDM/Motrix/FDM）共同使用的策略：拦截启用时隐藏下载 UI。
       syncDownloadShelfState(s.enabled);
       setInterceptListenersActive(s.enabled);
+      setSniffLimit(s.sniffMaxResources);
     })
     .catch((e) => {
-      console.warn("[FluxDown] Settings cache warmup failed (non-fatal):", e);
+      logWarn("[FluxDown] Settings cache warmup failed (non-fatal):", e);
     });
 }
 
@@ -69,10 +74,13 @@ function broadcastPageConfigChanged(): void {
 }
 
 export function startBackground(): void {
+  // 第一步：之后 background 的错误 / 未捕获异常都记入扩展错误日志，不进浏览器的扩展错误列表。
+  installBackgroundErrorLog();
   console.log("[FluxDown] Background service worker started");
 
   installSettingsCacheListener();
   installRequestCache();
+  installBypassKey();
   installTabState();
   installProbe();
   installRulesStore();
@@ -96,8 +104,8 @@ export function startBackground(): void {
   onEngineChanged(broadcastPageConfigChanged);
   applyInterceptState();
 
-  // 快捷键切换拦截开关（替代原来的 Alt+Click 绕过机制）
-  browser.commands.onCommand.addListener(async (command, tab) => {
+  // 快捷键切换拦截开关（替代原来的 Alt+Click 绕过机制）；移动端浏览器没有 commands API。
+  const handleCommand = async (command: string, tab?: Browser.tabs.Tab): Promise<void> => {
     if (command === "open-side-panel") {
       // Chromium 专用（Firefox 走内置 _execute_sidebar_action）。快捷键算用户手势，
       // 但 sidePanel.open 必须在任何 await 之前同步调用。
@@ -105,7 +113,7 @@ export function startBackground(): void {
       if (windowId !== undefined && typeof browser.sidePanel?.open === "function") {
         browser.sidePanel
           .open({ windowId })
-          .catch((e) => console.warn("[FluxDown] open side panel failed:", e));
+          .catch((e) => logWarn("[FluxDown] open side panel failed:", e));
       }
       return;
     }
@@ -123,7 +131,8 @@ export function startBackground(): void {
       t("shortcut.toggleTitle"),
       enabled ? t("shortcut.interceptOn") : t("shortcut.interceptOff"),
     );
-  });
+  };
+  if (hasCommandsApi()) browser.commands.onCommand.addListener(handleCommand);
 
   // 清理已删除功能（发送失败重队列）的遗留数据。
   browser.storage.local.remove(LEGACY_PENDING_QUEUE_KEY).catch(() => {});
@@ -132,6 +141,6 @@ export function startBackground(): void {
   initI18n()
     .then(() => createContextMenus())
     .catch((e) => {
-      console.warn("[FluxDown] i18n init failed (non-fatal):", e);
+      logWarn("[FluxDown] i18n init failed (non-fatal):", e);
     });
 }

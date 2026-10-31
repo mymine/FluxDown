@@ -42,6 +42,23 @@ class ExternalDownloadTest {
         assertNull(ExternalIntake.fromView(null))
     }
 
+    @Test fun extensionIntentExtrasCarryFileNameAndHeaders() {
+        val d = ExternalIntake.fromView(
+            "https://cdn.test/a.zip",
+            userAgent = "UA/extra",
+            fileName = "  报告 v2;final.zip ",
+            headersJson = """{"user-agent":"UA/json","Authorization":"Bearer x"}""",
+        )!!
+        assertEquals("报告 v2;final.zip", d.fileName)
+        // 请求头里已有 User-Agent（不区分大小写）时不再用 extra 覆盖或重复。
+        assertEquals(mapOf("user-agent" to "UA/json", "Authorization" to "Bearer x"), d.headers)
+
+        val noUaInJson = ExternalIntake.fromView("magnet:?xt=urn:btih:abc", userAgent = "UA/1", headersJson = """{"X-T":"1"}""")!!
+        assertEquals(mapOf("X-T" to "1", "User-Agent" to "UA/1"), noUaInJson.headers)
+        // 损坏的请求头 JSON 整体丢弃，不影响其余字段。
+        assertEquals(mapOf("User-Agent" to "UA/1"), ExternalIntake.fromView("https://h.test/x", userAgent = "UA/1", headersJson = "{oops")!!.headers)
+    }
+
     // ── fluxdown://download 协议 ──
 
     @Test fun protocolDecodesQueryParameters() {

@@ -24,10 +24,13 @@
 //! - [`quickjs_host`]：常驻宿主（`main`）的 QuickJS actor。
 //! - [`manager`]（含 `host_manager` 子模块）：宿主侧——会话、激活 / 回收、渲染节流、命令与 RPC。
 //! - [`bridge`]：`EngineBridge` 实现 `PluginBridge`（网络出口守卫 + flux.* API）。
+//! - [`call_egress`]：每次插件调用的出口计划与网络观测（站点规则 / 自带代理 / 全局模式 /
+//!   Auto 换路），解析与下载同出口的源头。
 //! - [`manager`]：`PluginManager`（Arc 共享，插件装载/启停/resolve/notify）。
 
 pub mod audit;
 pub mod bridge;
+pub mod call_egress;
 pub mod consent;
 #[cfg(test)]
 mod consent_tests;

@@ -613,6 +613,7 @@ async fn plugin_view_events_are_forwarded_verbatim_to_ui_subscribers() {
             ops: vec![ViewOp::Error {
                 message: "boom".to_owned(),
             }],
+            effects: Vec::new(),
         }),
         DaemonEvent::PluginViewClosed {
             session: "s".to_owned(),

@@ -24,7 +24,7 @@ const t = announcementGpui[lang];
   </PageHeader>
 
   <div class="frame">
-    <div class="section grid gap-12 lg:grid-cols-[220px_minmax(0,1fr)] lg:gap-16">
+    <div class="section grid grid-cols-1 gap-12 lg:grid-cols-[220px_minmax(0,1fr)] lg:gap-16">
       <nav aria-labelledby="gpui-toc" class="lg:sticky lg:top-[calc(var(--header-h)+32px)] lg:self-start">
         <p id="gpui-toc" class="eyebrow-plain mb-4">{t.contents}</p>
         <ol class="flex flex-col border-l border-line">
@@ -103,7 +103,7 @@ const t = announcementGpui[lang];
               )}
 
               {s.id === "interface" && (
-                <dl class="mt-8 grid gap-px border border-line bg-line sm:grid-cols-2" data-reveal>
+                <dl class="mt-8 grid grid-cols-1 gap-px border border-line bg-line sm:grid-cols-2" data-reveal>
                   {t.features.map((f) => (
                     <div class="bg-bg px-5 py-4">
                       <dt class="text-[14.5px] font-semibold text-fg">{f.k}</dt>

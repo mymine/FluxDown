@@ -34,6 +34,16 @@ pub const DAEMON_TASK_SET_SEED_LIMITS: &str = "daemon.task.setSeedLimits";
 /// 重哈希落盘数据，只读。慢方法：耗时与数据量成正比，同一任务同时只跑一个（`conflict`），
 /// 非已完成 BT 任务返回 `invalidArgument`，任务不存在返回 `notFound`。
 pub const DAEMON_TASK_VERIFY: &str = "daemon.task.verify";
+/// 本机做种（`DaemonSeedLocalParams` → `{taskId}`）：把 daemon 主机上已有的文件 / 文件夹
+/// （可选现成 `.torrent`）登记为已完成并开始做种。无现成种子时需要为数据做哈希，慢方法；
+/// BT 被禁用或路径 / 种子不匹配返回 `invalidArgument`。
+pub const DAEMON_TASK_SEED_LOCAL: &str = "daemon.task.seedLocal";
+/// BT 任务分享材料（`DaemonTorrentShareParams` → `TorrentShareDto`）：磁力链接与可选 `.torrent`
+/// 内容。非 BT 任务 / 任务不存在返回 `invalidArgument` / `notFound`。
+pub const DAEMON_TASK_TORRENT_SHARE: &str = "daemon.task.torrentShare";
+/// BT 任务实况（`DaemonBtStatusParams` → `BtStatusDto`）：peer 列表与逐 tracker 汇报状态，
+/// 供详情页轮询（对齐 qBittorrent 的 Peers / Trackers 页签）。非 BT 任务返回 `invalidArgument`。
+pub const DAEMON_TASK_BT_STATUS: &str = "daemon.task.btStatus";
 /// 批量暂停 / 恢复（`{taskIds}`）：整批只推一次任务快照；未知 id 忽略，空列表为空操作。
 pub const DAEMON_TASK_PAUSE_MANY: &str = "daemon.task.pauseMany";
 pub const DAEMON_TASK_RESUME_MANY: &str = "daemon.task.resumeMany";
@@ -64,6 +74,8 @@ pub const DAEMON_GROUP_DELETE: &str = "daemon.group.delete";
 pub const DAEMON_CONFIG_GET: &str = "daemon.config.get";
 pub const DAEMON_CONFIG_PATCH: &str = "daemon.config.patch";
 pub const DAEMON_CONFIG_PROXY_TEST: &str = "daemon.config.proxyTest";
+/// 站点代理规则草稿校验 + 「测试网址」解释（可能起 `scutil` 子进程，慢方法）。
+pub const DAEMON_CONFIG_PROXY_ROUTE: &str = "daemon.config.proxyRoute";
 pub const DAEMON_CONFIG_CONN_POLICY: &str = "daemon.config.connPolicy";
 pub const DAEMON_CONFIG_CLEAR_CONN_POLICY: &str = "daemon.config.clearConnPolicy";
 pub const DAEMON_CONFIG_SYSTEM_PROXY: &str = "daemon.config.systemProxy";
@@ -158,6 +170,25 @@ pub const DAEMON_CDN_CONFIG_APPLY: &str = "daemon.cdnConfig.apply";
 pub const DAEMON_EGRESS_PLAN: &str = "daemon.egress.plan";
 
 pub const DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH: &str = "daemon.bt.trackerSubscription.refresh";
+/// BT 防吸血状态总览（`BtGuardStateDto`）。
+pub const DAEMON_BT_GUARD_STATE: &str = "daemon.bt.guard.state";
+/// 过滤条目分页（`BtGuardEntriesListParams` → `BtGuardEntriesListDto`）。
+pub const DAEMON_BT_GUARD_ENTRIES_LIST: &str = "daemon.bt.guard.entries.list";
+/// 手动添加条目 / 白名单（`BtGuardEntriesAddParams` → `BtGuardEntryDto`）。
+pub const DAEMON_BT_GUARD_ENTRIES_ADD: &str = "daemon.bt.guard.entries.add";
+/// 按 id 移除条目（`BtGuardEntriesRemoveParams` → `BtGuardEntriesRemoveDto`）；云层条目拒绝。
+pub const DAEMON_BT_GUARD_ENTRIES_REMOVE: &str = "daemon.bt.guard.entries.remove";
+/// 事件日志分页（`BtGuardEventsListParams` → `BtGuardEventsListDto`）。
+pub const DAEMON_BT_GUARD_EVENTS_LIST: &str = "daemon.bt.guard.events.list";
+/// 导出条目文本（`BtGuardExportParams` → `BtGuardExportDto`）。慢方法：条目可达数万行。
+pub const DAEMON_BT_GUARD_EXPORT: &str = "daemon.bt.guard.export";
+/// 立即刷新过滤文件订阅（无参）。慢方法：会拉取网络。
+pub const DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH: &str = "daemon.bt.guard.filterSources.refresh";
+/// 仅 agent 调用：已验签的云名单整层替换（`BtGuardCloudApplyParams` → `BtGuardCloudApplyDto`）。
+/// 慢方法：差异防护 + 整层重建 + 持久化。
+pub const DAEMON_BT_GUARD_CLOUD_APPLY: &str = "daemon.bt.guard.cloud.apply";
+/// 仅 agent 调用：弹出待上报证据（`BtGuardEvidenceDrainDto`）。
+pub const DAEMON_BT_GUARD_EVIDENCE_DRAIN: &str = "daemon.bt.guard.evidence.drain";
 pub const DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH: &str = "daemon.ed2k.serverSubscription.refresh";
 pub const DAEMON_DIAGNOSTICS_DESCRIBE: &str = "daemon.diagnostics.describe";
 pub const DAEMON_DIAGNOSTICS_PREPARE_LOG_EXPORT: &str = "daemon.diagnostics.prepareLogExport";
@@ -246,6 +277,60 @@ pub const AGENT_LINK_CONTROL_CREDENTIAL: &str = "agent.link.controlCredential";
 /// `LinkDispatchParams` → `LinkDispatchResult`：下发下载到已配对设备。
 pub const AGENT_LINK_DISPATCH: &str = "agent.link.dispatch";
 
+/// FluxMesh（临时文件分享）。仅当 agent 编入FluxMesh服务时可用（否则 `Unsupported`，hello 不带
+/// `agent.share` 能力；已编入但本机开关未开启（`ShareLocalConfigDto.enabled`，实验性、默认关）或被
+/// 云端关闭时返回 `Unavailable` + `ShareUnavailable`——开关关闭时只有 `config` / `setLocalConfig` 可用）。
+/// 刷新云端策略并返回 → `ShareConfigDto`（云端策略摘要 + 本机设置）；开关关闭时不访问云端、策略摘要为空。
+pub const AGENT_SHARE_CONFIG: &str = "agent.share.config";
+/// `ShareLocalConfigDto` → `ShareLocalConfigDto`：整体替换本机FluxMesh设置，返回规范化后的值。
+/// 也是开启 / 关闭FluxMesh的唯一入口（`enabled`）。
+pub const AGENT_SHARE_SET_LOCAL_CONFIG: &str = "agent.share.setLocalConfig";
+/// `ShareCreateParams` → `ShareDto`：从已完成的本机任务创建分享（多任务合成一个分享）。
+pub const AGENT_SHARE_CREATE: &str = "agent.share.create";
+/// → `Vec<ShareDto>`：我的分享。
+pub const AGENT_SHARE_LIST: &str = "agent.share.list";
+/// `ShareUpdateParams` → `ShareDto`：改有效期 / 次数 / 领取通知，链接与取件码不变。
+pub const AGENT_SHARE_UPDATE: &str = "agent.share.update";
+/// `ShareIdParams` → `ShareDto`：停止分享（取件码释放），返回停止后的状态。
+pub const AGENT_SHARE_STOP: &str = "agent.share.stop";
+/// `ShareIdParams` → `ShareDto`：重新开始已停止 / 已过期的分享（同 id、同链接，重新分配取件码）。
+/// 已在分享中则原样返回；本机源文件缺失或已被修改 → `ShareSourceMissing`（只能删除）。
+pub const AGENT_SHARE_RESUME: &str = "agent.share.resume";
+/// `ShareIdParams` → `{ "ok": true }`：删除分享记录（分享中的先停止，云端记录一并删除）。
+pub const AGENT_SHARE_DELETE: &str = "agent.share.delete";
+/// `ShareResolveParams` → `ShareResolveDto`：解析取件码 / 链接，返回接收确认框预览。
+pub const AGENT_SHARE_RESOLVE: &str = "agent.share.resolve";
+/// `ShareReceiveParams` → `ShareReceiveResultDto`：接收分享，建出普通下载任务。
+pub const AGENT_SHARE_RECEIVE: &str = "agent.share.receive";
+/// `ShareDismissPendingParams` → `{ "ok": true }`：取消快照里待确认的链接接收（`pendingReceive`）。
+pub const AGENT_SHARE_DISMISS_PENDING: &str = "agent.share.dismissPending";
+/// `ShareReceiveRecordsParams` → `ShareReceiveRecordsPage`：接收记录翻页。
+pub const AGENT_SHARE_RECEIVE_RECORDS: &str = "agent.share.receiveRecords";
+/// `ShareSwitchToBridgeParams` → `ShareTaskFactsDto`：把接收任务切到实时桥接（分享方在线、网关可用时）。
+/// 无可用桥接 → `ShareBridgeUnavailable`；桥接流量额度耗尽 → `ShareTrafficExhausted`。
+pub const AGENT_SHARE_SWITCH_TO_BRIDGE: &str = "agent.share.switchToBridge";
+/// `ShareDiagnosticsParams` → `ShareDiagnosticsDto`：网络快照 + 原始 JSON + 全量 iroh 指标 + 会话详情。
+pub const AGENT_SHARE_DIAGNOSTICS: &str = "agent.share.diagnostics";
+/// `ShareLogsParams` → `ShareLogsDto`：iroh tracing 内存环形缓冲里的日志行。
+pub const AGENT_SHARE_LOGS: &str = "agent.share.logs";
+/// `ShareSessionKillParams` → `{ "ok": true }`：分享方强制中断一个接收方会话。
+pub const AGENT_SHARE_SESSION_KILL: &str = "agent.share.sessionKill";
+/// `ShareConvertToCloudParams` → `ShareDto`：把实时分享转为云端暂存。预检（登录、额度、存储可用）失败
+/// 同步返回错误；通过后立即返回 `cloudState = uploading`，上传在后台进行，进度经 `ShareChanged` 下发。
+pub const AGENT_SHARE_CONVERT_TO_CLOUD: &str = "agent.share.convertToCloud";
+/// `ShareIdParams` → `ShareDto`：删除云端副本（上传中则先取消）；分享回到实时模式。
+pub const AGENT_SHARE_DELETE_CLOUD_COPY: &str = "agent.share.deleteCloudCopy";
+/// `ShareStopProvidingParams` → `ShareReceiveRecordDto`：停止该次接收的共享（共享提供），记录 `provideState = stopped`；记录不存在 → `ShareNotFound`。
+pub const AGENT_SHARE_STOP_PROVIDING: &str = "agent.share.stopProviding";
+/// → `ShareUsageDto | null`：FluxMesh额度与贡献（距上次成功拉取不足 30 s 返回缓存，否则先拉取）。
+/// 未登录返回 `null`；结果同时写入 `ShareStateDto.usage` 并发布 `ShareChanged`。
+pub const AGENT_SHARE_USAGE_REFRESH: &str = "agent.share.usageRefresh";
+/// `ShareReportParams` → `{ "ok": true }`：举报一份本机已领取的分享（endpoint 签名提交）；
+/// 未领取 → `Forbidden`，重复举报静默成功。
+pub const AGENT_SHARE_REPORT: &str = "agent.share.report";
+/// `ShareAppealParams` → `ShareDto`：对已下架的分享申诉；已申诉 → `ShareAppealExists`。
+pub const AGENT_SHARE_APPEAL: &str = "agent.share.appeal";
+
 pub const AGENT_PLAN_LIST: &str = "agent.plan.list";
 pub const AGENT_ORDER_CREATE: &str = "agent.order.create";
 pub const AGENT_ORDER_GET: &str = "agent.order.get";
@@ -290,6 +375,9 @@ pub const AGENT_CLOUD_NOTIFY_VERIFY_EMAIL: &str = "agent.cloudNotify.verifyEmail
 
 pub const AGENT_PLATFORM_OPEN_TASK: &str = "agent.platform.openTask";
 pub const AGENT_PLATFORM_REVEAL_TASK: &str = "agent.platform.revealTask";
+/// `PlatformCopyTaskFilesParams` → `{ "ok": true }`：把已完成任务的产物以文件形式写入 agent 所在主机的
+/// 系统剪贴板（可直接在文件管理器 / 聊天软件里粘贴）。仅对带 [`CAPABILITY_AGENT_COPY_TASK_FILES`] 的连接可用。
+pub const AGENT_PLATFORM_COPY_TASK_FILES: &str = "agent.platform.copyTaskFiles";
 pub const AGENT_PLATFORM_OPEN_PATH: &str = "agent.platform.openPath";
 pub const AGENT_PLATFORM_INTEGRATION_GET: &str = "agent.platform.integrationGet";
 pub const AGENT_PLATFORM_SET_AUTOSTART: &str = "agent.platform.setAutostart";
@@ -297,6 +385,13 @@ pub const AGENT_PLATFORM_SET_FILE_ASSOCIATION: &str = "agent.platform.setFileAss
 pub const AGENT_PLATFORM_SET_URL_PROTOCOL: &str = "agent.platform.setUrlProtocol";
 /// 系统文件管理器为文件显示的图标（PNG）；参数见 `PlatformFileIconParams`。
 pub const AGENT_PLATFORM_FILE_ICON: &str = "agent.platform.fileIcon";
+/// `app_icon::PlatformSetAppIconParams` → `app_icon::AppIconStateDto`：切换 / 导入桌面应用图标，成功后
+/// agent 写入偏好 `desktop.app_icon` 并同步托盘、窗口与快捷方式图标。
+pub const AGENT_PLATFORM_SET_APP_ICON: &str = "agent.platform.setAppIcon";
+/// `app_icon::PlatformAppIconImageParams` → `app_icon::PlatformAppIconImageDto`：当前自定义应用图标的 PNG。
+pub const AGENT_PLATFORM_APP_ICON_IMAGE: &str = "agent.platform.appIconImage";
+/// `{}` → `{ "ok": true }`：为桌面界面进程现有窗口补设当前应用图标（Windows / X11；其余平台无操作）。
+pub const AGENT_PLATFORM_SYNC_WINDOW_ICONS: &str = "agent.platform.syncWindowIcons";
 /// `SoundPreviewParams` → `{ "ok": true }`：由 agent 在本机播放一次提示音偏好值（`off` / `system` / `file:<绝对路径>`）。
 pub const AGENT_SOUND_PREVIEW: &str = "agent.sound.preview";
 pub const AGENT_CAPTURE_SUBMIT: &str = "agent.capture.submit";
@@ -350,6 +445,14 @@ pub const CAPABILITY_AGENT_EXTERNAL_CAPTURE: &str = "agent.externalCapture";
 /// 产物。按连接下发：Windows / macOS / Linux 桌面宿主恒有，嵌入式移动宿主没有；headless
 /// server 只给本机来源（见 agent `server_mode::ServerHandle::local_platform_permitted`）。
 pub const CAPABILITY_AGENT_OPEN_TASK_FILES: &str = "agent.openTaskFiles";
+/// 本连接可调用 `agent.platform.copyTaskFiles`，把任务产物作为文件写入 agent 所在主机的系统剪贴板。
+/// 按连接下发：本机来源条件同 [`CAPABILITY_AGENT_OPEN_TASK_FILES`]，另要求本构建编入桌面剪贴板
+/// （agent `desktop` 特性）且检测到图形会话；headless / NAS 构建与远程连接都没有（浏览器无法把文件
+/// 写进系统剪贴板，客户端据此隐藏「复制文件」）。
+pub const CAPABILITY_AGENT_COPY_TASK_FILES: &str = "agent.copyTaskFiles";
+/// 本 agent 编入了FluxMesh服务（`agent.share.*`）。条件能力：未编入FluxMesh的构建（如 iOS 商店版）
+/// 不下发；因此不在服务级基线 hello 里无条件出现。
+pub const CAPABILITY_AGENT_SHARE: &str = "agent.share";
 pub const CAPABILITY_CLIENT_SELECTIONS: &str = "client.selections";
 
 /// 规范ALL_METHODS。
@@ -376,6 +479,9 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_TASK_RESCAN,
     DAEMON_TASK_SET_SEED_LIMITS,
     DAEMON_TASK_VERIFY,
+    DAEMON_TASK_SEED_LOCAL,
+    DAEMON_TASK_TORRENT_SHARE,
+    DAEMON_TASK_BT_STATUS,
     DAEMON_TASK_PAUSE_MANY,
     DAEMON_TASK_RESUME_MANY,
     DAEMON_TASK_DELETE_MANY,
@@ -398,6 +504,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_CONFIG_GET,
     DAEMON_CONFIG_PATCH,
     DAEMON_CONFIG_PROXY_TEST,
+    DAEMON_CONFIG_PROXY_ROUTE,
     DAEMON_CONFIG_CONN_POLICY,
     DAEMON_CONFIG_CLEAR_CONN_POLICY,
     DAEMON_CONFIG_SYSTEM_PROXY,
@@ -461,6 +568,15 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_CDN_REPORTS_ACK,
     DAEMON_CDN_CONFIG_APPLY,
     DAEMON_EGRESS_PLAN,
+    DAEMON_BT_GUARD_STATE,
+    DAEMON_BT_GUARD_ENTRIES_LIST,
+    DAEMON_BT_GUARD_ENTRIES_ADD,
+    DAEMON_BT_GUARD_ENTRIES_REMOVE,
+    DAEMON_BT_GUARD_EVENTS_LIST,
+    DAEMON_BT_GUARD_EXPORT,
+    DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH,
+    DAEMON_BT_GUARD_CLOUD_APPLY,
+    DAEMON_BT_GUARD_EVIDENCE_DRAIN,
     DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH,
     DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH,
     DAEMON_DIAGNOSTICS_DESCRIBE,
@@ -524,6 +640,28 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_LINK_REFRESH,
     AGENT_LINK_CONTROL_CREDENTIAL,
     AGENT_LINK_DISPATCH,
+    AGENT_SHARE_CONFIG,
+    AGENT_SHARE_SET_LOCAL_CONFIG,
+    AGENT_SHARE_CREATE,
+    AGENT_SHARE_LIST,
+    AGENT_SHARE_UPDATE,
+    AGENT_SHARE_STOP,
+    AGENT_SHARE_RESUME,
+    AGENT_SHARE_DELETE,
+    AGENT_SHARE_RESOLVE,
+    AGENT_SHARE_RECEIVE,
+    AGENT_SHARE_DISMISS_PENDING,
+    AGENT_SHARE_RECEIVE_RECORDS,
+    AGENT_SHARE_SWITCH_TO_BRIDGE,
+    AGENT_SHARE_DIAGNOSTICS,
+    AGENT_SHARE_LOGS,
+    AGENT_SHARE_SESSION_KILL,
+    AGENT_SHARE_CONVERT_TO_CLOUD,
+    AGENT_SHARE_DELETE_CLOUD_COPY,
+    AGENT_SHARE_STOP_PROVIDING,
+    AGENT_SHARE_USAGE_REFRESH,
+    AGENT_SHARE_REPORT,
+    AGENT_SHARE_APPEAL,
     AGENT_PLAN_LIST,
     AGENT_ORDER_CREATE,
     AGENT_ORDER_GET,
@@ -551,12 +689,16 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_CLOUD_NOTIFY_VERIFY_EMAIL,
     AGENT_PLATFORM_OPEN_TASK,
     AGENT_PLATFORM_REVEAL_TASK,
+    AGENT_PLATFORM_COPY_TASK_FILES,
     AGENT_PLATFORM_OPEN_PATH,
     AGENT_PLATFORM_INTEGRATION_GET,
     AGENT_PLATFORM_SET_AUTOSTART,
     AGENT_PLATFORM_SET_FILE_ASSOCIATION,
     AGENT_PLATFORM_SET_URL_PROTOCOL,
     AGENT_PLATFORM_FILE_ICON,
+    AGENT_PLATFORM_SET_APP_ICON,
+    AGENT_PLATFORM_APP_ICON_IMAGE,
+    AGENT_PLATFORM_SYNC_WINDOW_ICONS,
     AGENT_SOUND_PREVIEW,
     AGENT_CAPTURE_SUBMIT,
     AGENT_CAPTURE_SUBMIT_TORRENT_FILE,
@@ -596,13 +738,18 @@ pub const SLOW_DAEMON_METHODS: &[&str] = &[
     DAEMON_RSS_VALIDATE,
     DAEMON_LINK_PROBE,
     DAEMON_CONFIG_PROXY_TEST,
+    DAEMON_CONFIG_PROXY_ROUTE,
     DAEMON_WEBHOOK_TEST,
     DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH,
     DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH,
+    DAEMON_BT_GUARD_EXPORT,
+    DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH,
+    DAEMON_BT_GUARD_CLOUD_APPLY,
     DAEMON_FS_LIST,
     DAEMON_DIAGNOSTICS_PROBE,
     DAEMON_DIAGNOSTICS_FIX_COMPONENT,
     DAEMON_TASK_VERIFY,
+    DAEMON_TASK_SEED_LOCAL,
     DAEMON_EGRESS_PLAN,
 ];
 
@@ -629,8 +776,8 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
 /// 规范 `AGENT_CAPABILITIES`。
 ///
 /// 声明 agent 可能下发能力的规范全集（用于字面量断言与能力全景索引）。
-/// 注意：[`CAPABILITY_AGENT_OPEN_TASK_FILES`] 属于连接级条件能力，仅向本机来源或显式授权连接下发，
-/// 服务级基线 hello 并不无条件包含它。
+/// 注意：[`CAPABILITY_AGENT_OPEN_TASK_FILES`] / [`CAPABILITY_AGENT_COPY_TASK_FILES`] 属于连接级条件能力，
+/// 仅向本机来源或显式授权连接下发，服务级基线 hello 并不无条件包含它们。
 pub const AGENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_AGENT_GATEWAY,
     CAPABILITY_AGENT_AUTH,
@@ -641,6 +788,8 @@ pub const AGENT_CAPABILITIES: &[&str] = &[
     CAPABILITY_AGENT_DEVICE_LINK,
     CAPABILITY_AGENT_EXTERNAL_CAPTURE,
     CAPABILITY_AGENT_OPEN_TASK_FILES,
+    CAPABILITY_AGENT_COPY_TASK_FILES,
+    CAPABILITY_AGENT_SHARE,
 ];
 
 /// 规范CLIENT_CAPABILITIES。

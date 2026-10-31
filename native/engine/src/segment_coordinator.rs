@@ -5737,14 +5737,13 @@ async fn do_segment(
         if plain_first && let Some(held) = spec.take_held_response() {
             break held;
         }
-        // 仅任务 URL 经凭据刷新改写；重定向终点 `direct` 保持不变。
-        let routed = if direct.is_none() {
-            spec.route_url(url)
-        } else {
-            None
-        };
-        let target = direct.as_deref().or(routed.as_deref()).unwrap_or(url);
-        let mut req = crate::downloader::build_request(client, target, reqwest::Method::GET, &used);
+        // 仅任务 URL 经凭据刷新改写；重定向终点 `direct` 保持不变。凭据锚点恒为（改写后的）
+        // 任务 URL：直连终点与经跳转链抵达终点携带完全相同的 Cookie / Authorization。
+        let routed = spec.route_url(url);
+        let origin_target = routed.as_deref().unwrap_or(url);
+        let target = direct.as_deref().unwrap_or(origin_target);
+        let mut req = crate::downloader::build_request(client, target, reqwest::Method::GET, &used)
+            .anchor(origin_target);
         if !plain_first {
             req = req.header("Range", &range);
         }
@@ -5812,11 +5811,7 @@ async fn do_segment(
     };
     let resp = resp.error_for_status()?;
     spec.confirm(&used);
-    if reuse_redirect
-        && direct.is_none()
-        && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
-        && request_path::reuse_is_safe(url, resp.url(), &used)
-    {
+    if reuse_redirect && direct.is_none() && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
         request_path.learn_redirect(url, resp.url().as_str());
     }
 

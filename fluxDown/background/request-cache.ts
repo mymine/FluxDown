@@ -5,6 +5,9 @@
  */
 import { browser } from "wxt/browser";
 import type { Browser } from "wxt/browser";
+import { logWarn } from "@/utils/error-log";
+import { carryAcrossRedirect, recordCapturedRequest } from "./request-record";
+import type { CapturedBody, RequestRecordCache } from "./request-record";
 
 // 请求头缓存（Cookie / Authorization）；兼作「该 URL 确有网络请求」的证据（见 sawNetworkRequest）。
 export const requestHeaderCache = new Map<
@@ -12,17 +15,7 @@ export const requestHeaderCache = new Map<
   { cookies: string; headers: Record<string, string>; ts: number; navigationPreload: boolean }
 >();
 
-export type CapturedBody =
-  | { kind: "formData"; fields: Record<string, string[]> }
-  | { kind: "raw"; bytesB64: string; contentType?: string };
-
-export interface RequestRecord {
-  url: string;
-  method: string;
-  body?: CapturedBody;
-  ts: number;
-}
-export const requestRecordCache = new Map<string, RequestRecord>();
+export const requestRecordCache: RequestRecordCache = new Map();
 // ArrayBuffer → base64 字符串（chrome.webRequest 抓到的 raw body 是 ArrayBuffer）。
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
@@ -96,32 +89,18 @@ function onBeforeRequestHandler(
     }
     return undefined;
   }
-  const body = captureBody(details);
-  requestRecordCache.set(details.url, {
-    url: details.url,
-    method: details.method,
-    body,
-    ts: Date.now(),
-  });
+  recordCapturedRequest(requestRecordCache, details.url, details.method, captureBody(details), Date.now());
   return undefined;
 }
 
-// 取出 (method, body) 作为附加 payload —— onCreated / onDeterminingFilename
-// 路径在调用 sendDownloadRequest 之前调用此函数。
-// 优先匹配 finalUrl（重定向后的真实下载 URL），fallback 到原始 url。
-export function lookupRequestRecord(
-  url: string,
-  fallbackUrl?: string,
-): { method?: string; body?: CapturedBody } {
-  const rec =
-    requestRecordCache.get(url) ||
-    (fallbackUrl && fallbackUrl !== url
-      ? requestRecordCache.get(fallbackUrl)
-      : undefined);
-  if (!rec) return {};
-  // GET 是默认值——不传也罢，节省 NM 协议字节数
-  const method = rec.method && rec.method !== "GET" ? rec.method : undefined;
-  return { method, body: rec.body };
+function onBeforeRedirectHandler(details: Browser.webRequest.OnBeforeRedirectDetails): void {
+  carryAcrossRedirect(
+    requestRecordCache,
+    details.url,
+    details.redirectUrl,
+    details.statusCode,
+    Date.now(),
+  );
 }
 
 function onSendHeadersHandler(
@@ -229,10 +208,19 @@ export function installRequestCache(): void {
       "[FluxDown] webRequest.onBeforeRequest listener registered (with requestBody)",
     );
   } catch (e) {
-    console.warn(
+    logWarn(
       "[FluxDown] Failed to register onBeforeRequest listener:",
       e,
     );
+  }
+
+  try {
+    browser.webRequest.onBeforeRedirect.addListener(onBeforeRedirectHandler, {
+      urls: ["<all_urls>"],
+      types: ["main_frame", "sub_frame"],
+    });
+  } catch (e) {
+    logWarn("[FluxDown] Failed to register onBeforeRedirect listener:", e);
   }
 
   // requestRecordCache 周期清理（与 requestHeaderCache 同步策略）
@@ -282,7 +270,7 @@ export function installRequestCache(): void {
         "[FluxDown] webRequest.onSendHeaders listener registered (without extraHeaders)",
       );
     } catch (e) {
-      console.warn(
+      logWarn(
         "[FluxDown] Failed to register webRequest.onSendHeaders listener:",
         e,
       );

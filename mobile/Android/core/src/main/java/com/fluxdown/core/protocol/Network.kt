@@ -74,19 +74,24 @@ enum class NetworkRow(val rowId: String, val group: Group, val configKey: String
     Password("network.password", Group.Manual, "proxy_password"),
     NoList("network.noList", Group.Manual, "proxy_no_list"),
     Test("network.test", Group.Manual, null),
+    Rules("network.rules", Group.Rules, "proxy_rules"),
+    RulesAdd("network.rulesAdd", Group.Rules, null),
+    RulesTest("network.rulesTest", Group.Rules, null),
     SiteAuth("network.siteAuth", Group.SiteAuth, null),
     SiteAuthAdd("network.siteAuthAdd", Group.SiteAuth, null),
     SiteAuthClear("network.siteAuthClear", Group.SiteAuth, null);
 
-    enum class Group { Mode, Manual, SiteAuth }
+    enum class Group { Mode, Manual, Rules, SiteAuth }
 
     /**
+     * 站点规则在任何模式下都生效，只需配置已加载。
      * 手动配置分组需要主机配置已加载且模式为手动；代理模式行只需配置已加载；
      * 站点凭据走 `daemon.siteAuth.*`（`daemon.*` 恒可用），与配置是否已加载无关。
      */
     fun isVisible(mode: NetworkProxyMode, isLoaded: Boolean): Boolean = when (group) {
         Group.Mode -> isLoaded
         Group.Manual -> isLoaded && mode == NetworkProxyMode.Manual
+        Group.Rules -> isLoaded
         Group.SiteAuth -> true
     }
 

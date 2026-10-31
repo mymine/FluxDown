@@ -18,6 +18,7 @@ import type { RuleDocSummary, RuleSyncResult, RuleSyncStatus, StoredRulePacks, S
 import { canSkipStartupSync, createRuleSync } from "./rule-sync";
 import type { RuleSyncTrigger } from "./rule-sync";
 import { getCachedSettings } from "./settings-cache";
+import { logWarn } from "@/utils/error-log";
 
 export const LOCAL_RULES_KEY = "fluxdown_local_rules";
 export const RULE_OVERRIDES_KEY = "fluxdown_rule_overrides";
@@ -156,7 +157,7 @@ async function readSessionFingerprint(): Promise<string | null> {
     const raw = (await browser.storage.session?.get(FINGERPRINT_KEY))?.[FINGERPRINT_KEY];
     return typeof raw === "string" ? raw : null;
   } catch (e) {
-    console.warn("[FluxDown] rule fingerprint read failed:", e);
+    logWarn("[FluxDown] rule fingerprint read failed:", e);
     return null;
   }
 }
@@ -165,7 +166,7 @@ async function writeSessionFingerprint(fingerprint: string): Promise<void> {
   try {
     await browser.storage.session?.set({ [FINGERPRINT_KEY]: fingerprint });
   } catch (e) {
-    console.warn("[FluxDown] rule fingerprint write failed:", e);
+    logWarn("[FluxDown] rule fingerprint write failed:", e);
   }
 }
 
@@ -202,7 +203,7 @@ export function rebuildEngine(): Promise<void> {
         // 失败也刷新时间戳：否则 getEngine() 每次调用都会再触发一次注定失败的全量编译。
         compiledAt = Date.now();
         compileError = e instanceof Error ? e.message : String(e);
-        console.warn("[FluxDown] rule engine rebuild failed:", e);
+        logWarn("[FluxDown] rule engine rebuild failed:", e);
       }
     } while (dirty);
   })().finally(() => {
@@ -278,7 +279,7 @@ export function syncRemotePacks(trigger: RuleSyncTrigger = "manual"): Promise<Ru
 }
 
 function autoSync(reason: string): void {
-  syncRemotePacks("auto").catch((e) => console.warn(`[FluxDown] ${reason} failed:`, e));
+  syncRemotePacks("auto").catch((e) => logWarn(`[FluxDown] ${reason} failed:`, e));
 }
 
 /** 近期同步过且本地已有远程包就不在启动时再同步（SW 频繁唤醒不应每次都打到桌面端）。 */
@@ -321,7 +322,7 @@ export function installRulesStore(): void {
       if (existing?.periodInMinutes === SYNC_PERIOD_MIN) return undefined;
       return browser.alarms.create(SYNC_ALARM, { periodInMinutes: SYNC_PERIOD_MIN });
     })
-    .catch((e) => console.warn("[FluxDown] rule sync alarm setup failed:", e));
+    .catch((e) => logWarn("[FluxDown] rule sync alarm setup failed:", e));
   onCapabilities((caps) => {
     if (!caps.connected) return;
     void loadStored().then((stored) => {
@@ -336,6 +337,6 @@ export function installRulesStore(): void {
   });
   void rebuildEngine();
   setTimeout(() => {
-    startupSync().catch((e) => console.warn("[FluxDown] rule sync failed:", e));
+    startupSync().catch((e) => logWarn("[FluxDown] rule sync failed:", e));
   }, FIRST_SYNC_DELAY_MS);
 }

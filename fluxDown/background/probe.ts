@@ -14,6 +14,7 @@
 import { browser } from "wxt/browser";
 import type { ContentMessage, HooksInfo, ProbeReply, ProbeState } from "./protocol";
 import { getSession, markTabChanged, onTabChanged, registerSession, setSessionHooks, whenRestored } from "./tab-state";
+import { logWarn } from "@/utils/error-log";
 
 /** 触发后等待的时间：给正常加载的 sensor 留出登记窗口，并合并同一 tab 的连续触发。 */
 const CHECK_DELAY_MS = 1_000;
@@ -44,7 +45,7 @@ export function scheduleProbeCheck(tabId: number, delay = CHECK_DELAY_MS): void 
     tabId,
     setTimeout(() => {
       timers.delete(tabId);
-      probeTab(tabId).catch((e) => console.warn("[FluxDown] probe check failed:", e));
+      probeTab(tabId).catch((e) => logWarn("[FluxDown] probe check failed:", e));
     }, delay),
   );
 }
@@ -88,7 +89,7 @@ async function inject(tabId: number): Promise<void> {
   await browser.scripting.executeScript({ target, files: [SENSOR_FILE], injectImmediately: true });
   await browser.scripting
     .executeScript({ target: { tabId, frameIds: [0] }, files: [PANEL_FILE] })
-    .catch((e) => console.warn("[FluxDown] panel reinjection failed:", e));
+    .catch((e) => logWarn("[FluxDown] panel reinjection failed:", e));
 }
 
 function waitForSession(tabId: number): Promise<boolean> {
@@ -135,7 +136,7 @@ export async function probeTab(tabId: number): Promise<void> {
       await inject(tabId);
       recovered = await waitForSession(tabId);
     } catch (e) {
-      console.warn("[FluxDown] probe reinjection failed:", e);
+      logWarn("[FluxDown] probe reinjection failed:", e);
     }
     // 期间 tab 已开始加载新文档（reset 清了结论）：结论作废，交给新文档的 sensor
     if (outcomes.get(tabId) !== "recovering") return;
@@ -154,7 +155,7 @@ function recoverActiveTabs(): void {
     .then((tabs) => {
       for (const tab of tabs) if (tab.id !== undefined) scheduleProbeCheck(tab.id, 0);
     })
-    .catch((e) => console.warn("[FluxDown] probe tabs query failed:", e));
+    .catch((e) => logWarn("[FluxDown] probe tabs query failed:", e));
 }
 
 /** 同步注册触发点；由 startBackground 调用一次。 */

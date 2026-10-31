@@ -240,6 +240,8 @@ pub enum ViewLocation {
     Settings,
     TaskDetail,
     Window,
+    /// 登录弹窗承载的视图（至多 1 个，要求声明 `auth`）。
+    Auth,
 }
 
 impl ViewLocation {
@@ -248,6 +250,7 @@ impl ViewLocation {
             ViewLocation::Activity => "activity",
             ViewLocation::Settings => "settings",
             ViewLocation::TaskDetail => "taskDetail",
+            ViewLocation::Auth => "auth",
             ViewLocation::Window => "window",
         }
     }
@@ -867,6 +870,7 @@ fn validate_contributes(m: &PluginManifest) -> Result<(), PluginError> {
     if c.views.len() > VIEWS_MAX {
         return manifest_err(format!("contributes.views 至多 {VIEWS_MAX} 项"));
     }
+    let mut auth_views = 0usize;
     let mut seen: HashSet<&str> = HashSet::new();
     let mut settings_views = 0usize;
     for v in &c.views {
@@ -890,6 +894,15 @@ fn validate_contributes(m: &PluginManifest) -> Result<(), PluginError> {
             settings_views += 1;
             if settings_views > 1 {
                 return manifest_err("location 为 settings 的 view 至多 1 个".into());
+            }
+        }
+        if v.location == ViewLocation::Auth {
+            auth_views += 1;
+            if auth_views > 1 {
+                return manifest_err("location 为 auth 的 view 至多 1 个".into());
+            }
+            if m.auth.is_none() {
+                return manifest_err("location 为 auth 的 view 要求声明 auth".into());
             }
         }
         match &v.desktop {

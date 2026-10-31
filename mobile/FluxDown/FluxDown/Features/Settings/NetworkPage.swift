@@ -14,6 +14,9 @@ struct NetworkPage: View {
 
     @State private var proxy = NetworkProxyModel()
     @State private var siteAuth = SiteAuthModel()
+    @State private var rules: ProxyRulesModel?
+    /// 站点规则的排序态（Section header 的「排序 / 完成」切换；`Form` 的 `editMode` 驱动拖动手柄）。
+    @State private var rulesEditMode: EditMode = .inactive
 
     /// 系统代理检测的触发条件：切到系统模式 / 切换主机 / 连接恢复时重新检测。
     private nonisolated struct DetectKey: Hashable {
@@ -33,10 +36,12 @@ struct NetworkPage: View {
         let readOnly = store.state.isReadOnly
         let isLive = store.state.connection == .live
         let request = NetworkProxyTest.request(mode: mode, form: form, system: proxy.detection.system)
+        let ruleCount = ProxyRule.enabledCount(form.value("proxy_rules"))
         SettingsPage(title: L("settingsCatProxy"), showsReadOnlyBanner: true) {
             if form.isLoaded {
                 Section {
                     modeRow(mode)
+                    if ruleCount > 0 { rulesActiveRow(ruleCount) }
                 } footer: {
                     #if FULL_FLAVOR
                     Text(L("proxyBtNote"))
@@ -54,6 +59,9 @@ struct NetworkPage: View {
                 case .manual:
                     manualSection(request: request, readOnly: readOnly)
                 }
+                if let rules {
+                    ProxyRulesSection(model: rules, editMode: $rulesEditMode)
+                }
             } else {
                 Section {
                     HStack(spacing: 10) {
@@ -64,6 +72,7 @@ struct NetworkPage: View {
             }
             SiteAuthSection(model: siteAuth)
         }
+        .environment(\.editMode, $rulesEditMode)
         .fluxAnimation(.smooth, value: mode)
         .fluxAnimation(.smooth, value: proxy.detection)
         .task(id: DetectKey(hostID: container.host.id, isLive: isLive, isSystemMode: mode == .system)) {
@@ -75,7 +84,25 @@ struct NetworkPage: View {
         }
         // 测试参数（模式 / 类型 / 地址 / 端口 / 凭据 / 检测结果）或主机变化后，旧结果不再代表当前配置。
         .onChange(of: request) { _, _ in proxy.resetTest() }
-        .onChange(of: container.host.id) { _, _ in proxy.resetTest() }
+        .onChange(of: container.host.id) { _, _ in
+            proxy.resetTest()
+            rules?.resetExplain()
+        }
+        .onAppear { if rules == nil { rules = ProxyRulesModel(container: container) } }
+    }
+
+    /// 站点规则优先于代理模式的提示。
+    private func rulesActiveRow(_ count: Int) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "info.circle")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(L("proxyRulesActiveHint", ["count": count]))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .accessibilityElement(children: .combine)
     }
 
     // MARK: 代理模式
@@ -360,9 +387,11 @@ extension NetworkPage {
         }
     }
 
-    /// 设置首页读数：当前代理模式（配置未加载时 nil）。
+    /// 设置首页读数：当前代理模式，启用站点规则时追加规则数（配置未加载时 nil）。
     static func readout(_ ctx: SettingsSearchContext) -> String? {
         guard ctx.form.isLoaded else { return nil }
-        return L(NetworkProxyMode(wire: ctx.form.value("proxy_mode")).titleKey)
+        let mode = L(NetworkProxyMode(wire: ctx.form.value("proxy_mode")).titleKey)
+        let count = ProxyRule.enabledCount(ctx.form.value("proxy_rules"))
+        return count > 0 ? "\(mode) · \(L("proxyRulesCount", ["count": count]))" : mode
     }
 }

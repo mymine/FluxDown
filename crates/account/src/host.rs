@@ -2,6 +2,7 @@
 //! 入站配对确认框都读同一份数据；需要窗口的一次性提示（会话被结束、入站配对请求）
 //! 以事件抛给 app，由 app 选窗口展示。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use fluxdown_protocol::{
@@ -56,6 +57,8 @@ pub struct AccountHost {
     show_referral: bool,
     /// 本机已批准、正等待已配对列表出现对端指纹的入站配对。
     awaited_pairings: Vec<AwaitedPairing>,
+    /// 正在「让其下线」的云设备 id：对应按钮转菊花并拒绝重入。
+    disconnecting: HashSet<String>,
 }
 
 impl EventEmitter<AccountHostEvent> for AccountHost {}
@@ -74,6 +77,7 @@ impl AccountHost {
             sent_codes: SentCodes::default(),
             show_referral: false,
             awaited_pairings: Vec::new(),
+            disconnecting: HashSet::new(),
         }
     }
 
@@ -290,11 +294,33 @@ impl AccountHost {
         })
     }
 
+    /// 该云设备的「让其下线」请求是否在途。
+    #[must_use]
+    pub(crate) fn is_disconnecting(&self, device_id: &str) -> bool {
+        self.disconnecting.contains(device_id)
+    }
+
     /// 让同账号另一台在线设备下线以释放在线名额（不删除设备；不能对本机调用）。
-    pub(crate) fn disconnect_device(&mut self, device_id: &str) -> PortFuture<serde_json::Value> {
-        self.controller.port().execute(AccountCommand::Device {
+    /// 已在途时返回 `None`（拒绝重入）；否则登记在途并通知，调用方须在完成后调用 [`Self::finish_disconnect`]。
+    pub(crate) fn begin_disconnect(
+        &mut self,
+        device_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<PortFuture<serde_json::Value>> {
+        if !self.disconnecting.insert(device_id.to_owned()) {
+            return None;
+        }
+        cx.notify();
+        Some(self.controller.port().execute(AccountCommand::Device {
             method: fluxdown_protocol::method::AGENT_DEVICE_DISCONNECT,
             params: serde_json::json!({ "id": device_id }),
-        })
+        }))
+    }
+
+    /// 「让其下线」完成（成功或失败）：清除在途标记。
+    pub(crate) fn finish_disconnect(&mut self, device_id: &str, cx: &mut Context<Self>) {
+        if self.disconnecting.remove(device_id) {
+            cx.notify();
+        }
     }
 }

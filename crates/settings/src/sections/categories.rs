@@ -110,6 +110,7 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
     let reset = ctx.t("resetBuiltinCategories");
     let auto_dirs = ctx.t("autoCategoryDirs");
     let regex_label = ctx.t("regexLabel");
+    let url_label = ctx.t("urlPatternLabel");
     SettingsRow::custom(
         move |disabled: bool, _key: &SharedString, _window: &mut gpui::Window, cx: &mut App| {
             let theme = active_theme(cx);
@@ -121,6 +122,8 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
                 let name = display_name(&translator, entry);
                 let details = if entry.match_mode == "regex" {
                     format!("{regex_label}: {}", entry.regex_pattern)
+                } else if entry.match_mode == "url" {
+                    format!("{url_label}: {}", entry.url_pattern)
                 } else if entry.extensions.is_empty() {
                     String::new()
                 } else {

@@ -187,6 +187,7 @@ impl QuickJsScriptRuntime {
         let ytdlp_permitted = host.ytdlp_permitted;
         let auth_permitted = host.auth_permitted;
         let private_network_allowed = host.private_network_allowed;
+        let egress = host.egress.clone();
         let interrupt_ns_bridge = interrupt_ns.clone();
         // 脚本墙钟里扣除的排队时间（yt-dlp 并发槽等待）。
         let wall_pause = Arc::new(super::runtime::WallPause::default());
@@ -203,6 +204,7 @@ impl QuickJsScriptRuntime {
                 ytdlp_permitted,
                 auth_permitted,
                 private_network_allowed,
+                egress,
                 interrupt_ns_bridge,
                 wall_pause_bridge,
             )
@@ -717,6 +719,7 @@ pub(super) fn inject_bridge(
     ytdlp_permitted: bool,
     auth_permitted: bool,
     private_network_allowed: bool,
+    egress: Option<Arc<super::call_egress::CallEgress>>,
     interrupt_ns: Arc<AtomicU64>,
     wall_pause: Arc<super::runtime::WallPause>,
 ) -> Result<(), rquickjs::Error> {
@@ -726,6 +729,7 @@ pub(super) fn inject_bridge(
     {
         let b = bridge.clone();
         let pid = plugin_id.to_string();
+        let fetch_egress = egress.clone();
         let dl = interrupt_ns.clone();
         let f = Function::new(
             ctx.clone(),
@@ -733,12 +737,14 @@ pub(super) fn inject_bridge(
                 let b = b.clone();
                 let pid = pid.clone();
                 let dl = dl.clone();
+                let fetch_egress = fetch_egress.clone();
                 async move {
                     let req: super::runtime::BridgeHttpRequest =
                         serde_json::from_str(&opts).unwrap_or_default();
                     let mut req = req;
                     req.auth_allowed = auth_permitted;
                     req.private_network_allowed = private_network_allowed;
+                    req.egress = fetch_egress;
                     // 网络等待不烧 CPU：挂起时长补回中断预算（常驻宿主的 2 s CPU 预算依赖它）。
                     let started = Instant::now();
                     let outcome = b.http_request(&pid, req).await;
@@ -1177,6 +1183,7 @@ pub(super) fn inject_bridge(
             let pid = plugin_id.to_string();
             let dl = interrupt_ns.clone();
             let wp = wall_pause.clone();
+            let ytdlp_egress = egress.clone();
             let f = Function::new(
                 ctx.clone(),
                 Async(move |opts: String| {
@@ -1184,9 +1191,11 @@ pub(super) fn inject_bridge(
                     let pid = pid.clone();
                     let dl = dl.clone();
                     let wp = wp.clone();
+                    let ytdlp_egress = ytdlp_egress.clone();
                     async move {
                         let mut spec: YtdlpSpec = serde_json::from_str(&opts).unwrap_or_default();
                         spec.wall_pause = Some(wp);
+                        spec.egress = ytdlp_egress;
                         // 挂起时长补进中断预算：长时子进程返回后 JS 仍保有 CPU 预算。
                         let started = Instant::now();
                         let out = b.run_ytdlp(&pid, spec).await;

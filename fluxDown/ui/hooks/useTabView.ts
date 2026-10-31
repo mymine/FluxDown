@@ -1,11 +1,12 @@
 /**
  * 订阅某 tab 的 TabView（C6 端口协议）。
  * subscribe 为 number（popup/侧边栏指定 tab）或 "sender"（content UI 用端口所在 tab）。
- * 端口断开 1 s 后重连；tabId 变化时重新订阅。
+ * 端口断开 1 s 后重连；tabId 变化时重新订阅。页面进入 bfcache 时主动断开、恢复时立即重连：
+ * 否则 Chrome 会以「page … moved into back/forward cache」强制关闭端口。
  */
 import { useEffect, useRef } from "preact/hooks";
 import { signal, type Signal } from "@preact/signals";
-import { browser } from "wxt/browser";
+import { browser, type Browser } from "wxt/browser";
 import {
   TAB_VIEW_PORT,
   type TabView,
@@ -21,38 +22,61 @@ export function useTabView(tabId: number | "sender" | null): Signal<TabView | nu
   useEffect(() => {
     view.value = null;
     if (tabId === null) return;
-    let port: ReturnType<typeof browser.runtime.connect> | null = null;
+    let port: Browser.runtime.Port | null = null;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let disposed = false;
 
     const connect = () => {
-      if (disposed) return;
+      clearTimeout(timer);
+      timer = undefined;
+      if (disposed || port) return;
+      let opened: Browser.runtime.Port;
       try {
-        port = browser.runtime.connect({ name: TAB_VIEW_PORT });
+        opened = browser.runtime.connect({ name: TAB_VIEW_PORT });
       } catch {
         timer = setTimeout(connect, RECONNECT_MS);
         return;
       }
-      port.onMessage.addListener((msg: unknown) => {
+      port = opened;
+      opened.onMessage.addListener((msg: unknown) => {
         const push = msg as TabViewPush;
         if (push?.type === "tabView") view.value = push.view;
       });
-      port.onDisconnect.addListener(() => {
+      opened.onDisconnect.addListener(() => {
+        // 被动断开（后台重启、扩展重载等）的原因在 runtime.lastError；不读会被记为 Unchecked 错误。
+        void browser.runtime.lastError;
+        if (port !== opened) return;
         port = null;
         if (!disposed) timer = setTimeout(connect, RECONNECT_MS);
       });
       const sub: TabViewSubscribe = { subscribe: tabId };
-      port.postMessage(sub);
+      opened.postMessage(sub);
     };
-    connect();
-    return () => {
-      disposed = true;
-      if (timer) clearTimeout(timer);
+    const disconnect = () => {
+      clearTimeout(timer);
+      timer = undefined;
+      const current = port;
+      port = null;
       try {
-        port?.disconnect();
+        current?.disconnect();
       } catch {
         // 已断开
       }
+    };
+    const onPageHide = (event: PageTransitionEvent) => {
+      if (event.persisted) disconnect();
+    };
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) connect();
+    };
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
+    connect();
+    return () => {
+      disposed = true;
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
+      disconnect();
     };
   }, [tabId]);
   return view;

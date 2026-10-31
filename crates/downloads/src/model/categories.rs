@@ -1,10 +1,38 @@
-//! 分类匹配索引：由偏好 `custom_categories` 构建，按扩展名 / 正则把任务归类。
+//! 分类匹配索引：由偏好 `custom_categories` 构建，按扩展名 / 正则 / 网址通配符把任务归类。
 
 use std::collections::HashSet;
 
 use fluxdown_protocol::CustomCategoryDto;
 
 use super::DownloadTaskView;
+
+/// `url` 模式通配符 → 锚定正则：`*` 任意串、`?` 恰一个字符，其余字面；不分大小写。
+/// 空 / 非法模式返回 `None`。语义与引擎 `category_route.rs::wildcard_matches` 一致。
+fn wildcard_regex(pattern: &str) -> Option<regex::Regex> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return None;
+    }
+    let mut source = String::with_capacity(pattern.len() + 2);
+    source.push('^');
+    for ch in pattern.chars() {
+        match ch {
+            '*' => source.push_str(".*"),
+            '?' => source.push('.'),
+            other => source.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    source.push('$');
+    regex::RegexBuilder::new(&source)
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
+/// 通配符模式是否命中网址（语义见 [`wildcard_regex`]）；本 crate 各网址匹配入口共用。
+pub(crate) fn wildcard_matches(pattern: &str, url: &str) -> bool {
+    wildcard_regex(pattern).is_some_and(|regex| regex.is_match(url))
+}
 
 enum Matcher {
     /// `builtin_all`：匹配所有任务。
@@ -14,6 +42,9 @@ enum Matcher {
     Extensions(HashSet<String>),
     /// 编译失败视为不匹配。
     Regex(Option<regex::Regex>),
+    /// `url` 模式：通配符（`*` / `?`，不分大小写、锚定完整匹配）匹配来源网址，
+    /// 语义与引擎 `category_route.rs::wildcard_matches` 一致；编译失败视为不匹配。
+    Url(Option<regex::Regex>),
 }
 
 pub(crate) struct CategoryRule {
@@ -53,6 +84,7 @@ impl CategoryIndex {
                             })
                             .flatten(),
                     ),
+                    (_, "url") => Matcher::Url(wildcard_regex(&dto.url_pattern)),
                     _ => Matcher::Extensions(
                         dto.extensions
                             .iter()
@@ -93,6 +125,9 @@ impl CategoryIndex {
             Matcher::Regex(regex) => regex
                 .as_ref()
                 .is_some_and(|regex| regex.is_match(&task.name)),
+            Matcher::Url(regex) => regex
+                .as_ref()
+                .is_some_and(|regex| regex.is_match(task.share_url())),
         }
     }
 
@@ -112,12 +147,22 @@ impl CategoryIndex {
     }
 
     /// 任务命中的首个（非 all/other）分类 id；无 → `builtin_other`。
+    /// 网址规则固定优先：先在网址规则里找首条命中，再退回文件名规则（列表顺序），
+    /// 与引擎落点路由 `save_dir_for` 的优先级一致。
     pub(crate) fn category_of(&self, task: &DownloadTaskView) -> &str {
-        self.rules
-            .iter()
-            .filter(|rule| !matches!(rule.matcher, Matcher::All | Matcher::Other))
-            .find(|rule| Self::rule_matches(rule, task))
-            .map_or("builtin_other", |rule| rule.dto.id.as_str())
+        let specific = || {
+            self.rules
+                .iter()
+                .filter(|rule| !matches!(rule.matcher, Matcher::All | Matcher::Other))
+        };
+        let hit = specific()
+            .find(|rule| matches!(rule.matcher, Matcher::Url(_)) && Self::rule_matches(rule, task))
+            .or_else(|| {
+                specific().find(|rule| {
+                    !matches!(rule.matcher, Matcher::Url(_)) && Self::rule_matches(rule, task)
+                })
+            });
+        hit.map_or("builtin_other", |rule| rule.dto.id.as_str())
     }
 
     /// 对任务命中的每个分类 id 调用一次 `emit`：与对每个不同 id 逐个调用 [`Self::matches`]
@@ -189,6 +234,7 @@ mod tests {
             match_mode: "regex".to_owned(),
             extensions: Vec::new(),
             regex_pattern: r"S\d+E\d+".to_owned(),
+            url_pattern: String::new(),
             position: 9,
             visible: true,
             is_builtin: false,
@@ -202,6 +248,7 @@ mod tests {
             match_mode: "regex".to_owned(),
             extensions: Vec::new(),
             regex_pattern: "(".to_owned(),
+            url_pattern: String::new(),
             position: 10,
             visible: true,
             is_builtin: false,
@@ -215,6 +262,7 @@ mod tests {
             match_mode: "regex".to_owned(),
             extensions: Vec::new(),
             regex_pattern: String::new(),
+            url_pattern: String::new(),
             position: 11,
             visible: true,
             is_builtin: false,
@@ -226,5 +274,74 @@ mod tests {
         assert!(index.matches("c1", &task("show.s01e02.mkv")));
         assert!(!index.matches("bad", &task("anything")));
         assert!(!index.matches("empty", &task("anything.mkv")));
+    }
+
+    #[test]
+    fn url_wildcard_category_matches_origin_url() {
+        fn task_at(file_name: &str, url: &str, origin_url: &str) -> DownloadTaskView {
+            let dto = serde_json::from_value::<fluxdown_protocol::TaskDto>(serde_json::json!({
+                "taskId":"t","url":url,"originUrl":origin_url,"fileName":file_name,
+                "saveDir":"/tmp","status":3,"downloadedBytes":1,"totalBytes":1,
+                "errorMessage":"","createdAt":"1","proxyUrl":"","queueId":"main","checksum":""
+            }))
+            .expect("task");
+            DownloadTaskView::local(&dto, None, false)
+        }
+        let mut dtos = CustomCategoryDto::builtin_defaults();
+        dtos.push(CustomCategoryDto {
+            id: "site".to_owned(),
+            name: "Site".to_owned(),
+            icon: "globe".to_owned(),
+            match_mode: "url".to_owned(),
+            extensions: Vec::new(),
+            regex_pattern: String::new(),
+            url_pattern: "https://mirror.test/*".to_owned(),
+            position: 9,
+            visible: true,
+            is_builtin: false,
+            builtin_type: None,
+            save_dir: String::new(),
+        });
+        dtos.push(CustomCategoryDto {
+            id: "bad".to_owned(),
+            name: "Bad".to_owned(),
+            icon: "globe".to_owned(),
+            match_mode: "url".to_owned(),
+            extensions: Vec::new(),
+            regex_pattern: String::new(),
+            url_pattern: "(".to_owned(),
+            position: 10,
+            visible: true,
+            is_builtin: false,
+            builtin_type: None,
+            save_dir: String::new(),
+        });
+        let index = CategoryIndex::from_dtos(dtos);
+        assert!(index.matches(
+            "site",
+            &task_at("a.zip", "https://x.test/a.zip", "https://mirror.test/a.zip")
+        ));
+        // 无 origin 时回退 url；锚定匹配不分大小写。
+        assert!(index.matches("site", &task_at("a.zip", "https://MIRROR.TEST/a.zip", "")));
+        assert!(!index.matches(
+            "site",
+            &task_at("a.zip", "https://x.test/https://mirror.test/a", "")
+        ));
+        // 非法模式不命中。
+        assert!(!index.matches("bad", &task_at("a.zip", "https://mirror.test/a.zip", "")));
+        // 网址规则固定优先：即使排在压缩包后面，命中网址的 zip 也归入网址分类。
+        assert_eq!(
+            index.category_of(&task_at("blob", "https://mirror.test/a.zip", "")),
+            "site"
+        );
+        assert_eq!(
+            index.category_of(&task_at("a.zip", "https://mirror.test/a.zip", "")),
+            "site"
+        );
+        // 其他站点的 zip 照旧按扩展名归入压缩包。
+        assert_eq!(
+            index.category_of(&task_at("a.zip", "https://other.test/a.zip", "")),
+            "builtin_archive"
+        );
     }
 }

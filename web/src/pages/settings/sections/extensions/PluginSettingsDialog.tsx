@@ -273,7 +273,7 @@ function SettingsBody({ plugin, onClose }: { plugin: PluginDto; onClose: () => v
           />
         </div>
       ) : null}
-      {settingsView && activeTab === 'view' ? <PluginViewHost identity={plugin.identity} view={settingsView.id} /> : null}
+      {settingsView && activeTab === 'view' ? <PluginViewHost identity={plugin.identity} view={settingsView.id} onClose={onClose} /> : null}
       <div className={activeTab === 'basic' ? 'flex w-full flex-col gap-4 py-1' : 'hidden'}>
         {serverError ? (
           <div role="alert" className="rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -286,7 +286,10 @@ function SettingsBody({ plugin, onClose }: { plugin: PluginDto; onClose: () => v
   )
 }
 
-/** `plugin` 为打开时的快照（GPUI 同样在打开瞬间建表单，之后快照更新不覆盖用户输入）。 */
+/**
+ * `plugin` 取最新快照，但表单只在挂载时按当时的设置值建立（GPUI 同样在打开瞬间建表单，之后快照更新不覆盖用户
+ * 输入）。插件包被替换（更新 / dev 重载，`packageRevision` 变化）后设置声明可能已变，按新声明重建表单。
+ */
 export function PluginSettingsDialog({ plugin, onClose }: { plugin: PluginDto | null; onClose: () => void }) {
-  return plugin ? <SettingsBody key={plugin.identity} plugin={plugin} onClose={onClose} /> : null
+  return plugin ? <SettingsBody key={`${plugin.identity}#${plugin.packageRevision ?? 0}`} plugin={plugin} onClose={onClose} /> : null
 }

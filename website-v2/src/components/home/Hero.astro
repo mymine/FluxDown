@@ -14,6 +14,7 @@ import { common } from "../../i18n/messages/common";
 import { href } from "../../i18n/routing";
 import type { Lang } from "../../i18n/config";
 import { GITHUB_URL } from "../../lib/site-nav";
+import { withBase } from "../../lib/base";
 
 interface Props {
   lang: Lang;
@@ -51,20 +52,20 @@ const versions = [
     <canvas class="hero-layer hero-particles" aria-hidden="true" data-flux></canvas>
 
     <div class="hero-copy">
-      <a href={href("/announcements/gpui-client", lang)} class="hero-badge" data-reveal>
+      <a href={href("/announcements/gpui-client", lang)} class="hero-badge">
         <span class="hero-badge-tag">{t.badge}</span>
         <span>{t.badgeText}</span>
         <ArrowRight size={13} strokeWidth={2} />
       </a>
 
-      <h1 class="display hero-title" data-reveal style="--d:1">
+      <h1 class="display hero-title">
         <span class="block">{t.titleA}</span>
         <span class="block serif accent-gradient pr-[0.08em]">{t.titleB}</span>
       </h1>
 
-      <p class="lede mx-auto max-w-[60ch]" data-reveal style="--d:2">{t.lede}</p>
+      <p class="lede mx-auto max-w-[60ch]">{t.lede}</p>
 
-      <div class="flex flex-wrap items-center justify-center gap-3" data-reveal style="--d:3">
+      <div class="flex flex-wrap items-center justify-center gap-3">
         <a href={href("/download", lang)} class="btn btn-primary btn-lg" data-hero-download data-labels={JSON.stringify(osLabels)}>
           <span data-hero-download-label>{actions.download}</span>
           <span class="kbd">D</span>
@@ -103,7 +104,7 @@ const versions = [
         </a>
       </div>
 
-      <div class="mono flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[12px] text-subtle" data-reveal style="--d:4">
+      <div class="mono flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[12px] text-subtle">
         <span class="flex items-center gap-2">
           <BrandIcon name="apple" size={12} />
           <BrandIcon name="windows" size={11} />
@@ -112,11 +113,16 @@ const versions = [
         </span>
         <span class="opacity-40">/</span>
         <span>{t.license}</span>
+        <span class="opacity-40">/</span>
+        <a href={withBase(`/docs/${lang}/#compare`)} class="hero-compare">
+          {t.compare}
+          <ArrowRight size={12} strokeWidth={2} />
+        </a>
       </div>
     </div>
   </div>
 
-  <div class="hero-figure" data-reveal style="--d:4">
+  <div class="hero-figure">
     <div class="hero-tilt">
       <div class="fig hero-fig">
         <div class="fig-bar">
@@ -136,8 +142,7 @@ const versions = [
 </section>
 
 <script>
-  import { mountStage } from "../../scripts/particle-stage";
-  import { FluxField } from "./flux-field";
+  import { whenIdle } from "../../scripts/idle";
 
   // 按系统改写主按钮文案(不改链接:下载页负责精确匹配架构)
   const btn = document.querySelector<HTMLElement>("[data-hero-download]");
@@ -171,15 +176,19 @@ const versions = [
     });
   }
 
+  // 粒子数据流属装饰:首屏 UI 绘制后的空闲时段再下载并挂载
   const head = document.querySelector<HTMLElement>(".hero-head");
   const canvas = head?.querySelector<HTMLCanvasElement>("[data-flux]");
   if (head && canvas) {
-    const field = new FluxField();
-    mountStage(canvas, head, field);
-    // 悬停 / 聚焦下载按钮:数据流加速汇聚
-    for (const [type, on] of [["pointerenter", true], ["pointerleave", false], ["focus", true], ["blur", false]] as const) {
-      btn?.addEventListener(type, () => field.setSurge(on));
-    }
+    whenIdle(async () => {
+      const [{ mountStage }, { FluxField }] = await Promise.all([import("../../scripts/particle-stage"), import("./flux-field")]);
+      const field = new FluxField();
+      mountStage(canvas, head, field);
+      // 悬停 / 聚焦下载按钮:数据流加速汇聚
+      for (const [type, on] of [["pointerenter", true], ["pointerleave", false], ["focus", true], ["blur", false]] as const) {
+        btn?.addEventListener(type, () => field.setSurge(on));
+      }
+    });
   }
 </script>
 
@@ -269,6 +278,24 @@ const versions = [
     syntax: "<angle>";
     inherits: false;
     initial-value: 0deg;
+  }
+  .hero-compare {
+    position: relative;
+    z-index: 1;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--accent-ink);
+    transition: color 160ms var(--ease-out);
+  }
+  .hero-compare:hover {
+    color: var(--fg);
+  }
+  .hero-compare :global(svg) {
+    transition: transform 160ms var(--ease-out);
+  }
+  .hero-compare:hover :global(svg) {
+    transform: translateX(2px);
   }
   .hero-badge {
     position: relative;

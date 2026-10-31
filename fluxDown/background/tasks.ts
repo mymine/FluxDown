@@ -5,6 +5,8 @@ import { t } from "@/utils/i18n";
 import { nmhListTasks, nmhOpenFile, nmhRevealFile } from "@/utils/native-messaging";
 import type { TaskBrief } from "@/utils/native-messaging";
 import { loadSettings } from "@/utils/settings";
+import { logWarn } from "@/utils/error-log";
+import { peekAndroidPlatform } from "@/utils/platform";
 
 // ──────────────────────────────────────────────────────────────
 // 任务面板：完成通知轮询（chrome.alarms）
@@ -36,7 +38,7 @@ async function ensureTaskPollAlarm(): Promise<void> {
       periodInMinutes: TASK_POLL_ALARM_PERIOD_MIN,
     });
   } catch (e) {
-    console.warn("[FluxDown] ensureTaskPollAlarm failed:", e);
+    logWarn("[FluxDown] ensureTaskPollAlarm failed:", e);
   }
 }
 
@@ -48,9 +50,9 @@ async function clearTaskPollAlarm(): Promise<void> {
   }
 }
 
-/** download/batchDownload 成功发送后调用：远程通道不参与本地完成通知。 */
+/** download/batchDownload 成功发送后调用：远程通道与 Android（Intent 投递，没有 NMH 任务列表）不参与本地完成通知。 */
 export function maybeArmTaskPollForChannel(channel?: "local" | "remote"): void {
-  if (channel === "remote") return;
+  if (channel === "remote" || peekAndroidPlatform() === true) return;
   ensureTaskPollAlarm().catch(() => {});
 }
 
@@ -139,7 +141,7 @@ function notifyTaskCompleted(task: TaskBrief): void {
       browser.notifications.create(notificationId, opts as any),
     ).catch(() => {});
   } catch (e) {
-    console.warn("[FluxDown] notifyTaskCompleted: failed to create:", e);
+    logWarn("[FluxDown] notifyTaskCompleted: failed to create:", e);
   }
 }
 
@@ -237,7 +239,7 @@ export function installTaskListeners(): void {
         return processTasksPollResult(result.tasks);
       })
       .catch((e) => {
-        console.warn("[FluxDown] task poll alarm handler failed:", e);
+        logWarn("[FluxDown] task poll alarm handler failed:", e);
       });
   });
 }

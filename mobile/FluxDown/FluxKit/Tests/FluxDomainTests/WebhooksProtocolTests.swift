@@ -77,9 +77,9 @@ struct WebhooksProtocolTests {
     // MARK: 读-改-写
 
     /// 模拟主机：真实的 revision 校验；`cachedConfig` 可被固定成过期值（store 发布滞后）。
-    private final class FakePort: WebhookConfigPort {
-        var server = WebhookConfigSnapshot(revision: 5, values: [:])
-        var cache: WebhookConfigSnapshot?
+    private final class FakePort: DaemonConfigPort {
+        var server = DaemonConfigSnapshotDto(revision: 5, values: [:])
+        var cache: DaemonConfigSnapshotDto?
         /// 前 n 次 patch 无条件抛 conflict（并让别的客户端先写入 `concurrent`）。
         var forcedConflicts = 0
         var concurrent: [WebhookEndpoint] = []
@@ -87,9 +87,9 @@ struct WebhooksProtocolTests {
         var fetches = 0
         var failure: HostError?
 
-        var cachedConfig: WebhookConfigSnapshot? { cache }
+        var cachedConfig: DaemonConfigSnapshotDto? { cache }
 
-        func fetchConfig() async throws(HostError) -> WebhookConfigSnapshot {
+        func fetchConfig() async throws(HostError) -> DaemonConfigSnapshotDto {
             fetches += 1
             return server
         }
@@ -104,18 +104,18 @@ struct WebhooksProtocolTests {
                 var current = WebhookEndpoint.parseList(server.values[WebhookEndpoint.configKey])
                 current.append(contentsOf: concurrent)
                 concurrent = []
-                server = WebhookConfigSnapshot(
+                server = DaemonConfigSnapshotDto(
                     revision: server.revision + 1,
                     values: [WebhookEndpoint.configKey: try WebhookEndpoint.encodeList(current)]
                 )
                 throw HostError(.conflict)
             }
             guard expectedRevision == server.revision else { throw HostError(.conflict) }
-            server = WebhookConfigSnapshot(revision: server.revision + 1, values: values)
+            server = DaemonConfigSnapshotDto(revision: server.revision + 1, values: values)
         }
 
         func seed(_ list: [WebhookEndpoint]) throws {
-            server = WebhookConfigSnapshot(revision: server.revision, values: [WebhookEndpoint.configKey: try WebhookEndpoint.encodeList(list)])
+            server = DaemonConfigSnapshotDto(revision: server.revision, values: [WebhookEndpoint.configKey: try WebhookEndpoint.encodeList(list)])
             cache = server
         }
 

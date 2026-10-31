@@ -60,6 +60,7 @@ object HostMethod {
     const val daemonConfigGet = "daemon.config.get"
     const val daemonConfigPatch = "daemon.config.patch"
     const val daemonConfigProxyTest = "daemon.config.proxyTest"
+    const val daemonConfigProxyRoute = "daemon.config.proxyRoute"
     const val daemonConfigConnPolicy = "daemon.config.connPolicy"
     const val daemonConfigClearConnPolicy = "daemon.config.clearConnPolicy"
     const val daemonConfigSystemProxy = "daemon.config.systemProxy"
@@ -128,6 +129,17 @@ object HostMethod {
     const val daemonCdnConfigApply = "daemon.cdnConfig.apply"
     const val daemonEgressPlan = "daemon.egress.plan"
     const val daemonBtTrackerSubscriptionRefresh = "daemon.bt.trackerSubscription.refresh"
+    const val daemonBtGuardState = "daemon.bt.guard.state"
+    const val daemonBtGuardEntriesList = "daemon.bt.guard.entries.list"
+    const val daemonBtGuardEntriesAdd = "daemon.bt.guard.entries.add"
+    const val daemonBtGuardEntriesRemove = "daemon.bt.guard.entries.remove"
+    const val daemonBtGuardEventsList = "daemon.bt.guard.events.list"
+    const val daemonBtGuardExport = "daemon.bt.guard.export"
+    const val daemonBtGuardFilterSourcesRefresh = "daemon.bt.guard.filterSources.refresh"
+    /** 仅 agent 内部调用（已验签云名单整层替换）；UI 不得使用，原生桥通用通道会拒绝。 */
+    const val daemonBtGuardCloudApply = "daemon.bt.guard.cloud.apply"
+    /** 仅 agent 内部调用（弹出待上报证据）；UI 不得使用，原生桥通用通道会拒绝。 */
+    const val daemonBtGuardEvidenceDrain = "daemon.bt.guard.evidence.drain"
     const val daemonEd2kServerSubscriptionRefresh = "daemon.ed2k.serverSubscription.refresh"
     const val daemonDiagnosticsDescribe = "daemon.diagnostics.describe"
     const val daemonDiagnosticsPrepareLogExport = "daemon.diagnostics.prepareLogExport"
@@ -209,6 +221,26 @@ object HostMethod {
     const val agentLinkDispatch = "agent.link.dispatch"
     /** `LinkDeviceParams` → `LinkControlCredentialDto`：本机对已配对且可控制的主机签发设备专属控制凭据（仅发起方）。 */
     const val agentLinkControlCredential = "agent.link.controlCredential"
+    /** FluxMesh（`agent.share.*`）：仅当主机 hello 带 `agent.share` 能力时可用；移动端暂不使用，常量只为与 `method.rs` 一一对应。 */
+    const val agentShareConfig = "agent.share.config"
+    const val agentShareSetLocalConfig = "agent.share.setLocalConfig"
+    const val agentShareCreate = "agent.share.create"
+    const val agentShareList = "agent.share.list"
+    const val agentShareUpdate = "agent.share.update"
+    const val agentShareStop = "agent.share.stop"
+    const val agentShareResume = "agent.share.resume"
+    const val agentShareDelete = "agent.share.delete"
+    const val agentShareResolve = "agent.share.resolve"
+    const val agentShareReceive = "agent.share.receive"
+    const val agentShareReceiveRecords = "agent.share.receiveRecords"
+    const val agentShareDismissPending = "agent.share.dismissPending"
+    const val agentShareSwitchToBridge = "agent.share.switchToBridge"
+    const val agentShareDiagnostics = "agent.share.diagnostics"
+    const val agentShareLogs = "agent.share.logs"
+    const val agentShareSessionKill = "agent.share.sessionKill"
+    const val agentShareConvertToCloud = "agent.share.convertToCloud"
+    const val agentShareDeleteCloudCopy = "agent.share.deleteCloudCopy"
+    const val agentShareStopProviding = "agent.share.stopProviding"
     const val agentPlanList = "agent.plan.list"
     const val agentOrderCreate = "agent.order.create"
     const val agentOrderGet = "agent.order.get"
@@ -221,6 +253,8 @@ object HostMethod {
     const val agentReferralValidate = "agent.referral.validate"
     const val agentPlatformOpenTask = "agent.platform.openTask"
     const val agentPlatformRevealTask = "agent.platform.revealTask"
+    /** 把任务产物以文件写入主机系统剪贴板；仅桌面主机本机来源，移动端不使用。 */
+    const val agentPlatformCopyTaskFiles = "agent.platform.copyTaskFiles"
     const val agentPlatformOpenPath = "agent.platform.openPath"
     const val agentPlatformIntegrationGet = "agent.platform.integrationGet"
     const val agentPlatformSetAutostart = "agent.platform.setAutostart"
@@ -228,6 +262,12 @@ object HostMethod {
     const val agentPlatformSetUrlProtocol = "agent.platform.setUrlProtocol"
     /** 系统文件管理器为文件显示的图标（PNG）；参数见 `PlatformFileIconParams`。 */
     const val agentPlatformFileIcon = "agent.platform.fileIcon"
+    /** 切换 / 导入桌面应用图标；仅桌面，移动端不使用。 */
+    const val agentPlatformSetAppIcon = "agent.platform.setAppIcon"
+    /** 当前自定义桌面应用图标的 PNG；仅桌面，移动端不使用。 */
+    const val agentPlatformAppIconImage = "agent.platform.appIconImage"
+    /** 为桌面界面进程现有窗口补设应用图标；仅桌面，移动端不使用。 */
+    const val agentPlatformSyncWindowIcons = "agent.platform.syncWindowIcons"
     /** 由 agent 在本机播放一次提示音偏好值；仅桌面，移动端不使用。 */
     const val agentSoundPreview = "agent.sound.preview"
     const val agentCaptureSubmit = "agent.capture.submit"
@@ -290,5 +330,9 @@ object HostCapability {
     const val agentExternalCapture = "agent.externalCapture"
     /** 按连接下发：本连接可在 agent 所在主机上打开 / 定位任务产物（`agent.platform.openTask` / `revealTask`）。 */
     const val agentOpenTaskFiles = "agent.openTaskFiles"
+    /** 按连接下发：本连接可把任务产物写入 agent 所在主机的系统剪贴板（`agent.platform.copyTaskFiles`）。 */
+    const val agentCopyTaskFiles = "agent.copyTaskFiles"
+    /** 本主机编入了FluxMesh服务（`agent.share.*`）；移动端暂不使用。 */
+    const val agentShare = "agent.share"
     const val clientSelections = "client.selections"
 }

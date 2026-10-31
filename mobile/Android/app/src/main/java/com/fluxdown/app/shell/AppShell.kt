@@ -145,7 +145,9 @@ fun AppShell() {
     val scope = rememberCoroutineScope()
     val haptics = FluxTheme.haptics
     val actions = remember(overlays, haptics) {
-        TaskActions(context.applicationContext, scope, { container.session }, container.store, overlays, nav, haptics)
+        TaskActions(context.applicationContext, scope, { container.session }, container.store, overlays, nav, haptics) {
+            container.host.value is com.fluxdown.core.model.HostRef.Local
+        }
     }
     val disconnectedText = stringResource(R.string.localServiceDisconnected)
     val invalidText = stringResource(R.string.localServiceInvalidArgument)

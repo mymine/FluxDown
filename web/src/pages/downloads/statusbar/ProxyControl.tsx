@@ -2,6 +2,7 @@ import { Check, ChevronDown, Globe } from 'lucide-react'
 import { useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { useT } from '../../../i18n'
+import { enabledRuleCount } from '../../../lib/proxyRules'
 import { Icon, Popover, Tooltip } from '../../../ui'
 import { setDaemon, useDaemonValue } from '../../settings/kit/writeStore'
 import { popoverSide, RAIL_BUTTON, resolveSide, useDaemonReady } from './widget'
@@ -52,9 +53,12 @@ export function ProxyControl({ orientation = 'horizontal', side }: WidgetProps) 
   const mode = useDaemonValue('proxy_mode')
   const host = useDaemonValue('proxy_host')
   const port = useDaemonValue('proxy_port')
+  const ruleCount = enabledRuleCount(useDaemonValue('proxy_rules'))
+  const ruleHint = ruleCount > 0 ? t('proxyRulesActiveHint', { count: ruleCount }) : ''
   const current = MODES.find((item) => item.value === mode) ?? MODES[0]
   const title = t('settingsCatProxy')
   const label = t(current.labelKey)
+  const summary = ruleHint ? `${title}: ${label} · ${ruleHint}` : `${title}: ${label}`
   const endpoint = proxyEndpoint(host, port)
   const [open, setOpen] = useState(false)
   const triggerRef = useRef<HTMLButtonElement>(null)
@@ -70,12 +74,12 @@ export function ProxyControl({ orientation = 'horizontal', side }: WidgetProps) 
         if (!disabled || !next) setOpen(next)
       }}
       trigger={
-        <Tooltip content={`${title}: ${label}`} side={resolveSide(orientation, side)}>
+        <Tooltip content={summary} side={resolveSide(orientation, side)}>
           <button
             ref={triggerRef}
             type="button"
             disabled={disabled}
-            aria-label={`${title}: ${label}`}
+            aria-label={summary}
             aria-haspopup="dialog"
             aria-expanded={open}
             className={
@@ -88,6 +92,9 @@ export function ProxyControl({ orientation = 'horizontal', side }: WidgetProps) 
             {rail ? null : (
               <>
                 <span className="max-w-28 truncate narrow:max-w-20">{label}</span>
+                {ruleCount > 0 ? (
+                  <span className="rounded-sm bg-muted px-1 text-caption tabular-nums text-muted-foreground">{ruleCount}</span>
+                ) : null}
                 <Icon icon={ChevronDown} />
               </>
             )}
@@ -128,6 +135,9 @@ export function ProxyControl({ orientation = 'horizontal', side }: WidgetProps) 
               </span>
             </button>
           ))}
+          {ruleCount > 0 ? (
+            <div className="mt-1 border-t border-hairline px-2 pb-1 pt-1.5 text-caption text-muted-foreground">{ruleHint}</div>
+          ) : null}
         </div>
       )}
     </Popover>

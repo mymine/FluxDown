@@ -3,7 +3,7 @@
 
 use fluxdown_protocol::{CloudDevice, SyncLocalOnlyParams, SyncStatusDto};
 use fluxdown_ui_components::{
-    ButtonVariant, FluxIcon, button, card, tabular_numbers, tooltip_view,
+    ButtonVariant, FluxIcon, card, loading_button, tabular_numbers, tooltip_view,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::{SemanticThemeTokens, active_theme};
@@ -24,6 +24,8 @@ use crate::{AccountCommand, t, t_with, ui};
 pub(crate) struct CloudFeaturesState {
     pub logged_in: bool,
     pub disabled: bool,
+    /// 「立即同步」在途（含最短可见保持）。
+    pub sync_now_busy: bool,
 }
 
 pub(crate) fn render(
@@ -38,6 +40,7 @@ pub(crate) fn render(
     let CloudFeaturesState {
         logged_in,
         disabled,
+        sync_now_busy,
     } = state;
     let heading = t(translator, "accountGroupCloudFeatures");
     let desc = t(translator, "accountCloudFeaturesDesc");
@@ -53,7 +56,13 @@ pub(crate) fn render(
                 .flex()
                 .flex_col()
                 .child(config_sync_row(
-                    translator, tokens, logged_in, sync, disabled, cx,
+                    translator,
+                    tokens,
+                    logged_in,
+                    sync,
+                    disabled,
+                    sync_now_busy,
+                    cx,
                 ))
                 .when(logged_in && sync.enabled, |card| {
                     card.child(ui::row_divider(cx))
@@ -151,6 +160,7 @@ fn config_sync_row(
     logged_in: bool,
     sync: &SyncStatusDto,
     disabled: bool,
+    sync_now_busy: bool,
     cx: &mut Context<AccountView>,
 ) -> impl IntoElement {
     let title = t(translator, "cloudSyncTitle");
@@ -187,19 +197,16 @@ fn config_sync_row(
         .child(row_text(tokens, title, subtitle))
         .when(logged_in && sync.enabled, |this| {
             this.child(
-                button(
+                loading_button(
                     "account-sync-now",
                     t(translator, "cloudSyncNow"),
                     ButtonVariant::Secondary,
+                    sync_now_busy,
                     cx,
                 )
-                .disabled(!sync_now_enabled)
+                .disabled(!sync_now_enabled || sync_now_busy)
                 .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
-                    let future = view.port(cx).execute(AccountCommand::Sync {
-                        method: fluxdown_protocol::method::AGENT_SYNC_NOW,
-                        params: serde_json::json!({}),
-                    });
-                    view.spawn_action(future, ErrorContext::Sync, cx);
+                    view.sync_now(cx);
                 })),
             )
         })

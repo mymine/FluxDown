@@ -4,11 +4,12 @@
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
+    time::Instant,
 };
 
 use fluxdown_protocol::{InstalledPlugin, MarketEntryDto, PluginDto};
 use fluxdown_ui_components::{
-    BusyExt as _, ControlExt as _, FluxIcon, IconControlExt as _, card, form, form_field,
+    BusyExt as _, BusyHold, ControlExt as _, FluxIcon, IconControlExt as _, card, form, form_field,
     input_with_action, tabular_numbers, tooltip_view,
 };
 use fluxdown_ui_theme::active_theme;
@@ -30,12 +31,13 @@ use gpui_component::{
 
 use super::Frame;
 use crate::{
-    ExtensionsTab, ExtensionsView,
+    ExtensionsTab, ExtensionsView, PluginViewSlot,
     components::{
         plugin_audit::open_plugin_audit,
         plugin_auth::PluginAuthDialog,
         plugin_consent::{ConsentAction, ConsentRequest, open_consent_dialog},
         plugin_detail::{OpenAudit, PluginDetail, open_plugin_detail, yanked_label},
+        plugin_live::CloseWhenRemoved,
         plugin_settings::{PluginSettingsForm, PluginSettingsTabs},
     },
     controller::{COMPONENT_KINDS, component_wire_name, grant_plugin_consent},
@@ -43,7 +45,7 @@ use crate::{
     market::{
         ConsentFlow, MarketAction, MarketSort, arrange_market, confirmation_holds, consent_flow,
         filter_market, hosts_to_confirm, installed_version_yanked, latest_per_plugin,
-        market_action, permissions_to_confirm, risk_of,
+        market_action, market_needs_load, permissions_to_confirm, risk_of,
     },
     ui,
 };
@@ -76,6 +78,12 @@ pub(crate) struct PluginsUi {
     pub busy: HashSet<String>,
     /// 「重新加载」在途的 dev 插件（按钮显示转圈）；是 `busy` 的子集。
     pub reloading: HashSet<String>,
+    /// 「卸载」在途的插件（仅该按钮转圈）；是 `busy` 的子集。
+    pub uninstalling: HashSet<String>,
+    /// 点击「重新加载」后的最短转圈保持，按插件标识。
+    pub reload_holds: HashMap<String, BusyHold>,
+    /// 点击「刷新市场」后的最短转圈保持（自动加载不启动）。
+    pub market_hold: BusyHold,
     pub market: MarketUi,
     pub site_defaults: super::site_defaults::SiteDefaultsUi,
     /// 安装 / 更新 / 重载成功、等待插件列表追上后再判定授权流程的插件；
@@ -94,6 +102,9 @@ impl Default for PluginsUi {
             installing_dir: false,
             busy: HashSet::new(),
             reloading: HashSet::new(),
+            uninstalling: HashSet::new(),
+            reload_holds: HashMap::new(),
+            market_hold: BusyHold::default(),
             market: MarketUi::default(),
             site_defaults: super::site_defaults::SiteDefaultsUi::default(),
             awaiting_consent: HashMap::new(),
@@ -119,6 +130,8 @@ pub(crate) struct MarketUi {
     pub pending: HashSet<String>,
     /// 上次加载因断连失败；重连后重新加载一次。
     pub retry_on_reconnect: bool,
+    /// 上次成功加载完成的时刻；超过 `MARKET_MAX_AGE` 后再次渲染插件页会重新拉取。
+    pub loaded_at: Option<Instant>,
 }
 
 impl Default for MarketUi {
@@ -136,6 +149,7 @@ impl Default for MarketUi {
             limit: MARKET_PAGE_SIZE,
             pending: HashSet::new(),
             retry_on_reconnect: false,
+            loaded_at: None,
         }
     }
 }
@@ -191,6 +205,7 @@ impl ExtensionsView {
             .iter()
             .map(|plugin| (plugin.identity.as_str(), plugin))
             .collect::<HashMap<_, _>>();
+        let market_refreshing = market.loading || self.plugins.market_hold.is_held();
 
         v_flex()
             .w_full()
@@ -263,9 +278,10 @@ impl ExtensionsView {
                                     .ghost()
                                     .control(cx)
                                     .label(translator.text("marketRefreshTooltip").to_owned())
-                                    .busy(self.plugins.market.loading)
-                                    .disabled(self.plugins.market.loading || stale)
+                                    .busy(market_refreshing)
+                                    .disabled(market_refreshing || stale)
                                     .on_click(cx.listener(|this, _, window, cx| {
+                                        this.plugins.market_hold.start(cx);
                                         this.load_market(window, cx);
                                     })),
                             ),
@@ -556,7 +572,12 @@ impl ExtensionsView {
             })
             .when(plugin.dev_mode, |this| {
                 let identity = identity.clone();
-                let reloading = self.plugins.reloading.contains(&plugin.identity);
+                let reloading = self.plugins.reloading.contains(&plugin.identity)
+                    || self
+                        .plugins
+                        .reload_holds
+                        .get(&plugin.identity)
+                        .is_some_and(BusyHold::is_held);
                 this.child(
                     Button::new(("plugin-reload", index))
                         .ghost()
@@ -564,7 +585,7 @@ impl ExtensionsView {
                         .icon(FluxIcon::RotateCw)
                         .tooltip(translator.text("pluginReloadTooltip").to_owned())
                         .busy(reloading)
-                        .disabled(busy)
+                        .disabled(busy || reloading)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.reload_plugin(identity.clone(), window, cx);
                         })),
@@ -636,6 +657,7 @@ impl ExtensionsView {
                     .control_icon(cx)
                     .icon(FluxIcon::Trash2)
                     .tooltip(translator.text("pluginUninstallTooltip").to_owned())
+                    .busy(self.plugins.uninstalling.contains(&plugin.identity))
                     .disabled(busy)
                     .on_click({
                         let name = plugin.name.clone();
@@ -837,6 +859,7 @@ impl ExtensionsView {
                                     detail.clone(),
                                     detail_translator.clone(),
                                     None,
+                                    None,
                                     window,
                                     cx,
                                 );
@@ -861,7 +884,14 @@ impl ExtensionsView {
         if self.controller.is_stale() || self.plugins.market.loading {
             return;
         }
-        if self.plugins.market.requested && !self.plugins.market.retry_on_reconnect {
+        let market = &self.plugins.market;
+        if !market_needs_load(
+            market.requested,
+            market.retry_on_reconnect,
+            market.error.is_some(),
+            market.loaded_at,
+            Instant::now(),
+        ) {
             return;
         }
         self.load_market(window, cx);
@@ -887,6 +917,7 @@ impl ExtensionsView {
                         market.entries = entries;
                         market.error = None;
                         market.limit = MARKET_PAGE_SIZE;
+                        market.loaded_at = Some(Instant::now());
                     }
                     Err(error) => {
                         // 断连类失败：daemon 恢复后自动重试一次（其他失败保持手动刷新，避免重绘循环）。
@@ -1225,6 +1256,9 @@ impl ExtensionsView {
         if !self.plugins.busy.insert(identity.clone()) {
             return;
         }
+        if op == PluginOp::Uninstall {
+            self.plugins.uninstalling.insert(identity.clone());
+        }
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
@@ -1232,6 +1266,7 @@ impl ExtensionsView {
             let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.plugins.busy.remove(&identity);
                 this.plugins.reloading.remove(&identity);
+                this.plugins.uninstalling.remove(&identity);
                 this.finish_plugin_op(op, result, window, cx);
                 cx.notify();
             }) else {
@@ -1247,6 +1282,11 @@ impl ExtensionsView {
             return;
         }
         self.plugins.reloading.insert(identity.clone());
+        self.plugins
+            .reload_holds
+            .entry(identity.clone())
+            .or_default()
+            .start(cx);
         let future = self.controller.reload_plugin_dev(identity.clone());
         self.run_plugin_op(identity, PluginOp::Reload, future, window, cx);
     }
@@ -1421,7 +1461,14 @@ impl ExtensionsView {
         let translator_entity = self.translator.clone();
         let port = self.controller.port().clone();
         let view = match (self.settings_view(plugin), &self.plugin_view_factory) {
-            (Some(decl), Some(factory)) => Some(factory(plugin, decl, None, window, cx)),
+            (Some(decl), Some(factory)) => Some(factory(
+                plugin,
+                decl,
+                None,
+                PluginViewSlot::Dialog,
+                window,
+                cx,
+            )),
             _ => None,
         };
         let form = (!plugin.settings.is_empty()).then(|| {
@@ -1430,12 +1477,20 @@ impl ExtensionsView {
             })
         });
         let tabs = cx.new(|_| PluginSettingsTabs::new(translator_entity.clone(), view, form));
+        // 设置表单刻意保留打开时的快照（避免编辑中途被覆盖），但插件被卸载时关闭对话框。
+        let guard = CloseWhenRemoved::wrap(
+            tabs.clone(),
+            plugin.identity.clone(),
+            &self.live_plugins,
+            window,
+            cx,
+        );
         window.open_dialog(cx, move |dialog, _, cx| {
             let (is_saving, active_form) = {
                 let tabs = tabs.read(cx);
                 (tabs.is_saving(cx), tabs.active_form())
             };
-            let tabs_for_content = tabs.clone();
+            let tabs_for_content = guard.clone();
             let footer = DialogFooter::new()
                 .gap(active_theme(cx).tokens().spacing.sm)
                 .child(
@@ -1477,18 +1532,52 @@ impl ExtensionsView {
         let Some(plugin) = self.controller.plugin(identity) else {
             return;
         };
-        let translator = self.translator.clone();
-        let port = self.controller.port().clone();
-        let identity = plugin.identity.clone();
         let title = SharedString::from(
             self.translator
                 .read(cx)
                 .text_with("pluginAuthDialogTitle", &[("name", &plugin.name)]),
         );
+        // 插件自绘登录界面：弹窗只承载该视图（插件经 `ctx.close()` 自行关闭弹窗）。
+        if let (Some(decl), Some(factory)) = (self.auth_view(plugin), &self.plugin_view_factory) {
+            let view = factory(plugin, decl, None, PluginViewSlot::Dialog, window, cx);
+            let view = CloseWhenRemoved::wrap(
+                view,
+                plugin.identity.clone(),
+                &self.live_plugins,
+                window,
+                cx,
+            );
+            window.open_dialog(cx, move |dialog_view, _, cx| {
+                let view = view.clone();
+                dialog_view
+                    .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
+                    .w(active_theme(cx).text_extent(520.))
+                    .content(move |content, _, cx| {
+                        content.min_h_0().child(
+                            div()
+                                .w_full()
+                                .h(active_theme(cx).text_extent(420.))
+                                .overflow_hidden()
+                                .child(view.clone()),
+                        )
+                    })
+            });
+            return;
+        }
+        let translator = self.translator.clone();
+        let port = self.controller.port().clone();
+        let identity = plugin.identity.clone();
         let dialog = cx.new(|cx| PluginAuthDialog::new(translator, port, identity, window, cx));
+        let guard = CloseWhenRemoved::wrap(
+            dialog.clone(),
+            plugin.identity.clone(),
+            &self.live_plugins,
+            window,
+            cx,
+        );
         let dialog_for_cancel = dialog.clone();
         window.open_dialog(cx, move |dialog_view, _, cx| {
-            let dialog_for_content = dialog.clone();
+            let dialog_for_content = guard.clone();
             let dialog_for_cancel = dialog_for_cancel.clone();
             dialog_view
                 .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
@@ -1518,11 +1607,43 @@ impl ExtensionsView {
             .find(|view| view.location == "settings")
     }
 
+    /// 插件的 auth 位置视图：插件可用（已启用、已加载、无待授权）、视图工厂已注入，且视图在
+    /// 本机可渲染（可移植，或桌面脚本包在本机）时才接管登录弹窗；否则沿用固定登录流程。
+    fn auth_view<'a>(
+        &self,
+        plugin: &'a PluginDto,
+    ) -> Option<&'a fluxdown_protocol::PluginViewDeclDto> {
+        if self.plugin_view_factory.is_none()
+            || !plugin.enabled
+            || plugin.load_status != "Loaded"
+            || !plugin.consent_pending.is_empty()
+            || !plugin.consent_pending_hosts.is_empty()
+        {
+            return None;
+        }
+        plugin
+            .contributions
+            .views
+            .iter()
+            .find(|view| view.location == "auth")
+            .filter(|view| {
+                view.portable
+                    || view
+                        .desktop
+                        .as_ref()
+                        .zip(plugin.package_dir.as_ref())
+                        .is_some_and(|(entry, dir)| {
+                            std::path::Path::new(dir).join(&entry.entry).is_file()
+                        })
+            })
+    }
+
     fn open_consent(&self, plugin: PluginDto, window: &mut Window, cx: &mut Context<Self>) {
         let request = ConsentRequest::for_plugin(&plugin, self.translator.read(cx));
         let action = ConsentAction::Grant {
             port: self.controller.port().clone(),
             plugin: Box::new(plugin),
+            live: self.live_plugins.clone(),
         };
         open_consent_dialog(request, action, self.translator.clone(), window, cx);
     }
@@ -1564,7 +1685,14 @@ impl ExtensionsView {
                 cx,
             );
         });
-        open_plugin_detail(detail, translator, Some(open_audit), window, cx);
+        open_plugin_detail(
+            detail,
+            translator,
+            Some(open_audit),
+            Some(self.live_plugins.clone()),
+            window,
+            cx,
+        );
     }
 
     /// 安装 / 更新 / 重载成功：等插件列表追上后再判定授权流程。

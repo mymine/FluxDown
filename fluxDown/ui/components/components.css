@@ -209,7 +209,10 @@
   display: flex;
   flex-direction: column;
   width: min(560px, 92vw);
+  /* Modal.tsx 的内联 width:Npx 在窄视口会溢出：max-width 可压过内联 width */
+  max-width: calc(100vw - 24px);
   max-height: 88vh;
+  max-height: min(88vh, calc(100dvh - 24px));
   border: 1px solid var(--fd-border);
   border-radius: var(--fd-radius);
   background: var(--fd-surface);
@@ -220,6 +223,17 @@
 .fd-modal-title { font-weight: 600; }
 .fd-modal-body { padding: 14px 16px; overflow: auto; }
 .fd-modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--fd-border); }
+
+/* 触屏（无精确指针）：控件点击热区适度放大；桌面（精确指针）不受影响 */
+@media (pointer: coarse) {
+  .fd-icon-btn { width: 36px; height: 36px; }
+  .fd-btn-sm { padding: 8px 12px; }
+  .fd-tab { padding: 11px 12px; }
+  .fd-tag-x { padding: 6px 8px; font-size: 16px; }
+  /* 开关视觉不变，用透明的 input 外扩出 ≥40px 的点按区域 */
+  .fd-toggle input { inset: -10px -4px; width: calc(100% + 8px); height: calc(100% + 20px); }
+  .fd-modal-head { padding: 6px 8px 6px 16px; }
+}
 
 /* EmptyState */
 .fd-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 28px 16px; color: var(--fd-text-secondary); text-align: center; }

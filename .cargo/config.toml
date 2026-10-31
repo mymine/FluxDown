@@ -1,9 +1,5 @@
 [alias]
 desktop-dev = "run --quiet -p fluxdown-desktop-dev --"
 
-# 桌面 x86_64 产物基线提到 x86-64-v2（SSE4.2/POPCNT/SSSE3/CMPXCHG16B）：Win11 最低要求与
-# 主流桌面 CPU 均满足；不上 v3（AVX2），老 Pentium/部分 Atom 会直接 SIGILL。aarch64 维持默认 armv8-a。
-# 服务器 / CLI / NAS 套件 / Docker 的 x86_64 构建用 RUSTFLAGS="-C target-cpu=x86-64" 回退基线
-# （RUSTFLAGS 整体替换本文件的 rustflags，这里新增其它 flag 时必须同步那些构建步骤）。
-[target.'cfg(target_arch = "x86_64")']
-rustflags = ["-C", "target-cpu=x86-64-v2"]
+# x86_64 产物一律用 rustc 默认基线 x86-64，不设 target-cpu：曾提到 x86-64-v2，
+# 无 SSSE3 / SSE4.2 的老 CPU（AMD K10、Core 2 等）启动即 0xc000001d 崩溃（#1020）。

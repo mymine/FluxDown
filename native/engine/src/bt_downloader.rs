@@ -17,6 +17,7 @@
 //! - `add_torrent` blocks while resolving magnet metadata from DHT/peers, so
 //!   we report "preparing" status to the host while we wait.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
@@ -31,7 +32,7 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttr
 use bytes::Bytes;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, ListenerMode,
-    ListenerOptions, ManagedTorrent, PeerConnectionOptions, Session, SessionOptions,
+    ListenerOptions, ManagedTorrent, PeerConnectionOptions, PeerPolicy, Session, SessionOptions,
     SessionPersistenceConfig,
 };
 
@@ -92,12 +93,13 @@ impl TorrentSource {
 
     /// Lowercase hex info-hash of this source, if derivable.
     ///
-    /// Magnet links carry it in `xt=urn:btih:`; .torrent bytes are parsed
-    /// (bencode) to compute it.  Used to address the `{hash}.bitv` fastresume
-    /// file before the torrent is added to the session.
+    /// Magnet links carry it in `xt=urn:btih:` (parsed after `normalize_magnet`);
+    /// .torrent bytes are parsed (bencode) to compute
+    /// it.  Used to address the `{hash}.bitv` fastresume file before the
+    /// torrent is added to the session.
     pub fn info_hash_hex(&self) -> Option<String> {
         match self {
-            TorrentSource::Magnet(url) => librqbit::Magnet::parse(url)
+            TorrentSource::Magnet(url) => librqbit::Magnet::parse(&normalize_magnet(url))
                 .ok()?
                 .as_id20()
                 .map(|id| id.as_string()),
@@ -348,6 +350,94 @@ pub fn magnet_with_trackers(magnet: &str, trackers: &[String]) -> String {
     out
 }
 
+const MAGNET_PREFIX: &str = "magnet:?";
+
+/// 把磁力链接规范成 librqbit 能解析的形态。librqbit 的 `Magnet::parse` 对**每个** `xt`
+/// 都要求精确前缀 `urn:btih:` / `urn:btmh:1220`（区分大小写），遇到任何其他 `xt`
+/// 就整条拒绝（`expected xt to start with btih or btmh`），`add_torrent` 还要求小写
+/// `magnet:` 开头。本函数：
+///
+/// - `MAGNET:?` 前缀统一为小写；
+/// - `xt` 键大小写不敏感；`urn:btih:` / `urn:btmh:` 前缀统一为小写，32 位 base32
+///   哈希转大写（librqbit 只认大写 base32；40 位 hex 两种大小写都认，保持原样）；
+/// - 存在 BT `xt` 时丢弃其余 `xt`（`urn:ed2k:` / `urn:sha1:` / `urn:aich:` /
+///   `urn:tree:tiger:` 等多协议磁力），以及 librqbit 不支持的非 `1220` multihash。
+///
+/// 没有任何 BT `xt`、或已是规范形态时原样返回（与规范化前行为完全一致）。只作用于
+/// 交给 librqbit 的输入；DB 中的原始链接不改，复制链接 / URL 去重照旧。
+pub(crate) fn normalize_magnet(url: &str) -> Cow<'_, str> {
+    let Some(query) = url
+        .get(..MAGNET_PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(MAGNET_PREFIX))
+        .and_then(|_| url.get(MAGNET_PREFIX.len()..))
+    else {
+        return Cow::Borrowed(url);
+    };
+    let mut changed = !url.starts_with(MAGNET_PREFIX);
+    let mut has_bt = false;
+    let mut parts: Vec<Cow<'_, str>> = Vec::new();
+    for part in query.split('&') {
+        let Some(value) = part
+            .split_once('=')
+            .filter(|(key, _)| key.eq_ignore_ascii_case("xt"))
+            .map(|(_, value)| value)
+        else {
+            parts.push(Cow::Borrowed(part));
+            continue;
+        };
+        match normalize_bt_xt(value) {
+            Some(normalized) => {
+                has_bt = true;
+                if normalized == part {
+                    parts.push(Cow::Borrowed(part));
+                } else {
+                    changed = true;
+                    parts.push(Cow::Owned(normalized));
+                }
+            }
+            None => changed = true,
+        }
+    }
+    if !has_bt || !changed {
+        return Cow::Borrowed(url);
+    }
+    Cow::Owned(format!("{MAGNET_PREFIX}{}", parts.join("&")))
+}
+
+/// 单个 `xt` 值（未解码）→ 规范化后的 `xt=…` 参数；非 BT 的 `xt` 返回 `None`。
+/// 哈希含非字母数字字符时保留原参数，交由 librqbit 给出原本的报错。
+fn normalize_bt_xt(raw: &str) -> Option<String> {
+    const BTIH: &str = "urn:btih:";
+    const BTMH_SHA256: &str = "urn:btmh:1220";
+    let decoded = url::form_urlencoded::parse(raw.as_bytes())
+        .next()
+        .map(|(value, _)| value.into_owned())
+        .unwrap_or_default();
+    let value = decoded.trim();
+    let has_prefix = |prefix: &str| {
+        value
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    let (scheme, hash) = if has_prefix(BTIH) {
+        ("btih", value.get(BTIH.len()..)?)
+    } else if has_prefix(BTMH_SHA256) {
+        // 保留 multihash 头 `1220`，只规范 `urn:btmh:` 前缀。
+        ("btmh", value.get("urn:btmh:".len()..)?)
+    } else {
+        return None;
+    };
+    if hash.is_empty() || !hash.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Some(format!("xt={raw}"));
+    }
+    let hash = if scheme == "btih" && hash.len() == 32 {
+        hash.to_ascii_uppercase()
+    } else {
+        hash.to_owned()
+    };
+    Some(format!("xt=urn:{scheme}:{hash}"))
+}
+
 impl From<BtMseMode> for librqbit::MseMode {
     fn from(value: BtMseMode) -> Self {
         match value {
@@ -512,10 +602,10 @@ pub struct SharedBtSession {
     completion_move_lock: Mutex<()>,
     /// Tracks completed torrents that are kept alive for seeding.
     seeding: Arc<SeedingManager>,
-    /// task_id → pause 世代号。pause / resume / delete 各自增一次；「延迟
-    /// 暂停」等待者触发前校验世代未变，防止用户已 resume 后仍把 torrent
-    /// 暂停回去。`Arc` 使等待者能脱离 `&self` 存活于 BT runtime 上。
-    pause_epochs: Arc<Mutex<HashMap<String, u64>>>,
+    /// task_id → pause 世代号。pause / resume / delete 各自增一次；句柄入册前
+    /// 登记的暂停意图（`pending_pauses`）补执行前校验世代未变，防止用户已
+    /// resume 后仍把 torrent 暂停回去。
+    pause_epochs: Mutex<HashMap<String, u64>>,
     /// 句柄入册前（磁力元数据解析 / add 进行中）收到的暂停意图：task_id →
     /// 登记时的 pause 世代号。add 闭包在句柄入册后校验世代并补执行暂停；
     /// resume / delete / 新一次 add 会作废它。
@@ -548,12 +638,18 @@ impl SharedBtSession {
     ///
     /// `bt_config` contains user-configurable BT settings (DHT, UPnP, ports,
     /// custom trackers).
+    ///
+    /// `peer_policy` is installed on the librqbit session (admission before
+    /// every connection, per-event upload verdicts); `None` keeps every peer
+    /// welcome. It cannot change after construction — behaviour changes go
+    /// through the policy object itself (see `bt_guard`).
     pub fn new(
         default_save_dir: &str,
         app_data_dir: &str,
         speed_limit_bps: u64,
         upload_limit_bps: u64,
         bt_config: &BtConfig,
+        peer_policy: Option<Arc<dyn PeerPolicy>>,
     ) -> Result<Self, DownloadError> {
         // BT 每个文件、每个 peer 常驻 FD；macOS GUI 启动的软限制仅 256，
         // 多文件种子或多任务会撞 EMFILE 并连带拖垮同进程的 SQLite/HTTP。
@@ -701,6 +797,7 @@ impl SharedBtSession {
             }),
             // 连接中与已连接共用此上限，见 `BT_PEER_LIMIT`。
             peer_limit: Some(BT_PEER_LIMIT),
+            peer_policy: peer_policy.clone(),
             ..Default::default()
         };
         let start_session = |dht: bool| -> anyhow::Result<Arc<Session>> {
@@ -872,7 +969,7 @@ impl SharedBtSession {
             torrent_ids: Mutex::new(HashMap::new()),
             completion_move_lock: Mutex::new(()),
             seeding: Arc::new(SeedingManager::new()),
-            pause_epochs: Arc::new(Mutex::new(HashMap::new())),
+            pause_epochs: Mutex::new(HashMap::new()),
             pending_pauses: Mutex::new(HashMap::new()),
             fastresume_tainted: Mutex::new(HashSet::new()),
             persistence_folder,
@@ -995,7 +1092,7 @@ impl SharedBtSession {
             .clone();
         match source {
             TorrentSource::Magnet(url) => {
-                AddTorrent::from_url(magnet_with_trackers(url, &trackers))
+                AddTorrent::from_url(magnet_with_trackers(&normalize_magnet(url), &trackers))
             }
             TorrentSource::TorrentFileBytes(bytes) => {
                 opts.trackers = Some(trackers);
@@ -1049,18 +1146,16 @@ impl SharedBtSession {
     /// Pause a BT torrent by task_id.  The handle stays cached so that
     /// `resume_task` can unpause it without re-adding.
     ///
-    /// librqbit 只能从 Live 态暂停；Initializing（初检中）时 `session.pause`
-    /// 返回错误。此时安排一个「延迟暂停」：等初检结束，若期间世代号未变
-    /// （没有新的 resume/pause/delete）再补执行暂停。否则暂停一个正在初检
-    /// 的任务会留下幽灵 torrent——UI 已显示暂停，librqbit 里却继续
-    /// 初检 → 转 Live → 后台持续下载。
+    /// 初检中（Initializing）暂停由 librqbit 记为暂停请求：初检中止，或初检
+    /// 已越过最后一个 piece 时校验完落 Paused（fork 补丁），不会转 Live 形成
+    /// 幽灵下载；恢复经 `unpause` 重新起检查。
     pub async fn pause_task(&self, task_id: &str) -> Result<(), DownloadError> {
         // Clone the Arc handle and release the lock immediately so that
         // the async session.pause() call doesn't block other handle ops.
         let handle = self.handles.lock().await.get(task_id).cloned();
         let epoch = self.bump_pause_epoch(task_id).await;
         if let Some(handle) = handle {
-            return self.pause_handle(task_id, handle, epoch).await;
+            return self.pause_handle(task_id, handle).await;
         }
         // 句柄尚未入册（磁力元数据解析 / add 进行中）：登记暂停意图，由 add
         // 闭包在句柄入册后补执行；否则该 add 会以运行态入会话形成幽灵下载。
@@ -1078,7 +1173,7 @@ impl SharedBtSession {
         if let Some(handle) = late
             && self.pending_pauses.lock().await.remove(task_id) == Some(epoch)
         {
-            return self.pause_handle(task_id, handle, epoch).await;
+            return self.pause_handle(task_id, handle).await;
         }
         Ok(())
     }
@@ -1094,7 +1189,7 @@ impl SharedBtSession {
         }
         let handle = self.handles.lock().await.get(task_id).cloned();
         if let Some(handle) = handle
-            && let Err(e) = self.pause_handle(task_id, handle, epoch).await
+            && let Err(e) = self.pause_handle(task_id, handle).await
         {
             log_info!(
                 "[BT] task={} pending pause failed after add: {e}",
@@ -1109,26 +1204,10 @@ impl SharedBtSession {
         self.pending_pauses.lock().await.remove(task_id);
     }
 
-    async fn pause_handle(
-        &self,
-        task_id: &str,
-        handle: BtHandle,
-        epoch: u64,
-    ) -> Result<(), DownloadError> {
+    async fn pause_handle(&self, task_id: &str, handle: BtHandle) -> Result<(), DownloadError> {
         if !handle.is_paused()
             && let Err(e) = self.session.pause(&handle).await
         {
-            if matches!(
-                handle.stats().state,
-                librqbit::TorrentStatsState::Initializing { .. }
-            ) {
-                log_info!(
-                    "[BT] task={} pause requested during init — deferring until check completes",
-                    short_id(task_id)
-                );
-                self.spawn_deferred_pause(task_id.to_string(), handle, epoch);
-                return Ok(());
-            }
             return Err(DownloadError::Other(format!("BT pause failed: {e:#}")));
         }
         log_info!("[BT] task={} paused via session API", short_id(task_id));
@@ -1141,41 +1220,6 @@ impl SharedBtSession {
         let e = map.entry(task_id.to_string()).or_insert(0);
         *e += 1;
         *e
-    }
-
-    /// 在 BT runtime 上等待初检结束后补执行暂停。触发前持世代锁校验：
-    /// 世代号已变（用户 resume / 再次 pause / 删除）则本次作废；锁跨越
-    /// `session.pause` 调用，与 `resume_task` 的世代自增互相串行，保证
-    /// 「等待者暂停」与「用户恢复」不会交错出与用户意图相反的终态。
-    fn spawn_deferred_pause(&self, task_id: String, handle: BtHandle, epoch: u64) {
-        let epochs = Arc::clone(&self.pause_epochs);
-        let session = self.session.clone();
-        self.runtime_handle.spawn(async move {
-            if let Err(error) = handle.wait_until_initialized().await {
-                // Initial checking failed; resume uses the Error → recheck path.
-                log_info!(
-                    "[BT] task={} deferred pause initial check failed: {error:#}",
-                    short_id(&task_id)
-                );
-                return;
-            }
-            let guard = epochs.lock().await;
-            if guard.get(&task_id).copied() != Some(epoch) {
-                return;
-            }
-            if !handle.is_paused() {
-                match session.pause(&handle).await {
-                    Ok(()) => log_info!(
-                        "[BT] task={} deferred pause applied after init",
-                        short_id(&task_id)
-                    ),
-                    Err(e) => log_info!(
-                        "[BT] task={} deferred pause failed: {e:#}",
-                        short_id(&task_id)
-                    ),
-                }
-            }
-        });
     }
 
     /// Resume a previously paused BT torrent.  Returns the handle if
@@ -1191,7 +1235,7 @@ impl SharedBtSession {
     pub async fn resume_task(&self, task_id: &str) -> Result<Option<BtHandle>, DownloadError> {
         // Clone the Arc handle and release the lock immediately.
         let handle = self.handles.lock().await.get(task_id).cloned();
-        // 作废在途的延迟暂停与元数据窗口内登记的暂停意图（无句柄时同样要作废）。
+        // 作废元数据窗口内登记的暂停意图（无句柄时同样要作废）。
         self.bump_pause_epoch(task_id).await;
         self.pending_pauses.lock().await.remove(task_id);
         if let Some(handle) = handle {
@@ -1216,7 +1260,7 @@ impl SharedBtSession {
         }
     }
 
-    /// 是否存在「已暂停（或初检中带延迟暂停）的未完成 torrent」。
+    /// 是否存在「已暂停（或初检中已请求暂停）的未完成 torrent」。
     ///
     /// download_manager 用它决定 BT 会话保活：拆会话连带丢句柄缓存，恢复
     /// 就得重走 add_torrent + fastresume 采样校验 + peer swarm 冷启动；保留
@@ -1543,6 +1587,9 @@ impl Drop for InflightGuard {
 
 impl Drop for SharedBtSession {
     fn drop(&mut self) {
+        // 会话级后台任务（防吸血的重连 / 云名单 / 订阅节拍）监听此信号；`shutdown`
+        // 之外的释放路径（测试、异常退出）同样要让它们停下。幂等。
+        self.closing.cancel();
         let Some(runtime) = self.runtime.take() else {
             return;
         };
@@ -4310,8 +4357,12 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
     // 交互式选择是 post-add 应用的,而 add 后 librqbit 立即按「全部文件」
     // 开始下载:用户浏览大种子文件列表的几分钟里,未选文件的数据白下
     // (带宽 + staging 磁盘)。Path B 弹框前把 torrent 暂停,选择应用后恢复。
-    // Initializing 窗口会拒绝 pause(仅 Live 可暂停),放到后台短退避重试,
-    // 不阻塞对话框弹出;始终失败则退回旧行为(边选边下)。
+    // 只暂停已转 Live 的种子:Initializing 期间 librqbit 接受 pause 但做法是
+    // 中止初检,种子停在 Initializing 且无检查在跑,随后 post-add 的
+    // `apply_only_files_after_init` 会永远等不到初检结束(部分选择 / 种子含
+    // padding 文件时必经此路,表现为「准备中」卡死、手动暂停再继续才恢复)。
+    // 故初检期间放到后台短退避重试,不阻塞对话框弹出;始终未转 Live 则退回
+    // 旧行为(边选边下)。
     // 状态机:0=尝试中, 1=已暂停, 2=结束(需恢复), 3=结束(保持暂停,用户取消)。
     const DIALOG_PAUSE_TRYING: u8 = 0;
     const DIALOG_PAUSE_PAUSED: u8 = 1;
@@ -4390,7 +4441,8 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     {
                         return;
                     }
-                    if session.pause(&handle).await.is_ok() {
+                    // 初检中不暂停(见上方状态机注释),等转 Live 后再试。
+                    if handle.live().is_some() && session.pause(&handle).await.is_ok() {
                         // 主流程已越过选择阶段(CAS 失败)则按其意图回滚/保留,
                         // 绝不把任务卡在意外的暂停态。
                         match state.compare_exchange(
@@ -5517,6 +5569,8 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 .await?
                 .map(|v| v != "0")
                 .unwrap_or(true);
+            // 新一轮下载完成：清掉上一轮手动恢复做种遗留的限制豁免，新完成的做种照常受限制约束。
+            db.set_task_seed_limits_exempt(&task_id, false).await?;
             // 完成阶段（重哈希/搬移可持续数分钟）内用户或队列要求暂停时，
             // 不能再登记为活动做种者：暂停不会被撤销，登记会让 UI 显示
             // 「做种中」而实际不上传。
@@ -5992,7 +6046,7 @@ mod tests {
             ..Default::default()
         };
 
-        let session = super::SharedBtSession::new(&work_string, &work_string, 0, 0, &config)
+        let session = super::SharedBtSession::new(&work_string, &work_string, 0, 0, &config, None)
             .expect("the free successor port must allow BT session creation");
         let listen_addr = session
             .session
@@ -6003,6 +6057,106 @@ mod tests {
         drop(session);
         drop(occupied);
         std::fs::remove_dir_all(work).expect("the BT session test directory must be removable");
+    }
+
+    /// 生产构造路径：策略对象经 `SharedBtSession::new` 装进 librqbit 会话——被封禁的地址在握手前
+    /// 就被拒绝（计入拦截数）、受限队列速率在挂接时下发、会话关停后宿主的会话任务随之结束。
+    #[test]
+    fn session_with_the_guard_policy_refuses_banned_peers_and_stops_with_the_session() {
+        use crate::bt_guard::{BtGuard, BtGuardConfig, BtGuardHost, FilterAction, NewEntry};
+        use std::io::Read as _;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let guard = Arc::new(BtGuard::new(BtGuardConfig {
+            skip_lan: false,
+            throttle_kib: 48,
+            ..BtGuardConfig::default()
+        }));
+        let host = runtime.block_on(async {
+            let db = crate::db::Db::connect("sqlite::memory:")
+                .await
+                .expect("memory db");
+            BtGuardHost::new(
+                Arc::clone(&guard),
+                db,
+                Arc::new(crate::NoopSink),
+                crate::proxy_config::ProxyConfig::default(),
+            )
+        });
+        guard
+            .add_entry(NewEntry {
+                cidr: "127.0.0.1/32".to_owned(),
+                action: FilterAction::Ban,
+                duration_secs: None,
+                reason: String::new(),
+            })
+            .expect("ban entry");
+
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("probe port")
+            .local_addr()
+            .expect("probe addr")
+            .port();
+        let work = unique_test_dir("guard_policy_session");
+        std::fs::create_dir_all(&work).expect("test directory");
+        let work_string = work.to_string_lossy().into_owned();
+        let config = super::BtConfig {
+            enable_dht: false,
+            enable_upnp: false,
+            port_start: port,
+            port_end: port,
+            ..Default::default()
+        };
+        let session = Arc::new(
+            super::SharedBtSession::new(
+                &work_string,
+                &work_string,
+                0,
+                0,
+                &config,
+                Some(host.policy()),
+            )
+            .expect("BT session with a policy"),
+        );
+        let bound = session
+            .session()
+            .listen_addr()
+            .expect("listener address")
+            .port();
+        runtime.block_on(async { host.attach(&session.session(), session.closing_token()) });
+        assert!(host.session_active());
+        assert_eq!(
+            session
+                .session()
+                .throttled_upload_bps()
+                .map(std::num::NonZeroU32::get),
+            Some(48 * 1024)
+        );
+
+        // 被封禁的回环地址：连接被接受后立即丢弃（读到 EOF / 复位），不会进入握手。
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", bound)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        assert!(matches!(stream.read(&mut buf), Ok(0) | Err(_)));
+        assert_eq!(guard.stats().blocked_connections, 1);
+
+        session.shutdown();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while host.session_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the guard session task must stop with the session"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        runtime.block_on(host.shutdown());
+        drop(session);
+        drop(runtime);
+        std::fs::remove_dir_all(work).expect("remove test directory");
     }
 
     // -------------------------------------------------------------------------
@@ -6081,7 +6235,7 @@ mod tests {
             port_end: port.max(1024).saturating_add(8),
             ..Default::default()
         };
-        let session = super::SharedBtSession::new(&work_string, &work_string, 0, 0, &config)
+        let session = super::SharedBtSession::new(&work_string, &work_string, 0, 0, &config, None)
             .expect("BT session");
         session.runtime_handle.block_on(async {
             assert!(session.pause_task("t1").await.is_ok());
@@ -6143,6 +6297,8 @@ mod tests {
             pause_on_choice: bool,
             indices: Vec<i32>,
             observed_handle: Mutex<Option<BtHandle>>,
+            /// 模拟用户浏览文件列表的时长：给对话框的后台暂停留出尝试窗口。
+            answer_delay: Duration,
         }
 
         #[async_trait::async_trait]
@@ -6171,6 +6327,7 @@ mod tests {
                 // pauses initial checking; waiting for initialization here
                 // would make the selector wait for its own answer to resume it.
                 *self.observed_handle.lock().await = Some(handle);
+                tokio::time::sleep(self.answer_delay).await;
                 if self.pause_on_choice {
                     self.cancelled.store(true, Ordering::SeqCst);
                 }
@@ -6245,18 +6402,23 @@ mod tests {
                 torrent_ids: Mutex::new(HashMap::new()),
                 completion_move_lock: Mutex::new(()),
                 seeding: Arc::new(SeedingManager::new()),
-                pause_epochs: Arc::new(Mutex::new(HashMap::new())),
+                pause_epochs: Mutex::new(HashMap::new()),
                 pending_pauses: Mutex::new(HashMap::new()),
                 fastresume_tainted: Mutex::new(HashSet::new()),
                 persistence_folder,
             })
         }
 
-        async fn local_torrent(root: &Path, name: &str, file_count: usize) -> Bytes {
+        async fn local_torrent(
+            root: &Path,
+            name: &str,
+            file_count: usize,
+            file_len: usize,
+        ) -> Bytes {
             let content = root.join(name);
             std::fs::create_dir_all(&content).expect("torrent content directory");
             for index in 0..file_count {
-                let payload: Vec<u8> = (0..16_384)
+                let payload: Vec<u8> = (0..file_len)
                     .map(|offset| {
                         (offset as u8)
                             .wrapping_mul(31)
@@ -6350,7 +6512,7 @@ mod tests {
 
                 // An independent incomplete, paused torrent keeps the same
                 // shared session alive across the rejected choice and resume.
-                let companion_torrent = local_torrent(&root, "companion", 1).await;
+                let companion_torrent = local_torrent(&root, "companion", 1, 16_384).await;
                 let companion_dir = root.join("companion-stage");
                 std::fs::create_dir_all(&companion_dir).expect("companion staging");
                 let mut companion_opts = build_add_torrent_options(
@@ -6382,7 +6544,7 @@ mod tests {
                     .register_torrent_id(companion.id(), "companion-task")
                     .await;
 
-                let torrent = local_torrent(&root, "selection", 2).await;
+                let torrent = local_torrent(&root, "selection", 2, 16_384).await;
                 let stage = bt_stage_dir(&save_dir.to_string_lossy(), "selection-task");
                 std::fs::create_dir_all(&stage).expect("selection staging");
                 let metadata = probe_torrent_meta("fixture".to_string(), torrent.to_vec());
@@ -6408,6 +6570,7 @@ mod tests {
                     } else {
                         vec![0]
                     },
+                    answer_delay: Duration::ZERO,
                     observed_handle: Mutex::new(None),
                 });
                 let (params, _progress_rx) = inner_params(
@@ -6496,6 +6659,103 @@ mod tests {
         #[test]
         fn bt_selection_user_cancel_stays_cancelled_with_live_session() {
             exercise_dialog_exit(DialogExit::Cancel);
+        }
+
+        // 新建任务的部分选择（或带 padding 文件种子上的「全选」）走 post-add 应用：
+        // 对话框期间的后台暂停若落在初检里，会中止初检并让应用选择永远等不到
+        // 初检结束——任务卡在「准备中」，只有手动暂停再继续才恢复。
+        #[test]
+        fn bt_dialog_partial_selection_reaches_downloading() {
+            let root = super::unique_test_dir("dialog_partial_selection");
+            let save_dir = root.join("save");
+            std::fs::create_dir_all(&save_dir).expect("fixture save directory");
+            let shared_bt = local_session(&root);
+            shared_bt.runtime_handle.block_on(async {
+                let db = Db::open(&root).await.expect("fixture DB");
+                db.insert_task(
+                    "selection-task",
+                    "bt://local-fixture",
+                    "selection",
+                    &save_dir.to_string_lossy(),
+                    STATUS_DOWNLOADING,
+                    0,
+                    "",
+                    "",
+                    "",
+                    0,
+                )
+                .await
+                .expect("insert BT task");
+                // 初检要真实读盘哈希一段时间（staging 已有等长但不匹配的数据），
+                // 对话框的后台暂停才会落在初检窗口内，与生产时序一致。
+                const FILE_LEN: usize = 16 * 1024 * 1024;
+                let torrent = local_torrent(&root, "selection", 2, FILE_LEN).await;
+                let stage = bt_stage_dir(&save_dir.to_string_lossy(), "selection-task");
+                for file in probe_torrent_meta("fixture".to_string(), torrent.to_vec()).files {
+                    let staged = stage.join(&file.path);
+                    std::fs::create_dir_all(staged.parent().expect("staged parent"))
+                        .expect("staged directories");
+                    std::fs::write(&staged, vec![0x55; FILE_LEN]).expect("stale staged data");
+                }
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let selector = Arc::new(DialogChoice {
+                    shared_bt: shared_bt.clone(),
+                    cancelled: cancelled.clone(),
+                    pause_on_choice: false,
+                    indices: vec![0],
+                    observed_handle: Mutex::new(None),
+                    answer_delay: Duration::from_millis(300),
+                });
+                let (params, mut progress_rx) = inner_params(
+                    &shared_bt,
+                    &db,
+                    &save_dir,
+                    &torrent,
+                    &cancelled,
+                    selector.clone(),
+                );
+                let download = tokio::spawn(bt_download_inner(params));
+                let reached = tokio::time::timeout(Duration::from_secs(10), async {
+                    while let Some(update) = progress_rx.recv().await {
+                        if update.status == STATUS_DOWNLOADING {
+                            return true;
+                        }
+                    }
+                    false
+                })
+                .await;
+                cancelled.store(true, Ordering::SeqCst);
+                // 继续排空进度通道，避免下载循环阻塞在已满的 channel 上。
+                let drain =
+                    tokio::spawn(async move { while progress_rx.recv().await.is_some() {} });
+                let result = tokio::time::timeout(Duration::from_secs(10), download)
+                    .await
+                    .expect("download loop must exit after cancel")
+                    .expect("download task panicked");
+                drain.abort();
+                assert_eq!(
+                    reached,
+                    Ok(true),
+                    "partial dialog selection never reached downloading"
+                );
+                assert!(
+                    matches!(result, Err(DownloadError::Cancelled)),
+                    "{result:?}"
+                );
+                let handle = selector
+                    .observed_handle
+                    .lock()
+                    .await
+                    .clone()
+                    .expect("observed handle");
+                assert_eq!(handle.only_files(), Some(vec![0]));
+                shared_bt
+                    .delete_task("selection-task", false)
+                    .await
+                    .expect("cleanup task");
+            });
+            drop(shared_bt);
+            std::fs::remove_dir_all(root).expect("remove BT selection fixture");
         }
     }
 
@@ -7494,6 +7754,84 @@ mod tests {
         );
         let bad = super::TorrentSource::Magnet("magnet:?dn=nohash".to_string());
         assert_eq!(bad.info_hash_hex(), None);
+    }
+
+    const NORM_HASH: &str = "d5146f69f1bb6b9d95c8270769ebca7f82c2936a";
+
+    fn parsed_hash(url: &str) -> Option<String> {
+        librqbit::Magnet::parse(&super::normalize_magnet(url))
+            .ok()?
+            .as_id20()
+            .map(|id| id.as_string())
+    }
+
+    /// 已规范的磁力（含混合 v1/v2、tracker、大写 hex）不得被改写：逐字节原样借出。
+    #[test]
+    fn normalize_magnet_keeps_canonical_links_untouched() {
+        for url in [
+            "magnet:?xt=urn:btih:d5146f69f1bb6b9d95c8270769ebca7f82c2936a&dn=a%20b&tr=udp%3A%2F%2Ft%3A1",
+            "magnet:?xt=urn:btih:D5146F69F1BB6B9D95C8270769EBCA7F82C2936A",
+            "magnet:?xt=urn:btih:d5146f69f1bb6b9d95c8270769ebca7f82c2936a&xt=urn:btmh:1220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "https://example.com/a?xt=urn:sha1:abc",
+            "magnet:?dn=nohash",
+        ] {
+            assert!(
+                matches!(super::normalize_magnet(url), std::borrow::Cow::Borrowed(same) if same == url),
+                "{url}"
+            );
+        }
+    }
+
+    /// 没有任何 BT `xt` 的磁力原样交给 librqbit（行为与规范化前一致）。
+    #[test]
+    fn normalize_magnet_without_bt_hash_is_unchanged() {
+        let url = "magnet:?xt=urn:ed2k:31d6cfe0d16ae931b73c59d7e0c089c0&dn=x";
+        assert_eq!(super::normalize_magnet(url), url);
+        assert_eq!(parsed_hash(url), None);
+    }
+
+    /// 多协议磁力（BT 与 ed2k / sha1 / aich 等并列，任意顺序）去掉非 BT `xt` 后可解析，
+    /// 其余参数原样保留。
+    #[test]
+    fn normalize_magnet_drops_foreign_exact_topics() {
+        let before = format!(
+            "magnet:?xt=urn:sha1:3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ&xt=urn:btih:{NORM_HASH}&dn=sample&tr=udp%3A%2F%2Ft%3A1"
+        );
+        let after = format!(
+            "magnet:?xt=urn:btih:{NORM_HASH}&xt=urn:ed2k:31d6cfe0d16ae931b73c59d7e0c089c0&xt=urn:aich:abc&xt=urn:btmh:1114abcd"
+        );
+        assert_eq!(
+            super::normalize_magnet(&before),
+            format!("magnet:?xt=urn:btih:{NORM_HASH}&dn=sample&tr=udp%3A%2F%2Ft%3A1")
+        );
+        for url in [&before, &after] {
+            assert!(
+                librqbit::Magnet::parse(url).is_err(),
+                "librqbit rejects raw {url}"
+            );
+            assert_eq!(parsed_hash(url).as_deref(), Some(NORM_HASH), "{url}");
+        }
+        let parsed = librqbit::Magnet::parse(&super::normalize_magnet(&before)).expect("parse");
+        assert_eq!(parsed.name.as_deref(), Some("sample"));
+        assert_eq!(parsed.trackers, ["udp://t:1"]);
+    }
+
+    /// 大写前缀 / 键 / 协议头、小写 base32、百分号编码的 `xt` 都规范到 librqbit 可解析。
+    #[test]
+    fn normalize_magnet_fixes_case_and_encoding() {
+        for url in [
+            format!("magnet:?xt=urn:BTIH:{NORM_HASH}"),
+            format!("magnet:?XT=URN:BTIH:{NORM_HASH}&dn=x"),
+            format!("MAGNET:?xt=urn:btih:{NORM_HASH}"),
+            format!("magnet:?xt=urn%3Abtih%3A{NORM_HASH}"),
+            "magnet:?xt=urn:btih:2ukg62prxnvz3foie4dwt26kp6bmfe3k".to_owned(),
+        ] {
+            assert_eq!(parsed_hash(&url).as_deref(), Some(NORM_HASH), "{url}");
+        }
+        let source = super::TorrentSource::Magnet(format!(
+            "magnet:?xt=urn:ed2k:31d6cfe0d16ae931b73c59d7e0c089c0&xt=urn:BTIH:{NORM_HASH}"
+        ));
+        assert_eq!(source.info_hash_hex().as_deref(), Some(NORM_HASH));
     }
 
     // -------------------------------------------------------------------------

@@ -6,10 +6,34 @@ plugins {
 }
 
 /**
- * 文案单一事实源 = 仓库根 `assets/i18n/{en,zh,zh-TW}.json`（App / GPUI / Web 共用，AGENTS.md §5）。
- * 构建期生成英文默认、简体中文与繁体中文资源；Hant script 覆盖 TW / HK / MO，不按地域复制翻译。
+ * 文案单一事实源 = 仓库根 `assets/i18n/<语言>.json`（App / GPUI / Web 共用，AGENTS.md §5）。
+ * 构建期为目录下每个语言文件生成资源：en → 默认 `values`；繁中（zh-TW / zh-HK / zh-MO / zh-Hant*）→ `b+zh+Hant`
+ * （Hant script 覆盖 TW / HK / MO，不按地域复制翻译）；其余按 BCP 47 生成（tr → `values-tr`，pt-BR → `values-b+pt+BR`）。
+ * 新增语言只需新增 JSON，`localeFilters` 同样自动跟随。非默认语言的空值不写出，由 Android 资源回退到英文。
  * 占位符 `{name}` 原样保留，由 `:app` 的 `fill()` 运行期替换。禁止在 res/ 里手写同名文案。
  */
+/** assets/i18n 语言代码（JSON 文件名）↔ Android 资源限定符，资源生成与 localeFilters 共用。 */
+object I18nLocales {
+    /** 英文为默认资源返回 null。 */
+    fun qualifier(code: String): String? {
+        val parts = code.split('-', '_')
+        val lang = parts[0].lowercase()
+        val rest = parts.drop(1)
+        return when {
+            lang == "en" && rest.isEmpty() -> null
+            lang == "zh" && rest.firstOrNull()?.lowercase() in setOf("tw", "hk", "mo", "hant") -> "b+zh+Hant"
+            rest.isEmpty() -> lang
+            else -> (listOf("b", lang) + rest).joinToString("+")
+        }
+    }
+
+    /** `localeFilters` / localeConfig 用的语言标识。 */
+    fun localeFilter(code: String): String = qualifier(code) ?: "en"
+
+    fun locales(dir: File): List<String> =
+        dir.listFiles { f -> f.isFile && f.name.endsWith(".json") }.orEmpty().map { it.nameWithoutExtension }.sorted()
+}
+
 abstract class GenerateI18nResources : DefaultTask() {
     @get:InputDirectory
     @get:PathSensitive(PathSensitivity.RELATIVE)
@@ -22,14 +46,15 @@ abstract class GenerateI18nResources : DefaultTask() {
     fun generate() {
         val out = outputDir.get().asFile
         out.deleteRecursively()
-        mapOf("en" to "values", "zh" to "values-zh", "zh-TW" to "values-b+zh+Hant").forEach { (lang, dir) ->
+        for (lang in I18nLocales.locales(i18nDir.get().asFile)) {
+            val dir = I18nLocales.qualifier(lang)?.let { "values-$it" } ?: "values"
             val src = i18nDir.file("$lang.json").get().asFile
             @Suppress("UNCHECKED_CAST")
             val map = JsonSlurper().parse(src) as Map<String, Any?>
             val xml = buildString {
                 append("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n")
                 for ((k, v) in map) {
-                    if (v !is String) continue
+                    if (v !is String || (dir != "values" && v.isEmpty())) continue
                     append("    <string name=\"").append(k).append("\" formatted=\"false\">")
                         .append(escape(v)).append("</string>\n")
                 }
@@ -122,6 +147,9 @@ val releaseSigning: Map<String, String>? = run {
     }
 }
 
+// 系统“应用语言”列表随 assets/i18n/*.json 自动生成（与 GenerateI18nResources 同一映射）。
+val i18nLocaleFilters = I18nLocales.locales(rootProject.file("../../assets/i18n")).map(I18nLocales::localeFilter)
+
 android {
     namespace = "com.fluxdown.app"
     compileSdk {
@@ -181,8 +209,8 @@ android {
         compose = true
     }
     androidResources {
-        // 生成 localeConfig 供系统“应用语言”设置列出；Android 按 script 匹配繁中（TW / HK / MO）。
-        localeFilters += listOf("en", "zh", "b+zh+Hant")
+        // 生成 localeConfig 供系统“应用语言”设置列出，语言列表随 assets/i18n/*.json 自动生成。
+        localeFilters += i18nLocaleFilters
         generateLocaleConfig = true
     }
 }

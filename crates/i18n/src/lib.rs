@@ -426,4 +426,75 @@ mod tests {
         assert_eq!(english, chinese);
         Ok(())
     }
+
+    /// `{name}` / `{task.fileName}` 形式的占位符（JSON 示例等含引号空格的花括号不算）。
+    fn placeholders(value: &str) -> BTreeSet<&str> {
+        let mut found = BTreeSet::new();
+        let mut rest = value;
+        while let Some(start) = rest.find('{') {
+            let Some(after) = rest.get(start + 1..) else {
+                break;
+            };
+            let Some(end) = after.find('}') else {
+                break;
+            };
+            let name = after.get(..end).unwrap_or_default();
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            {
+                found.insert(name);
+            }
+            rest = after;
+        }
+        found
+    }
+
+    /// 非基线语言（翻译自动化 / 人工维护）不能引入调用方不传的占位符（会原样显示 `{x}`），
+    /// 也不能丢掉 en 与 zh 都保留的占位符（会丢信息）。
+    #[test]
+    fn translated_locales_keep_baseline_placeholders() -> Result<(), I18nError> {
+        let catalog = I18nCatalog::load_embedded()?;
+        let (english, chinese) = (catalog.tables.get("en"), catalog.tables.get("zh"));
+        assert!(
+            english.is_some() && chinese.is_some(),
+            "baseline locales must be bundled"
+        );
+        let (Some(english), Some(chinese)) = (english, chinese) else {
+            return Ok(());
+        };
+        let mut violations = Vec::new();
+        for (locale, table) in &catalog.tables {
+            if locale == "en" || locale == "zh" {
+                continue;
+            }
+            for (key, value) in table {
+                let Some(en_value) = english.get(key) else {
+                    continue;
+                };
+                let en_names = placeholders(en_value);
+                let zh_names = chinese
+                    .get(key)
+                    .map(|v| placeholders(v))
+                    .unwrap_or_default();
+                let names = placeholders(value);
+                let unknown: Vec<_> = names
+                    .iter()
+                    .filter(|n| !en_names.contains(*n) && !zh_names.contains(*n))
+                    .collect();
+                let dropped: Vec<_> = en_names
+                    .intersection(&zh_names)
+                    .filter(|n| !names.contains(*n))
+                    .collect();
+                if !unknown.is_empty() || !dropped.is_empty() {
+                    violations.push(format!(
+                        "{locale}.{key}: unknown {unknown:?}, dropped {dropped:?}"
+                    ));
+                }
+            }
+        }
+        assert!(violations.is_empty(), "{violations:#?}");
+        Ok(())
+    }
 }

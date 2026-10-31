@@ -614,6 +614,8 @@ pub struct CategoryDto {
     pub extensions: Vec<String>,
     /// 非空 = 正则模式（`matchMode = regex`）。
     pub regex_pattern: String,
+    /// 非空 = 网址模式（`matchMode = url`）的通配符模式。
+    pub url_pattern: String,
     pub position: i32,
     pub visible: bool,
     /// all / video / audio / document / image / program / archive / other；自定义为 `None`。
@@ -630,6 +632,11 @@ impl From<&proto::CustomCategoryDto> for CategoryDto {
             extensions: category.extensions.clone(),
             regex_pattern: if regex_mode {
                 category.regex_pattern.clone()
+            } else {
+                String::new()
+            },
+            url_pattern: if category.match_mode == "url" {
+                category.url_pattern.clone()
             } else {
                 String::new()
             },

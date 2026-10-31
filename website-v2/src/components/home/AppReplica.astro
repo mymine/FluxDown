@@ -214,8 +214,18 @@ const iconProps = { size: 14, strokeWidth: 1.75 };
 </div>
 
 <script>
-  import { mountAppDemo } from "./app-demo";
-  document.querySelectorAll<HTMLElement>("[data-app]:not([data-external])").forEach((el) => mountAppDemo(el));
+  import { fitApp } from "./app-fit";
+  import { whenIdle } from "../../scripts/idle";
+
+  // 缩放决定首屏布局,同步执行;演示动画延后到首屏绘制后的空闲时段再加载
+  const roots = [...document.querySelectorAll<HTMLElement>("[data-app]:not([data-external])")];
+  roots.forEach(fitApp);
+  if (roots.length) {
+    whenIdle(async () => {
+      const { mountAppDemo } = await import("./app-demo");
+      roots.forEach((el) => mountAppDemo(el));
+    });
+  }
 </script>
 
 <style is:global>

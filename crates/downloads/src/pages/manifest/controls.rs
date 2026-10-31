@@ -1,4 +1,6 @@
-use fluxdown_ui_components::{ControlExt as _, FluxIcon, IconControlExt as _, field_hint};
+use fluxdown_ui_components::{
+    BusyExt as _, ControlExt as _, FluxIcon, IconControlExt as _, field_hint,
+};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     Anchor, App, ClickEvent, Context, Div, ParentElement, SharedString, Styled, Window, div,
@@ -288,6 +290,7 @@ impl ManifestView {
                         Button::new("manifest-later-main")
                             .control(cx)
                             .label(self.t("downloadLater", cx))
+                            .busy(self.submitting && self.submitting_paused)
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.submit(true, None, window, cx)
                             })),
@@ -313,6 +316,7 @@ impl ManifestView {
                                 &[("count", &count.to_string())],
                                 cx,
                             ))
+                            .busy(self.submitting && !self.submitting_paused)
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.submit(false, None, window, cx)
                             })),

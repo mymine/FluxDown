@@ -14,6 +14,8 @@ import { browser } from "wxt/browser";
 import { t } from "@/utils/i18n";
 import type { BrowserDownloadNotice } from "./protocol";
 import { getCachedSettings } from "./settings-cache";
+import { logWarn } from "@/utils/error-log";
+import { hasDownloadsApi } from "@/utils/platform";
 
 const NOTIFICATION_PREFIX = "fluxdown-browser-download-";
 
@@ -30,8 +32,9 @@ interface Tracked {
 
 const tracked = new Map<number, Tracked>();
 
-/** 当前浏览器是否支持（因而会被本扩展）隐藏下载 UI；Firefox 没有这些 API。 */
+/** 当前浏览器是否支持（因而会被本扩展）隐藏下载 UI；Firefox（含没有 downloads API 的 Android 版）没有这些 API。 */
 function canHideDownloadUi(): boolean {
+  if (!hasDownloadsApi()) return false;
   const downloads = browser.downloads as unknown as Record<string, unknown>;
   return typeof downloads.setShelfEnabled === "function" || typeof downloads.setUiOptions === "function";
 }
@@ -97,7 +100,7 @@ function scheduleStart(downloadId: number): void {
   if (!entry || entry.channel || entry.startTimer) return;
   entry.startTimer = setTimeout(() => {
     entry.startTimer = undefined;
-    confirmStarted(downloadId).catch((e) => console.warn("[FluxDown] browser download start notice failed:", e));
+    confirmStarted(downloadId).catch((e) => logWarn("[FluxDown] browser download start notice failed:", e));
   }, START_CONFIRM_MS);
 }
 
@@ -153,12 +156,12 @@ export function installBrowserDownloadNotices(): void {
         entry.tabId = tabId;
         if (item.filename && item.state === "in_progress") scheduleStart(item.id);
       })
-      .catch((e) => console.warn("[FluxDown] active tab lookup failed:", e));
+      .catch((e) => logWarn("[FluxDown] active tab lookup failed:", e));
   });
   browser.downloads.onChanged.addListener((delta) => {
     const state = delta.state?.current;
     if (state === "complete" || state === "interrupted") {
-      onFinished(delta.id, state).catch((e) => console.warn("[FluxDown] browser download notice failed:", e));
+      onFinished(delta.id, state).catch((e) => logWarn("[FluxDown] browser download notice failed:", e));
       return;
     }
     if (delta.filename?.current) scheduleStart(delta.id);
@@ -170,11 +173,11 @@ export function installBrowserDownloadNotices(): void {
       try {
         browser.downloads.show(downloadId);
       } catch (e) {
-        console.warn("[FluxDown] downloads.show failed:", e);
+        logWarn("[FluxDown] downloads.show failed:", e);
       }
     }
     Promise.resolve(browser.notifications.clear(notificationId)).catch((e) => {
-      console.warn("[FluxDown] notifications.clear failed:", e);
+      logWarn("[FluxDown] notifications.clear failed:", e);
     });
   });
 }

@@ -257,12 +257,6 @@ impl TableSync {
         &self.epoch
     }
 
-    /// 已载入行数（任务 + 队列位置），供加载态显示进度。
-    #[must_use]
-    pub fn loaded_rows(&self) -> usize {
-        self.tasks.rows.len() + self.queue.rows.len()
-    }
-
     /// 下一个要发的页请求；全部载入完毕返回 `None`。任务表先于队列位置表。
     #[must_use]
     pub fn next_request(&mut self) -> Option<TablePageParams> {

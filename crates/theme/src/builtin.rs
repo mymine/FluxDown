@@ -9,7 +9,7 @@ use gpui_base::{
 use gpui_component::ThemeMode;
 
 use crate::runtime::semantic_slot;
-use crate::{BuiltinThemeId, DefaultExpr, TOKENS, TokenValue};
+use crate::{BuiltinThemeId, DefaultExpr, ShadowValue, TOKENS, TokenValue};
 
 /// 字体哨兵：平台默认等宽字体（macOS Menlo / Windows Consolas / Linux DejaVu Sans Mono），
 /// 运行时替换为实际字体名；网页预览可直接当 CSS 通用族名使用。
@@ -33,16 +33,22 @@ pub enum BuiltinBase {
     MidnightBlue,
     Nord,
     WarmLight,
+    /// 石墨：近黑三层中性色 + 单一信号蓝，2/4px 方角、1px 焦点线的高密度控制台风格。
+    Graphite,
+    /// 石墨亮色：与 `Graphite` 同一层级模型与形状的纸面版本。
+    GraphiteLight,
 }
 
 impl BuiltinBase {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Default,
         Self::DefaultDark,
         Self::DefaultLight,
         Self::MidnightBlue,
         Self::Nord,
         Self::WarmLight,
+        Self::Graphite,
+        Self::GraphiteLight,
     ];
 
     /// 文件中的 `extends` 取值。
@@ -55,6 +61,8 @@ impl BuiltinBase {
             Self::MidnightBlue => "builtin:midnight-blue",
             Self::Nord => "builtin:nord",
             Self::WarmLight => "builtin:warm-light",
+            Self::Graphite => "builtin:graphite",
+            Self::GraphiteLight => "builtin:graphite-light",
         }
     }
 
@@ -75,6 +83,8 @@ impl BuiltinBase {
             Self::MidnightBlue => Some(BuiltinThemeId::MidnightBlue),
             Self::Nord => Some(BuiltinThemeId::Nord),
             Self::WarmLight => Some(BuiltinThemeId::WarmLight),
+            Self::Graphite => Some(BuiltinThemeId::Graphite),
+            Self::GraphiteLight => Some(BuiltinThemeId::GraphiteLight),
         }
     }
 
@@ -96,11 +106,14 @@ impl From<BuiltinThemeId> for BuiltinBase {
             BuiltinThemeId::MidnightBlue => Self::MidnightBlue,
             BuiltinThemeId::Nord => Self::Nord,
             BuiltinThemeId::WarmLight => Self::WarmLight,
+            BuiltinThemeId::Graphite => Self::Graphite,
+            BuiltinThemeId::GraphiteLight => Self::GraphiteLight,
         }
     }
 }
 
-/// 基底在某模式下全部 Base token 的值（注册表顺序）。
+/// 基底在某模式下的全部 token 值（注册表顺序）：Base token 来自调色板，
+/// 另含预设对非 Base token 的固定取值（[`preset_overrides`]）。
 ///
 /// `accent` 为用户强调色，用于重算
 /// `primary` / `accent` / `ring` 系列；文件中显式给出的值仍优先于基底。
@@ -109,18 +122,136 @@ pub(crate) fn base_values(
     mode: ThemeMode,
     accent: Option<Hsla>,
 ) -> Vec<(&'static str, TokenValue)> {
-    let mut colors = color_tokens(palette(base.preset_for(mode)));
+    let preset = base.preset_for(mode);
+    let mut colors = color_tokens(palette(preset));
     if let Some(accent) = accent {
         apply_accent(&mut colors, accent);
     }
     let mut tokens = semantic_tokens(colors);
+    let overrides = preset_overrides(preset);
     TOKENS
         .iter()
-        .filter(|spec| spec.default == DefaultExpr::Base)
         .filter_map(|spec| {
+            if let Some((_, value)) = overrides.iter().find(|(path, _)| *path == spec.path) {
+                return Some((spec.path, value.clone()));
+            }
+            if spec.default != DefaultExpr::Base {
+                return None;
+            }
             semantic_slot(&mut tokens, spec.path).map(|slot| (spec.path, slot.get()))
         })
         .collect()
+}
+
+/// 预设在调色板之外固定的 token（形状、密度、排版、阴影与扩展色）。
+///
+/// 只用于「整套设计语言」类预设；不得包含 [`ACCENT_TOKEN_PATHS`]（会钉死用户强调色）
+/// 与 `kitBound` token（只跟随 `radius.md/lg`）。主题文件中的显式值仍优先。
+fn preset_overrides(id: BuiltinThemeId) -> Vec<(&'static str, TokenValue)> {
+    match id {
+        BuiltinThemeId::DefaultDark
+        | BuiltinThemeId::DefaultLight
+        | BuiltinThemeId::MidnightBlue
+        | BuiltinThemeId::Nord
+        | BuiltinThemeId::WarmLight => Vec::new(),
+        BuiltinThemeId::Graphite => graphite_overrides(&GraphiteChrome {
+            success: 0x25E192,
+            warning: 0xFFCC56,
+            info: 0x23C4F8,
+            text_tertiary: 0x747B8B,
+            hairline: 0x16181D,
+            row_hover: 0xECEE_F20A,
+            chrome: 0x121317,
+            nav_hover: 0x16181D,
+            nav_selected: 0x1D2027,
+            shadow_alpha: [0x1A, 0x33, 0x66],
+        }),
+        BuiltinThemeId::GraphiteLight => graphite_overrides(&GraphiteChrome {
+            success: 0x1EB475,
+            warning: 0xD99A00,
+            info: 0x0EA5D9,
+            text_tertiary: 0x80828D,
+            hairline: 0xEFF0F3,
+            row_hover: 0x1E1F_240A,
+            chrome: 0xF9F9FB,
+            nav_hover: 0xEFF0F3,
+            nav_selected: 0xE7E8EC,
+            shadow_alpha: [0x1A, 0x14, 0x29],
+        }),
+    }
+}
+
+/// 石墨亮暗两套共用的形状 / 密度，只有扩展色与浮层阴影浓度随外观变化。
+struct GraphiteChrome {
+    success: u32,
+    warning: u32,
+    info: u32,
+    text_tertiary: u32,
+    hairline: u32,
+    /// RGBA。
+    row_hover: u32,
+    chrome: u32,
+    nav_hover: u32,
+    nav_selected: u32,
+    /// `shadow.{sm,md,lg}` 的黑色 alpha。
+    shadow_alpha: [u32; 3],
+}
+
+fn graphite_overrides(chrome: &GraphiteChrome) -> Vec<(&'static str, TokenValue)> {
+    let number = TokenValue::Number;
+    let solid = |value: u32| TokenValue::Color(color(value));
+    // (x, y, blur, spread, alpha)
+    let shadow = |layers: &[(f32, f32, f32, f32, u32)]| {
+        TokenValue::Shadow(
+            layers
+                .iter()
+                .map(|&(x, y, blur, spread, alpha)| ShadowValue {
+                    x,
+                    y,
+                    blur,
+                    spread,
+                    color: Hsla::from(gpui::rgba(alpha)),
+                    inset: false,
+                })
+                .collect(),
+        )
+    };
+    let [sm, md, lg] = chrome.shadow_alpha;
+    vec![
+        ("colors.success", solid(chrome.success)),
+        ("colors.warning", solid(chrome.warning)),
+        ("colors.info", solid(chrome.info)),
+        ("colors.textTertiary", solid(chrome.text_tertiary)),
+        ("colors.hairline", solid(chrome.hairline)),
+        (
+            "colors.rowHover",
+            TokenValue::Color(Hsla::from(gpui::rgba(chrome.row_hover))),
+        ),
+        ("colors.chrome", solid(chrome.chrome)),
+        ("colors.navHover", solid(chrome.nav_hover)),
+        ("colors.navSelected", solid(chrome.nav_selected)),
+        ("radius.sm", number(2.)),
+        ("radius.md", number(2.)),
+        ("radius.lg", number(4.)),
+        ("radius.xl", number(6.)),
+        ("typography.title.size", number(14.)),
+        ("typography.title.weight", number(500.)),
+        // 常驻面无阴影；只有浮层（菜单 / 对话框 / 浮动面板）轻微抬起。
+        (
+            "shadow.sm",
+            shadow(&[(0., 4., 6., -1., sm), (0., 2., 4., -2., sm)]),
+        ),
+        ("shadow.md", shadow(&[(0., 4., 12., 0., md)])),
+        ("shadow.lg", shadow(&[(0., 8., 24., 0., lg)])),
+        ("focusRing.width", number(1.)),
+        ("focusRing.offset", number(1.)),
+        ("density.control", number(32.)),
+        ("density.navRow", number(32.)),
+        ("components.navItem.radius", number(3.)),
+        ("components.checkbox.radius", number(2.)),
+        ("components.tab.radius", number(4.)),
+        ("components.progress.radius", number(2.)),
+    ]
 }
 
 fn semantic_tokens(colors: ColorTokens) -> SemanticThemeTokens {
@@ -227,6 +358,30 @@ fn palette(id: BuiltinThemeId) -> &'static Palette {
             text_secondary: 0x78716C,
             border: 0xE7E5E4,
             status_error: 0xDC2626,
+        },
+        BuiltinThemeId::Graphite => &Palette {
+            accent: 0x4E74F8,
+            accent_background_alpha: ACCENT_ALPHA_LIGHT,
+            accent_foreground: None,
+            background: 0x0A0C10,
+            surface1: 0x121317,
+            surface2: 0x23262E,
+            text_primary: 0xECEEF2,
+            text_secondary: 0xADB4C2,
+            border: 0x23262E,
+            status_error: 0xE5484D,
+        },
+        BuiltinThemeId::GraphiteLight => &Palette {
+            accent: 0x4E74F8,
+            accent_background_alpha: ACCENT_ALPHA_LIGHT,
+            accent_foreground: None,
+            background: 0xFCFCFD,
+            surface1: 0xF9F9FB,
+            surface2: 0xE7E8EC,
+            text_primary: 0x1E1F24,
+            text_secondary: 0x62636C,
+            border: 0xE0E1E6,
+            status_error: 0xE5484D,
         },
     }
 }
@@ -412,5 +567,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 预设固定值必须是合法、可被文件覆盖的 token：不钉强调色、不碰 kitBound、类型匹配。
+    #[test]
+    fn preset_overrides_are_valid_tokens() {
+        for id in BuiltinThemeId::ALL {
+            for (path, value) in super::preset_overrides(id) {
+                let spec = crate::token(path).unwrap_or_else(|| panic!("{id:?} {path}"));
+                assert!(!spec.kit_bound, "{id:?} {path}");
+                assert!(!ACCENT_TOKEN_PATHS.contains(&path), "{id:?} {path}");
+                assert!(value.fits(spec.kind), "{id:?} {path}");
+            }
+        }
+    }
+
+    /// 石墨的形状 / 密度经 `extends` 生效，主题文件显式值仍优先，另一模式回退默认亮色。
+    #[test]
+    fn graphite_preset_flows_through_extends() {
+        use crate::{ThemeDocument, resolve};
+        let number = |values: &crate::ResolvedModeTokens, path: &str| {
+            values
+                .to_flat_json()
+                .get(path)
+                .and_then(serde_json::Value::as_f64)
+        };
+        let (dark, diagnostics) = resolve(
+            &ThemeDocument::builtin(BuiltinThemeId::Graphite),
+            ThemeMode::Dark,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(number(&dark, "radius.md"), Some(2.));
+        assert_eq!(number(&dark, "components.input.radius"), Some(2.));
+        assert_eq!(number(&dark, "components.dialog.radius"), Some(4.));
+        assert_eq!(number(&dark, "density.control"), Some(32.));
+        assert_eq!(number(&dark, "focusRing.width"), Some(1.));
+
+        let (document, _) = ThemeDocument::parse(
+            r#"{"schemaVersion":2,"extends":"builtin:graphite","tokens":{"density":{"control":28}}}"#,
+        )
+        .expect("parse");
+        let (custom, _) = resolve(&document, ThemeMode::Dark);
+        assert_eq!(number(&custom, "density.control"), Some(28.));
+        let (light, _) = resolve(&document, ThemeMode::Light);
+        assert_eq!(number(&light, "density.control"), Some(28.));
+        assert_eq!(number(&light, "radius.md"), Some(6.));
+
+        let (paper, diagnostics) = resolve(
+            &ThemeDocument::builtin(BuiltinThemeId::GraphiteLight),
+            ThemeMode::Light,
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(number(&paper, "radius.md"), Some(2.));
+        assert_eq!(number(&paper, "density.control"), Some(32.));
+        assert_eq!(number(&paper, "focusRing.width"), Some(1.));
     }
 }

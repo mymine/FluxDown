@@ -7,6 +7,7 @@ import { applyBackup, backupFileName, collectBackup, parseBackup, type ParsedBac
 import { downloadJson } from "../lib/download";
 import { refreshSettings } from "../lib/store";
 import { ConfirmModal, PanelShell, SettingRow } from "../parts";
+import { logError } from "@/utils/error-log";
 
 export function BackupPanel(): JSX.Element {
   const t = useT();
@@ -19,7 +20,7 @@ export function BackupPanel(): JSX.Element {
       downloadJson(backupFileName(now), await collectBackup(now));
       showToast(t("backup.exportDone"), "success");
     } catch (e) {
-      console.error("[FluxDown Options] export backup failed:", e);
+      logError("[FluxDown Options] export backup failed:", e);
       showToast(t("backup.exportFailed"), "error");
     }
   };
@@ -46,7 +47,7 @@ export function BackupPanel(): JSX.Element {
       await refreshSettings();
       showToast(t("backup.importDone"), "success");
     } catch (e) {
-      console.error("[FluxDown Options] import backup failed:", e);
+      logError("[FluxDown Options] import backup failed:", e);
       showToast(t("backup.importFailed"), "error");
     } finally {
       setPending(null);

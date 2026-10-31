@@ -11,7 +11,7 @@
  *
  *   assets/logo/
  *     fluxdown_logo.png (600×600；Linux 打包图标，GPUI PC 客户端 X11 窗口图标同源)
- *     fluxdown_bolt.png (512×512, 内置备选应用图标「闪电」)
+ *     fluxdown_bolt.png (512×512, 内置备选应用图标「闪电」；Windows / Linux 运行期由 agent 派生 ICO / 托盘图)
  *     logo.png (600×600)
  *     tray_iconTemplate.png (36×36, macOS 2x 菜单栏模板图标)
  *     tray_iconTemplate@1x.png (18×18, macOS 1x 菜单栏模板图标)
@@ -22,6 +22,7 @@
  *
  *   assets/logo/macos/
  *     app_icon_{16,32,64,128,256,512,1024}.png（app_icon_512 同时是 GPUI 裸二进制的 Dock 图标）
+ *     app_icon_bolt_512.png（「闪电」的 Apple HIG 版：圆角方块占 824/1024，GPUI 运行期 Dock 图标）
  *
  *   mobile/Android/app/src/main/res/
  *     mipmap-{mdpi,hdpi,xhdpi,xxhdpi,xxxhdpi}/ic_launcher.png
@@ -109,6 +110,37 @@ async function renderMacAppIcon(size: number): Promise<Buffer> {
     },
   })
     .composite([{ input: logo, gravity: "center" }])
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+}
+
+/**
+ * 「闪电」的 macOS Dock 版：源 SVG 的白色圆角方块在 viewBox 内是 (16,16)-(496,496)，裁到该方块后
+ * 与默认图标同样按 Apple HIG 内缩到画布的 824/1024，否则在 Dock 里比其他图标大一圈。
+ */
+async function renderMacBoltIcon(size: number): Promise<Buffer> {
+  const svg = readFileSync(BOLT_SVG_SRC, "utf8").replace(
+    'viewBox="0 0 512 512"',
+    'viewBox="16 16 480 480"',
+  );
+  const content = Math.round(size * MAC_RECT_RATIO);
+  const bolt = await sharp(Buffer.from(svg), { density: 300 })
+    .resize(content, content, {
+      kernel: sharp.kernel.lanczos3,
+      fit: "contain",
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png()
+    .toBuffer();
+  return sharp({
+    create: {
+      width: size,
+      height: size,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  })
+    .composite([{ input: bolt, gravity: "center" }])
     .png({ compressionLevel: 9 })
     .toBuffer();
 }
@@ -366,11 +398,15 @@ async function main() {
     const logoDark = await renderWindowsTrayArrow(64, "#3B82F6");
     await saveFile("assets/logo/logo_on_dark.png", logoDark);
 
-    // 内置备选应用图标「闪电」— 512px，运行时由 AppIconService 转 ICO
+    // 内置备选应用图标「闪电」— 512px（Windows / Linux）+ macOS Dock 的 HIG 版
     if (existsSync(BOLT_SVG_SRC)) {
       const bolt = await renderPngFrom(BOLT_SVG_SRC, 512);
       await saveFile("assets/logo/fluxdown_bolt.png", bolt);
-      totalCount += 1;
+      await saveFile(
+        "assets/logo/macos/app_icon_bolt_512.png",
+        await renderMacBoltIcon(512),
+      );
+      totalCount += 2;
     }
 
     totalCount += 5;

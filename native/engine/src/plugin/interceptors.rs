@@ -2,15 +2,12 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::{
-    CIRCUIT_BREAKER_THRESHOLD, EXTERNAL_TOOL_HOOK_BUDGET, PluginManager, build_typed_settings_json,
-    value_of,
-};
-use crate::intercept::{InterceptStage, InterceptorEntry, TaskInterceptor};
+use super::{EXTERNAL_TOOL_HOOK_BUDGET, PluginManager, build_typed_settings_json, value_of};
+use crate::intercept::{InterceptStage, InterceptorEntry, TaskEgressView, TaskInterceptor};
 use crate::plugin::audit::PluginAuditRow;
+use crate::plugin::call_egress::CallEgress;
 use crate::plugin::manifest::{
     InterceptFailure, PERMISSION_AUTH, PERMISSION_FFMPEG, PERMISSION_INTERCEPT, PERMISSION_YTDLP,
     url_glob_match,
@@ -67,6 +64,7 @@ impl PluginManager {
             task_id: task_id.to_string(),
             source_url: source_url.to_string(),
             entries,
+            egress: std::sync::Mutex::new(None),
         })
     }
 
@@ -78,17 +76,19 @@ impl PluginManager {
         stage: InterceptStage,
         arg_json: String,
         file_root: Option<PathBuf>,
+        egress: Option<Arc<CallEgress>>,
     ) -> Result<Option<String>, PluginError> {
         let (manifest, streak, source, dev_mode) = {
             let snapshot = self.plugins.read().await.clone();
-            let Some(p) = snapshot
-                .iter()
-                .find(|p| p.manifest.identity == identity && p.enabled)
-            else {
-                return Err(PluginError::Runtime(format!(
-                    "插件 {identity} 已卸载或被禁用"
-                )));
+            let Some(p) = snapshot.iter().find(|p| p.manifest.identity == identity) else {
+                return Err(PluginError::Runtime(format!("插件 {identity} 已卸载")));
             };
+            if !p.enabled {
+                return Err(PluginError::Runtime(format!(
+                    "插件 {identity} {}",
+                    p.disabled_reason.describe()
+                )));
+            }
             let source = p.intercept_source().await;
             (p.manifest.clone(), p.timeout_streak.clone(), source, p.dev)
         };
@@ -148,6 +148,7 @@ impl PluginManager {
             ytdlp_permitted,
             auth_permitted: manifest.has_permission(PERMISSION_AUTH),
             private_network_allowed: dev_mode,
+            egress: egress.clone(),
         };
         let result = self
             .runtime
@@ -162,18 +163,8 @@ impl PluginManager {
                 finalize.then(|| task_id.to_string()),
             )
             .await;
-
-        match &result {
-            Err(PluginError::Timeout) | Err(PluginError::MemoryLimitExceeded) => {
-                let n = streak.fetch_add(1, Ordering::SeqCst) + 1;
-                if n >= CIRCUIT_BREAKER_THRESHOLD {
-                    self.trip_circuit_breaker(identity).await;
-                }
-            }
-            _ => {
-                streak.store(0, Ordering::SeqCst);
-            }
-        }
+        self.note_execution(identity, &streak, result.as_ref().err(), egress.as_deref())
+            .await;
 
         let (outcome, detail) = match &result {
             Ok(_) => ("ok", String::new()),
@@ -206,6 +197,8 @@ struct PluginTaskInterceptor {
     task_id: String,
     source_url: String,
     entries: Vec<InterceptorEntry>,
+    /// 任务当前出口（见 [`crate::intercept::sync_egress`]）；`None` = 全局出口。
+    egress: std::sync::Mutex<Option<TaskEgressView>>,
 }
 
 #[async_trait::async_trait]
@@ -218,6 +211,13 @@ impl TaskInterceptor for PluginTaskInterceptor {
         &self.source_url
     }
 
+    fn set_egress(&self, egress: TaskEgressView) {
+        *self
+            .egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(egress);
+    }
+
     async fn call(
         &self,
         identity: &str,
@@ -228,8 +228,15 @@ impl TaskInterceptor for PluginTaskInterceptor {
         let pm = self.pm.clone();
         let task_id = self.task_id.clone();
         let identity = identity.to_string();
+        // 每次调用一个新的观测器：拦截阶段不换路，只用于熔断豁免。
+        let egress = self
+            .egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .map(|view| Arc::new(CallEgress::new(view.proxy, view.explicit, view.rules)));
         let handle = self.pm.runtime_handle().spawn(async move {
-            pm.intercept(&identity, &task_id, stage, arg_json, file_root)
+            pm.intercept(&identity, &task_id, stage, arg_json, file_root, egress)
                 .await
         });
         let mut guard = AbortGuard(handle);

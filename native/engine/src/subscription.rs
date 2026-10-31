@@ -26,9 +26,15 @@ pub struct SubscriptionFetchRequest {
     /// 已解析的 User-Agent。插件 provider 只经 `ctx.userAgent` 透传，脚本
     /// 自行决定是否作为请求头发送。
     pub user_agent: String,
-    /// 已解析的代理配置。**仅内置 `rss` provider 使用**；插件 provider 的
-    /// `flux.fetch` 走 bridge 的全局出口，订阅级代理对其不生效。
+    /// 订阅自带代理原值（`tasks.proxy_url` 同语义：空串跟随全局，`direct://` /
+    /// `system://` 哨兵）。插件 provider 据此为 `flux.fetch` / yt-dlp 制定出口计划。
+    pub proxy_url: String,
+    /// 已解析的代理配置。**仅内置 `rss` provider 使用**；插件 provider 按
+    /// [`Self::proxy_url`]、站点规则与全局设定自行制定出口（见 `plugin::call_egress`）。
     pub proxy: ProxyConfig,
+    /// 站点代理规则的逐请求路由器（重定向各跳按规则换出口）。只有内置 `rss`
+    /// provider 使用；插件 provider 走 bridge，由 bridge 自行应用规则。
+    pub egress: Option<std::sync::Arc<crate::rule_route::EgressRouter>>,
 }
 
 /// provider 抓取 future 的返回类型。

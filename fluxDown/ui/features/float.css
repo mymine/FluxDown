@@ -53,7 +53,8 @@
   position: absolute;
   right: 0;
   top: calc(100% + 6px);
-  min-width: 220px;
+  min-width: min(220px, calc(100vw - 16px));
+  max-width: calc(100vw - 16px);
   max-height: 280px;
   overflow: auto;
   border: 1px solid var(--fd-border);
@@ -65,4 +66,25 @@
 .fd-float-pop.fd-flip {
   top: auto;
   bottom: calc(100% + 6px);
+}
+
+/* 触屏（无 hover）：按钮 / 菜单项放大到可舒适点按，菜单高度随视口收敛（横屏矮视口）。
+ * 横向夹取由 FloatButton 的位置循环按视口计算。 */
+@media (pointer: coarse) {
+  .fd-float-wrap {
+    font-size: 13px;
+  }
+  .fd-float-btn {
+    height: 40px;
+    padding: 0 14px;
+    border-radius: 20px;
+    gap: 8px;
+  }
+  .fd-float-pop {
+    max-height: min(280px, 50vh);
+  }
+  .fd-float-pop .fd-qp-item,
+  .fd-float-pop .fd-qp-extra {
+    min-height: 40px;
+  }
 }

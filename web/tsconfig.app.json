@@ -9,7 +9,8 @@
     "paths": {
       "@i18n-assets/*": ["../assets/i18n/*"],
       "@gpui-theme/*": ["../website-v2/src/lib/gpui-theme/*"],
-      "@icon-packs/*": ["../assets/icon-packs/*"]
+      "@icon-packs/*": ["../assets/icon-packs/*"],
+      "@flags/*": ["../assets/flags/*"]
     },
     "allowArbitraryExtensions": true,
     "skipLibCheck": true,

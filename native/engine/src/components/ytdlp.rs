@@ -226,10 +226,11 @@ mod install {
         egress: &crate::egress::Egress,
     ) -> Result<YtdlpVersions, ComponentError> {
         platform_asset().ok_or(ComponentError::Unsupported)?;
-        let client = super::super::egress_client(egress).await?;
+        let clients = super::super::egress_clients(egress).await?;
         let mirror_base = super::super::component_mirror_base(db).await;
         let releases =
-            super::super::fetch_versions_json(&client, "ytdlp", RELEASES_API, &mirror_base).await?;
+            super::super::fetch_versions_json(&clients, "ytdlp", RELEASES_API, &mirror_base)
+                .await?;
         let empty = Vec::new();
         let arr = releases.as_array().unwrap_or(&empty);
         let versions: Vec<String> = arr
@@ -260,14 +261,14 @@ mod install {
         progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<YtdlpStatus, ComponentError> {
         let asset = platform_asset().ok_or(ComponentError::Unsupported)?;
-        let client = super::super::egress_client(egress).await?;
+        let clients = super::super::egress_clients(egress).await?;
         let mirror_base = super::super::component_mirror_base(db).await;
         let url = match version {
             Some(tag) => format!("{RELEASE_TAG_API}{tag}"),
             None => RELEASE_LATEST_API.to_string(),
         };
         let release =
-            super::super::fetch_github_json_with_mirror(&client, &url, &mirror_base).await?;
+            super::super::fetch_github_json_with_mirror(&clients, &url, &mirror_base).await?;
         let chosen_ver = release["tag_name"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -292,7 +293,7 @@ mod install {
         super::super::require_upstream_asset_url(&sums_url, UPSTREAM_DOWNLOAD_PREFIX)?;
         // 校验和是完整性锚：只走代理，不交给插件改写。
         let expected_sha256 =
-            super::super::fetch_expected_sha256(&client, &sums_url, &mirror_base, asset).await?;
+            super::super::fetch_expected_sha256(&clients, &sums_url, &mirror_base, asset).await?;
 
         // 单文件二进制：流式下载到 bin/ 下临时文件，哈希 + 探版都通过后才原子替换
         // 目标，失败不碰原有托管二进制。Windows 上临时文件须保留 `.exe` 才能探版。
@@ -308,7 +309,7 @@ mod install {
         });
         let route = egress.route_verified(&dl_url).await;
         super::super::download_to_file(
-            &client,
+            &clients,
             &route,
             &mirror_base,
             &tmp,

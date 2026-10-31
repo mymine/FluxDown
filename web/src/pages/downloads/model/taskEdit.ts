@@ -1,5 +1,5 @@
-// 「更换链接 / 修改线程数」的可用性判定与线程数输入解析（镜像 GPUI `TaskMenuFacts::can_change_url` /
-// `can_change_segments` 与 `pages/task_edit.rs::parse_task_segments`，改一处须同步另一处）。
+// 「重命名 / 更换链接 / 修改线程数」的可用性判定与线程数输入解析（镜像 GPUI `TaskMenuFacts::can_rename` /
+// `can_change_url` / `can_change_segments` 与 `pages/task_edit.rs::parse_task_segments`，改一处须同步另一处）。
 
 import { MAX_TASK_SEGMENTS } from '../../../lib/threadsRisk'
 import type { DownloadTaskView } from './task'
@@ -19,6 +19,14 @@ export function isBtUrl(url: string): boolean {
 /** 引擎 `change_task_url` 接受的源：http(s) / ftp。 */
 export function isReplaceableUrl(url: string): boolean {
   return hasPrefix(url, ['http://', 'https://', 'ftp://'])
+}
+
+/**
+ * 「重命名」：本地非 BT、不在下载 / 准备中的任务（对齐引擎 `rename_task`：活跃任务 `task-active`，
+ * BT 落盘名由完成布局决定、做种期间持有句柄，`bt-unsupported`）。eD2K 与 HTTP 同以 `<名>.fdownloading` 续传，可改名。
+ */
+export function canRename(view: EditFacts & Pick<DownloadTaskView, 'preparing'>): boolean {
+  return view.source === 'local' && view.state !== 'downloading' && !view.preparing && !isBtUrl(view.url)
 }
 
 /** 「更换链接」：本地任务，暂停 / 失败 / 等待（引擎拒绝下载中与已完成），源为 http(s) / ftp。 */

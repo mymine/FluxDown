@@ -1,10 +1,5 @@
 package com.fluxdown.core.protocol
 
-import com.fluxdown.core.host.HostErrorCode
-import com.fluxdown.core.host.HostException
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-
 /*
  * Webhook（`daemon.webhook.*` + 配置键 `webhook.endpoints`）：DTO 镜像 `native/protocol/src/daemon.rs` 的 Webhook 段
  * （同 iOS `Webhooks.swift`、Web `web/src/lib/rpc/protocol/webhook.ts`）；端点解析 / 写入对齐
@@ -236,25 +231,6 @@ fun latestWebhookDelivery(deliveries: List<WebhookDelivery>, endpointId: String)
 
 // ───────────────────────────── 读-改-写 ─────────────────────────────
 
-/** `daemon.config.get` 结果（`DaemonConfigSnapshot`）。 */
-data class WebhookConfigSnapshot(val revision: Long, val values: Map<String, String>) {
-    companion object {
-        fun fromJson(v: JsonValue?): WebhookConfigSnapshot = WebhookConfigSnapshot(v.long("revision"), v.stringMap("values"))
-    }
-}
-
-/** 端点写入依赖的主机端口（生产实现读 `HostStore` + `HostSession`；测试用假实现）。 */
-interface WebhookConfigPort {
-    /** 快照里的最新配置；未连接为 null。 */
-    val cachedConfig: WebhookConfigSnapshot?
-
-    /** `daemon.config.get`。 */
-    suspend fun fetchConfig(): WebhookConfigSnapshot
-
-    /** `daemon.config.patch`：revision 不符抛 [HostErrorCode.Conflict]。 */
-    suspend fun patchConfig(expectedRevision: Long, values: Map<String, String>)
-}
-
 /**
  * 读-改-写端点列表（AGENTS.md §5 镜像契约：写入始终基于最新配置重算，冲突时重读并重放）。
  *
@@ -266,13 +242,16 @@ interface WebhookConfigPort {
  * - 每次都基于最新快照重新计算；`expectedRevision` 冲突时重新 `daemon.config.get` 后再算一遍（最多 [MAX_CONFLICT_RETRIES] 次）。
  * - 写入串行化（FIFO 互斥）：连续操作不会互相制造冲突，也不会基于过期数组回写。
  */
-class WebhookEndpointWriter(private val port: WebhookConfigPort) {
-    private val lock = Mutex()
+class WebhookEndpointWriter(port: DaemonConfigPort) {
+    private val writer = DaemonConfigListWriter<WebhookEndpoint>(
+        port,
+        WebhookEndpoint.CONFIG_KEY,
+        { WebhookEndpoint.parseList(it) },
+        { WebhookEndpoint.encodeList(it) },
+    )
 
-    /** [transform] 返回 null 表示无需写入。失败抛 [HostException]。 */
-    suspend fun mutate(transform: (List<WebhookEndpoint>) -> List<WebhookEndpoint>?) {
-        lock.withLock { perform(transform) }
-    }
+    /** [transform] 返回 null 表示无需写入。失败抛 [com.fluxdown.core.host.HostException]。 */
+    suspend fun mutate(transform: (List<WebhookEndpoint>) -> List<WebhookEndpoint>?) = writer.mutate(transform)
 
     /** 新增或按 id 覆盖。 */
     suspend fun upsert(draft: WebhookEndpoint) = mutate { list ->
@@ -286,26 +265,8 @@ class WebhookEndpointWriter(private val port: WebhookConfigPort) {
 
     suspend fun remove(id: String) = mutate { list -> list.filter { it.id != id } }
 
-    private suspend fun perform(transform: (List<WebhookEndpoint>) -> List<WebhookEndpoint>?) {
-        var config = port.cachedConfig
-        var attempt = 0
-        while (true) {
-            val current = config ?: port.fetchConfig()
-            val next = transform(WebhookEndpoint.parseList(current.values[WebhookEndpoint.CONFIG_KEY])) ?: return
-            val encoded = WebhookEndpoint.encodeList(next)
-            try {
-                port.patchConfig(current.revision, mapOf(WebhookEndpoint.CONFIG_KEY to encoded))
-                return
-            } catch (e: HostException) {
-                if (e.code != HostErrorCode.Conflict || attempt >= MAX_CONFLICT_RETRIES) throw e
-                attempt += 1
-                config = port.fetchConfig()
-            }
-        }
-    }
-
     companion object {
         /** 与 GPUI `MAX_CONFLICT_RETRIES` 一致。 */
-        const val MAX_CONFLICT_RETRIES = 3
+        const val MAX_CONFLICT_RETRIES = DaemonConfigListWriter.MAX_CONFLICT_RETRIES
     }
 }

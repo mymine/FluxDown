@@ -509,6 +509,8 @@ fn builtin_name(id: BuiltinThemeId) -> &'static str {
         BuiltinThemeId::MidnightBlue => "Midnight Blue",
         BuiltinThemeId::Nord => "Nord",
         BuiltinThemeId::WarmLight => "Warm Light",
+        BuiltinThemeId::Graphite => "Graphite",
+        BuiltinThemeId::GraphiteLight => "Graphite Light",
     }
 }
 

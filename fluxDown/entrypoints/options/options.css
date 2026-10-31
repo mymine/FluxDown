@@ -714,3 +714,171 @@ body {
   font-size: 12px;
   white-space: pre;
 }
+
+/* ===== 窄屏（手机 / 窄窗口）：侧栏变顶栏，设置行上下堆叠 ===== */
+@media (max-width: 720px) {
+  .opt-layout {
+    flex-direction: column;
+  }
+
+  .opt-sidebar {
+    width: auto;
+    height: auto;
+    padding: 8px 12px 6px;
+    border-right: none;
+    border-bottom: 1px solid var(--fd-border);
+    z-index: 5;
+  }
+
+  .opt-logo {
+    padding: 0 4px 6px;
+  }
+
+  .opt-nav-group {
+    display: none;
+  }
+
+  /* 导航横向滚动，条目不换行、不被压缩 */
+  .opt-nav {
+    flex-direction: row;
+    gap: 4px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    padding-bottom: 2px;
+  }
+
+  .opt-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .opt-nav-item {
+    flex: 0 0 auto;
+    width: auto;
+    min-height: 40px;
+    padding: 8px 12px;
+    white-space: nowrap;
+  }
+
+  .opt-sidebar-footer {
+    margin-top: 0;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .opt-sidebar-footer .opt-nav-item {
+    width: auto;
+  }
+
+  .opt-version {
+    padding: 2px 4px 0;
+  }
+
+  .opt-content {
+    padding: 16px 14px 40px;
+  }
+
+  .opt-panel {
+    max-width: none;
+  }
+
+  /* 设置行：说明在上，控件占满整行 */
+  .opt-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 16px 0;
+  }
+
+  .opt-row-info {
+    flex: none;
+  }
+
+  .opt-row-control {
+    flex: none;
+    width: 100%;
+    max-width: none;
+  }
+
+  .opt-row-control-inline {
+    justify-content: flex-start;
+  }
+
+  /* 开关 / 按钮类行仍左右排布：说明靠左，开关靠右 */
+  .opt-row:has(> .opt-row-control-inline) {
+    flex-direction: row;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .opt-row:has(> .opt-row-control-inline) .opt-row-info {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .opt-row:has(> .opt-row-control-inline) .opt-row-control {
+    flex: 0 0 auto;
+    width: auto;
+  }
+
+  .opt-card {
+    padding: 12px;
+  }
+
+  .opt-card-head {
+    flex-wrap: wrap;
+  }
+
+  .opt-filters {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .opt-filters .fd-input {
+    width: 100%;
+    flex: 1 1 100%;
+  }
+
+  .opt-kv {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  .opt-kv dd {
+    margin-bottom: 6px;
+    overflow-wrap: anywhere;
+  }
+
+  .opt-shortcut-cell {
+    align-items: stretch;
+  }
+
+  .opt-shortcut {
+    width: 100%;
+    min-height: 40px;
+  }
+
+  .opt-shortcut-msg {
+    text-align: left;
+  }
+
+  .opt-pager {
+    justify-content: center;
+  }
+
+  .opt-pager-nav {
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .opt-pager-page {
+    min-width: 36px;
+    height: 36px;
+  }
+
+  .opt-ps-source {
+    max-height: 40vh;
+  }
+}

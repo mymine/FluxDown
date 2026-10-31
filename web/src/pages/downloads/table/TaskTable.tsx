@@ -21,7 +21,6 @@ import {
   MAX_COLUMN_WIDTH,
   MIN_WIDTH,
   nextHeaderSort,
-  NUMERIC_COLUMNS,
   resolveColumns,
   toColumnPrefs,
 } from '../model/viewPrefs'
@@ -502,7 +501,7 @@ export function TaskTable() {
               {columns.map((column) => {
                 const sortKey = COLUMN_SORT_KEY[column.kind]
                 const active = sortKey !== undefined && sortKey === prefs.sort_key
-                const numeric = NUMERIC_COLUMNS.has(column.kind)
+                const alignEnd = prefs.header_align === 'right'
                 const arrow = active ? (
                   <Icon icon={prefs.sort_dir === 'asc' ? ArrowUp : ArrowDown} size="sm" />
                 ) : null
@@ -523,14 +522,15 @@ export function TaskTable() {
                     onClick={() => toggleSort(column.kind)}
                     className={cn(
                       'group/th relative flex min-w-0 shrink-0 items-center gap-0.5 text-xs font-medium text-text-tertiary',
-                      numeric && 'justify-end',
+                      prefs.header_align === 'center' && 'justify-center',
+                      alignEnd && 'justify-end',
                       sortKey && 'cursor-pointer',
                     )}
                     style={{ ...cellStyle(column), paddingInline: CELL_PADDING_X }}
                   >
-                    {numeric ? arrow : null}
+                    {alignEnd ? arrow : null}
                     <span className="min-w-0 truncate">{t(COLUMN_LABEL_KEY[column.kind])}</span>
-                    {numeric ? null : arrow}
+                    {alignEnd ? null : arrow}
                     <div
                       role="separator"
                       onPointerDown={(event) => startResize(event, column)}

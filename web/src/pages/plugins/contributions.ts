@@ -115,6 +115,16 @@ export function activeSettingsViewOf(plugin: PluginDto): PluginViewDeclDto | und
   return pluginUsable(plugin) ? settingsViewOf(plugin) : undefined
 }
 
+/** 插件的登录视图（可移植，至多一个）。 */
+export function authViewOf(plugin: PluginDto): PluginViewDeclDto | undefined {
+  return plugin.contributions.views.find((view) => view.portable && view.location === 'auth')
+}
+
+/** 登录弹窗实际承载的视图：仅插件可用时才有；有则弹窗只承载它，否则走固定登录流程。 */
+export function activeAuthViewOf(plugin: PluginDto): PluginViewDeclDto | undefined {
+  return pluginUsable(plugin) ? authViewOf(plugin) : undefined
+}
+
 /** 插件行是否显示设置按钮：有设置字段，或有可运行的设置视图（同 GPUI `plugins.rs`）。 */
 export function hasPluginSettings(plugin: PluginDto): boolean {
   return plugin.settings.length > 0 || activeSettingsViewOf(plugin) !== undefined

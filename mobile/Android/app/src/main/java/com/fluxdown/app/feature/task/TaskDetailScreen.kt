@@ -556,7 +556,9 @@ private fun ActionRow(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         val tile = Modifier.weight(1f).fillMaxHeight()
-        FluxActionTile(primaryLabel, primaryIcon, onPrimary, tile, prominent = true)
+        // 远端主机的已完成文件在主机磁盘上，本机无法打开：不给「打开文件」主动作（iOS 同规则）
+        val remoteFile = remoteHost && (model.visual == TaskVisualState.Completed || model.visual == TaskVisualState.Seeding)
+        if (!remoteFile) FluxActionTile(primaryLabel, primaryIcon, onPrimary, tile, prominent = true)
         if (!remoteHost) FluxActionTile(folderLabel, FluxIcons.FolderOpen, onFolder, tile)
         FluxActionTile(shareShort, FluxIcons.Share2, { actions.shareLink(task) }, tile, contentDescription = shareLabel)
         FluxActionTile(

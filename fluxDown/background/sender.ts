@@ -1,5 +1,5 @@
 /**
- * 发送层：把下载交给 FluxDown（NMH / 远程 / fluxdown:// 协议），以及失败回退。
+ * 发送层：把下载交给 FluxDown（NMH / 远程 / Android Intent，经 download-dispatch 路由；或 fluxdown:// 协议），以及失败回退。
  */
 import { browser } from "wxt/browser";
 import type { Browser } from "wxt/browser";
@@ -11,12 +11,17 @@ import { t } from "@/utils/i18n";
 import { allowBypass, claimAppDownNotice, markAppDown, markAppUp, probeAppReachable } from "./breaker";
 import { notify } from "./notify";
 import type { SendChannel, SendResult } from "./protocol";
-import { extractAuthFromCache, lookupRequestRecord, requestHeaderCache, requestRecordCache, withBrowserUserAgent } from "./request-cache";
-import type { CapturedBody } from "./request-cache";
+import { extractAuthFromCache, requestHeaderCache, requestRecordCache, withBrowserUserAgent } from "./request-cache";
+import { lookupRequestRecord } from "./request-record";
+import type { CapturedBody } from "./request-record";
 import { getCachedProfiles, getCachedSettings } from "./settings-cache";
 import { incrementStat } from "./stats";
 import { maybeArmTaskPollForChannel } from "./tasks";
 import { getEngine } from "./rules-store";
+import { logError, logWarn } from "@/utils/error-log";
+import { hasDownloadsApi, isAndroidPlatform } from "@/utils/platform";
+import { ANDROID_UNSUPPORTED_MESSAGES } from "./android-handoff";
+import { openInHandoffTab } from "./handoff-tab";
 
 /**
  * 补上 request 阶段 headers 规则为该 URL 声明的请求头，只补缺失的名字（浏览器真实请求头优先）。
@@ -79,14 +84,9 @@ export async function resolveSaveDir(input: SendInput): Promise<string | undefin
   return undefined;
 }
 
-/** 协议唤起复用的标签页 id（避免每次下载都泄漏一个空白标签页）。 */
-let protocolTabId: number | null = null;
-let protocolTabCloseTimer: ReturnType<typeof setTimeout> | undefined;
-
 /**
  * 打开 fluxdown://download?url=...&filename=... 协议 URL，触发系统唤起
- * 已注册该协议的应用。复用单个标签页（连续下载不开一排标签），并在最后
- * 一次唤起 4s 后自动回收标签页。
+ * 已注册该协议的应用（交接标签页复用与回收见 handoff-tab.ts）。
  */
 export async function openProtocolUrl(
   url: string,
@@ -96,39 +96,7 @@ export async function openProtocolUrl(
   if (filename) params.set("filename", filename);
   const protocolUrl = `fluxdown://download?${params.toString()}`;
   console.log("[FluxDown] protocol mode — opening:", protocolUrl);
-  try {
-    if (protocolTabId !== null) {
-      try {
-        await browser.tabs.update(protocolTabId, {
-          url: protocolUrl,
-          active: true,
-        });
-      } catch {
-        // 标签页已被用户关闭 — 重新创建
-        protocolTabId = null;
-      }
-    }
-    if (protocolTabId === null) {
-      const tab = await browser.tabs.create({
-        url: protocolUrl,
-        active: true,
-      });
-      protocolTabId = tab.id ?? null;
-    }
-    // 每次唤起重置回收定时器：4s 无新请求则关闭遗留的空白/错误标签页
-    if (protocolTabCloseTimer) clearTimeout(protocolTabCloseTimer);
-    protocolTabCloseTimer = setTimeout(() => {
-      const id = protocolTabId;
-      protocolTabId = null;
-      if (id !== null) {
-        browser.tabs.remove(id).catch(() => {});
-      }
-    }, 4000);
-    return true;
-  } catch (e) {
-    console.warn("[FluxDown] failed to open fluxdown:// URL:", e);
-    return false;
-  }
+  return openInHandoffTab(protocolUrl);
 }
 
 // 投递失败的表单 POST 下载：原下载已被取消，回退时需要原 method/body 重放。
@@ -148,12 +116,12 @@ export async function sendToFluxDown(input: SendInput): Promise<SendOutcome> {
   const { url, referrer, filename, fileSize, mimeType, originalUrl, storedCookies, storedHeaders, audioUrl, channel } = input;
   // === fluxdown:// 自定义协议模式 ===
   // 开启后跳过 NMH/远端投递，经协议 URL 唤起 FluxDown 客户端。
-  // 限制：不经过 NMH，Cookie/Headers/method/body 无法携带，适用于公开文件。
+  // 限制：不经过 NMH，Cookie/Headers/method/body 无法携带，适用于公开文件。仅桌面：Android 由 Intent 交接（可携带 Cookie / 请求头）取代。
   {
     const protocolSettings = await getCachedSettings();
     // fluxdown:// 只承载单 URL；音视频分轨对必须继续走 NMH/远程，
     // 否则音频轨会被静默丢弃，最终得到无声视频。
-    if (protocolSettings.enableFluxdownProtocol && !audioUrl && !channel) {
+    if (protocolSettings.enableFluxdownProtocol && !audioUrl && !channel && !(await isAndroidPlatform())) {
       const ok = await openProtocolUrl(url, filename);
       await incrementStat(ok ? "sent" : "failed");
       if (ok && (await shouldNotifyChannel("local"))) {
@@ -190,7 +158,7 @@ export async function sendToFluxDown(input: SendInput): Promise<SendOutcome> {
       ]);
       cookieString = cookiesResult.map((c) => `${c.name}=${c.value}`).join("; ");
     } catch (e) {
-      console.warn("[FluxDown] Failed/timeout to extract cookies via API:", e);
+      logWarn("[FluxDown] Failed/timeout to extract cookies via API:", e);
     }
   }
 
@@ -207,11 +175,12 @@ export async function sendToFluxDown(input: SendInput): Promise<SendOutcome> {
   extraHeaders = withBrowserUserAgent(extraHeaders) ?? extraHeaders;
 
   // 反查浏览器原始 method 与 body —— 修复 form-POST 触发的下载（uupdump 等）。
-  const reqRecord = lookupRequestRecord(url, originalUrl);
+  // 只认下载 URL 自身的记录：307/308 跳转已由 onBeforeRedirect 把事务带到目标
+  // URL；301/302/303 后浏览器改发 GET，跳转前的 POST 不属于这次下载。
+  const reqRecord = lookupRequestRecord(requestRecordCache, url);
   if (reqRecord.method || reqRecord.body) {
     // 用过即清——避免下次同 URL 复用旧 record
     requestRecordCache.delete(url);
-    if (originalUrl && originalUrl !== url) requestRecordCache.delete(originalUrl);
   }
 
   const request: DownloadRequest = {
@@ -249,7 +218,7 @@ export async function sendToFluxDown(input: SendInput): Promise<SendOutcome> {
   }
 
   await incrementStat("failed");
-  console.warn("[FluxDown] sendToFluxDown failed:", response.message, "url:", url);
+  logWarn("[FluxDown] sendToFluxDown failed:", response.message, "url:", url);
   if (notifyOk) {
     notify(t("notify.sendFailed"), describeSendError(response.message));
   }
@@ -275,6 +244,8 @@ export function describeSendError(message?: string): string {
     return t("remote.testNotConfigured");
   if (message?.startsWith("remote_unreachable"))
     return t("remote.testUnreachable");
+  if (message && ANDROID_UNSUPPORTED_MESSAGES.has(message)) return t("notify.androidUnsupported");
+  if (message === "android_handoff_failed") return t("notify.androidHandoffFailed");
   return t("notify.connectionFailed", { message: message || "unknown" });
 }
 
@@ -349,23 +320,34 @@ export async function fallbackToBrowserDownload(
   const post = failedPostRecords.get(url);
   failedPostRecords.delete(url);
   try {
-    const opts: Browser.downloads.DownloadOptions = { url };
-    if (filename) opts.filename = filename;
-    if (post) {
-      const replay = buildPostReplay(url, post.body);
-      if (!replay) {
-        // 多部分/二进制请求体无法无损重建，GET 重发只会落盘一个损坏文件。
+    if (!hasDownloadsApi()) {
+      // Firefox for Android 没有 downloads API：在新标签页导航到该链接，交给浏览器自己下载
+      // （上面的 bypass 令牌让 blocking 拦截放行）。POST 事务无法以导航重放。
+      if (post) {
         notify(t("notify.sendFailed"), url);
         return;
       }
-      opts.method = "POST";
-      opts.body = replay.body;
-      opts.headers = replay.headers;
+      await browser.tabs.create({ url, active: true });
+      console.log("[FluxDown] Fallback: opened link for browser download:", url);
+    } else {
+      const opts: Browser.downloads.DownloadOptions = { url };
+      if (filename) opts.filename = filename;
+      if (post) {
+        const replay = buildPostReplay(url, post.body);
+        if (!replay) {
+          // 多部分/二进制请求体无法无损重建，GET 重发只会落盘一个损坏文件。
+          notify(t("notify.sendFailed"), url);
+          return;
+        }
+        opts.method = "POST";
+        opts.body = replay.body;
+        opts.headers = replay.headers;
+      }
+      await browser.downloads.download(opts);
+      console.log("[FluxDown] Fallback: re-initiated browser download:", url);
     }
-    await browser.downloads.download(opts);
-    console.log("[FluxDown] Fallback: re-initiated browser download:", url);
   } catch (e) {
-    console.error(
+    logError(
       "[FluxDown] Fallback: failed to re-initiate browser download:",
       e,
     );
@@ -416,7 +398,7 @@ export async function fallbackAfterSendFailure(
       notify(t("notify.sendFailed"), describeSendError(rejection.message));
     }
     if (!fallbackOnReject) return;
-    console.warn(
+    logWarn(
       "[FluxDown] Send rejected by FluxDown — falling back to browser download:",
       rejection.message,
       url,

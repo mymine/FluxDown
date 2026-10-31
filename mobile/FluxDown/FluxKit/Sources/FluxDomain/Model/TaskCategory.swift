@@ -11,6 +11,8 @@ public struct TaskCategory: Sendable, Hashable, Identifiable {
     public var extensions: [String]
     /// 非空 = 正则模式（`matchMode = regex`）。
     public var regexPattern: String
+    /// 非空 = 网址模式（`matchMode = url`）的通配符模式（桥接层只在 url 模式下下发）。
+    public var urlPattern: String
     public var position: Int32
     public var visible: Bool
     /// all / video / audio / document / image / program / archive / other；自定义为 nil。
@@ -22,6 +24,7 @@ public struct TaskCategory: Sendable, Hashable, Identifiable {
         icon: String,
         extensions: [String],
         regexPattern: String = "",
+        urlPattern: String = "",
         position: Int32,
         visible: Bool = true,
         builtinType: String? = nil
@@ -31,6 +34,7 @@ public struct TaskCategory: Sendable, Hashable, Identifiable {
         self.icon = icon
         self.extensions = extensions
         self.regexPattern = regexPattern
+        self.urlPattern = urlPattern
         self.position = position
         self.visible = visible
         self.builtinType = builtinType
@@ -57,25 +61,66 @@ public struct TaskCategory: Sendable, Hashable, Identifiable {
     }
 }
 
+/// 网址通配符（`*` 任意串、`?` 单字符，其余字面；不分大小写；须完整匹配整个网址）：
+/// 与 agent `category_dir.rs` / 引擎 `wildcard_matches` 同语义。空白 / 非法模式编译为 nil（不命中）。
+public enum UrlWildcard {
+    public static func compile(_ pattern: String) -> NSRegularExpression? {
+        let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return nil }
+        var source = "^"
+        for ch in trimmed {
+            switch ch {
+            case "*": source += ".*"
+            case "?": source += "."
+            default: source += NSRegularExpression.escapedPattern(for: String(ch))
+            }
+        }
+        source += "\\z"
+        return try? NSRegularExpression(pattern: source, options: [.caseInsensitive])
+    }
+
+    public static func matches(_ regex: NSRegularExpression, _ url: String) -> Bool {
+        regex.firstMatch(in: url, range: NSRange(url.startIndex..., in: url)) != nil
+    }
+}
+
 /// 按 position 排序的匹配索引（语义同 GPUI `CategoryIndex` / Android `CategoryIndex`）：
-/// 首个命中的具体分类；都不命中 → other。
+/// 网址规则固定优先（规则间按列表顺序），其后是扩展名 / 正则规则（列表顺序）；都不命中 → other。
+/// 网址规则匹配「来源地址」（调用方传 `DownloadTask.shareUrl`：`originUrl` 非空取它，否则取 `url`）；
+/// 文件名未知（空串）时只有网址规则参与。规则（含正则 / 通配符编译）在构造时一次编译。
 public struct CategoryIndex: Sendable {
     public let ordered: [TaskCategory]
     private let other: TaskCategory?
-    private let rules: [Rule]
+    private let urlRules: [Rule]
+    private let nameRules: [Rule]
 
     private struct Rule: Sendable {
-        let category: TaskCategory
-        let regex: NSRegularExpression?
-        let extensions: Set<String>
+        enum Kind: Sendable {
+            case url(NSRegularExpression?)
+            case regex(NSRegularExpression?)
+            case extensions(Set<String>)
+        }
 
-        func matches(_ fileName: String) -> Bool {
-            if !category.regexPattern.isEmpty {
+        let category: TaskCategory
+        let kind: Kind
+
+        var isUrl: Bool {
+            if case .url = kind { return true }
+            return false
+        }
+
+        func matches(_ fileName: String, url: String) -> Bool {
+            switch kind {
+            case let .url(regex):
                 guard let regex else { return false }
+                return UrlWildcard.matches(regex, url)
+            case let .regex(regex):
+                guard !fileName.isEmpty, let regex else { return false }
                 let range = NSRange(fileName.startIndex..., in: fileName)
                 return regex.firstMatch(in: fileName, range: range) != nil
+            case let .extensions(extensions):
+                return extensions.contains(Self.extensionOf(fileName))
             }
-            return extensions.contains(Self.extensionOf(fileName))
         }
 
         static func extensionOf(_ name: String) -> String {
@@ -87,27 +132,41 @@ public struct CategoryIndex: Sendable {
     public init(_ categories: [TaskCategory]) {
         ordered = categories.sorted { $0.position < $1.position }
         other = ordered.first { $0.isOther }
-        rules = ordered.filter { !$0.isAll && !$0.isOther }.map { category in
-            let regex: NSRegularExpression? = category.regexPattern.isEmpty
-                ? nil
-                : try? NSRegularExpression(pattern: category.regexPattern, options: [.caseInsensitive])
+        let rules: [Rule] = ordered.filter { !$0.isAll && !$0.isOther }.map { category in
+            if !category.urlPattern.isEmpty {
+                return Rule(category: category, kind: .url(UrlWildcard.compile(category.urlPattern)))
+            }
+            if !category.regexPattern.isEmpty {
+                return Rule(
+                    category: category,
+                    kind: .regex(try? NSRegularExpression(pattern: category.regexPattern, options: [.caseInsensitive]))
+                )
+            }
             let exts = Set(category.extensions.map { ext in
                 let lower = ext.lowercased()
                 return lower.hasPrefix(".") ? String(lower.dropFirst()) : lower
             })
-            return Rule(category: category, regex: regex, extensions: exts)
+            return Rule(category: category, kind: .extensions(exts))
         }
+        urlRules = rules.filter(\.isUrl)
+        nameRules = rules.filter { !$0.isUrl }
     }
 
-    /// 文件命中的首个具体分类；都不命中 → other（无 other 时 nil）。
-    public func categoryOf(_ fileName: String) -> TaskCategory? {
-        rules.first { $0.matches(fileName) }?.category ?? other
+    /// 任务命中的首个具体分类：网址规则优先，其后扩展名 / 正则；都不命中 → other（无 other 时 nil）。
+    public func categoryOf(_ fileName: String, url: String = "") -> TaskCategory? {
+        urlRules.first { $0.matches(fileName, url: url) }?.category
+            ?? nameRules.first { $0.matches(fileName, url: url) }?.category
+            ?? other
     }
 
-    /// 文件是否属于分类（all 恒真；other = 未命中任何具体分类）。
-    public func matches(_ category: TaskCategory, _ fileName: String) -> Bool {
+    /// 任务是否属于分类（all 恒真；other = 未命中任何具体分类）。
+    public func matches(_ category: TaskCategory, _ fileName: String, url: String = "") -> Bool {
         if category.isAll { return true }
-        if category.isOther { return !rules.contains { $0.matches(fileName) } }
-        return rules.first { $0.category.id == category.id }?.matches(fileName) ?? false
+        if category.isOther {
+            return !urlRules.contains { $0.matches(fileName, url: url) }
+                && !nameRules.contains { $0.matches(fileName, url: url) }
+        }
+        let rule = urlRules.first { $0.category.id == category.id } ?? nameRules.first { $0.category.id == category.id }
+        return rule?.matches(fileName, url: url) ?? false
     }
 }

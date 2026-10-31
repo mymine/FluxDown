@@ -25,6 +25,9 @@ pub(crate) struct SubmissionGate {
     boundary: Arc<tokio::sync::Mutex<()>>,
     controls: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     pub(crate) interruption: tokio::sync::watch::Sender<Option<String>>,
+    /// 系统打开 / 拖入的链接或种子文件被 agent 拒绝（分享链接解析失败、不支持等）：
+    /// 界面据此提示用户，而不是静默什么都不发生。每次发送都会唤醒订阅者。
+    pub(crate) capture_failure: tokio::sync::watch::Sender<Option<fluxdown_protocol::RpcErrorData>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -56,6 +59,7 @@ impl Default for SubmissionGate {
             boundary: Arc::new(tokio::sync::Mutex::new(())),
             controls: std::sync::Mutex::new(None),
             interruption: tokio::sync::watch::channel(None).0,
+            capture_failure: tokio::sync::watch::channel(None).0,
         }
     }
 }
@@ -163,6 +167,7 @@ fn is_non_idempotent_submission(command: &DownloadsCommand) -> bool {
         DownloadsCommand::Create(_)
             | DownloadsCommand::CreateGroup { .. }
             | DownloadsCommand::SubmitTorrentFile { .. }
+            | DownloadsCommand::SeedLocal { .. }
             | DownloadsCommand::Redownload(..)
     ) || matches!(command, DownloadsCommand::CaptureResolve(params) if params.accepted)
 }
@@ -188,7 +193,8 @@ impl DownloadsPort for AgentDownloadsPort {
             DownloadsCommand::CaptureResolve(params) => {
                 params.request.as_ref().map(|request| request.url.clone())
             }
-            DownloadsCommand::SubmitTorrentFile { path, .. } => Some(path.clone()),
+            DownloadsCommand::SubmitTorrentFile { path, .. }
+            | DownloadsCommand::SeedLocal { path, .. } => Some(path.clone()),
             DownloadsCommand::Redownload(request, _) => Some(request.url.clone()),
             _ => None,
         };
@@ -265,6 +271,30 @@ impl AgentDownloadsPort {
                         .await?;
                     return Ok(DownloadsResult::TaskSpeedHistory(history));
                 }
+                DownloadsCommand::BtStatus(params) => {
+                    let status = client
+                        .call(method::DAEMON_TASK_BT_STATUS, Some(params))
+                        .await?;
+                    return Ok(DownloadsResult::BtStatus(status));
+                }
+                DownloadsCommand::BtGuardAddEntry(params) => {
+                    (method::DAEMON_BT_GUARD_ENTRIES_ADD, serialize(params)?)
+                }
+                DownloadsCommand::BtGuardEvidence { ip_group } => {
+                    let (entries_params, events_params) = evidence_params(&ip_group);
+                    let entries: fluxdown_protocol::BtGuardEntriesListDto = client
+                        .call(method::DAEMON_BT_GUARD_ENTRIES_LIST, Some(entries_params))
+                        .await?;
+                    let events: fluxdown_protocol::BtGuardEventsListDto = client
+                        .call(method::DAEMON_BT_GUARD_EVENTS_LIST, Some(events_params))
+                        .await?;
+                    return Ok(DownloadsResult::BtGuardEvidence(
+                        fluxdown_ui_downloads::BtGuardEvidence {
+                            entries: entries.items,
+                            events: events.items,
+                        },
+                    ));
+                }
                 DownloadsCommand::FileIcon(params) => {
                     let icon: fluxdown_protocol::PlatformFileIconDto = client
                         .call(method::AGENT_PLATFORM_FILE_ICON, Some(params))
@@ -310,6 +340,46 @@ impl AgentDownloadsPort {
                         .await?;
                     return Ok(DownloadsResult::TaskVerify(result));
                 }
+                DownloadsCommand::TorrentShare {
+                    task_id,
+                    include_torrent,
+                } => {
+                    let share: fluxdown_protocol::TorrentShareDto = client
+                        .call(
+                            method::DAEMON_TASK_TORRENT_SHARE,
+                            Some(serialize(fluxdown_protocol::DaemonTorrentShareParams {
+                                task_id,
+                                include_torrent,
+                            })?),
+                        )
+                        .await?;
+                    let torrent = share
+                        .torrent_b64
+                        .map(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded))
+                        .transpose()
+                        .map_err(|_| internal_error())?;
+                    return Ok(DownloadsResult::TorrentShare(
+                        fluxdown_ui_downloads::TorrentShare {
+                            name: share.name,
+                            magnet: share.magnet,
+                            torrent,
+                        },
+                    ));
+                }
+                DownloadsCommand::SeedLocal {
+                    path,
+                    torrent_path,
+                    trackers,
+                    unlimited,
+                } => (
+                    method::DAEMON_TASK_SEED_LOCAL,
+                    serialize(fluxdown_protocol::DaemonSeedLocalParams {
+                        path,
+                        torrent_path,
+                        trackers,
+                        unlimited,
+                    })?,
+                ),
                 DownloadsCommand::Delete {
                     task_id,
                     delete_files,
@@ -538,6 +608,11 @@ impl AgentDownloadsPort {
                     method::AGENT_PLATFORM_REVEAL_TASK,
                     json!({ "taskId": task_id }),
                 ),
+                // 剪贴板不涉及前台授权，Windows 同样由常驻 agent 写入（进程常驻，X11 剪贴板内容不丢）。
+                DownloadsCommand::CopyTaskFiles { task_ids } => (
+                    method::AGENT_PLATFORM_COPY_TASK_FILES,
+                    serialize(fluxdown_protocol::PlatformCopyTaskFilesParams { task_ids })?,
+                ),
                 DownloadsCommand::RescanFiles => (method::DAEMON_TASK_RESCAN, json!({})),
                 DownloadsCommand::SubmitTorrentFile {
                     path,
@@ -570,6 +645,27 @@ impl AgentDownloadsPort {
 
 fn serialize<T: serde::Serialize>(value: T) -> Result<Value, fluxdown_protocol::RpcErrorData> {
     serde_json::to_value(value).map_err(|_| internal_error())
+}
+
+/// 「查看证据」的两次查询参数：条目取覆盖该 IP 的全部名单条目，事件按 IP 组精确过滤，均由 daemon 筛选。
+fn evidence_params(
+    ip_group: &str,
+) -> (
+    fluxdown_protocol::BtGuardEntriesListParams,
+    fluxdown_protocol::BtGuardEventsListParams,
+) {
+    (
+        fluxdown_protocol::BtGuardEntriesListParams {
+            contains_ip: Some(ip_group.to_owned()),
+            limit: fluxdown_protocol::BT_GUARD_LIST_MAX_LIMIT,
+            ..Default::default()
+        },
+        fluxdown_protocol::BtGuardEventsListParams {
+            ip_group: Some(ip_group.to_owned()),
+            limit: fluxdown_protocol::BT_GUARD_LIST_MAX_LIMIT,
+            ..Default::default()
+        },
+    )
 }
 
 fn internal_error() -> fluxdown_protocol::RpcErrorData {
@@ -624,6 +720,19 @@ fn torrent_file_params(
         }
     }
     params
+}
+
+#[cfg(test)]
+mod evidence_params_tests {
+    use super::evidence_params;
+
+    #[test]
+    fn evidence_queries_are_filtered_by_the_daemon() {
+        let (entries, events) = evidence_params("2001:db8::/64");
+        assert_eq!(entries.contains_ip.as_deref(), Some("2001:db8::/64"));
+        assert!(entries.query.is_none());
+        assert_eq!(events.ip_group.as_deref(), Some("2001:db8::/64"));
+    }
 }
 
 #[cfg(test)]

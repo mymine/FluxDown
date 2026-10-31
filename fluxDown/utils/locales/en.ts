@@ -9,6 +9,7 @@ const en: Record<MessageKey, string> = {
   "header.languageSwitch": "Switch to {language}",
   "header.checking": "Checking...",
   "header.connected": "Connected",
+  "header.androidHandoff": "To FluxDown app",
   "header.disconnected": "Disconnected",
 
   // Main switch
@@ -156,6 +157,8 @@ const en: Record<MessageKey, string> = {
   "notify.batchSentDetail": "{count} tasks sent to FluxDown",
   "notify.sendFailed": "Send Failed",
   "notify.connectionFailed": "Cannot connect to FluxDown app: {message}",
+  "notify.androidUnsupported": "This download can't be handed to the FluxDown Android app (audio/video track pairs, form submissions and FTP links need the desktop or remote channel)",
+  "notify.androidHandoffFailed": "The browser refused to open the FluxDown Android app",
   "notify.fallbackBrowser": "Fell back to browser download",
   "notify.fallbackBrowserDetail":
     "Could not send to FluxDown, fell back to browser: {url}",
@@ -296,6 +299,8 @@ const en: Record<MessageKey, string> = {
   // Popup / side panel
   "popup.viewAll": "View all in side panel ({count})",
   "popup.sidePanel": "Side panel",
+  "popup.bypassHint": "{key}+click to skip",
+  "popup.bypassHintTip": "Hold {key} while clicking a link and the browser downloads it instead of FluxDown (magnet links go to the system handler). Also works for buttons that start the download via script. Change the key in Settings → Download Interception.",
   "sidepanel.tab.resources": "Resources",
   "sidepanel.tab.links": "Links",
   "sidepanel.tab.tasks": "Tasks",
@@ -326,6 +331,19 @@ const en: Record<MessageKey, string> = {
   "sidepanel.diag.unnamed": "(unnamed)",
   "sidepanel.diag.exportLog": "Export resource debug log",
   "sidepanel.diag.exportConn": "Export connection diagnostics",
+  "sidepanel.diag.errorLog": "Extension errors",
+  "sidepanel.diag.errorLogEmpty": "No errors recorded",
+  "sidepanel.diag.errorLogClear": "Clear",
+  "sidepanel.diag.errorLogCleared": "Error log cleared",
+  "sidepanel.diag.errorLogClearFailed": "Could not clear the error log",
+  "sidepanel.diag.errorLogHint": "Errors from every part of the extension are kept here for 7 days (latest 100) and included in the connection diagnostics export",
+  "sidepanel.diag.errorLevel.error": "Error",
+  "sidepanel.diag.errorLevel.warn": "Warning",
+  "sidepanel.diag.errorSource.background": "Background",
+  "sidepanel.diag.errorSource.popup": "Popup",
+  "sidepanel.diag.errorSource.options": "Settings",
+  "sidepanel.diag.errorSource.sidepanel": "Side panel",
+  "sidepanel.diag.errorSource.content": "Web page",
 
   // Options migration extras
   "options.general.statsDesc": "Reset the downloaded/failed counters shown in the popup",
@@ -335,7 +353,7 @@ const en: Record<MessageKey, string> = {
   "options.protocol.label": "FluxDown Protocol",
   "options.protocol.enabled": "On — launch app via fluxdown://",
   "options.protocol.disabled": "Off (default)",
-  "options.protocol.desc": "Launch the app via the fluxdown:// protocol — supported on Windows, macOS, Linux and Android. The native channel is more capable, so enable this only when it is unavailable",
+  "options.protocol.desc": "Launch the app via the fluxdown:// protocol — supported on Windows, macOS and Linux (browsers on Android hand downloads to the FluxDown app automatically, no need to enable this). The native channel is more capable, so enable this only when it is unavailable",
 
   // Task completion notification (task panel)
   "notify.taskCompletedTitle": "Download Complete",
@@ -514,6 +532,10 @@ const en: Record<MessageKey, string> = {
   "options.intercept.localDownloadHint": "Files generated inside the browser (blob:/data: links, service-worker streamed downloads) can't be taken over and use the browser download",
   "options.intercept.magnet": "Take Over Magnet Links",
   "options.intercept.magnetHint": "When off, magnet links go to the system default handler (e.g. qBittorrent)",
+  "options.intercept.bypassKey": "Skip Takeover Key",
+  "options.intercept.bypassKeyDesc": "Hold this key while clicking a link to let the browser handle that download (magnet links go to the system handler)",
+  "options.intercept.bypassKeyAlt": "Alt (Option on Mac)",
+  "options.intercept.bypassKeyOff": "Off",
   "options.intercept.minSize": "Min File Size",
   "options.intercept.sizeNoLimit": "No limit",
   "options.intercept.fallbackReject": "Fall back to browser when the desktop app rejects",
@@ -544,6 +566,9 @@ const en: Record<MessageKey, string> = {
   "options.sniff.imagesDesc": "Detect large images on web pages (>100KB)",
   "options.sniff.lowConfidence": "Show Low-confidence Resources",
   "options.sniff.lowConfidenceDesc": "Also list items the detector is less sure about",
+  "options.sniff.maxResources": "Max Resources per Page",
+  "options.sniff.maxResourcesDesc":
+    "Stop scanning page links after this many items (1–{max}). Very large values may slow down long list pages. Media caught from network requests is not counted.",
   "options.sites.desc": "Override the global behaviour per site: whether to take over downloads, sniff, show the dot and float button, and where to save. A site entry also applies to its subdomains.",
   "options.sites.colHost": "Site",
   "options.sites.colIntercept": "Intercept",

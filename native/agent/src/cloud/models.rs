@@ -1,6 +1,8 @@
 //! FluxCloud HTTP 私有模型；含令牌的类型不得导出到本机协议。
 
-use fluxdown_protocol::{AgentSessionDto, CloudDevice, CloudPlan, CloudUser, Entitlements};
+use fluxdown_protocol::{
+    AgentSessionDto, CloudDevice, CloudPlan, CloudSubscription, CloudUser, Entitlements,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -13,6 +15,8 @@ pub(crate) struct AuthResponse {
     #[serde(default)]
     pub entitlements: Entitlements,
     pub current_plan: Option<CloudPlan>,
+    #[serde(default)]
+    pub active_subscription: Option<CloudSubscription>,
     pub device: CloudDevice,
 }
 
@@ -22,6 +26,7 @@ impl AuthResponse {
             user: self.user.clone(),
             entitlements: self.entitlements.clone(),
             current_plan: self.current_plan.clone(),
+            active_subscription: self.active_subscription.clone(),
             device: self.device.clone(),
         }
     }
@@ -31,6 +36,7 @@ impl AuthResponse {
 pub(crate) struct CloudErrorBody {
     pub code: Option<String>,
     pub message: Option<String>,
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]

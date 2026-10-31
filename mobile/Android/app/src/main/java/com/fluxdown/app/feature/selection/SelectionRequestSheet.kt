@@ -303,7 +303,7 @@ internal fun SelectionTaskRow(task: Task?, modifier: Modifier = Modifier) {
     val type = FluxTheme.type
     val host = hostState()
     val categories by remember { derivedStateOf { host.value.categories } }
-    val cat = remember(categories, task.fileName) { CategoryIndex(categories).categoryOf(task.fileName).fileCategory() }
+    val cat = remember(categories, task.fileName, task.shareUrl) { CategoryIndex(categories).categoryOf(task.fileName, task.shareUrl).fileCategory() }
     Row(
         modifier
             .fillMaxWidth()

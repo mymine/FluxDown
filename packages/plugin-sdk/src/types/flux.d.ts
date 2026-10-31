@@ -131,6 +131,9 @@ export interface ViewEvent {
   action?: string;
 }
 
+/** Navigation target: a built-in page, or an `activity` view of this plugin. */
+export type NavigateTarget = "downloads" | "rss" | "webhooks" | "share" | { view: string };
+
 export interface ViewContext {
   /** Unique id of this open view session. */
   session: string;
@@ -141,6 +144,22 @@ export interface ViewContext {
   locale: string;
   /** Requests a re-render (throttled to one render per 100 ms per session). */
   refresh(): void;
+  /**
+   * Closes the container hosting this view (login dialog, settings dialog, standalone
+   * window) and ends the session. For views embedded in a page (activity page, task
+   * detail tab) there is no container: the view just shows as "ended" with a reopen button.
+   * Idempotent. May be called inside `init` (for example when already logged in): the client
+   * shows the view and closes it right away.
+   */
+  close(): void;
+  /**
+   * Brings the main window to the front and switches to the target page. Rejects on an
+   * unknown target or a `{ view }` that is not an `activity` view of this plugin. Ignored by
+   * the client if the target page does not exist. Only the client that opened this view is
+   * affected. Rejects when called after `close()` (navigate first, then close). May be called
+   * inside `init`.
+   */
+  navigate(target: NavigateTarget): Promise<void>;
 }
 
 type Awaitable<T> = T | Promise<T>;

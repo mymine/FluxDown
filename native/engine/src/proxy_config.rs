@@ -9,6 +9,7 @@
 //! - Parsing a Windows `ProxyServer` registry value (multi-protocol format)
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::downloader::DownloadError;
 use crate::logger::log_info;
@@ -171,6 +172,11 @@ pub struct ProxyConfig {
     /// Comma-separated list of hosts/domains to bypass the proxy.
     /// Supports wildcards like `*.local`.
     pub no_proxy_list: String,
+    /// 已编译的站点代理规则（`proxy_rules` 配置键）。**只有 [`Self::from_config_map`]
+    /// 产出的全局配置携带它**；[`Self::resolve`]、[`Self::from_proxy_url`] 与一切派生
+    /// 出口配置（Auto 候选、规则出口、系统代理检测结果）恒为 `None`。
+    /// `build_client_builder` 不读它：规则由调用方逐请求换 client 生效。
+    pub rules: Option<Arc<crate::proxy_rules::ProxyRuleSet>>,
 }
 
 impl Default for ProxyConfig {
@@ -183,6 +189,7 @@ impl Default for ProxyConfig {
             username: String::new(),
             password: String::new(),
             no_proxy_list: String::new(),
+            rules: None,
         }
     }
 }
@@ -209,6 +216,18 @@ impl ProxyConfig {
         let password = map.get("proxy_password").cloned().unwrap_or_default();
         let no_proxy_list = map.get("proxy_no_list").cloned().unwrap_or_default();
 
+        let manual = Self {
+            mode: ProxyMode::Manual,
+            proxy_type: proxy_type.clone(),
+            host: host.clone(),
+            port,
+            username: username.clone(),
+            password: password.clone(),
+            no_proxy_list: String::new(),
+            rules: None,
+        };
+        let rules = crate::proxy_rules::rules_from_config_map(map, &manual);
+
         Self {
             mode,
             proxy_type,
@@ -217,6 +236,7 @@ impl ProxyConfig {
             username,
             password,
             no_proxy_list,
+            rules,
         }
     }
 
@@ -297,7 +317,11 @@ impl ProxyConfig {
             // 非 HTTP-coordinator 路径拿到的 Auto 就是直连语义）。具体
             // 代理只能由 auto_proxy 的缓存/采样决策显式给出。
             ProxyMode::Auto => Self::default(),
-            _ => self.clone(),
+            // 解析后的出口配置不携带站点规则（规则只挂在全局配置上）。
+            _ => Self {
+                rules: None,
+                ..self.clone()
+            },
         }
     }
 
@@ -381,6 +405,7 @@ impl ProxyConfig {
             username,
             password,
             no_proxy_list: String::new(),
+            rules: None,
         }
     }
 }
@@ -392,10 +417,13 @@ impl ProxyConfig {
 /// 把用户/系统写的绕过列表归一化为 `reqwest::NoProxy` 能识别的写法。
 ///
 /// `NoProxy` 只支持精确域名、`.suffix` 后缀、精确 IP 与 CIDR；Windows
-/// `ProxyOverride` 和用户手填常见的 `*.corp.com`、`192.168.*`、`<local>`
-/// 不在其内，直接传入会静默失效。分隔符 `;` 统一为 `,`。
+/// `ProxyOverride`、macOS `ExceptionsList` 和用户手填常见的 `*.corp.com`、
+/// `192.168.*`、`169.254/16`（macOS 系统默认项）、`<local>` 不在其内，直接传入会
+/// 静默失效。分隔符 `;` 统一为 `,`。
 /// `<local>`（不含点的主机名直连）无法用 `NoProxy` 表达，按环回 + 私网段
 /// 近似。幂等。
+///
+/// 镜像：`native/agent/src/system_proxy.rs::normalize_no_proxy`（agent 不依赖引擎）。
 pub fn normalize_no_proxy(list: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     for raw in list.split([',', ';']) {
@@ -429,9 +457,120 @@ pub fn normalize_no_proxy(list: &str) -> String {
                 continue;
             }
         }
+        if let Some(cidr) = expand_abbreviated_ipv4_cidr(entry) {
+            out.push(cidr);
+            continue;
+        }
         out.push(entry.to_string());
     }
     out.join(",")
+}
+
+/// 缩写 IPv4 网段补足为四段：`169.254/16` → `169.254.0.0/16`。完整四段或非 IPv4 返回 `None`。
+fn expand_abbreviated_ipv4_cidr(entry: &str) -> Option<String> {
+    let (prefix, bits) = entry.split_once('/')?;
+    let mut octets: Vec<&str> = prefix.split('.').collect();
+    let valid = (1..=3).contains(&octets.len())
+        && octets.iter().all(|o| o.parse::<u8>().is_ok())
+        && bits.parse::<u8>().is_ok_and(|b| b <= 32);
+    if !valid {
+        return None;
+    }
+    octets.resize(4, "0");
+    Some(format!("{}/{bits}", octets.join(".")))
+}
+
+/// 环回地址恒直连：本机适配器 / 本地服务绝不能被转发到外部代理。
+const LOOPBACK_NO_PROXY: [&str; 3] = ["localhost", "127.0.0.0/8", "::1"];
+
+/// 安装 `reqwest::Proxy` 时使用的绕过列表：环回名单 + 归一化后的用户名单
+/// （用户名单为空也保留环回；已含的条目不重复）。
+pub fn loopback_no_proxy(user_list: &str) -> String {
+    let mut out: Vec<String> = LOOPBACK_NO_PROXY.iter().map(|e| (*e).to_string()).collect();
+    for entry in normalize_no_proxy(user_list).split(',') {
+        if !entry.is_empty() && !out.iter().any(|e| e.eq_ignore_ascii_case(entry)) {
+            out.push(entry.to_string());
+        }
+    }
+    out.join(",")
+}
+
+/// 仅供集成测试：用环回假代理 + 环回假源站模拟「远端源站走代理」的场景时关闭环回直连。
+/// 进程级开关，生产代码不得调用；测试应按 nextest 的每测试一进程模型使用。
+static LOOPBACK_BYPASS_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 见 [`LOOPBACK_BYPASS_DISABLED`]。
+#[doc(hidden)]
+pub fn disable_loopback_bypass_for_tests() {
+    LOOPBACK_BYPASS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `build_client_builder` 为 `reqwest::Proxy` 装配的绕过列表：恒含环回（见
+/// [`loopback_no_proxy`]），测试开关打开时退回纯用户名单。
+pub(crate) fn proxy_bypass_list(user_list: &str) -> String {
+    if LOOPBACK_BYPASS_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        normalize_no_proxy(user_list)
+    } else {
+        loopback_no_proxy(user_list)
+    }
+}
+
+/// no_proxy 匹配（逗号/分号分隔）：`*`、精确主机、域后缀（`.x` / `*.x` / `x`）、
+/// 精确 IP 与 CIDR，语义对齐 reqwest::NoProxy。
+pub(crate) fn host_matches_no_proxy(host: &str, list: &str) -> bool {
+    use std::net::IpAddr;
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    let host_ip = host.parse::<IpAddr>().ok();
+    for raw in list.split([',', ';']) {
+        let entry = raw.trim().to_ascii_lowercase();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry == "*" {
+            return true;
+        }
+        if let Some((net, bits)) = entry.split_once('/')
+            && let (Ok(net), Ok(bits), Some(ip)) =
+                (net.parse::<IpAddr>(), bits.parse::<u32>(), host_ip)
+        {
+            let in_net = match (net, ip) {
+                (IpAddr::V4(n), IpAddr::V4(h)) if bits <= 32 => {
+                    let mask = if bits == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - bits)
+                    };
+                    u32::from(n) & mask == u32::from(h) & mask
+                }
+                (IpAddr::V6(n), IpAddr::V6(h)) if bits <= 128 => {
+                    let mask = if bits == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - bits)
+                    };
+                    u128::from(n) & mask == u128::from(h) & mask
+                }
+                _ => false,
+            };
+            if in_net {
+                return true;
+            }
+            continue;
+        }
+        let suffix = entry.trim_start_matches("*.").trim_start_matches('.');
+        if host == suffix || host.ends_with(&format!(".{suffix}")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 主机是否落在恒直连的环回名单内（测试开关 [`disable_loopback_bypass_for_tests`]
+/// 打开时恒为 `false`）。站点规则据此对环回地址永不匹配。
+pub(crate) fn is_loopback_bypassed(host: &str) -> bool {
+    !LOOPBACK_BYPASS_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+        && host_matches_no_proxy(host, &LOOPBACK_NO_PROXY.join(","))
 }
 
 /// Detect the system-level proxy from Windows registry.
@@ -481,49 +620,65 @@ pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
         username: String::new(),
         password: String::new(),
         no_proxy_list: no_proxy,
+        rules: None,
     }))
 }
 
-/// `ProxyMode::Auto` 的系统代理候选端点（Auto 自己按 host 实测选路，只需要
-/// 「系统代理指向哪个端点」）。静态系统代理优先；否则系统配置了 PAC URL 时
-/// 取 PAC 脚本里出现的第一个代理端点（见 [`crate::pac`]，不逐 URL 执行
-/// `FindProxyForURL`）。WPAD 自动发现（无 URL）不在范围内。探测失败按无候选
-/// 处理并记日志。
+/// `ProxyMode::Auto` 的系统代理候选端点（Auto 自己按 host 实测选路，这里只
+/// 判定「有没有系统代理、指向哪个端点」）。静态系统代理优先；否则系统配置了
+/// PAC（含 WPAD 自动发现）时取已缓存 PAC 脚本里出现的第一个代理端点——只读
+/// 缓存、不在调用线程上做网络 IO（见 [`crate::pac`]），逐链接的 PAC 结论由
+/// 任务起跑时的 [`crate::pac_route`] 修正。探测失败按无候选处理并记日志。
 pub fn detect_auto_system_proxy() -> Option<ProxyConfig> {
     match detect_system_proxy() {
         Ok(Some(found)) => return Some(found),
         Ok(None) => {}
         Err(error) => log_info!("[auto-proxy] 系统代理检测失败: {error}"),
     }
-    let pac_url = detect_system_pac_url()?;
+    let pac_url = system_pac_url()?;
     crate::pac::resolve_pac_endpoint(&pac_url)
 }
 
-/// Windows PAC URL：`Internet Settings\AutoConfigURL`。
+/// 系统当前生效的 PAC 地址：显式 PAC URL 优先；系统开启了「自动发现代理」
+/// 且无显式 URL 时为 WPAD 地址 [`crate::pac::WPAD_URL`]；都没有 → `None`。
+/// 只读本地配置（macOS/Linux 带 30s 缓存），不做网络 IO。
 #[cfg(target_os = "windows")]
-fn detect_system_pac_url() -> Option<String> {
+pub(crate) fn system_pac_url() -> Option<String> {
     use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
 
     let inet = RegKey::predef(HKEY_CURRENT_USER)
         .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
         .ok()?;
-    let url: String = inet.get_value("AutoConfigURL").ok()?;
-    let url = url.trim();
-    if url.is_empty() {
-        None
-    } else {
-        Some(url.to_string())
+    let explicit = inet
+        .get_value::<String, _>("AutoConfigURL")
+        .ok()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty());
+    if explicit.is_some() {
+        return explicit;
     }
+    let auto_detect = inet
+        .open_subkey("Connections")
+        .and_then(|connections| connections.get_raw_value("DefaultConnectionSettings"))
+        .is_ok_and(|value| windows_auto_detect_enabled(&value.bytes));
+    auto_detect.then(|| crate::pac::WPAD_URL.to_string())
+}
+
+/// `Internet Settings\Connections\DefaultConnectionSettings` 第 8 字节是连接标志位，
+/// `0x08` = 「自动检测设置」（WinINet `PROXY_TYPE_AUTO_DETECT`）。
+#[allow(dead_code)] // 仅 Windows 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn windows_auto_detect_enabled(settings: &[u8]) -> bool {
+    settings.get(8).is_some_and(|flags| flags & 0x08 != 0)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn detect_system_pac_url() -> Option<String> {
+pub(crate) fn system_pac_url() -> Option<String> {
     system_proxy_snapshot().pac_url
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-fn detect_system_pac_url() -> Option<String> {
+pub(crate) fn system_pac_url() -> Option<String> {
     None
 }
 
@@ -710,11 +865,32 @@ fn parse_scutil_dict(text: &str) -> HashMap<String, String> {
     map
 }
 
+/// `scutil --proxy` 的 `ExceptionsList` 数组（系统设置「忽略这些主机与域的代理设置」）。
+/// [`parse_scutil_dict`] 只取顶层标量，数组项须单独收集；缺失返回空。
+#[allow(dead_code)] // 仅 macOS 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn parse_scutil_exceptions(text: &str) -> Vec<String> {
+    let mut lines = text.lines().map(str::trim);
+    if !lines.any(|line| {
+        line.split_once(':').is_some_and(|(key, value)| {
+            key.trim() == "ExceptionsList" && value.trim().starts_with("<array>")
+        })
+    }) {
+        return Vec::new();
+    }
+    lines
+        .take_while(|line| *line != "}")
+        .filter_map(|line| line.split_once(':'))
+        .map(|(_, value)| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
 /// 从 `scutil --proxy` 字典中选出一个已启用的代理协议，按 socks > https >
 /// http 优先（与 [`parse_windows_proxy_server`] 一致）。`HTTPSProxy` 字段
 /// 命名的是【流量目标】协议而非代理端点自身的传输层——该端点仍然只会
 /// 应答明文 HTTP `CONNECT`，因此映射到 [`ProxyType::Http`]，理由与
 /// Windows `ProxyServer` 的 `https=` 键完全相同（见该函数文档）。
+/// 直连名单取 `ExceptionsList`（归一化后存入，同 Windows `ProxyOverride`）。
 #[allow(dead_code)] // 仅 macOS 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
 fn parse_scutil_proxy_output(text: &str) -> Option<ProxyConfig> {
     let map = parse_scutil_dict(text);
@@ -744,6 +920,7 @@ fn parse_scutil_proxy_output(text: &str) -> Option<ProxyConfig> {
                 proxy_type,
                 host,
                 port,
+                no_proxy_list: normalize_no_proxy(&parse_scutil_exceptions(text).join(",")),
                 ..Default::default()
             });
         }
@@ -751,18 +928,22 @@ fn parse_scutil_proxy_output(text: &str) -> Option<ProxyConfig> {
     None
 }
 
-/// 从 `scutil --proxy` 字典读取 PAC 脚本 URL：`ProxyAutoConfigEnable : 1`
-/// 且 `ProxyAutoConfigURLString` 非空。
+/// 从 `scutil --proxy` 字典读取生效的 PAC 地址：`ProxyAutoConfigEnable : 1` 且
+/// `ProxyAutoConfigURLString` 非空 → 该 URL；否则 `ProxyAutoDiscoveryEnable : 1`
+/// （「自动发现代理」）→ WPAD 地址。
 #[allow(dead_code)] // 仅 macOS 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
 fn parse_scutil_pac_url(text: &str) -> Option<String> {
     let map = parse_scutil_dict(text);
-    if map.get("ProxyAutoConfigEnable").map(|v| v.trim()) != Some("1") {
-        return None;
+    let enabled = |key: &str| map.get(key).map(|v| v.trim()) == Some("1");
+    if enabled("ProxyAutoConfigEnable")
+        && let Some(url) = map
+            .get("ProxyAutoConfigURLString")
+            .map(|u| u.trim())
+            .filter(|u| !u.is_empty())
+    {
+        return Some(url.to_string());
     }
-    map.get("ProxyAutoConfigURLString")
-        .map(|u| u.trim())
-        .filter(|u| !u.is_empty())
-        .map(str::to_string)
+    enabled("ProxyAutoDiscoveryEnable").then(|| crate::pac::WPAD_URL.to_string())
 }
 
 /// 按 `https_proxy` > `http_proxy` > `all_proxy` 优先读取代理环境变量
@@ -817,6 +998,7 @@ fn parse_env_proxy_url(raw: &str) -> Option<ProxyConfig> {
         username,
         password,
         no_proxy_list: first_nonempty_env(&["no_proxy", "NO_PROXY"]).unwrap_or_default(),
+        rules: None,
     })
 }
 
@@ -857,15 +1039,19 @@ fn detect_proxy_from_gsettings() -> Option<ProxyConfig> {
     None
 }
 
-/// GNOME `gsettings` PAC 配置：`mode` 为 `auto` 时取 `autoconfig-url`。
-/// `auto` 模式下 URL 为空即 WPAD 自动发现，不在支持范围内（无 URL 可取）。
+/// GNOME `gsettings` PAC 配置：`mode` 为 `auto` 时取 `autoconfig-url`；URL 为空
+/// 即 WPAD 自动发现，给出 WPAD 地址。
 #[allow(dead_code)] // 仅 Linux 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
 fn detect_pac_url_from_gsettings() -> Option<String> {
     let mode = gsettings_get("org.gnome.system.proxy", "mode")?;
     if mode != "auto" {
         return None;
     }
-    gsettings_get("org.gnome.system.proxy", "autoconfig-url")
+    Some(
+        gsettings_get("org.gnome.system.proxy", "autoconfig-url")
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| crate::pac::WPAD_URL.to_string()),
+    )
 }
 
 /// 剥掉 GNOME dconf 字符串取值外层的单引号（固定输出 `'value'`）；整数
@@ -1727,6 +1913,7 @@ pub async fn test_proxy_connection(
         username: proxy_username.to_string(),
         password: proxy_password.to_string(),
         no_proxy_list: String::new(),
+        rules: None,
     };
 
     let proxy_url = config.to_proxy_url().ok_or_else(|| {
@@ -1828,6 +2015,21 @@ mod tests {
         assert!(local.contains("localhost") && local.contains("192.168.0.0/16"));
         // 幂等：已归一化的列表再次归一化不变。
         assert_eq!(normalize_no_proxy(&local), local);
+        // macOS `ExceptionsList` 的缩写网段补足为四段；完整网段与 IPv6 原样保留。
+        assert_eq!(
+            normalize_no_proxy("169.254/16, 10/8,192.168.0.0/16,fe80::/10"),
+            "169.254.0.0/16,10.0.0.0/8,192.168.0.0/16,fe80::/10"
+        );
+    }
+
+    #[test]
+    fn loopback_no_proxy_always_included_and_merged() {
+        use super::loopback_no_proxy;
+        assert_eq!(loopback_no_proxy(""), "localhost,127.0.0.0/8,::1");
+        assert_eq!(
+            loopback_no_proxy("*.corp.com;LOCALHOST;10.0.0.5"),
+            "localhost,127.0.0.0/8,::1,.corp.com,10.0.0.5"
+        );
     }
 
     use super::{
@@ -2021,6 +2223,7 @@ mod tests {
             username: "admin".to_string(),
             password: "secret".to_string(),
             no_proxy_list: String::new(),
+            rules: None,
         };
         assert_eq!(
             config.to_proxy_url().as_deref(),
@@ -2220,6 +2423,7 @@ mod tests {
             username: String::new(),
             password: String::new(),
             no_proxy_list: String::new(),
+            rules: None,
         };
         let client = crate::downloader::build_client_with_tls_policy(&config, "", false)
             .expect("build manual socks5 client");
@@ -2432,6 +2636,7 @@ mod tests {
             username: String::new(),
             password: String::new(),
             no_proxy_list: String::new(),
+            rules: None,
         };
         assert_eq!(
             config.to_proxy_url().as_deref(),
@@ -2662,6 +2867,7 @@ mod tests {
             username: "user@domain".to_string(),
             password: "p@ss:word".to_string(),
             no_proxy_list: String::new(),
+            rules: None,
         };
         let url = config.to_proxy_url();
         assert!(url.is_some());
@@ -2683,6 +2889,7 @@ mod tests {
             username: "admin@corp".to_string(),
             password: "s3cr3t!".to_string(),
             no_proxy_list: String::new(),
+            rules: None,
         };
         let url = config.to_proxy_url().unwrap_or_default();
         let parsed = ProxyConfig::from_proxy_url(&url);
@@ -2774,6 +2981,24 @@ mod tests {
         assert_eq!(map.get("HTTPProxy").map(String::as_str), Some("127.0.0.1"));
     }
 
+    /// Clash 一类工具写入的典型 `scutil --proxy` 输出：例外列表必须进入直连名单（此前整段被丢弃，
+    /// 系统代理模式下局域网 / `.local` 也被送进代理）；没有例外列表时名单为空。
+    #[test]
+    fn parse_scutil_proxy_output_keeps_exceptions_list_as_bypass() {
+        let text = "<dictionary> {\n  ExceptionsList : <array> {\n    0 : 127.0.0.1\n    1 : 192.168.0.0/16\n    2 : *.local\n    3 : 169.254/16\n    4 : <local>\n    5 : fe80::/10\n  }\n  ExcludeSimpleHostnames : 1\n  HTTPEnable : 1\n  HTTPPort : 7897\n  HTTPProxy : 127.0.0.1\n  SOCKSEnable : 1\n  SOCKSPort : 7897\n  SOCKSProxy : 127.0.0.1\n}\n";
+        let cfg = parse_scutil_proxy_output(text).expect("proxy should be detected");
+        assert_eq!(cfg.proxy_type, ProxyType::Socks5);
+        assert_eq!(
+            cfg.no_proxy_list,
+            "127.0.0.1,192.168.0.0/16,.local,169.254.0.0/16,localhost,127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fe80::/10"
+        );
+
+        let bare =
+            "<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : 7897\n  HTTPProxy : 127.0.0.1\n}\n";
+        let cfg = parse_scutil_proxy_output(bare).expect("proxy should be detected");
+        assert!(cfg.no_proxy_list.is_empty());
+    }
+
     #[test]
     fn parse_scutil_proxy_output_all_disabled_returns_none() {
         let text = "<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 0\n  SOCKSEnable : 0\n}\n";
@@ -2818,6 +3043,34 @@ mod tests {
         // GUI 关掉某个协议但残留旧字段时常见：*Enable=1 但 host 字段是空串。
         let text = "<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : 1087\n  HTTPProxy : \n}\n";
         assert!(parse_scutil_proxy_output(text).is_none());
+    }
+
+    #[test]
+    fn auto_discovery_without_explicit_pac_maps_to_wpad() {
+        let discovery =
+            "<dictionary> {\n  ProxyAutoConfigEnable : 0\n  ProxyAutoDiscoveryEnable : 1\n}\n";
+        assert_eq!(
+            super::parse_scutil_pac_url(discovery).as_deref(),
+            Some(crate::pac::WPAD_URL)
+        );
+        // 显式 PAC URL 优先于自动发现。
+        let both = "<dictionary> {\n  ProxyAutoConfigEnable : 1\n  ProxyAutoConfigURLString : http://10.0.0.1/p.pac\n  ProxyAutoDiscoveryEnable : 1\n}\n";
+        assert_eq!(
+            super::parse_scutil_pac_url(both).as_deref(),
+            Some("http://10.0.0.1/p.pac")
+        );
+        let off = "<dictionary> {\n  ProxyAutoDiscoveryEnable : 0\n}\n";
+        assert!(super::parse_scutil_pac_url(off).is_none());
+
+        // Windows DefaultConnectionSettings：第 8 字节 0x08 = 自动检测。
+        let mut settings = vec![0x46, 0, 0, 0, 0x05, 0, 0, 0, 0x01];
+        assert!(!super::windows_auto_detect_enabled(&settings));
+        settings[8] = 0x09;
+        assert!(super::windows_auto_detect_enabled(&settings));
+        assert!(
+            !super::windows_auto_detect_enabled(&settings[..4]),
+            "截断数据不得误判"
+        );
     }
 
     #[test]

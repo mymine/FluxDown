@@ -1,6 +1,7 @@
 import type { JSX } from "preact";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { useT } from "@/ui/i18n";
+import { usePlatform } from "@/ui/hooks/usePlatform";
 import {
   LOCAL_RULES_KEY,
   RULE_OVERRIDES_KEY,
@@ -19,6 +20,7 @@ import { useRulesData } from "./useRulesData";
 
 export function RulesPanel(): JSX.Element {
   const t = useT();
+  const platform = usePlatform();
   const data = useRulesData();
   const [overrides, writeOverrides] = useLocalValue(RULE_OVERRIDES_KEY, parseOverrides);
   const [localRules, writeLocalRules] = useLocalValue(LOCAL_RULES_KEY, parseLocalRules);
@@ -60,7 +62,7 @@ export function RulesPanel(): JSX.Element {
           {t("rules.loadError", { message: data.loadError })}
         </div>
       ) : null}
-      <SyncCard sync={data.sync} onSynced={data.setSync} />
+      {platform.desktopApp ? <SyncCard sync={data.sync} onSynced={data.setSync} /> : null}
       <RuleTable
         entries={data.entries}
         overrides={overrides}

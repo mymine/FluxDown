@@ -60,6 +60,14 @@ const HOOK_FLAG = "__fluxdown_hooks__";
 /** 每个 MediaSource 会话可重放的上限（sensor 重注入时只需要当前仍挂在元素上的那些）。 */
 const MAX_REPLAY_MS = 64;
 
+/**
+ * 不装钩子的帧：Cloudflare 质询 / Turnstile 帧（challenges.cloudflare.com）没有可下载资源；其脚本会
+ * fetch 被本帧 CSP 拦下的地址（如 `data:,`），经包装后的 fetch 发出时控制台报错的来源脚本是本扩展，
+ * 会被记进扩展的错误列表。改写原生 fetch / XHR 也可能干扰质询的环境检测。
+ * 声明式注入与补注入（background/probe.ts，allFrames）都经过这里，所以在运行期判断。
+ */
+const CHALLENGE_FRAME_HOST = "challenges.cloudflare.com";
+
 function makeHookId(): string {
   try {
     return crypto.randomUUID().slice(0, 8);
@@ -85,7 +93,7 @@ const GENERIC_BINARY_CT = new Set([
 
 export function start(): void {
   const w = window as unknown as Record<string, unknown>;
-  if (w[HOOK_FLAG]) return;
+  if (w[HOOK_FLAG] || location.hostname === CHALLENGE_FRAME_HOST) return;
   const hid = makeHookId();
   // document_start 注入时文档仍在 loading；之后才装上的钩子（扩展安装 / 更新后补注入）
   // 漏掉了已建立的 MediaSource ↔ 元素关联，sensor 据此把无证据的播放元素标为「需刷新」。
@@ -646,17 +654,17 @@ export function start(): void {
   // ===== fetch =====
 
   const originalFetch = window.fetch;
-  if (typeof originalFetch === "function") {
+  const NativeRequest = window.Request;
+  if (typeof originalFetch === "function" && typeof NativeRequest === "function") {
     window.fetch = function (this: unknown, ...args: Parameters<typeof fetch>) {
-      let url = "";
+      // 与规范一致（fetch 第一步就是 `new Request(input, init)`）：同步固定请求，调用方之后改 init 不影响。
+      let request: Request;
       try {
-        const first = args[0];
-        if (typeof first === "string") url = new URL(first, location.href).href;
-        else if (first instanceof Request) url = first.url;
-        else if (first instanceof URL) url = first.href;
-      } catch {
-        /* ignore */
+        request = new NativeRequest(...args);
+      } catch (error) {
+        return Promise.reject(error);
       }
+      const url = request.url;
 
       try {
         if (url && isStreamingUrl(url)) notify("fetch", url, streamMime(url));
@@ -664,14 +672,20 @@ export function start(): void {
         /* 嗅探绝不打断页面请求 */
       }
 
-      return originalFetch.apply(this, args).then((response) => {
-        try {
-          onFetchResponse(response, url);
-        } catch {
-          /* 不干扰原始响应 */
-        }
-        return response;
-      });
+      // 原生 fetch 以绑定函数作为微任务回调发起，调用栈上没有本脚本的帧：页面自己被 CSP 拦下的请求
+      // （connect-src 违规等）在控制台的来源不再是 page-hooks.js，Chrome 不会把它记进扩展错误列表。
+      // 直接 `originalFetch.apply` 时栈顶是本包装函数，这些页面错误全都算到扩展头上。
+      const start = originalFetch.bind(this, request) as () => Promise<Response>;
+      return Promise.resolve()
+        .then(start)
+        .then((response) => {
+          try {
+            onFetchResponse(response, url);
+          } catch {
+            /* 不干扰原始响应 */
+          }
+          return response;
+        });
     };
   }
 

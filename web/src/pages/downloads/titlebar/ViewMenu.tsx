@@ -15,7 +15,16 @@ import {
   resolveColumns,
   toColumnPrefs,
 } from '../model/viewPrefs'
-import type { ColumnKind, DetailPlacement, ResolvedColumn, SortDir, ViewDensity, ViewGroupBy, ViewSortKey } from '../model/viewPrefs'
+import type {
+  ColumnKind,
+  DetailPlacement,
+  HeaderAlign,
+  ResolvedColumn,
+  SortDir,
+  ViewDensity,
+  ViewGroupBy,
+  ViewSortKey,
+} from '../model/viewPrefs'
 import { useDownloads } from '../state'
 
 /** 视图菜单的分页（分段标签）。 */
@@ -56,6 +65,12 @@ const DENSITIES: readonly { value: ViewDensity; labelKey: string }[] = [
   { value: 'compact', labelKey: 'viewDensityCompact' },
   { value: 'comfortable', labelKey: 'viewDensityComfortable' },
   { value: 'relaxed', labelKey: 'viewDensityRelaxed' },
+]
+
+const HEADER_ALIGNS: readonly { value: HeaderAlign; labelKey: string }[] = [
+  { value: 'left', labelKey: 'viewHeaderAlignLeft' },
+  { value: 'center', labelKey: 'viewHeaderAlignCenter' },
+  { value: 'right', labelKey: 'viewHeaderAlignRight' },
 ]
 
 const PLACEMENTS: readonly { value: DetailPlacement; labelKey: string }[] = [
@@ -305,6 +320,18 @@ function DisplayPage() {
           label={t(density.labelKey)}
           checked={prefs.density === density.value}
           onSelect={() => updatePrefs((current) => (current.density === density.value ? current : { ...current, density: density.value }))}
+        />
+      ))}
+      <Separator />
+      <SectionTitle>{t('viewSectionHeaderAlign')}</SectionTitle>
+      {HEADER_ALIGNS.map((align) => (
+        <OptionRow
+          key={align.value}
+          label={t(align.labelKey)}
+          checked={prefs.header_align === align.value}
+          onSelect={() =>
+            updatePrefs((current) => (current.header_align === align.value ? current : { ...current, header_align: align.value }))
+          }
         />
       ))}
       <Separator />

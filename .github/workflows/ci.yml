@@ -36,6 +36,7 @@ jobs:
       website: ${{ steps.f.outputs.website }}
       extension: ${{ steps.f.outputs.extension }}
       android: ${{ steps.f.outputs.android }}
+      ios: ${{ steps.f.outputs.ios }}
       sdk: ${{ steps.f.outputs.sdk }}
       docker: ${{ steps.f.outputs.docker }}
     steps:
@@ -63,6 +64,7 @@ jobs:
               - 'assets/i18n/**'
               - 'website-v2/src/lib/gpui-theme/**'
               - 'assets/icon-packs/**'
+              - 'assets/flags/**'
               - 'crates/icon_pack/tests/fixtures/**'
               - 'native/protocol/tests/fixtures/plugin_view_apply.json'
               - 'native/protocol/src/plugin_view_tones.json'
@@ -87,6 +89,17 @@ jobs:
               - 'assets/i18n/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            ios:
+              - 'native/**'
+              - 'crates/i18n/**'
+              - 'third_party/**'
+              - 'assets/logo/**'
+              - 'assets/i18n/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'mobile/FluxDown/scripts/build-core.sh'
               - '.github/workflows/ci.yml'
             sdk:
               - 'packages/plugin-sdk/**'
@@ -188,7 +201,7 @@ jobs:
           - name: mobile
             packages: "-p fluxdown_mobile"
           - name: gpui
-            packages: "-p fluxdown_ui_account -p fluxdown_ui_app -p fluxdown_ui_command_palette -p fluxdown_ui_components -p fluxdown_ui_downloads -p fluxdown_ui_extensions -p fluxdown_ui_i18n -p fluxdown_ui_plugin_ui -p fluxdown_ui_rss -p fluxdown_ui_settings -p fluxdown_ui_shell -p fluxdown_ui_theme"
+            packages: "-p fluxdown_ui_account -p fluxdown_ui_app -p fluxdown_ui_command_palette -p fluxdown_ui_components -p fluxdown_ui_downloads -p fluxdown_ui_extensions -p fluxdown_ui_i18n -p fluxdown_ui_plugin_ui -p fluxdown_ui_rss -p fluxdown_ui_settings -p fluxdown_ui_share -p fluxdown_ui_shell -p fluxdown_ui_theme"
     steps:
       - uses: actions/checkout@v4
 
@@ -329,6 +342,32 @@ jobs:
           ./gradlew --no-daemon -Pfluxdown.abis=arm64-v8a
           :core:testDebugUnitTest :fluxui:testDebugUnitTest :bridge:testDebugUnitTest
           :app:assembleDebug :app:lintDebug
+
+  # 发布对齐：iOS 核心（fluxdown_mobile）只在 ios-sideload / ios-testflight 打包时交叉编译，
+  # Linux 门禁覆盖不到 Apple 移动目标的 cfg（libc 0.2.190 把路由 / in6 符号收窄到仅 macOS，
+  # FluxMesh iroh → netwatch / netdev 因此只在 iOS 上编译失败）。两种 flavor 与 build-core.sh 同参数，
+  # check 级（不链接、不生成 xcframework），几分钟内完成。
+  ios-core:
+    name: iOS core cross-check (full + store)
+    needs: changes
+    if: needs.changes.outputs.ios == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    env:
+      # 与 build-core.sh / Xcode 工程的最低部署版本一致（cc 构建的 C 依赖按它编译）。
+      IPHONEOS_DEPLOYMENT_TARGET: "26.1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-ios-core
+          cache-on-failure: true
+      - name: full flavor (sideload)
+        run: cargo check --locked -p fluxdown_mobile --lib --target aarch64-apple-ios
+      - name: store flavor (TestFlight)
+        run: cargo check --locked -p fluxdown_mobile --lib --target aarch64-apple-ios --no-default-features
 
   # 发布对齐：Docker 构建上下文（.dockerignore 白名单 + Dockerfile COPY 清单）缺东西时，
   # 发布流水线要到 Docker 编译才失败（历史 5 次：crates/*、scripts/desktop-dev、assets/logo、

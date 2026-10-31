@@ -417,12 +417,15 @@ impl ManifestSelection {
             })
             .collect()
     }
+    /// `resolver_plugin_id` is the preview's `pluginId`: the engine binds every member to
+    /// exactly that plugin instead of re-routing, so members cannot drift to another one.
     pub(crate) fn build_request(
         &self,
         base: &CreateTaskRequest,
         group_name: &str,
         save_dir: &str,
         queue_id: &str,
+        resolver_plugin_id: &str,
         start_paused: bool,
     ) -> Option<CreateGroupRequest> {
         let items = self.group_items();
@@ -442,6 +445,7 @@ impl ManifestSelection {
             extra_headers: base.headers.clone().unwrap_or_default(),
             ignore_tls_errors: base.ignore_tls_errors,
             start_paused,
+            resolver_plugin_id: resolver_plugin_id.to_owned(),
             items,
         })
     }

@@ -194,7 +194,7 @@ export default function FeedbackForm({ lang, onSuccess }: { lang: Lang; onSucces
           />
         </Field>
 
-        <div className="grid gap-6 sm:grid-cols-2">
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2">
           <Field id="fb-version" label={t.versionLabel} tag={detailTag} hint={t.versionHint}>
             <input
               id="fb-version"

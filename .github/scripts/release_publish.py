@@ -3,7 +3,7 @@
 
 1. 以 `SHA256SUMS-<组件>.txt` 完成哨兵判定已上传完整的组件（契约见 .github/actions/release-upload）。
 2. 把各组件哨兵合并为总校验文件 `SHA256SUMS.txt`。
-3. 刷新 release 说明头部：已发布组件清单 + 服务器 / CLI / Android 安装说明。头部位于第一个
+3. 刷新 release 说明头部：已发布组件清单 + 服务器 / CLI / Android / iOS 安装说明。头部位于第一个
    `<!-- fluxdown:lang:* -->` 标记之前，官网 / App 的双语解析只取标记区块，不会把安装说明
    混进更新日志；组件清单变化会让补发产生 release `edited` 事件，官网据此清缓存。
 4. 头部起始标记同时持久化本 tag 的发布状态：`expected=` 为历次运行（tag 推送 + 各次补发）应发布
@@ -33,13 +33,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-COMPONENTS = ("app", "extension", "server", "cli", "mobile")
+COMPONENTS = ("app", "extension", "server", "cli", "mobile", "ios")
 LABELS = {
     "app": "桌面客户端",
     "extension": "浏览器扩展",
     "server": "Headless 服务器",
     "cli": "命令行 CLI",
     "mobile": "Android",
+    "ios": "iOS 侧载包",
 }
 HEADER_RE = re.compile(
     r"<!-- fluxdown:release:begin[^>]*-->.*?<!-- fluxdown:release:end -->\n*", re.S
@@ -139,6 +140,18 @@ fluxdown ls
 请先在旧版中记下需要保留的下载任务与设置，卸载旧版后再安装新版；卸载会清除旧版的本地数据，已下载到公共目录的文件不受影响。
 """
         )
+    if "ios" in present:
+        sections.append(
+            f"""## 📱 iOS（侧载，未签名）
+
+| 版本 | 资产 |
+|---|---|
+| 完整版：含 BitTorrent / eD2K，远端主机的插件 / 组件管理可用 | `FluxDown-{version}-ios-sideload-unsigned.ipa` |
+
+IPA 未签名，需用 AltStore / SideStore / Sideloadly 等工具以自己的 Apple ID 签名后安装；免费 Apple ID 的签名 7 天后过期，需重新签名（AltStore / SideStore 可自动续签）。
+不想自签可加入 TestFlight 公测（App Store 版，不含 P2P 与插件 / 组件功能），入口见官网下载页。
+"""
+        )
     return "\n".join(sections)
 
 
@@ -185,7 +198,7 @@ def compose_body(
     sections = install_sections(present, version, repo, owner)
     if sections:
         header += (
-            "<details>\n<summary>📦 下载与安装说明（服务器 / CLI / Android）· 文件校验见 SHA256SUMS.txt</summary>\n\n"
+            "<details>\n<summary>📦 下载与安装说明（服务器 / CLI / Android / iOS）· 文件校验见 SHA256SUMS.txt</summary>\n\n"
             f"{sections}\n</details>\n"
         )
     header += "<!-- fluxdown:release:end -->\n\n"

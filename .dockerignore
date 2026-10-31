@@ -15,6 +15,7 @@ scripts/*
 !assets/i18n
 !assets/logo
 !assets/icon-packs
+!assets/flags
 !website-v2/src/lib/gpui-theme
 web/node_modules
 web/dist

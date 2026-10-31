@@ -41,6 +41,12 @@ You don't need to open the popup to flip it: press **Alt+Shift+D** anywhere in t
 
 The toolbar icon itself reflects the current state too (it dims when interception is off), so you can tell at a glance without opening the popup.
 
+## Using with SingleFile
+
+In Chrome, Brave, and other Chromium-based browsers, with both the FluxDown extension and [SingleFile](https://github.com/gildas-lormeau/SingleFile) enabled, pages saved by SingleFile may get a random ID as their file name (for example `fc17bc0e-762a-4990-a07d-b8a4b7c91ae2.htm`). This is a known Chromium bug ([crbug 41418926](https://issues.chromium.org/issues/41418926)): while any extension takes part in deciding download file names, a file name another extension passes to the downloads API can be lost. IDM, XDown, and Video DownloadHelper trigger it the same way.
+
+Fix: open SingleFile's options and, under **Misc**, turn off **Save pages in background**. SingleFile then saves from within the page, file names come out correctly, and FluxDown's download interception keeps working.
+
 ## The fluxdown:// protocol mode
 
 Normally the extension hands downloads to the FluxDown app over Native Messaging. The **FluxDown Protocol** toggle in the popup's Quick Settings and on the options page (off by default) switches to a different channel: an intercepted download navigates to a `fluxdown://download?url=...&filename=...` URL, and the operating system wakes whatever app is registered for that protocol — the FluxDown desktop or Android app.
@@ -73,6 +79,8 @@ The last option sends the current page's own URL to FluxDown — useful when the
 ## Detect media and downloadable resources on a page
 
 FluxDown continuously scans each page for downloadable resources — video and audio elements, streaming manifests (HLS `.m3u8`, DASH `.mpd`), subtitles, and links or network responses that look like files — combining a DOM scan with live monitoring of the page's network activity. Detected items are classified (video, audio, document, archive, image, torrent, stream, subtitle, magnet link, other) and lightly filtered, so the list stays about real downloadable content instead of every icon, ad ping, or preload fragment: very small files are dropped per type, tracker/analytics traffic is ignored, and raw streaming segments stay hidden unless they're large enough to plausibly be a real file on their own. Image sniffing is off by default, so ordinary page images don't clutter the results.
+
+Links found by scanning the page are capped at 200 per page by default, so very long list pages stay responsive. If a page has more files than that (for example a model library with hundreds of entries), raise **Max Resources per Page** under **Resource Sniffing** in the options page (up to 99999). Media caught from network requests doesn't count toward this limit.
 
 What counts as a downloadable resource is decided by sniffing rules. If a site isn't detected correctly, you can write your own rule under **Sniffing Rules** in the options page — see the [Sniffing Rules Reference](/docs/en/browser-extension/sniff-rules/).
 

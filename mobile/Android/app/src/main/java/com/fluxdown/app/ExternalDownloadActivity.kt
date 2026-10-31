@@ -74,7 +74,8 @@ private const val TOAST_LINGER_MS = 1_800L
  * （浏览器 / 文件管理器）上方弹出「新建下载」，关闭后结束整个任务、露出来源应用。
  *
  * 来源：浏览器「外部下载器」（X / Via 等的 http(s) VIEW，extra `User-Agent` / `Cookie` / `Referer`）、浏览器扩展
- * `fluxdown://download?…`、系统分享、`magnet:` / `ed2k://` 链接。弹窗打开期间的后续唤起追加进同一表单。
+ * （Android 浏览器经 `intent:` URI 显式唤起 http(s) / magnet / ed2k VIEW，另带文件名与请求头 extra；桌面协议
+ * `fluxdown://download?…`）、系统分享、`magnet:` / `ed2k://` 链接。弹窗打开期间的后续唤起追加进同一表单。
  * 「免打扰下载」开启时不弹窗，按默认设置直接建任务后返回；算不出保存目录、本机目录不可写或建任务失败时退回弹窗。
  * 与主界面共用进程级 [AppContainer]（同一主机会话）。
  */
@@ -195,6 +196,8 @@ class ExternalDownloadActivity : ComponentActivity() {
             userAgent = intent.getStringExtra(EXTRA_USER_AGENT),
             cookie = intent.getStringExtra(EXTRA_COOKIE),
             referer = intent.getStringExtra(EXTRA_REFERER),
+            fileName = intent.getStringExtra(EXTRA_FILE_NAME),
+            headersJson = intent.getStringExtra(EXTRA_HEADERS),
         )
         else -> null
     }
@@ -214,6 +217,10 @@ class ExternalDownloadActivity : ComponentActivity() {
         const val EXTRA_USER_AGENT = "User-Agent"
         const val EXTRA_COOKIE = "Cookie"
         const val EXTRA_REFERER = "Referer"
+
+        /** 浏览器扩展在 Android 上经 `intent:` URI 附带的建议文件名与完整请求头（JSON 对象），同 `fluxDown/utils/android-intent.ts`。 */
+        const val EXTRA_FILE_NAME = "com.fluxdown.extra.FILE_NAME"
+        const val EXTRA_HEADERS = "com.fluxdown.extra.HEADERS"
     }
 }
 
@@ -237,7 +244,9 @@ private fun ExternalDownloadStage(
     val scope = rememberCoroutineScope()
     val haptics = FluxTheme.haptics
     val actions = remember(overlays, haptics) {
-        TaskActions(context.applicationContext, scope, { container.session }, container.store, overlays, nav, haptics)
+        TaskActions(context.applicationContext, scope, { container.session }, container.store, overlays, nav, haptics) {
+            container.host.value is HostRef.Local
+        }
     }
     val close by rememberUpdatedState(onClosed)
     CompositionLocalProvider(LocalFluxOverlays provides overlays, LocalTaskActions provides actions) {

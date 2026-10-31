@@ -4,7 +4,8 @@
 //! 1. [`detect`]：启动时一次，只读环境，得出安装形态 / 资产键 / 不可自更新原因；
 //! 2. [`preflight`]：确认有新版本后再探测目录可写、提权可用、macOS 签名团队等；
 //! 3. [`apply`]：对已校验的更新包做替换（旧进程仍在运行），失败则回滚、原程序保持可用；
-//! 4. [`cleanup_leftovers`]：下次启动清理改名让位的旧文件。
+//! 4. [`cleanup_leftovers`]：下次启动清理改名让位的旧文件；macOS 另由 `heal_installed_quarantine`
+//!    清除已安装 bundle 残留的隔离标记。
 //!
 //! 各形态的具体行为见同目录的 `windows.rs` / `macos.rs` / `linux.rs` / `server.rs`。
 #![cfg_attr(
@@ -14,6 +15,7 @@
 
 mod archive;
 mod detect;
+pub(crate) use detect::current_exe_path;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -284,6 +286,13 @@ pub(crate) fn cleanup_leftovers() {
 fn is_macos_leftover(name: &str) -> bool {
     name.starts_with('.') && (name.contains(".app.old-") || name.starts_with(".fluxdown-staging-"))
         || name.ends_with(replace::ASIDE_SUFFIX)
+}
+
+/// macOS 启动自愈：「应用程序」文件夹里的 bundle 仍带 `com.apple.quarantine` 时清除并重新登记
+/// Launch Services（见 `macos.rs` 模块文档）。失败只记日志。
+#[cfg(target_os = "macos")]
+pub(crate) async fn heal_installed_quarantine() {
+    macos::heal_installed_quarantine().await;
 }
 
 /// 删除 `dir` 下名字命中 `is_leftover` 的条目（含 `depth` 层子目录）；不进入受保护目录，不跟随符号链接。

@@ -2,13 +2,11 @@
 // 与 `engine::webhook::EndpointSpec` 同 wire 形状（camelCase）。
 
 import type { TFunction } from '../../i18n'
-import { RpcError, errorMessage, rpc, rpcStore } from '../../lib/rpc'
+import { createConfigListPatcher } from '../../lib/configList'
+import { errorMessage } from '../../lib/rpc'
 import type { WebhookDeliveryDto, WebhookTestResponse } from '../../lib/rpc'
 
 export const ENDPOINTS_KEY = 'webhook.endpoints'
-
-/** 与 GPUI `MAX_CONFLICT_RETRIES` 一致：修订冲突时的自动重试上限。 */
-const MAX_CONFLICT_RETRIES = 3
 
 export interface EndpointSpec {
   id: string
@@ -83,40 +81,8 @@ export function parseEndpoints(raw: string | undefined): EndpointSpec[] {
   }
 }
 
-/**
- * 读-改-写端点列表。`mutate` 返回 `null` 表示无需写入。
- * 每次都基于最新快照重新计算，`expectedRevision` 冲突时重新 `config.get` 后再算一遍
- * （最多 3 次），避免覆盖别处（另一浏览器 / GPUI 客户端）的并发修改。
- * 写入串行化：连续操作不会互相制造冲突。
- */
-let writeChain: Promise<unknown> = Promise.resolve()
-
-export function patchEndpoints(mutate: (list: EndpointSpec[]) => EndpointSpec[] | null): Promise<void> {
-  const run = async (): Promise<void> => {
-    let config = rpcStore.peek().snapshot?.daemon.config
-    for (let attempt = 0; ; attempt += 1) {
-      if (!config) config = await rpc.daemon.config.get()
-      const next = mutate(parseEndpoints(config.values[ENDPOINTS_KEY]))
-      if (next === null) return
-      try {
-        await rpc.daemon.config.patch({
-          expectedRevision: config.revision,
-          values: { [ENDPOINTS_KEY]: JSON.stringify(next) },
-        })
-        return
-      } catch (error) {
-        if (error instanceof RpcError && error.is('conflict') && attempt < MAX_CONFLICT_RETRIES) {
-          config = await rpc.daemon.config.get()
-          continue
-        }
-        throw error
-      }
-    }
-  }
-  const result = writeChain.then(run, run)
-  writeChain = result.catch(() => undefined)
-  return result
-}
+/** 读-改-写端点列表（串行化 + 冲突重试见 `createConfigListPatcher`）。 */
+export const patchEndpoints = createConfigListPatcher(ENDPOINTS_KEY, parseEndpoints, (list) => JSON.stringify(list))
 
 /** 新增或按 id 覆盖。 */
 export const upsertEndpoint = (draft: EndpointSpec) =>

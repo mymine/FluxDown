@@ -5,11 +5,13 @@ import { Select } from "@/ui/components/Select";
 import { TagInput } from "@/ui/components/TagInput";
 import { TextInput } from "@/ui/components/TextInput";
 import { showToast } from "@/ui/components/Toast";
+import { usePlatform } from "@/ui/hooks/usePlatform";
 import { useT } from "@/ui/i18n";
 import {
   BUILTIN_EXTENSIONS,
   DEFAULT_SETTINGS,
   normalizeExtension,
+  type BypassKey,
   type InterceptMode,
 } from "@/utils/settings";
 import { settings, updateSettings } from "../lib/store";
@@ -39,6 +41,7 @@ export function InterceptPanel(): JSX.Element | null {
   const s = settings.value;
   const [customMode, setCustomMode] = useState(false);
   const [customDraft, setCustomDraft] = useState<string | null>(null);
+  const platform = usePlatform();
   if (!s) return null;
 
   const isPreset = String(s.minFileSize) in MIN_SIZE_PRESETS;
@@ -136,6 +139,20 @@ export function InterceptPanel(): JSX.Element | null {
         onChange={(v) => void updateSettings({ interceptMagnet: v })}
       />
 
+      {platform.desktopApp ? (
+        <SettingRow title={t("options.intercept.bypassKey")} desc={t("options.intercept.bypassKeyDesc")}>
+          <Select<BypassKey>
+            value={s.bypassKey}
+            onChange={(v) => void updateSettings({ bypassKey: v })}
+            options={[
+              { value: "alt", label: t("options.intercept.bypassKeyAlt") },
+              { value: "shift", label: "Shift" },
+              { value: "off", label: t("options.intercept.bypassKeyOff") },
+            ]}
+          />
+        </SettingRow>
+      ) : null}
+
       <SettingRow title={t("options.intercept.minSize")} desc={t("options.rules.minFileSizeDesc")}>
         <div class="opt-stack-gap">
           <Select<string>
@@ -216,24 +233,30 @@ export function InterceptPanel(): JSX.Element | null {
         checked={s.fallbackOnReject}
         onChange={(v) => void updateSettings({ fallbackOnReject: v })}
       />
-      <ToggleRow
-        title={t("options.intercept.fallbackCancel")}
-        desc={t("options.intercept.fallbackCancelDesc")}
-        checked={s.fallbackOnCancel}
-        onChange={(v) => void updateSettings({ fallbackOnCancel: v })}
-      />
-      <ToggleRow
-        title={t("options.intercept.askExclude")}
-        desc={t("options.intercept.askExcludeDesc")}
-        checked={s.askExcludeAfterCancels}
-        onChange={(v) => void updateSettings({ askExcludeAfterCancels: v })}
-      />
-      <ToggleRow
-        title={t("options.intercept.contextMenu")}
-        desc={t("options.intercept.contextMenuDesc")}
-        checked={s.contextMenuEnabled}
-        onChange={(v) => void updateSettings({ contextMenuEnabled: v })}
-      />
+      {platform.desktopApp ? (
+        <>
+          <ToggleRow
+            title={t("options.intercept.fallbackCancel")}
+            desc={t("options.intercept.fallbackCancelDesc")}
+            checked={s.fallbackOnCancel}
+            onChange={(v) => void updateSettings({ fallbackOnCancel: v })}
+          />
+          <ToggleRow
+            title={t("options.intercept.askExclude")}
+            desc={t("options.intercept.askExcludeDesc")}
+            checked={s.askExcludeAfterCancels}
+            onChange={(v) => void updateSettings({ askExcludeAfterCancels: v })}
+          />
+        </>
+      ) : null}
+      {platform.contextMenus ? (
+        <ToggleRow
+          title={t("options.intercept.contextMenu")}
+          desc={t("options.intercept.contextMenuDesc")}
+          checked={s.contextMenuEnabled}
+          onChange={(v) => void updateSettings({ contextMenuEnabled: v })}
+        />
+      ) : null}
     </PanelShell>
   );
 }

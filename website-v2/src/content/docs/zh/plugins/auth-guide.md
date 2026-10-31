@@ -54,6 +54,61 @@ sourceHash: "02aa234e9ce7"
 
 不用界面也能驱动同样的 action：通过 `/rpc` 调用 `daemon.plugin.auth`，或者对管理 API 发 `POST /api/v1/plugins/{identity}/auth`，请求体为 `{ "action", "site", "authRef", "sessionId", "input" }`。在无界面的服务器上登录、或者写脚本测试，就用这种方式。被禁用的插件无法登录，调用会以 `插件 <identity> 未启用` 失败。
 
+## 自定义登录界面
+
+默认情况下，**登录**按钮打开上文所述的固定对话框。插件可以声明一个 `location: "auth"` 的视图，用自己的界面替换整个对话框内容：
+
+```json
+{
+  "permissions": ["auth"],
+  "auth": { "entry": "auth.js" },
+  "main": { "entry": "main.js" },
+  "contributes": {
+    "views": [{ "id": "login", "title": "Log in", "location": "auth" }]
+  }
+}
+```
+
+- 每个插件至多一个 `auth` 视图，并且要求顶层声明 `auth`（因而需要 `auth` 权限）。视图可以是可移植视图（由 `main` 用 `flux.ui.view` 渲染），也可以是[桌面脚本](/docs/zh/plugins/desktop-ui-guide/)；桌面端优先使用桌面脚本，Web 端只显示可移植视图。
+- 插件已启用、已加载且没有待授权项时，对话框只承载你的视图。标题仍为「登录 <插件名>」，不再显示「站点 / 登录信息」表单与固定按钮；否则，以及在移动端，使用默认对话框。仅有桌面脚本实现、而插件包不在本机（连接远端主机）时，桌面端同样回退到默认对话框。只要插件声明了 `auth.entry`，按钮就照常显示。
+- 登录由视图自己驱动：调用你自己的 `flux.rpc.handle` 处理函数，或在 `main` 里完成流程，用 `flux.auth.save` 保存结果，再调用 `ctx.close()` 关闭对话框（桌面脚本用 `fluxdown.close()`）。已经登录时可以直接在 `init` 里调用 `ctx.close()`。
+- 不认识该 location 的旧版本应用会拒绝此 manifest，请把 `minAppVersion` 设为下一个版本或更高。
+
+```js
+// main.js — 插件自绘的二维码登录
+const { h } = flux.ui;
+
+flux.ui.view("login", {
+  async init(ctx) {
+    const res = await flux.fetch({ url: "https://passport.example.com/qr/generate" });
+    const data = JSON.parse(res.body); // { key, url, image: "data:image/png;base64,…" }
+    const state = { ctx, key: data.key, image: data.image, message: "Scan with the Example app", timer: 0 };
+    state.timer = flux.timers.setInterval(async () => {
+      const poll = JSON.parse((await flux.fetch({ url: "https://passport.example.com/qr/poll?key=" + encodeURIComponent(state.key) })).body);
+      if (poll.state === "scanned") state.message = "Scanned, confirm on your phone";
+      if (poll.state === "expired") state.message = "The QR code expired, reopen this dialog";
+      if (poll.state === "confirmed") {
+        flux.timers.clear(state.timer);
+        await flux.auth.save({ site: "https://www.example.com", kind: "cookie", cookies: poll.cookies });
+        state.ctx.close();
+        return;
+      }
+      state.ctx.refresh();
+    }, 2000);
+    return state;
+  },
+  render: (state) =>
+    h("stack", { gap: "md", padding: "md", align: "center" },
+      h("image", { src: state.image, alt: "QR code", width: 200, height: 200 }),
+      h("text", { text: state.message })),
+  dispose(state) {
+    flux.timers.clear(state.timer);
+  },
+});
+```
+
+示例假设登录服务直接返回二维码图片和确认后的 Cookie，请按你的站点调整请求（`Set-Cookie` 的读取方式见[完整示例](#完整示例二维码登录)）。没有声明 `auth` 视图时一切照旧：默认的表单对话框与 `authenticate` 各 action 的行为完全不变。
+
 ## `authenticate` 入口
 
 `authenticate(ctx)` 是一个处理全部五个 action 的全局函数。**每次调用都在全新的脚本上下文里运行**，所以 `begin` 和 `poll` 之间不会保留任何东西，除非你把它存进 `flux.storage`（以你发出的 `sessionId` 为线索）。

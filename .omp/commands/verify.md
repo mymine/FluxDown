@@ -23,7 +23,6 @@ argument-hint: "[crate / 子项目 / 路径，留空 = 自 origin/main 分叉以
 5. 原生移动端有改动：Android `./gradlew :core:testDebugUnitTest :bridge:testDebugUnitTest :app:assembleDebug`；iOS 改了 Rust 先 `scripts/build-core.sh`，再按 AGENTS.md §2 跑 FluxKit `xcodebuild test` 与 App `xcodebuild build` + `python3 scripts/check-i18n.py`。本机缺工具链就明确写「未跑：原因」。
 6. 配置有改动：
    - `.github/workflows/ci.yml` 或新增跨目录引用 / crate / path 依赖：`python3 .github/scripts/check_ci_paths.py`。
-   - `.omp/{RULES.md,WATCHDOG.md,rules,agents,skills}`：`python3 .augment/sync_from_omp.py` 后 `--check` 为 0。
 7. 提交前的全量静态门禁只跑一次：`cargo clippy --workspace --all-targets -- -D warnings`（改动只在单 crate 且第 2 步已过时可跳过并说明）。
 
 最后报告：每条命令 → 通过 / 失败（附错误摘录）/ 未跑（原因）；UI 改动注明「未做 GUI 验证」及建议的人工检查步骤。不要声称没跑过的检查通过。

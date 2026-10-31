@@ -72,7 +72,7 @@ internal fun GeneralSettingsEffects() {
                 context.str(R.string.mobileNotifCompletedSummary, "n" to done.count)
             }
             val task = openableLocalFile(container.localState.value.task(done.taskId), done)
-            val open = task?.let { FluxToastAction(context.str(R.string.mobileNotifActionOpen)) { actions.open(it) } }
+            val open = task?.let { FluxToastAction(context.str(R.string.mobileNotifActionOpen)) { actions.openLocalFile(it) } }
             overlays.toast(text, FluxToastKind.Success, FluxIcons.CircleCheck, action = open)
         }
     }

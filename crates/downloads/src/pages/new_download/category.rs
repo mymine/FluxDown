@@ -25,7 +25,7 @@ use gpui_component::{
 
 use super::NewDownloadView;
 use crate::model::save_dir_category::{
-    CategoryMode, auto_follow_target, matched_category, predict_save_dir,
+    CategoryMode, auto_follow_target, category_options, matched_category, predict_save_dir,
 };
 
 /// 分类下拉触发器定宽（图标 + 名称 + chevron）。
@@ -52,6 +52,61 @@ impl NewDownloadView {
         self.context.category_route.is_some()
             && !self.context.category_options.is_empty()
             && !self.is_remote()
+    }
+
+    /// 快捷添加的网址规则在本表单内生效：追加进分类列表并重算路由 / 候选，模式回「自动」
+    /// 让网址优先预测立即命中。偏好写回由对话框自己发起（最新列表 + 新条目整体写回），
+    /// 这里只管本地反馈。
+    pub(super) fn apply_url_rule(
+        &mut self,
+        entry: fluxdown_protocol::CustomCategoryDto,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self
+            .context
+            .custom_categories
+            .iter()
+            .any(|known| known.id == entry.id)
+        {
+            self.context.custom_categories.push(entry);
+        }
+        let categories = self.context.custom_categories.clone();
+        self.context.category_route =
+            fluxdown_protocol::CategoryRouteDto::from_categories(&categories);
+        self.context.category_options = category_options(&categories);
+        self.category_mode = CategoryMode::Auto;
+        self.sync_category(window, cx);
+        cx.notify();
+    }
+
+    /// 宿主随偏好快照推送的最新 `custom_categories`：整体替换原始列表并重算路由 / 候选，
+    /// 让快捷添加网址规则永远基于最新列表写回（设置页 / 其他设备的并发修改不被旧快照覆盖）。
+    /// 当前手选的分类若已不在候选里则回到「自动」。
+    pub fn set_custom_categories(
+        &mut self,
+        categories: Vec<fluxdown_protocol::CustomCategoryDto>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if categories == self.context.custom_categories {
+            return;
+        }
+        self.context.category_route =
+            fluxdown_protocol::CategoryRouteDto::from_categories(&categories);
+        self.context.category_options = category_options(&categories);
+        self.context.custom_categories = categories;
+        if let CategoryMode::Category(id) = &self.category_mode
+            && !self
+                .context
+                .category_options
+                .iter()
+                .any(|option| option.id == *id)
+        {
+            self.category_mode = CategoryMode::Auto;
+        }
+        self.sync_category(window, cx);
+        cx.notify();
     }
 
     /// 按当前输入预测分类目录：文件名取重命名框（批量时隐藏，不取），否则第一条链接已识别的
@@ -211,6 +266,10 @@ impl NewDownloadView {
         let (fixed, categories) = self.category_menu_entries();
         let current = self.category_mode.clone();
         let this = cx.weak_entity();
+        let add_this = cx.weak_entity();
+        let translator = self.translator.read(cx).clone();
+        let add_title = SharedString::from(translator.text("addUrlRule").to_owned());
+        let add_desc = SharedString::from(translator.text("addUrlRuleDesc").to_owned());
         let (sm, xs) = (tokens.typography.sm, tokens.typography.xs);
         let (foreground, muted) = (tokens.colors.foreground, tokens.colors.muted_foreground);
         let gap = tokens.spacing.xxs;
@@ -280,9 +339,47 @@ impl NewDownloadView {
                     let menu = fixed
                         .iter()
                         .fold(menu, |menu, entry| menu.item(item(entry)));
-                    categories
+                    let menu = categories
                         .iter()
-                        .fold(menu.separator(), |menu, entry| menu.item(item(entry)))
+                        .fold(menu.separator(), |menu, entry| menu.item(item(entry)));
+                    // 尾部固定动作项：按当前链接快捷添加网址保存规则。Fn 闭包可重入，
+                    // 捕获值先克隆成本地再移入元素闭包。
+                    let (add_title, add_desc, add_this) =
+                        (add_title.clone(), add_desc.clone(), add_this.clone());
+                    let add_entry = PopupMenuItem::element(move |_, _| {
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .gap(gap)
+                            .py(gap)
+                            .child(
+                                div()
+                                    .text_size(sm.size)
+                                    .line_height(sm.line_height)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(foreground)
+                                    .child(add_title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(xs.size)
+                                    .line_height(xs.line_height)
+                                    .text_color(muted)
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis_middle()
+                                    .child(add_desc.clone()),
+                            )
+                    })
+                    .icon(Icon::new(FluxIcon::Globe))
+                    .on_click(move |_, window, cx| {
+                        let Some(view) = add_this.upgrade() else {
+                            return;
+                        };
+                        super::url_rule::open(view, window, cx);
+                    });
+                    menu.separator().item(add_entry)
                 })
                 .into_any_element(),
         )

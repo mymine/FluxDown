@@ -86,18 +86,20 @@ enum NetworkProxyTest {
 /// 本页的每一行（页面渲染与设置搜索共用同一份可见性判定）。
 nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
     case mode, type, host, port, username, password, noList, test
+    case rules, rulesAdd, rulesTest
     case siteAuth, siteAuthAdd, siteAuthClear
 
     var id: String { "network.\(rawValue)" }
 
     /// 搜索面包屑里的分组名文案键。
     nonisolated enum Group {
-        case mode, manual, siteAuth
+        case mode, manual, rules, siteAuth
 
         var titleKey: String {
             switch self {
             case .mode: "proxySettings"
             case .manual: "proxyModeManual"
+            case .rules: "proxyRulesTitle"
             case .siteAuth: "settingsSiteAuthTitle"
             }
         }
@@ -107,6 +109,7 @@ nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
         switch self {
         case .mode: .mode
         case .type, .host, .port, .username, .password, .noList, .test: .manual
+        case .rules, .rulesAdd, .rulesTest: .rules
         case .siteAuth, .siteAuthAdd, .siteAuthClear: .siteAuth
         }
     }
@@ -121,6 +124,9 @@ nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
         case .password: "proxyPassword"
         case .noList: "proxyNoList"
         case .test: "proxyTestConnection"
+        case .rules: "proxyRulesTitle"
+        case .rulesAdd: "proxyRulesAdd"
+        case .rulesTest: "proxyRouteTest"
         case .siteAuth: "settingsSiteAuthTitle"
         case .siteAuthAdd: "settingsSiteAuthAdd"
         case .siteAuthClear: "settingsSiteAuthClearAll"
@@ -131,6 +137,8 @@ nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
         switch self {
         case .mode: "proxySettingsDesc"
         case .noList: "proxyNoListDesc"
+        case .rules: "proxyRulesDesc"
+        case .rulesTest: "proxyRouteTestDesc"
         case .siteAuth: "settingsSiteAuthDesc"
         default: nil
         }
@@ -146,14 +154,21 @@ nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
         case .username: "proxy_username"
         case .password: "proxy_password"
         case .noList: "proxy_no_list"
-        case .test, .siteAuth, .siteAuthAdd, .siteAuthClear: nil
+        case .rules: "proxy_rules"
+        case .test, .rulesAdd, .rulesTest, .siteAuth, .siteAuthAdd, .siteAuthClear: nil
         }
     }
 
     var symbol: String {
+        switch self {
+        case .rules: return "arrow.triangle.branch"
+        case .rulesAdd: return "plus" // = FluxSymbol.add；纯逻辑文件不依赖 FluxUI
+        case .rulesTest: return "magnifyingglass"
+        default: break
+        }
         switch group {
-        case .mode, .manual: "globe"
-        case .siteAuth: "key.fill"
+        case .mode, .manual, .rules: return "globe"
+        case .siteAuth: return "key.fill"
         }
     }
 
@@ -168,6 +183,7 @@ nonisolated enum NetworkRow: String, CaseIterable, Identifiable {
         switch group {
         case .mode: isLoaded
         case .manual: isLoaded && mode == .manual
+        case .rules: isLoaded
         case .siteAuth: true
         }
     }

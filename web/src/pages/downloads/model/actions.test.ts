@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { canOpenTaskFile, canRevealTaskFile, isDownloadable } from './actions'
+import { canCopyTaskFiles, canOpenTaskFile, canRevealTaskFile, isDownloadable } from './actions'
 import type { DownloadTaskView } from './task'
-import { CAPABILITY_AGENT_OPEN_TASK_FILES, rpcStore } from '../../../lib/rpc'
+import { CAPABILITY_AGENT_COPY_TASK_FILES, CAPABILITY_AGENT_OPEN_TASK_FILES, rpcStore } from '../../../lib/rpc'
 import type { ServiceHello } from '../../../lib/rpc'
 
 function mockHello(capabilities: string[]): ServiceHello {
@@ -89,6 +89,22 @@ describe('actions task file permissions', () => {
       expect(isDownloadable(view({}))).toBe(true)
       expect(isDownloadable(view({ source: 'remote' }))).toBe(false)
       expect(isDownloadable(view({ fileMissing: true }))).toBe(false)
+    })
+  })
+
+  describe('复制文件：只看 agent.copyTaskFiles（同机桌面会话），NAS / 远程连接不提供', () => {
+    test('只有 openTaskFiles（如本机访问 headless server）时不提供复制文件', () => {
+      rpcStore.update((state) => ({ ...state, hello: mockHello([CAPABILITY_AGENT_OPEN_TASK_FILES]) }), true)
+      expect(canCopyTaskFiles([view({})])).toBe(false)
+    })
+
+    test('具备 copyTaskFiles：多选全部可复制才提供，任一不满足或空选区即隐藏', () => {
+      rpcStore.update((state) => ({ ...state, hello: mockHello([CAPABILITY_AGENT_COPY_TASK_FILES]) }), true)
+      expect(canCopyTaskFiles([view({}), view({ taskId: 't2' })])).toBe(true)
+      expect(canCopyTaskFiles([])).toBe(false)
+      expect(canCopyTaskFiles([view({}), view({ taskId: 't2', fileMissing: true })])).toBe(false)
+      expect(canCopyTaskFiles([view({}), view({ taskId: 't2', state: 'downloading' })])).toBe(false)
+      expect(canCopyTaskFiles([view({}), view({ taskId: 't2', source: 'remote' })])).toBe(false)
     })
   })
 })

@@ -102,6 +102,7 @@ export const common = defineMessages({
       built: "Engine in Rust. Interface on GPUI.",
       status: "All systems local",
       copyright: (year: number) => `© ${year} zerx-lab`,
+      icp: "京ICP备2026039441号-3",
     },
     actions: {
       download: "Download",
@@ -217,6 +218,7 @@ export const common = defineMessages({
       built: "引擎 Rust，界面 GPUI。",
       status: "一切都在本地运行",
       copyright: (year: number) => `© ${year} zerx-lab`,
+      icp: "京ICP备2026039441号-3",
     },
     actions: {
       download: "下载",

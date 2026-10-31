@@ -1,0 +1,392 @@
+---
+/**
+ * 文档首页的 FluxDown ↔ Ghost Downloader 功能对照表。
+ *
+ * 结论等级与出处在这里(与语言无关),文案在 `docsCompare` 消息模块。GD 每格都带原始出处:
+ * `docs` = gd.xychr.com 的同语言文档页,`repo` = GitHub 仓库内路径;`null` 表示其文档 / README
+ * 未提及该能力(脚注说明)。FluxDown 一侧以本仓源码与本站文档为准。
+ */
+import { ArrowUpRight, Check, CircleDashed, Info, X } from "lucide-react";
+import type { DocsLang } from "@/lib/docs-nav";
+import { MAIN_REPO, githubUrl } from "@/lib/ecosystem";
+import { docsCompare } from "@/i18n/messages/docsCompare";
+
+interface Props {
+  lang: DocsLang;
+}
+const { lang } = Astro.props;
+const t = docsCompare[lang];
+
+type Level = "yes" | "better" | "partial" | "no" | "info";
+type RowId = keyof typeof t.rows;
+type GroupId = keyof typeof t.groups;
+type Source = { docs: string } | { repo: string } | null;
+
+const GD_DOCS = `https://gd.xychr.com/${lang}/docs/`;
+const GD_REPO = githubUrl("XiaoYouChR/Ghost-Downloader-3");
+const FD_REPO = githubUrl(MAIN_REPO);
+
+const GROUPS: readonly {
+  id: GroupId;
+  rows: readonly { id: RowId; fd: Level; gd: Level; src: Source }[];
+}[] = [
+  {
+    id: "measured",
+    rows: [
+      { id: "size", fd: "better", gd: "info", src: { repo: "/releases/tag/v4.4.5" } },
+      { id: "idleMem", fd: "better", gd: "info", src: null },
+      { id: "speedLarge", fd: "better", gd: "info", src: null },
+      { id: "speedSmall", fd: "better", gd: "info", src: null },
+      { id: "cpu", fd: "info", gd: "info", src: null },
+    ],
+  },
+  {
+    id: "architecture",
+    rows: [
+      { id: "process", fd: "yes", gd: "partial", src: { docs: "dev/overview/" } },
+      { id: "storage", fd: "yes", gd: "partial", src: { docs: "dev/overview/" } },
+      { id: "stack", fd: "info", gd: "info", src: { repo: "#readme" } },
+    ],
+  },
+  {
+    id: "protocols",
+    rows: [
+      { id: "http", fd: "yes", gd: "yes", src: { docs: "features/files/" } },
+      { id: "ftp", fd: "yes", gd: "yes", src: { docs: "features/files/" } },
+      { id: "bt", fd: "yes", gd: "yes", src: { docs: "features/torrents/" } },
+      { id: "ed2k", fd: "yes", gd: "partial", src: { docs: "features/ed2k/" } },
+      { id: "hls", fd: "yes", gd: "yes", src: { repo: "#features" } },
+      { id: "live", fd: "partial", gd: "yes", src: { docs: "features/live-streams/" } },
+    ],
+  },
+  {
+    id: "platforms",
+    rows: [
+      { id: "desktop", fd: "yes", gd: "yes", src: { docs: "getting-started/install/" } },
+      { id: "android", fd: "yes", gd: "partial", src: { docs: "getting-started/install/" } },
+      { id: "ios", fd: "partial", gd: "no", src: { docs: "getting-started/install/" } },
+      { id: "server", fd: "yes", gd: "no", src: null },
+    ],
+  },
+  {
+    id: "browser",
+    rows: [
+      { id: "extension", fd: "yes", gd: "yes", src: { docs: "getting-started/browser-extension/" } },
+      { id: "userscript", fd: "yes", gd: "partial", src: { docs: "features/aria2-rpc/" } },
+    ],
+  },
+  {
+    id: "network",
+    rows: [
+      { id: "sites", fd: "partial", gd: "yes", src: { docs: "dev/built-in-packs/" } },
+      { id: "tls", fd: "no", gd: "yes", src: { docs: "network/tls-fingerprint/" } },
+      { id: "proxy", fd: "partial", gd: "yes", src: { docs: "network/proxy/" } },
+    ],
+  },
+  {
+    id: "tasks",
+    rows: [
+      { id: "edit", fd: "partial", gd: "yes", src: { docs: "features/editing-tasks/" } },
+      { id: "batch", fd: "partial", gd: "yes", src: { docs: "features/batch-downloads/" } },
+      { id: "queue", fd: "yes", gd: "partial", src: { repo: "/blob/main/app/config/cfg.py" } },
+      { id: "after", fd: "partial", gd: "yes", src: { docs: "features/plan/" } },
+      { id: "rss", fd: "yes", gd: "no", src: null },
+      { id: "category", fd: "yes", gd: "yes", src: { docs: "features/categories/" } },
+    ],
+  },
+  {
+    id: "integration",
+    rows: [
+      { id: "plugins", fd: "yes", gd: "partial", src: { repo: "#roadmap" } },
+      { id: "aria2", fd: "yes", gd: "partial", src: { docs: "features/aria2-rpc/" } },
+      { id: "api", fd: "yes", gd: "no", src: null },
+      { id: "cli", fd: "yes", gd: "yes", src: { repo: "#command-line" } },
+      { id: "devices", fd: "yes", gd: "no", src: null },
+    ],
+  },
+  {
+    id: "basics",
+    rows: [
+      { id: "license", fd: "info", gd: "info", src: { repo: "/blob/main/LICENSE" } },
+      { id: "languages", fd: "partial", gd: "yes", src: { repo: "/blob/main/app/config/cfg.py" } },
+    ],
+  },
+];
+
+const ICONS = { yes: Check, better: Check, partial: CircleDashed, no: X, info: Info } as const;
+const LEVEL_TEXT: Record<Level, string> = {
+  yes: t.yes,
+  better: t.better,
+  partial: t.partial,
+  no: t.no,
+  info: "",
+};
+
+function sourceHref(src: Source): string | null {
+  if (src === null) return null;
+  return "docs" in src ? GD_DOCS + src.docs : GD_REPO + src.repo;
+}
+---
+
+<figure class="fig overflow-x-auto">
+  <figcaption class="fig-bar">
+    <span>{t.figTag}</span>
+    <span>{t.checked}</span>
+  </figcaption>
+  <table class="cmp-table">
+    <thead>
+      <tr>
+        <th scope="col" class="cmp-feature">{t.feature}</th>
+        <th scope="col" class="cmp-fd">FluxDown</th>
+        <th scope="col">Ghost Downloader</th>
+      </tr>
+    </thead>
+    {
+      GROUPS.map((group) => (
+        <tbody>
+          <tr class="cmp-group">
+            <th scope="colgroup" colspan="3">
+              {t.groups[group.id]}
+            </th>
+          </tr>
+          {group.rows.map((row) => {
+            const copy = t.rows[row.id];
+            const href = sourceHref(row.src);
+            return (
+              <tr class="cmp-row">
+                <th scope="row">{copy.label}</th>
+                {(["fd", "gd"] as const).map((side) => {
+                  const level = row[side];
+                  const Icon = ICONS[level];
+                  return (
+                    <td class={`cmp-cell cmp-${level}`} data-side={side === "fd" ? "FluxDown" : "Ghost Downloader"}>
+                      <span class="cmp-icon">
+                        <Icon size={14} strokeWidth={2} aria-hidden="true" />
+                        {level !== "info" && <span class="sr-only">{LEVEL_TEXT[level]}:</span>}
+                      </span>
+                      <span class="cmp-text">
+                        {copy[side]}
+                        {side === "gd" && href && (
+                          <a
+                            href={href}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            class="cmp-src"
+                            title={t.source}
+                            aria-label={`${t.source}: ${copy.label}`}
+                          >
+                            <ArrowUpRight size={12} aria-hidden="true" />
+                          </a>
+                        )}
+                      </span>
+                    </td>
+                  );
+                })}
+              </tr>
+            );
+          })}
+        </tbody>
+      ))
+    }
+  </table>
+  <div class="cmp-foot">
+    <ul class="cmp-legend" aria-hidden="true">
+      {
+        (["yes", "partial", "no"] as const).map((level) => {
+          const Icon = ICONS[level];
+          return (
+            <li class={`cmp-${level}`}>
+              <Icon size={13} strokeWidth={2} />
+              {LEVEL_TEXT[level]}
+            </li>
+          );
+        })
+      }
+    </ul>
+    <p><strong class="cmp-method">{t.methodLabel}:</strong> {t.method}</p>
+    <p>{t.footnote}</p>
+    <p>
+      {t.sources}:
+      <a href={GD_DOCS} target="_blank" rel="noopener noreferrer">{t.sourceGdDocs}</a>
+      ·
+      <a href={GD_REPO} target="_blank" rel="noopener noreferrer">{t.sourceGdRepo}</a>
+      ·
+      <a href={FD_REPO} target="_blank" rel="noopener noreferrer">{t.sourceFluxDown}</a>
+    </p>
+  </div>
+</figure>
+
+<style>
+  .cmp-table {
+    width: 100%;
+    min-width: 720px;
+    border-collapse: collapse;
+    text-align: left;
+    font-size: 14px;
+  }
+  .cmp-table thead tr {
+    border-bottom: 1px solid var(--line);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--fg-subtle);
+  }
+  .cmp-table thead th {
+    padding: 12px 20px;
+    font-weight: 500;
+  }
+  .cmp-feature {
+    width: 26%;
+  }
+  .cmp-table thead .cmp-fd {
+    color: var(--accent-ink);
+  }
+  .cmp-group th {
+    padding: 18px 20px 8px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-sunken);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+  }
+  .cmp-row {
+    border-bottom: 1px solid var(--line);
+    transition: background-color 160ms var(--ease-out);
+  }
+  .cmp-row:hover {
+    background: var(--bg-sunken);
+  }
+  .cmp-row > th {
+    padding: 12px 20px;
+    font-weight: 500;
+    color: var(--fg);
+    vertical-align: top;
+  }
+  .cmp-cell {
+    padding: 12px 20px;
+    vertical-align: top;
+    line-height: 1.55;
+    color: var(--fg-muted);
+  }
+  .cmp-icon {
+    display: inline-flex;
+    margin-right: 8px;
+    vertical-align: -2px;
+  }
+  .cmp-text {
+    display: inline;
+  }
+  .cmp-yes .cmp-icon,
+  .cmp-better .cmp-icon,
+  .cmp-legend .cmp-yes {
+    color: var(--ok);
+  }
+  .cmp-better .cmp-text {
+    font-weight: 560;
+    color: var(--fg);
+  }
+  .cmp-method {
+    font-weight: 560;
+    color: var(--fg-muted);
+  }
+  .cmp-partial .cmp-icon,
+  .cmp-legend .cmp-partial {
+    color: var(--warn);
+  }
+  .cmp-no .cmp-icon,
+  .cmp-legend .cmp-no {
+    color: var(--danger);
+  }
+  .cmp-info .cmp-icon {
+    color: var(--fg-subtle);
+  }
+  .cmp-src {
+    display: inline-flex;
+    margin-left: 4px;
+    vertical-align: -1px;
+    color: var(--fg-subtle);
+    transition: color 160ms var(--ease-out);
+  }
+  .cmp-src:hover {
+    color: var(--accent-ink);
+  }
+  .cmp-foot {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 14px 20px 16px;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--fg-subtle);
+  }
+  .cmp-foot a {
+    color: var(--fg-muted);
+    text-decoration: underline;
+    text-decoration-color: var(--line-strong);
+    text-underline-offset: 3px;
+  }
+  .cmp-foot a:hover {
+    color: var(--accent-ink);
+  }
+  .cmp-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+  }
+  .cmp-legend li {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  /* 窄屏:三列表格改为「功能名整行 + 两侧并排」的卡片行,列名由 data-side 标注,不再横向滚动 */
+  @media (max-width: 639px) {
+    .cmp-table {
+      display: block;
+      min-width: 0;
+      font-size: 13.5px;
+    }
+    .cmp-table thead {
+      display: none;
+    }
+    .cmp-table tbody,
+    .cmp-group,
+    .cmp-group th {
+      display: block;
+    }
+    .cmp-group th {
+      padding: 14px 16px 8px;
+    }
+    .cmp-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .cmp-row > th {
+      grid-column: 1 / -1;
+      padding: 12px 16px 4px;
+    }
+    .cmp-cell {
+      padding: 4px 16px 12px;
+      overflow-wrap: anywhere;
+    }
+    .cmp-cell::before {
+      content: attr(data-side);
+      display: block;
+      margin-bottom: 4px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--fg-subtle);
+    }
+    .cmp-cell[data-side="FluxDown"]::before {
+      color: var(--accent-ink);
+    }
+    .cmp-foot {
+      padding-inline: 16px;
+    }
+  }
+</style>

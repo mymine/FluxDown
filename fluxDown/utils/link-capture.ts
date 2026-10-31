@@ -1,3 +1,4 @@
+import { logWarn } from "./error-log";
 /**
  * 右键「用 FluxDown 下载链接」的浏览器捕获事务。
  *
@@ -106,7 +107,7 @@ export class LinkCaptureRegistry<Channel = string> {
           if (entry.abandoned) this.discard(downloadId);
         },
         (error: unknown) => {
-          console.warn("[FluxDown] browser capture of link failed to start:", request.url, error);
+          logWarn("[FluxDown] browser capture of link failed to start:", request.url, error);
           this.entries.delete(entry);
           this.settle(entry, false);
         },

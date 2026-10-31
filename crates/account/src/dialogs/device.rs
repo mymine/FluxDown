@@ -313,11 +313,17 @@ pub(crate) fn disconnect_device(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let future = host.update(cx, |host, _| host.disconnect_device(&device.id));
+    let Some(future) = host.update(cx, |host, cx| host.begin_disconnect(&device.id, cx)) else {
+        // 该设备的下线请求已在途，拒绝重入。
+        return;
+    };
     let host = host.clone();
+    let device_id = device.id.clone();
     window
         .spawn(cx, async move |cx| {
             let result = future.await;
+            // 窗口可能已关闭：先在应用层清除在途标记（host 跨窗口共享），再尝试弹通知。
+            host.update(cx, |host, cx| host.finish_disconnect(&device_id, cx));
             let Ok(()) = cx.update(|window, cx| {
                 if let Err(error) = result {
                     let message = error_text(

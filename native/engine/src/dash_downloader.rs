@@ -10,9 +10,7 @@ use crate::downloader::{
     RequestSpec, TEMP_EXT,
 };
 use crate::events::EventSink;
-use crate::hls_downloader::{
-    SEGMENT_HEADER_TIMEOUT, SEGMENT_IDLE_TIMEOUT, SMALL_REQUEST_TIMEOUT, extra_headers_for_origin,
-};
+use crate::hls_downloader::{SEGMENT_HEADER_TIMEOUT, SEGMENT_IDLE_TIMEOUT, SMALL_REQUEST_TIMEOUT};
 use crate::logger::log_info;
 use crate::model::HlsQualityOption;
 use crate::naming::{extract_from_url, sanitize_filename};
@@ -41,31 +39,6 @@ fn dash_runtime(task_id: &str, state: &ProgressState) -> TaskRuntime {
             })
             .collect(),
         source_bytes: None,
-    }
-}
-
-fn is_same_origin(base_url: &str, target_url: &str) -> bool {
-    let base = match url::Url::parse(base_url) {
-        Ok(u) => u,
-        Err(_) => return false,
-    };
-    let target = match url::Url::parse(target_url) {
-        Ok(u) => u,
-        Err(_) => return false,
-    };
-    base.scheme() == target.scheme()
-        && base.host_str() == target.host_str()
-        && base.port_or_known_default() == target.port_or_known_default()
-}
-
-fn cookies_for_url<'a>(manifest_url: &str, target_url: &str, cookies: &'a str) -> &'a str {
-    if cookies.is_empty() {
-        return "";
-    }
-    if is_same_origin(manifest_url, target_url) {
-        cookies
-    } else {
-        ""
     }
 }
 
@@ -131,32 +104,21 @@ impl SendFailure {
     }
 }
 
-/// 以请求身份 `spec` 构造一次 DASH GET：Cookie 按 `reference_url` 同源过滤，凭据类头
-/// 按其源站过滤，Referer 对所有请求附加，按站点请求头随身份切换。
-fn dash_get(
+/// 以请求身份 `spec` 构造一次 DASH GET：以用户清单 `reference_url` 为凭据锚点，Cookie /
+/// Authorization / Referer 按 [`crate::credential_scope`] 逐跳判定，按站点请求头随身份切换。
+fn dash_get<'s>(
     client: &Client,
-    spec: &RequestSpec,
+    spec: &'s RequestSpec,
     reference_url: &str,
     url: &str,
     range: Option<&str>,
-) -> reqwest::RequestBuilder {
-    let mut req = client.get(url);
-    if let Some(r) = range {
-        req = req.header("Range", format!("bytes={}", r));
+) -> crate::http_request::HttpRequest<'s> {
+    let req = crate::downloader::build_request(client, url, reqwest::Method::GET, spec)
+        .anchor(reference_url);
+    match range {
+        Some(r) => req.header("Range", format!("bytes={r}")),
+        None => req,
     }
-    let safe_cookies = cookies_for_url(reference_url, url, &spec.cookies);
-    if !safe_cookies.is_empty() {
-        req = req.header("Cookie", safe_cookies);
-    }
-    // CDN 常对分段强制要求 Referer（缺失即 403）。放在 apply_extra_headers 之前：
-    // 扩展捕获的真实请求头若含 referer 会覆盖此默认值。
-    if crate::downloader::is_valid_referrer(&spec.referrer) {
-        req = req.header(reqwest::header::REFERER, &spec.referrer);
-    }
-    // 目标指向清单以外的主机时，Authorization/Cookie 等凭据类头不随请求发出。
-    let headers = extra_headers_for_origin(reference_url, url, &spec.extra_headers);
-    req = crate::downloader::apply_extra_headers(req, &headers);
-    crate::downloader::apply_origin_headers(req, url, &spec.origin_headers)
 }
 
 /// 一次 DASH 运行内发请求用的上下文。请求身份（Cookie / Referer / 请求头 / 按站点
@@ -199,7 +161,7 @@ impl SegmentDownloadContext<'_> {
             _ = self.cancel_token.cancelled() => Err(SendFailure::Abort(DownloadError::Cancelled)),
             sent = tokio::time::timeout(header_timeout, req.send()) => match sent {
                 Ok(Ok(resp)) => Ok(resp),
-                Ok(Err(e)) => Err(SendFailure::Transient(DownloadError::from(e))),
+                Ok(Err(e)) => Err(SendFailure::Transient(e)),
                 Err(_) => Err(SendFailure::Transient(DownloadError::Other(format!(
                     "{what} stalled: no response headers within {header_timeout:?}"
                 )))),
@@ -2155,7 +2117,7 @@ fn join_base(current: &str, next: &str) -> Result<String, DownloadError> {
                 if joined.query().is_none()
                     && let Some(base_query) = base.query()
                     && matches!(joined.scheme(), "http" | "https")
-                    && is_same_origin(current, joined.as_str())
+                    && crate::credential_scope::same_origin(&base, &joined)
                 {
                     joined.set_query(Some(base_query));
                 }

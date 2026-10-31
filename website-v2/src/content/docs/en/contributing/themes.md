@@ -27,7 +27,7 @@ Each theme lives in `themes/<theme-id>/`. **A pull request may change only one t
 `theme-id` rules:
 
 - kebab-case — lowercase letters, digits and hyphens (`^[a-z0-9]+(-[a-z0-9]+)*$`), 3–40 characters, unique in the repository.
-- Reserved for built-in themes: `default`, `default-dark`, `default-light`, `midnight-blue`, `nord`, `warm-light`.
+- Reserved for built-in themes: `default`, `default-dark`, `default-light`, `midnight-blue`, `nord`, `warm-light`, `graphite`, `graphite-light`.
 
 `manifest.json`:
 

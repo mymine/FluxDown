@@ -8,6 +8,12 @@
 //!    插件 > 首个候选，并把这次自动选择记成未确认的站点记录，供插件页展示冲突；
 //! 3. 其余任务经 [`HostSelection::select_resolver_plugin`] 询问用户，可选记为站点默认。
 //!
+//! 从未起跑（无落盘进度、无 `resolver_item`）的任务若绑定的插件被禁用 / 待授权 / 熔断 /
+//! 不再匹配，而其它插件命中，起跑前同样走上述定案并改绑；有进度的任务维持绑定并
+//! fail-closed（中途换 resolver 可能写坏文件）。空绑定从不自动改绑——它与「忽略插件
+//! 重试」逃生舱的结果无法区分。没有任何候选时不写回，待选标记保持，等插件重新启用后
+//! 的下一次起跑再定案。
+//!
 //! 站点记录存在 config `plugin.site_default.<site>`（JSON）。`site` 是链接主机名（小写、
 //! 去掉 `www.`）；记录携带当时的候选集合，出现集合外的新插件时会重新询问。
 
@@ -209,6 +215,22 @@ impl PluginManager {
         })
     }
 
+    /// 插件当前是否可作为 resolver 使用：已启用（待授权 / 熔断 / 被撤销的插件都不算）且
+    /// 声明了 resolver。任务组成员的显式绑定据此判定，不可用即 fail-closed。
+    pub async fn resolver_available(&self, identity: &str) -> bool {
+        self.plugins.read().await.iter().any(|p| {
+            p.enabled && p.manifest.identity == identity && !p.manifest.resolvers.is_empty()
+        })
+    }
+
+    /// 已绑定的插件 `bound` 不再命中链接（被禁用 / 待授权 / 熔断 / 规则不再匹配），但仍有
+    /// 其它已启用 resolver 命中——从未起跑的任务据此改按当前路由重新选择。没有任何候选时
+    /// 返回 `false`（无处可换，维持 fail-closed）。
+    pub async fn bound_resolver_superseded(&self, url: &str, bound: &str) -> bool {
+        let candidates = self.matching_resolvers(url, false).await;
+        !candidates.is_empty() && !candidates.iter().any(|c| c.identity == bound)
+    }
+
     /// 前置预解析（[`super::super::ResolveManifest`]）选用的插件：只看声明了
     /// `"multi": true` 的 resolver，多个命中时优先确认过的站点默认插件，否则取首个——
     /// 避免解析昂贵的单文件插件在创建下载时白跑一次（A2 契约）。
@@ -254,6 +276,10 @@ impl PluginManager {
     ///
     /// `bound` 是建任务时绑定的回退插件；`unattended` 任务绝不询问。用户关闭选择框时
     /// 返回 [`ResolverChoice::Cancelled`]，任务绑定保持待选。
+    ///
+    /// 当前没有任何候选（全部被禁用 / 卸载 / 待授权）时**不写回**：返回 `Use(bound)`，
+    /// 本次 resolve 按既有 fail-closed 语义报错，而任务仍保持待选，等插件重新启用后的
+    /// 下一次起跑再定案。
     pub async fn choose_task_resolver(
         &self,
         task_id: &str,
@@ -264,8 +290,7 @@ impl PluginManager {
     ) -> Result<ResolverChoice, PluginError> {
         let candidates = self.matching_resolvers(url, false).await;
         let chosen = match candidates.as_slice() {
-            // 候选全部被卸载 / 禁用：保留绑定，由 resolve 按既有 fail-closed 语义报错。
-            [] => bound.to_owned(),
+            [] => return Ok(ResolverChoice::Use(bound.to_owned())),
             [only] => only.identity.clone(),
             _ => {
                 match self
@@ -386,7 +411,8 @@ impl PluginManager {
         }
     }
 
-    /// 写站点记录。失败只记日志：本次选择已经生效，记录缺失只会让下次重新询问。
+    /// 写站点记录并广播插件状态（客户端据此重拉站点默认）。失败只记日志：本次选择已经
+    /// 生效，记录缺失只会让下次重新询问。
     async fn write_site_default(&self, site: &str, record: &StoredSiteDefault) {
         let json = match serde_json::to_string(record) {
             Ok(json) => json,
@@ -397,7 +423,9 @@ impl PluginManager {
         };
         if let Err(error) = self.db.set_config(&site_config_key(site), &json).await {
             crate::logger::report_error("plugin-route", "save site default plugin", &error);
+            return;
         }
+        self.publish_state().await;
     }
 
     /// 全部站点记录（按站点排序）。
@@ -441,11 +469,12 @@ impl PluginManager {
         validate_site(site)?;
         let key = site_config_key(site);
         let Some(identity) = identity else {
-            return self
-                .db
+            self.db
                 .delete_config(&key)
                 .await
-                .map_err(|e| PluginError::Runtime(e.to_string()));
+                .map_err(|e| PluginError::Runtime(e.to_string()))?;
+            self.publish_state().await;
+            return Ok(());
         };
         let Some(stored) = self.read_site_default(site).await else {
             return Err(invalid("site", format!("站点 {site} 没有插件选择记录")));
@@ -466,7 +495,9 @@ impl PluginManager {
         self.db
             .set_config(&key, &json)
             .await
-            .map_err(|e| PluginError::Runtime(e.to_string()))
+            .map_err(|e| PluginError::Runtime(e.to_string()))?;
+        self.publish_state().await;
+        Ok(())
     }
 
     /// 卸载插件后整理站点记录：把它移出候选；选中它或剩余候选不足两个的记录删除。

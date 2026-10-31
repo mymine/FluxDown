@@ -26,6 +26,7 @@ fluxdown_ui_i18n = { path = "../i18n" }
 fluxdown_ui_icon_pack = { path = "../icon_pack" }
 fluxdown_ui_rss = { version = "0.1.0", path = "../rss" }
 fluxdown_ui_settings = { path = "../settings" }
+fluxdown_ui_share = { version = "0.1.0", path = "../share" }
 fluxdown_ui_shell = { path = "../shell" }
 fluxdown_ui_theme = { path = "../theme" }
 futures-util = "0.3.32"
@@ -54,5 +55,5 @@ winresource.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSRunningApplication", "NSDockTile", "NSImage", "NSImageView", "NSView", "NSResponder", "NSControl", "NSCell"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSGeometry", "NSObject"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSData", "NSObject"] }

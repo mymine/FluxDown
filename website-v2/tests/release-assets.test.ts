@@ -80,6 +80,23 @@ describe("pickComponentRelease", () => {
       pickComponentRelease(pool.filter((r) => !r.prerelease), "mobile", false)?.tag_name,
     ).toBe("mobile-v0.4.8");
   });
+
+  test("iOS：并入哨兵前挂在统一 release 上的 IPA 按资产名识别，哨兵版本出现后以哨兵为准", () => {
+    // 旧版本：IPA 由独立 workflow 挂到已发布的统一 release，没有 SHA256SUMS-ios.txt
+    const attached = release("v0.6.3", [
+      "FluxDown-0.6.3-windows-x64-setup.exe",
+      "FluxDown-0.6.3-ios-sideload-unsigned.ipa",
+      "SHA256SUMS-app.txt",
+    ]);
+    // iOS 未改动的新版本：不含 IPA，回落到上一个带 IPA 的版本
+    const unchanged = release("v0.6.4", ["FluxDown-0.6.4-windows-x64-setup.exe", "SHA256SUMS-app.txt"]);
+    expect(pickComponentRelease([unchanged, attached], "ios", false)?.tag_name).toBe("v0.6.3");
+    const uploaded = release("v0.6.5", [
+      "FluxDown-0.6.5-ios-sideload-unsigned.ipa",
+      "SHA256SUMS-ios.txt",
+    ]);
+    expect(pickComponentRelease([uploaded, unchanged, attached], "ios", false)?.tag_name).toBe("v0.6.5");
+  });
 });
 
 test("desktopAssets 排除同后缀的服务器与 CLI 压缩包", () => {

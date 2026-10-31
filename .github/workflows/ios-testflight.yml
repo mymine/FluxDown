@@ -10,7 +10,8 @@
 #   - 被 test-package.yml（target=ios / all）以 workflow_call 复用，可指定构建 ref。
 # 构建号 = UTC 时间 YYYYMMDD.HHMMSS：跨 workflow / 重跑都唯一且递增（run_number 各 workflow 独立计数会撞号）。
 # 只出商店构建（store flavor：核心 build-core.sh --flavor store = --no-default-features，App 不定义 FULL_FLAVOR）；
-# 侧载未签名 IPA（full flavor）见 ios-sideload.yml。
+# 侧载未签名 IPA（full flavor）见 ios-sideload.yml（由 release.yml 的 ios 组件调用，随统一 release 发布）。
+# 缓存：tag 推送运行不保存（tag 作用域的缓存之后任何运行都恢复不了，见 release.yml 头部「缓存」）。
 # Secrets：IOS_DIST_CERT_P12_BASE64 / IOS_DIST_CERT_PASSWORD / IOS_APPSTORE_PROFILE_BASE64
 #          APPLE_API_KEY_ID / APPLE_API_ISSUER_ID / APPLE_API_KEY_P8_BASE64（与 macOS 公证共用）/ FLUXCLOUD_BASE_URL
 # 证书与描述文件 2027-09-12 到期，续期步骤见 .omp/knowledge/ops.md「iOS TestFlight」。
@@ -163,6 +164,7 @@ jobs:
         with:
           key: ios-testflight
           cache-on-failure: true
+          save-if: ${{ github.ref_type != 'tag' }}
 
       - name: Decode signing credentials
         env:

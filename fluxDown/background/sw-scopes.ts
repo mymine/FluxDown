@@ -6,6 +6,7 @@
  */
 import { browser } from "wxt/browser";
 import { ServiceWorkerScopes } from "@/utils/download-source";
+import { logWarn } from "@/utils/error-log";
 
 const STORAGE_KEY = "fluxdownServiceWorkerScopes";
 
@@ -17,7 +18,7 @@ const early: string[] = [];
 function persist(scopes: ServiceWorkerScopes): void {
   browser.storage.session
     ?.set({ [STORAGE_KEY]: scopes.toJSON() })
-    .catch((e: unknown) => console.warn("[FluxDown] failed to persist service worker scopes:", e));
+    .catch((e: unknown) => logWarn("[FluxDown] failed to persist service worker scopes:", e));
 }
 
 /** 同步可用的登记表；SW 冷启动、恢复完成前为 null（调用方需走异步路径）。 */
@@ -32,7 +33,7 @@ export function loadServiceWorkerScopes(): Promise<ServiceWorkerScopes> {
     try {
       stored = (await browser.storage.session?.get(STORAGE_KEY))?.[STORAGE_KEY];
     } catch (e) {
-      console.warn("[FluxDown] failed to restore service worker scopes:", e);
+      logWarn("[FluxDown] failed to restore service worker scopes:", e);
     }
     const scopes = ServiceWorkerScopes.from(stored);
     let added = false;

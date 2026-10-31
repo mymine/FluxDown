@@ -38,6 +38,21 @@ pub enum ActorOperation {
         /// 分类目录路由，见 `DaemonCreateTaskParams::category_route`。
         category_route: Option<fluxdown_protocol::CategoryRouteDto>,
     },
+    /// BT 任务实况（`daemon.task.btStatus`）：peer 与 tracker 状态。
+    BtStatus {
+        task_id: String,
+    },
+    /// BT 任务的分享材料（`daemon.task.torrentShare`）。
+    TorrentShare {
+        task_id: String,
+        include_torrent: bool,
+    },
+    /// 本机做种（`daemon.task.seedLocal`）：`torrent_bytes` 已由服务层在 actor 之外生成 / 读取。
+    SeedLocal {
+        path: String,
+        torrent_bytes: Vec<u8>,
+        unlimited: bool,
+    },
     /// 批量建任务（`daemon.task.createMany`）：保存目录与队列只解析一次，
     /// 整块一个事务落库，按 `batch_id` 幂等。
     CreateTasks {
@@ -266,6 +281,9 @@ pub enum ActorResult {
     WebhookSimulation(usize),
     WebhookTest(Box<fluxdown_engine::webhook::WebhookDelivery>),
     TaskVerify(fluxdown_protocol::TaskVerifyResult),
+    SeedLocal(fluxdown_protocol::SeedLocalResultDto),
+    TorrentShare(Box<fluxdown_protocol::TorrentShareDto>),
+    BtStatus(Box<fluxdown_protocol::BtStatusDto>),
 }
 
 /// actor 领域错误。
@@ -928,6 +946,119 @@ async fn execute_operation(
                 .ok_or_else(|| ActorError::Operation("failed to persist task".to_owned()))?;
             return Ok(ActorResult::Created(task_id));
         }
+        ActorOperation::SeedLocal {
+            path,
+            torrent_bytes,
+            unlimited,
+        } => {
+            #[cfg(feature = "bt")]
+            {
+                use fluxdown_engine::bt_local_seed::{LocalSeedError, plan_local_seed};
+                let local_error = |error: LocalSeedError| match error {
+                    LocalSeedError::InvalidArgument(message) => {
+                        ActorError::InvalidArgument(message)
+                    }
+                    LocalSeedError::Operation(message) => ActorError::Operation(message),
+                    error @ LocalSeedError::Duplicate { .. } => {
+                        ActorError::Operation(error.to_string())
+                    }
+                };
+                let plan = plan_local_seed(std::path::Path::new(&path), torrent_bytes)
+                    .map_err(local_error)?;
+                let queue_id = resolve_queue_id(&engine.db, String::new()).await?;
+                let created = engine
+                    .manager
+                    .create_local_seed(plan, queue_id, unlimited)
+                    .await;
+                return match created {
+                    Ok(task_id) => Ok(ActorResult::SeedLocal(
+                        fluxdown_protocol::SeedLocalResultDto {
+                            task_id,
+                            duplicate: false,
+                            existing_name: String::new(),
+                        },
+                    )),
+                    Err(LocalSeedError::Duplicate { task_id, name }) => Ok(ActorResult::SeedLocal(
+                        fluxdown_protocol::SeedLocalResultDto {
+                            task_id,
+                            duplicate: true,
+                            existing_name: name,
+                        },
+                    )),
+                    Err(error) => Err(local_error(error)),
+                };
+            }
+            #[cfg(not(feature = "bt"))]
+            {
+                let _ = (path, torrent_bytes, unlimited);
+                return Err(ActorError::InvalidArgument(
+                    UNSUPPORTED_PROTOCOL_MESSAGE.to_owned(),
+                ));
+            }
+        }
+        ActorOperation::BtStatus { task_id } => {
+            #[cfg(feature = "bt")]
+            {
+                use fluxdown_engine::bt_local_seed::LocalSeedError;
+                let view =
+                    engine
+                        .manager
+                        .bt_status(&task_id)
+                        .await
+                        .map_err(|error| match error {
+                            LocalSeedError::InvalidArgument(message) => {
+                                ActorError::InvalidArgument(message)
+                            }
+                            other => ActorError::Operation(other.to_string()),
+                        })?;
+                return Ok(ActorResult::BtStatus(Box::new(bt_status_to_dto(view))));
+            }
+            #[cfg(not(feature = "bt"))]
+            {
+                let _ = task_id;
+                return Err(ActorError::InvalidArgument(
+                    UNSUPPORTED_PROTOCOL_MESSAGE.to_owned(),
+                ));
+            }
+        }
+        ActorOperation::TorrentShare {
+            task_id,
+            include_torrent,
+        } => {
+            #[cfg(feature = "bt")]
+            {
+                use fluxdown_engine::bt_local_seed::LocalSeedError;
+                let (share, torrent) = engine
+                    .manager
+                    .torrent_share(&task_id, include_torrent)
+                    .await
+                    .map_err(|error| match error {
+                        LocalSeedError::InvalidArgument(message) => {
+                            ActorError::InvalidArgument(message)
+                        }
+                        error @ LocalSeedError::Duplicate { .. } => {
+                            ActorError::Operation(error.to_string())
+                        }
+                        LocalSeedError::Operation(message) => ActorError::Operation(message),
+                    })?;
+                return Ok(ActorResult::TorrentShare(Box::new(
+                    fluxdown_protocol::TorrentShareDto {
+                        info_hash: share.info_hash,
+                        name: share.name,
+                        magnet: share.magnet,
+                        torrent_b64: torrent
+                            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+                    },
+                )));
+            }
+            #[cfg(not(feature = "bt"))]
+            {
+                let _ = (task_id, include_torrent);
+                return Err(ActorError::InvalidArgument(
+                    UNSUPPORTED_PROTOCOL_MESSAGE.to_owned(),
+                ));
+            }
+        }
         ActorOperation::CreateTasks {
             batch_id,
             common,
@@ -1546,6 +1677,94 @@ async fn commit_ed2k_refresh(
 
 /// 引擎完整性校验报告 → wire DTO（引擎不依赖 protocol，转换放在 daemon 边界）。
 #[cfg(feature = "bt")]
+fn bt_status_to_dto(
+    view: fluxdown_engine::bt_status::BtStatusView,
+) -> fluxdown_protocol::BtStatusDto {
+    use fluxdown_engine::bt_status::{TrackerSource, TrackerState};
+    use fluxdown_protocol::{BtTrackerDto, BtTrackerSource, BtTrackerStatus};
+    let available = fluxdown_engine::bt_status::installed();
+    fluxdown_protocol::BtStatusDto {
+        dht_enabled: view.dht_enabled,
+        peer_counts: fluxdown_protocol::BtPeerCountsDto {
+            live: view.counts.live,
+            connecting: view.counts.connecting,
+            queued: view.counts.queued,
+            seen: view.counts.seen,
+            dead: view.counts.dead,
+        },
+        trackers: view
+            .trackers
+            .into_iter()
+            .map(|row| {
+                let source = match row.source {
+                    TrackerSource::Torrent => BtTrackerSource::Torrent,
+                    TrackerSource::Session => BtTrackerSource::Session,
+                };
+                let status = match (&row.entry, available) {
+                    (_, false) => BtTrackerStatus::Unknown,
+                    (None, true) => BtTrackerStatus::NotContacted,
+                    (Some(entry), true) => match entry.state {
+                        TrackerState::Updating => BtTrackerStatus::Updating,
+                        TrackerState::Working => BtTrackerStatus::Working,
+                        TrackerState::NotWorking => BtTrackerStatus::NotWorking,
+                    },
+                };
+                let entry = row
+                    .entry
+                    .unwrap_or(fluxdown_engine::bt_status::TrackerEntry {
+                        state: TrackerState::Updating,
+                        peers: None,
+                        message: String::new(),
+                        detail: String::new(),
+                        last_ok_at: 0,
+                        next_announce_at: 0,
+                    });
+                BtTrackerDto {
+                    url: row.url,
+                    source,
+                    status,
+                    peers: entry.peers,
+                    message: entry.message,
+                    detail: entry.detail,
+                    last_ok_at: entry.last_ok_at,
+                    next_announce_at: entry.next_announce_at,
+                }
+            })
+            .collect(),
+        peers: view.peers.into_iter().map(peer_row_to_dto).collect(),
+    }
+}
+
+/// 一个 peer 行 → wire DTO；防吸血研判（若该连接已被观察到）一并带出。
+#[cfg(feature = "bt")]
+fn peer_row_to_dto(peer: fluxdown_engine::bt_status::PeerRow) -> fluxdown_protocol::BtPeerDto {
+    let mut dto = fluxdown_protocol::BtPeerDto {
+        addr: peer.addr,
+        client: peer.client,
+        transport: peer.transport,
+        downloaded: peer.downloaded,
+        uploaded: peer.uploaded,
+        down_bps: peer.down_bps,
+        up_bps: peer.up_bps,
+        country: peer.country,
+        ..fluxdown_protocol::BtPeerDto::default()
+    };
+    if let Some(insight) = peer.insight {
+        dto.ip_group = insight.ip_group;
+        dto.group_delivered_bytes = insight.group_delivered_bytes;
+        dto.suspicion = Some(insight.suspicion.to_owned());
+        dto.rules = insight
+            .rules
+            .iter()
+            .map(|rule| (*rule).to_owned())
+            .collect();
+        dto.action = insight.action.to_owned();
+        dto.observe_only = insight.observe_only;
+    }
+    dto
+}
+
+#[cfg(feature = "bt")]
 fn task_verify_to_dto(
     report: fluxdown_engine::bt_verify::BtIntegrityReport,
 ) -> fluxdown_protocol::TaskVerifyResult {
@@ -1705,6 +1924,11 @@ async fn patch_config(
             .iter()
             .map(|(key, value)| (key.clone(), value.clone())),
     );
+    if let Some(raw) = values.get(fluxdown_engine::proxy_rules::PROXY_RULES_KEY)
+        && let Some(first) = fluxdown_engine::proxy_rules::validate(raw).first()
+    {
+        return Err(ActorError::InvalidArgument(first.message()));
+    }
     if values
         .keys()
         .any(|key| key.starts_with("proxy_") || key == "global_user_agent")
@@ -2058,13 +2282,21 @@ async fn apply_live_config<'a>(
             .set_user_agent(value.clone())
             .map_err(|error| ActorError::Operation(format!("{error:#}")))?;
     }
-    if keys.iter().any(|key| key.starts_with("proxy_")) {
+    let rules_key = fluxdown_engine::proxy_rules::PROXY_RULES_KEY;
+    if keys
+        .iter()
+        .any(|key| key.starts_with("proxy_") && *key != rules_key)
+    {
         engine
             .manager
             .set_proxy_config(fluxdown_engine::proxy_config::ProxyConfig::from_config_map(
                 all,
             ))
             .map_err(|error| ActorError::Operation(format!("{error:#}")))?;
+    } else if keys.contains(&rules_key) {
+        engine.manager.set_proxy_rules(
+            fluxdown_engine::proxy_config::ProxyConfig::from_config_map(all).rules,
+        );
     }
     if keys.iter().any(|key| key.starts_with("bt_")) {
         engine
@@ -2086,6 +2318,13 @@ async fn apply_live_config<'a>(
         }) {
             engine.manager.invalidate_bt_session().await;
         }
+    }
+    // 防吸血配置全部热生效：不在监听类键之列，不重建 BT 会话。
+    #[cfg(feature = "bt")]
+    if keys.iter().any(|key| key.starts_with("bt_guard_")) {
+        engine
+            .manager
+            .set_bt_guard_config(crate::config::bt_guard_config_from_map(all));
     }
     if keys.contains(&"webhook.endpoints")
         && let Some(value) = all.get("webhook.endpoints")
@@ -2625,6 +2864,168 @@ mod tests {
         }
     }
 
+    /// 防吸血的 19 个设置键全部热生效：patch 之后 guard 配置立即变化，只读节奏（BT 会话）不被触碰；
+    /// 其余 `bt_*` 键的 patch 不影响 guard 配置。
+    #[cfg(feature = "bt")]
+    #[tokio::test]
+    async fn bt_guard_settings_apply_live_through_a_config_patch() {
+        use fluxdown_engine::bt_guard::{DownloadingMaxAction, RuleMode};
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_daemon_guard_patch_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create guard patch test dir");
+        let dir_text = dir.to_string_lossy().into_owned();
+        let mut engine = fluxdown_engine::Engine::new(
+            fluxdown_engine::EngineConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: dir_text.clone(),
+                app_data_dir: dir_text.clone(),
+                bt_config: fluxdown_engine::bt_config::BtConfig::default(),
+                proxy_config: fluxdown_engine::proxy_config::ProxyConfig::default(),
+                user_agent: String::new(),
+                data_dir_override: Some(dir.clone()),
+                database_url: None,
+            },
+            std::sync::Arc::new(fluxdown_engine::NoopSink),
+            std::sync::Arc::new(fluxdown_engine::NoopSelection),
+        )
+        .await
+        .expect("construct engine");
+        let events =
+            crate::event_hub::DaemonEventHub::new(fluxdown_protocol::DaemonSnapshot::default(), 32);
+        assert_eq!(
+            *engine.manager.bt_guard().config(),
+            fluxdown_engine::bt_guard::BtGuardConfig::default()
+        );
+
+        let patch = |pairs: &[(&str, &str)]| ActorOperation::PatchConfig {
+            expected_revision: 0,
+            values: pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect(),
+        };
+        let revision_of = |result: Result<super::ActorResult, ActorError>| match result {
+            Ok(super::ActorResult::Config(snapshot)) => snapshot.revision,
+            Ok(_) => panic!("unexpected actor result"),
+            Err(error) => panic!("patch failed: {error}"),
+        };
+        let first = revision_of(
+            execute_operation(
+                patch(&[
+                    ("bt_guard_enabled", "false"),
+                    ("bt_guard_rule_excessive", "enforce"),
+                    ("bt_guard_rule_rerequest", "off"),
+                    ("bt_guard_rule_rewind", "enforce"),
+                    ("bt_guard_rule_lag", "off"),
+                    ("bt_guard_rule_fingerprint", "enforce"),
+                    ("bt_guard_cloud_mode", "enforce"),
+                    ("bt_guard_excess_ratio_pct", "350"),
+                    ("bt_guard_min_torrent_mib", "0"),
+                    ("bt_guard_rewind_tolerance_pct", "15"),
+                    ("bt_guard_throttle_kib", "128"),
+                    ("bt_guard_ban_base_hours", "2"),
+                    ("bt_guard_ban_max_days", "9"),
+                    ("bt_guard_downloading_max_action", "ban"),
+                    ("bt_guard_skip_private", "false"),
+                    ("bt_guard_skip_lan", "false"),
+                    ("bt_guard_ipv6_prefix", "48"),
+                    ("bt_guard_filter_urls", "https://a.test/list.txt"),
+                    ("bt_guard_cloud_enabled", "false"),
+                    ("bt_guard_report_enabled", "true"),
+                ]),
+                &mut engine,
+                &events,
+            )
+            .await,
+        );
+        let config = engine.manager.bt_guard().config();
+        assert!(!config.enabled);
+        assert_eq!(config.rule_excessive, RuleMode::Enforce);
+        assert_eq!(config.rule_rerequest, RuleMode::Off);
+        assert_eq!(config.rule_rewind, RuleMode::Enforce);
+        assert_eq!(config.rule_lag, RuleMode::Off);
+        assert_eq!(config.rule_fingerprint, RuleMode::Enforce);
+        assert_eq!(config.cloud_mode, RuleMode::Enforce);
+        assert_eq!(config.excess_ratio_pct, 350);
+        assert_eq!(config.min_torrent_mib, 0);
+        assert_eq!(config.rewind_tolerance_pct, 15);
+        assert_eq!(config.throttle_kib, 128);
+        assert_eq!(config.ban_base_hours, 2);
+        assert_eq!(config.ban_max_days, 9);
+        assert_eq!(config.downloading_max_action, DownloadingMaxAction::Ban);
+        assert!(!config.skip_private && !config.skip_lan && !config.cloud_enabled);
+        assert_eq!(config.ipv6_prefix, 48);
+        assert_eq!(config.filter_urls, "https://a.test/list.txt");
+        assert!(config.report_enabled);
+        assert!(
+            !engine.manager.bt_guard().session_active(),
+            "patching guard settings never creates or rebuilds a BT session"
+        );
+
+        // 其余 bt_* 键的 patch 不改 guard 配置。
+        let mut op = patch(&[("bt_seed_max_active", "3")]);
+        if let ActorOperation::PatchConfig {
+            expected_revision, ..
+        } = &mut op
+        {
+            *expected_revision = first;
+        }
+        revision_of(execute_operation(op, &mut engine, &events).await);
+        assert_eq!(*engine.manager.bt_guard().config(), *config);
+
+        drop(engine);
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await {
+            eprintln!("actor guard patch test directory removal failed: {error}");
+        }
+    }
+
+    /// peer 行 → DTO：有防吸血研判时带出全部新字段，没有时保持旧字段与默认值。
+    #[cfg(feature = "bt")]
+    #[test]
+    fn peer_rows_carry_the_guard_insight_into_the_dto() {
+        use fluxdown_engine::bt_guard::PeerInsight;
+        let row = |insight| fluxdown_engine::bt_status::PeerRow {
+            addr: "203.0.113.9:6881".to_owned(),
+            client: "Xunlei".to_owned(),
+            transport: "tcp".to_owned(),
+            downloaded: 1,
+            uploaded: 2,
+            down_bps: 3,
+            up_bps: 4,
+            country: Some("CN".to_owned()),
+            insight,
+        };
+        let plain = super::peer_row_to_dto(row(None));
+        assert_eq!(plain.addr, "203.0.113.9:6881");
+        assert_eq!((plain.downloaded, plain.uploaded), (1, 2));
+        assert_eq!(plain.country.as_deref(), Some("CN"));
+        assert_eq!(plain.action, "allow");
+        assert!(plain.ip_group.is_empty() && plain.suspicion.is_none() && plain.rules.is_empty());
+        assert!(!plain.observe_only);
+
+        let flagged = super::peer_row_to_dto(row(Some(PeerInsight {
+            ip_group: "203.0.113.9".to_owned(),
+            group_delivered_bytes: 4096,
+            suspicion: "strong",
+            rules: vec!["excessive", "rerequest"],
+            action: "banned",
+            observe_only: true,
+        })));
+        assert_eq!(flagged.ip_group, "203.0.113.9");
+        assert_eq!(flagged.group_delivered_bytes, 4096);
+        assert_eq!(flagged.suspicion.as_deref(), Some("strong"));
+        assert_eq!(flagged.rules, vec!["excessive", "rerequest"]);
+        assert_eq!(flagged.action, "banned");
+        assert!(flagged.observe_only);
+    }
+
     /// `daemon.task.setSegments`：暂停任务改线程数后落库且状态不变；不存在 / 已完成任务
     /// 映射为 `NotFound`，不改库。
     #[tokio::test]
@@ -2988,6 +3389,7 @@ mod tests {
                     match_mode: "extension".to_owned(),
                     extensions: vec!["jpg".to_owned()],
                     regex_pattern: String::new(),
+                    url_pattern: String::new(),
                     save_dir: images_text.clone(),
                 }],
                 other_dir: String::new(),

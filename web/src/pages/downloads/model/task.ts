@@ -36,7 +36,7 @@ export const remoteKey = (taskId: string): RowKey => `r:${taskId}`
 export const isLocalKey = (key: RowKey): boolean => key.startsWith('l:')
 export const taskIdOfKey = (key: RowKey): string => key.slice(2)
 
-/** 引擎/daemon 插件系统失败任务的错误消息前缀。 */
+/** 可「忽略插件重试」的插件失败错误消息前缀（二段解析任务失败用 `[解析插件]`，不匹配本前缀）。 */
 export const PLUGIN_ERROR_PREFIX = '[插件]'
 
 export interface DownloadTaskView {

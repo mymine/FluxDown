@@ -19,6 +19,9 @@ const DONATE = 'https://fluxdown.com/sponsor'
 const WEBSITE = 'https://fluxdown.com'
 /** 服务端资产随统一的 `vX.Y.Z` release 发布（更早版本在 `server-v*` release）。 */
 const SERVER_RELEASES = 'https://github.com/zerx-lab/FluxDown/releases'
+/** 对端国家：DB-IP lite 地理库（CC BY 4.0 署名）与国旗图标（flag-icons，MIT）。 */
+const DB_IP = 'https://db-ip.com'
+const FLAG_ICONS = 'https://github.com/lipis/flag-icons'
 
 function openUrl(url: string) {
   window.open(url, '_blank', 'noopener,noreferrer')
@@ -224,6 +227,14 @@ export function AboutSettings() {
               { label: t('officialWebsite'), url: WEBSITE },
             ]}
           />
+        </SettingsRow>
+      </SettingsSection>
+      <SettingsSection title={t('mobileOpenSource')}>
+        <SettingsRow title="IP Geolocation by DB-IP">
+          <LinkButtons links={[{ label: 'db-ip.com', url: DB_IP }]} />
+        </SettingsRow>
+        <SettingsRow title="flag-icons (MIT)">
+          <LinkButtons links={[{ label: 'GitHub', url: FLAG_ICONS }]} />
         </SettingsRow>
       </SettingsSection>
     </SettingsPage>

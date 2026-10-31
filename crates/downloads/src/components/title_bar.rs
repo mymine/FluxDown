@@ -17,7 +17,7 @@ use gpui::{
     Anchor, AnyElement, App, AppContext as _, Context, Div, ElementId, Entity, FocusHandle,
     Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled,
-    WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    WeakEntity, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{
     Icon, Sizable as _, Size,
@@ -33,7 +33,7 @@ use gpui_component::{
 use crate::{
     components::task_table::{DownloadTableDelegate, DraggedColumnMenuItem},
     model::view_prefs::{
-        DetailPlacement, SortDir, ViewDensity, ViewGroupBy, ViewPrefs, ViewSortKey,
+        DetailPlacement, HeaderAlign, SortDir, ViewDensity, ViewGroupBy, ViewPrefs, ViewSortKey,
     },
     pages::downloads::DownloadView,
     strings::SEARCH_SHORTCUT_HINT,
@@ -44,10 +44,12 @@ const SEARCH_WIDTH: f32 = 280.;
 const SEARCH_MIN_WIDTH: f32 = 160.;
 /// 视图菜单宽度（100% 下的 px，容纳四个分段标签，经 `text_extent` 放大）。
 const VIEW_MENU_WIDTH: f32 = 320.;
-/// 视图菜单滚动区的最大高度；窗口较矮时再按可见高度收紧。
-const VIEW_MENU_MAX_BODY_HEIGHT: Pixels = px(420.);
-/// 弹层打开在顶栏下方：可见高度需扣除顶栏（40）、标签头与上下留白。
-const VIEW_MENU_WINDOW_RESERVE: Pixels = px(120.);
+/// 视图菜单滚动区最多容纳的行数（以 `nav_row` 计）：列页 10 列 + 提示 + 分隔 + 重置约 12 行，
+/// 留余量后取 15（默认缩放下即 420px）。按行高而非固定 px 封顶，字体 / 界面缩放抬高行高时
+/// 上限随之放大，底部「重置为默认列」等行不会被裁到滚动区外。
+const VIEW_MENU_MAX_BODY_ROWS: f32 = 15.;
+/// 弹层打开在顶栏下方：可见高度需扣除顶栏、标签头与上下留白（标签头与留白约 3 行高）。
+const VIEW_MENU_WINDOW_RESERVE_ROWS: f32 = 3.;
 
 /// 视图菜单的分页（分段标签）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -388,9 +390,14 @@ impl Render for DownloadViewMenu {
                         .upgrade()
                         .map(|view_menu| view_menu.read(cx).view_menu_page)
                         .unwrap_or_default();
-                    let body_max_height = VIEW_MENU_MAX_BODY_HEIGHT
-                        .min(window.viewport_size().height - VIEW_MENU_WINDOW_RESERVE)
-                        .max(active_theme(cx).density().nav_row * 3.);
+                    let density = active_theme(cx).density();
+                    let body_max_height = (density.nav_row * VIEW_MENU_MAX_BODY_ROWS)
+                        .min(
+                            window.viewport_size().height
+                                - density.title_bar
+                                - density.nav_row * VIEW_MENU_WINDOW_RESERVE_ROWS,
+                        )
+                        .max(density.nav_row * 3.);
                     view_menu_content(
                         ViewMenuContext {
                             view_menu: &view_menu,
@@ -791,6 +798,29 @@ fn display_page(menu: &ViewMenuContext<'_>, style: MenuStyle, cx: &App) -> Vec<A
                     menu_text(menu, key, cx),
                     prefs.density == density,
                     move |cx| update_prefs(&view, move |prefs| prefs.density = density, cx),
+                )
+                .into_any_element(),
+        );
+    }
+    rows.push(style.separator().into_any_element());
+    rows.push(
+        style
+            .section_title(menu_text(menu, "viewSectionHeaderAlign", cx))
+            .into_any_element(),
+    );
+    for (align, key) in [
+        (HeaderAlign::Left, "viewHeaderAlignLeft"),
+        (HeaderAlign::Center, "viewHeaderAlignCenter"),
+        (HeaderAlign::Right, "viewHeaderAlignRight"),
+    ] {
+        let view = menu.view.clone();
+        rows.push(
+            style
+                .option_row(
+                    SharedString::from(format!("download-view-header-align-{align:?}")),
+                    menu_text(menu, key, cx),
+                    prefs.header_align == align,
+                    move |cx| update_prefs(&view, move |prefs| prefs.header_align = align, cx),
                 )
                 .into_any_element(),
         );

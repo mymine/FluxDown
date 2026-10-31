@@ -9,6 +9,8 @@ import { copyText } from '../../../../lib/copy'
 import { rpc } from '../../../../lib/rpc'
 import type { PluginAuthRequest, PluginAuthResponse, PluginDto } from '../../../../lib/rpc'
 import { Button, Dialog, DialogFooter, FieldError, FormField, Icon, Input, toast } from '../../../../ui'
+import { activeAuthViewOf } from '../../../plugins/contributions'
+import { PluginViewHost } from '../../../plugins/view/PluginViewHost'
 import { encodeQrChallengeImage } from './challengeImage'
 import { extensionErrorText } from './errors'
 import { applyPluginAuthResponse, dataImageChallengeSrc, isQrcodeChallenge, safeHttpUrl, truncateChallengeText } from './logic'
@@ -267,6 +269,19 @@ function AuthBody({ plugin, onClose }: { plugin: PluginDto; onClose: () => void 
   )
 }
 
+/** 插件声明了可运行的登录视图：弹窗只承载该视图（插件自己决定流程与关闭）。 */
+function AuthViewBody({ plugin, view, onClose }: { plugin: PluginDto; view: string; onClose: () => void }) {
+  const t = useT()
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()} title={t('pluginAuthDialogTitle', { name: plugin.name })}>
+      <PluginViewHost identity={plugin.identity} view={view} onClose={onClose} />
+    </Dialog>
+  )
+}
+
 export function PluginAuthDialog({ plugin, onClose }: { plugin: PluginDto | null; onClose: () => void }) {
-  return plugin ? <AuthBody key={plugin.identity} plugin={plugin} onClose={onClose} /> : null
+  if (!plugin) return null
+  const authView = activeAuthViewOf(plugin)
+  if (authView) return <AuthViewBody key={plugin.identity} plugin={plugin} view={authView.id} onClose={onClose} />
+  return <AuthBody key={plugin.identity} plugin={plugin} onClose={onClose} />
 }

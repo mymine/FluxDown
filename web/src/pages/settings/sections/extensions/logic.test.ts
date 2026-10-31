@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test'
-import type { MarketEntryDto, SettingFieldDto } from '../../../../lib/rpc/protocol'
+import type { MarketEntryDto, PluginDto, SettingFieldDto } from '../../../../lib/rpc/protocol'
 import {
   CHALLENGE_TEXT_LIMIT,
   dataImageChallengeSrc,
   filterMarket,
   formatBytes,
+  liveDialogPlugins,
   safeHttpUrl,
   truncateChallengeText,
   validateField,
@@ -135,5 +136,33 @@ describe('formatBytes', () => {
     expect(formatBytes(1536)).toBe('1.5 KB')
     expect(formatBytes(12 * 1024 * 1024 + 300 * 1024)).toBe('12.3 MB')
     expect(formatBytes(1024 ** 3)).toBe('1.0 GB')
+  })
+})
+
+describe('liveDialogPlugins', () => {
+  const plugin = (identity: string, pending: string[] = []) => ({ identity, consentPending: pending, consentPendingHosts: [] }) as unknown as PluginDto
+  const none = { detail: null, settings: null, auth: null, consent: null }
+
+  test('对话框内容取最新快照，卸载后为 null', () => {
+    const v1 = plugin('a@x')
+    const open = { ...none, detail: 'a@x', settings: 'a@x', auth: 'b@x' }
+    expect(liveDialogPlugins([v1, plugin('b@x')], open)).toMatchObject({ detail: v1, settings: v1 })
+    const v2 = plugin('a@x')
+    const next = liveDialogPlugins([v2], open)
+    expect(next.detail).toBe(v2)
+    expect(next.settings).toBe(v2)
+    expect(next.auth).toBeNull()
+  })
+
+  test('授权框在待授权集合清空后为 null，仍有待授权则取最新快照', () => {
+    const open = { ...none, consent: 'a@x' }
+    const pending = plugin('a@x', ['ffmpeg'])
+    expect(liveDialogPlugins([pending], open).consent).toBe(pending)
+    expect(liveDialogPlugins([plugin('a@x')], open).consent).toBeNull()
+    expect(liveDialogPlugins([], open).consent).toBeNull()
+  })
+
+  test('未打开的对话框恒为 null', () => {
+    expect(liveDialogPlugins([plugin('a@x')], none)).toEqual(none)
   })
 })

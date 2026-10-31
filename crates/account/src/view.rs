@@ -5,21 +5,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fluxdown_protocol::{CloudEndpointDto, method};
+use fluxdown_ui_components::BusyHold;
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, Entity, IntoElement, ParentElement, Render,
-    SharedString, Styled, Subscription, Window, div, px,
+    AnyView, App, AppContext as _, ClipboardItem, Context, Entity, IntoElement, ParentElement,
+    Render, SharedString, Styled, Subscription, Window, div, px,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::input::{InputEvent, InputState};
 use gpui_component::notification::Notification;
 
 use crate::controller::AccountController;
+use crate::dialogs::plan_purchase::PurchaseTab;
 use crate::errors::{ErrorContext, error_text};
 use crate::host::{AccountHost, AccountHostEvent};
 use crate::link::now_unix_ms;
 use crate::pages;
+use crate::rpc::decode;
 use crate::sync_scope::{SyncPhase, relative_time_changes_in, sync_phase};
 use crate::{AccountCommand, AccountPort, PortFuture};
 
@@ -50,10 +53,23 @@ pub struct AccountView {
     devices_refreshing: bool,
     /// 已配对设备「刷新」在途。
     linked_refreshing: bool,
+    /// 三个刷新按钮的最短可见保持（本地调用常在一帧内返回，菊花否则不可见）；仅由用户点击启动。
+    cloud_hold: BusyHold,
+    devices_hold: BusyHold,
+    linked_hold: BusyHold,
+    /// 「立即同步」在途。
+    sync_now_busy: bool,
+    sync_now_hold: BusyHold,
     /// 「退出登录」在途：按钮置灰并拒绝重入。
     signing_out: bool,
     /// 上次观察到的登录态，用于在切换时清掉旧错误。
     had_session: bool,
+    /// app 注入的额度视图（共享加速额度 / 贡献）；登录态下显示在资料卡之后。
+    share_usage: Option<AnyView>,
+    /// 额度卡是否显示：FluxMesh 不可用（未启用 / 云端未开放）时隐藏，由 app 随 hub 推送。
+    share_usage_visible: bool,
+    /// 云端是否上架了可购买的流量包；没有时隐藏「流量包」按钮（加载前 / 失败按无处理）。
+    packs_available: bool,
     _endpoint_subscription: Subscription,
     _host_subscription: Subscription,
 }
@@ -73,6 +89,11 @@ impl AccountView {
             if has_session != this.had_session {
                 this.had_session = has_session;
                 this.last_error = None;
+                if has_session {
+                    this.load_pack_availability(cx);
+                } else {
+                    this.packs_available = false;
+                }
             }
             cx.notify();
         })
@@ -103,14 +124,70 @@ impl AccountView {
             cloud_refreshing: false,
             devices_refreshing: false,
             linked_refreshing: false,
+            cloud_hold: BusyHold::default(),
+            devices_hold: BusyHold::default(),
+            linked_hold: BusyHold::default(),
+            sync_now_busy: false,
+            sync_now_hold: BusyHold::default(),
             signing_out: false,
             had_session,
+            share_usage: None,
+            share_usage_visible: false,
+            packs_available: false,
             _endpoint_subscription,
             _host_subscription,
         };
         this.load_endpoint(cx);
+        if had_session {
+            this.load_pack_availability(cx);
+        }
         Self::spawn_sync_time_ticker(cx);
         this
+    }
+
+    /// 注入「共享加速额度」视图（由 app 创建）；登录态下以 `shareTabUsage` 为标题渲染。
+    pub fn set_share_usage(&mut self, view: AnyView, cx: &mut Context<Self>) {
+        self.share_usage = Some(view);
+        cx.notify();
+    }
+
+    /// 额度卡显隐（FluxMesh 可用性）；隐藏时视图不渲染，也就不会触发额度刷新。
+    pub fn set_share_usage_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.share_usage_visible != visible {
+            self.share_usage_visible = visible;
+            cx.notify();
+        }
+    }
+
+    /// 拉一次套餐目录，判断是否有可购买的流量包。
+    fn load_pack_availability(&mut self, cx: &mut Context<Self>) {
+        let future = self.port(cx).execute(AccountCommand::Plan {
+            method: method::AGENT_PLAN_LIST,
+            params: serde_json::json!({}),
+        });
+        cx.spawn(async move |this, cx| {
+            let plans = match future.await {
+                Ok(value) => decode!(value => Vec<fluxdown_protocol::CloudPlan>),
+                Err(error) => Err(error),
+            };
+            let available = match plans {
+                Ok(plans) => !crate::billing::pack_plans(&plans).is_empty(),
+                Err(error) => {
+                    log::warn!("load plan catalog for pack button failed: {:?}", error.code);
+                    false
+                }
+            };
+            let Ok(()) = this.update(cx, |this, cx| {
+                if this.packs_available != available {
+                    this.packs_available = available;
+                    cx.notify();
+                }
+            }) else {
+                // 账户页已释放，丢弃结果。
+                return;
+            };
+        })
+        .detach();
     }
 
     /// 「上次同步 N 分钟前」由时钟推进，不在任何被追踪的状态里：retained 渲染只在依赖变化时
@@ -172,10 +249,15 @@ impl AccountView {
         }
     }
 
-    /// 套餐购买对话框；断线 / 退出中不打开。
-    pub(crate) fn open_plan_purchase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 套餐购买对话框（`tab` 决定初始页签）；断线 / 退出中不打开。
+    pub(crate) fn open_plan_purchase(
+        &mut self,
+        tab: PurchaseTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.signing_out && !self.controller(cx).is_stale() {
-            crate::dialogs::plan_purchase::open(&self.host, window, cx);
+            crate::dialogs::plan_purchase::open(&self.host, tab, window, cx);
         }
     }
 
@@ -199,6 +281,39 @@ impl AccountView {
             let Ok(()) = this.update(cx, |this, cx| {
                 if let Err(error) = result {
                     this.last_error = Some(error_text(this.translator.read(cx), &error, context));
+                }
+                cx.notify();
+            }) else {
+                // 账户视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
+        })
+        .detach();
+    }
+
+    /// 「立即同步」：在途期间按钮转菊花并拒绝重入；最短可见时长由 [`BusyHold`] 保证。
+    pub(crate) fn sync_now(&mut self, cx: &mut Context<Self>) {
+        if self.sync_now_busy {
+            return;
+        }
+        let future = self.port(cx).execute(AccountCommand::Sync {
+            method: method::AGENT_SYNC_NOW,
+            params: serde_json::json!({}),
+        });
+        self.sync_now_busy = true;
+        self.sync_now_hold.start(cx);
+        self.last_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = future.await;
+            let Ok(()) = this.update(cx, |this, cx| {
+                this.sync_now_busy = false;
+                if let Err(error) = result {
+                    this.last_error = Some(error_text(
+                        this.translator.read(cx),
+                        &error,
+                        ErrorContext::Sync,
+                    ));
                 }
                 cx.notify();
             }) else {
@@ -255,6 +370,7 @@ impl AccountView {
             params: serde_json::json!({}),
         });
         self.linked_refreshing = true;
+        self.linked_hold.start(cx);
         self.last_error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -312,6 +428,8 @@ impl AccountView {
             params: serde_json::json!({}),
         });
         self.cloud_refreshing = true;
+        self.cloud_hold.start(cx);
+        self.load_pack_availability(cx);
         self.last_error = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -338,6 +456,7 @@ impl AccountView {
         let port = self.port(cx);
         self.devices_refreshing = true;
         self.last_error = None;
+        self.devices_hold.start(cx);
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = async {
@@ -579,15 +698,33 @@ impl Render for AccountView {
                 pages::profile::ProfileState {
                     copied: origin_id_copied,
                     disabled: disabled || self.signing_out,
-                    refreshing: self.cloud_refreshing,
+                    refreshing: self.cloud_refreshing || self.cloud_hold.is_held(),
                     last_error,
                     show_referral: self.host.read(cx).show_referral(),
+                    packs_available: self.packs_available,
                 },
                 cx,
             )),
         };
 
         let logged_in = session.is_some();
+        if logged_in
+            && self.share_usage_visible
+            && let Some(usage) = self.share_usage.clone()
+        {
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(tokens.spacing.sm)
+                    .child(crate::ui::group_heading(
+                        crate::t(&translator, "shareTabUsage"),
+                        None,
+                        cx,
+                    ))
+                    .child(usage),
+            );
+        }
         if let Some(session) = &session {
             column = column.child(pages::security::render(
                 &translator,
@@ -607,8 +744,8 @@ impl Render for AccountView {
                 linked: &linked,
                 logged_in,
                 disabled,
-                refreshing: self.devices_refreshing,
-                linked_refreshing: self.linked_refreshing,
+                refreshing: self.devices_refreshing || self.devices_hold.is_held(),
+                linked_refreshing: self.linked_refreshing || self.linked_hold.is_held(),
             },
             cx,
         ));
@@ -618,6 +755,7 @@ impl Render for AccountView {
             pages::cloud_features::CloudFeaturesState {
                 logged_in,
                 disabled,
+                sync_now_busy: self.sync_now_busy || self.sync_now_hold.is_held(),
             },
             &sync,
             (!self.host.read(cx).controller.is_stale()

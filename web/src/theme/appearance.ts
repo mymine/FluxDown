@@ -12,9 +12,9 @@ export type ThemePreference = 'system' | 'light' | 'dark'
 export type ThemeModeName = 'light' | 'dark'
 export type AccentScheme = 'blue' | 'green' | 'violet' | 'rose' | 'custom'
 
-export type BuiltinThemeId = 'defaultDark' | 'defaultLight' | 'midnightBlue' | 'nord' | 'warmLight'
+export type BuiltinThemeId = 'defaultDark' | 'defaultLight' | 'midnightBlue' | 'nord' | 'warmLight' | 'graphite' | 'graphiteLight'
 
-export const BUILTIN_THEMES: readonly BuiltinThemeId[] = ['defaultDark', 'defaultLight', 'midnightBlue', 'nord', 'warmLight']
+export const BUILTIN_THEMES: readonly BuiltinThemeId[] = ['defaultDark', 'defaultLight', 'midnightBlue', 'nord', 'warmLight', 'graphite', 'graphiteLight']
 
 const BUILTIN_APPEARANCE: Readonly<Record<BuiltinThemeId, ThemeModeName>> = {
   defaultDark: 'dark',
@@ -22,6 +22,8 @@ const BUILTIN_APPEARANCE: Readonly<Record<BuiltinThemeId, ThemeModeName>> = {
   midnightBlue: 'dark',
   nord: 'dark',
   warmLight: 'light',
+  graphite: 'dark',
+  graphiteLight: 'light',
 }
 
 /** 主题库 `extends` 取值（registry.json 的 `extends`）。 */
@@ -31,6 +33,8 @@ const BUILTIN_EXTENDS: Readonly<Record<BuiltinThemeId, string>> = {
   midnightBlue: 'builtin:midnight-blue',
   nord: 'builtin:nord',
   warmLight: 'builtin:warm-light',
+  graphite: 'builtin:graphite',
+  graphiteLight: 'builtin:graphite-light',
 }
 
 /** i18n 文案键（`themeDefaultDark` 等）。 */
@@ -40,6 +44,8 @@ export const BUILTIN_THEME_LABEL_KEYS: Readonly<Record<BuiltinThemeId, string>> 
   midnightBlue: 'themeMidnightBlue',
   nord: 'themeNord',
   warmLight: 'themeWarmLight',
+  graphite: 'themeGraphite',
+  graphiteLight: 'themeGraphiteLight',
 }
 
 export const ACCENT_SCHEMES: readonly AccentScheme[] = ['blue', 'green', 'violet', 'rose', 'custom']

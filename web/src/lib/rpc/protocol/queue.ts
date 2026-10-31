@@ -95,6 +95,11 @@ export interface CreateGroupRequest {
   extraHeaders?: Record<string, string>;
   ignoreTlsErrors?: boolean;
   startPaused?: boolean;
+  /**
+   * 预解析清单的来源插件（`ResolvePreviewResponse.pluginId` 原样回填）。非空 = 引擎把全部成员绑定到
+   * 该插件，插件已不可用则成员 fail-closed；空 = 引擎按预解析同一规则选插件。
+   */
+  resolverPluginId?: string;
   items: GroupItemRequest[];
 }
 
@@ -135,5 +140,7 @@ export interface ResolvePreviewResponse {
   name: string;
   sourceUrl: string;
   error: string;
+  /** 产出清单的插件 identity；无清单为空串（旧 daemon 缺省）。建组时回填 `CreateGroupRequest.resolverPluginId`。 */
+  pluginId?: string;
   items: PreviewItemDto[];
 }

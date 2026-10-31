@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use fluxdown_ui_downloads::actions as dl;
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_shell::ShellView;
-use gpui::{App, Context, Entity, Global, Menu, MenuItem, SharedString, Window};
+use gpui::{
+    Action, App, Context, Entity, Focusable as _, Global, Menu, MenuItem, SharedString, Window,
+};
 use gpui_component::{GlobalState, menu::AppMenuBar};
 
 use crate::{
@@ -52,6 +54,7 @@ pub fn build_menus(translator: &Translator) -> Vec<Menu> {
     let mut file = vec![
         MenuItem::action(t(translator, "menuNewDownload"), dl::NewDownload),
         MenuItem::action(t(translator, "openTorrentFile"), dl::OpenTorrentFile),
+        MenuItem::action(t(translator, "seedLocalTitle"), dl::SeedLocal),
     ];
     file.push(MenuItem::separator());
     if cfg!(target_os = "macos") {
@@ -79,7 +82,10 @@ pub fn build_menus(translator: &Translator) -> Vec<Menu> {
         MenuItem::separator(),
         MenuItem::action(t(translator, "openFile"), dl::OpenSelected),
         MenuItem::action(t(translator, "openFolder"), dl::RevealSelected),
+        MenuItem::action(t(translator, "copyFileAction"), dl::CopySelectedFiles),
         MenuItem::action(t(translator, "copyUrl"), dl::CopySelectedUrl),
+        MenuItem::action(t(translator, "btCopyMagnet"), dl::CopyMagnetSelected),
+        MenuItem::action(t(translator, "btExportTorrent"), dl::ExportTorrentSelected),
         MenuItem::action(t(translator, "renameTask"), dl::RenameSelected),
         MenuItem::action(t(translator, "webChangeUrl"), dl::ChangeSelectedUrl),
         MenuItem::action(t(translator, "editThreads"), dl::ChangeSelectedSegments),
@@ -216,6 +222,99 @@ pub fn install_global_actions(cx: &mut App) {
         );
     });
     cx.on_action(|_: &ToggleCommandPalette, cx| crate::command_palette::toggle(cx));
+    install_download_fallbacks(cx);
+}
+
+/// 下载页动作的应用级兜底。这些动作的处理器挂在下载页根元素上，只有派发路径经过下载页才会
+/// 命中；Windows / Linux 标题栏菜单以「打开菜单时的焦点」为派发目标，焦点为空（启动后未点过
+/// 列表）、在标题栏搜索框或当前不在下载页时，动作只沿标题栏冒泡、无人处理。下载页处理过的
+/// 动作不会冒泡到这里，因此焦点在下载页内时行为不变。
+fn install_download_fallbacks(cx: &mut App) {
+    forward_to_downloads::<dl::OpenTorrentFile>(cx);
+    forward_to_downloads::<dl::SeedLocal>(cx);
+    forward_to_downloads::<dl::PauseSelected>(cx);
+    forward_to_downloads::<dl::ResumeSelected>(cx);
+    forward_to_downloads::<dl::DeleteSelected>(cx);
+    forward_to_downloads::<dl::DeleteSelectedWithFiles>(cx);
+    forward_to_downloads::<dl::SelectAllTasks>(cx);
+    forward_to_downloads::<dl::PauseAll>(cx);
+    forward_to_downloads::<dl::ResumeAll>(cx);
+    forward_to_downloads::<dl::ClearFinished>(cx);
+    forward_to_downloads::<dl::OpenSelected>(cx);
+    forward_to_downloads::<dl::RevealSelected>(cx);
+    forward_to_downloads::<dl::CopySelectedFiles>(cx);
+    forward_to_downloads::<dl::CopySelectedUrl>(cx);
+    forward_to_downloads::<dl::CopyMagnetSelected>(cx);
+    forward_to_downloads::<dl::ExportTorrentSelected>(cx);
+    forward_to_downloads::<dl::RenameSelected>(cx);
+    forward_to_downloads::<dl::ChangeSelectedUrl>(cx);
+    forward_to_downloads::<dl::ChangeSelectedSegments>(cx);
+    forward_to_downloads::<dl::VerifySelected>(cx);
+    forward_to_downloads::<dl::RedownloadSelected>(cx);
+    forward_to_downloads::<dl::ToggleBoostSelected>(cx);
+    forward_to_downloads::<dl::OpenSelectedInWindow>(cx);
+    forward_to_downloads::<dl::CycleDensity>(cx);
+    forward_to_downloads::<dl::CycleGroupBy>(cx);
+    forward_to_downloads::<dl::CycleSort>(cx);
+    forward_to_downloads::<dl::ToggleDetailPanel>(cx);
+}
+
+fn forward_to_downloads<A: Action>(cx: &mut App) {
+    cx.on_action(|action: &A, cx| {
+        let action = action.boxed_clone();
+        cx.defer(move |cx| dispatch_in_downloads(action, cx));
+    });
+}
+
+/// 主窗口切到下载页、聚焦下载页根元素，再在其上派发动作。
+///
+/// 焦点已在下载页内说明下载页自己让出了该动作（如输入框聚焦时的字母键守卫），不再接管，
+/// 否则快捷键会抢走输入框焦点。刚切换路由时下载页尚未进入派发树，等它渲染一帧后再派发：
+/// 首个 next-frame 回调在该帧绘制前执行，第二个才能看到包含下载页的已渲染帧。
+fn dispatch_in_downloads(action: Box<dyn Action>, cx: &mut App) {
+    let Some(downloads) = Desktop::global(cx)
+        .main_downloads
+        .as_ref()
+        .and_then(gpui::WeakEntity::upgrade)
+    else {
+        return;
+    };
+    let Some(handle) = WindowRegistry::handle(cx, &WindowKey::Main) else {
+        return;
+    };
+    let focus = downloads.read(cx).focus_handle(cx);
+    let rendered = Desktop::global(cx)
+        .main_shell
+        .as_ref()
+        .and_then(gpui::WeakEntity::upgrade)
+        .is_some_and(|shell| {
+            shell.read(cx).active_route() == Some(&crate::activity::DOWNLOADS_ROUTE)
+        });
+    let declined = match handle.update(cx, |_, window, cx| focus.contains_focused(window, cx)) {
+        Ok(declined) => declined,
+        Err(error) => {
+            log::debug!("main window released before menu action dispatch: {error:#}");
+            return;
+        }
+    };
+    if declined {
+        return;
+    }
+    crate::command_palette::navigate_now(cx, crate::activity::DOWNLOADS_ROUTE);
+    if let Err(error) = handle.update(cx, move |_, window, cx| {
+        focus.focus(window, cx);
+        if rendered {
+            focus.dispatch_action(action.as_ref(), window, cx);
+        } else {
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |window, cx| {
+                    focus.dispatch_action(action.as_ref(), window, cx);
+                });
+            });
+        }
+    }) {
+        log::debug!("main window released before menu action dispatch: {error:#}");
+    }
 }
 
 /// 全局动作里操作活动窗口必须 defer：有活动窗口时，菜单点击与键盘一样经
@@ -234,7 +333,7 @@ fn with_active_window(cx: &mut App, f: impl FnOnce(&Window) + 'static) {
 /// 确认「下载将暂停」。只退出界面、保留后台，走关闭窗口（托盘驻留时）。
 pub fn request_quit(cx: &mut App) {
     if Desktop::active_task_count(cx) == 0 {
-        crate::lifecycle::quit_everything(cx);
+        crate::lifecycle::quit_everything_gated(cx);
         return;
     }
     cx.defer(|cx| {
@@ -245,7 +344,9 @@ pub fn request_quit(cx: &mut App) {
             return;
         };
         if let Err(error) = window.update(cx, |_, window, cx| {
-            confirm_active_tasks(window, cx, |_, cx| crate::lifecycle::quit_everything(cx));
+            confirm_active_tasks(window, cx, |window, cx| {
+                crate::lifecycle::quit_everything_in(window, cx);
+            });
         }) {
             log::debug!("view or window released before lifecycle update: {error:#}");
         }

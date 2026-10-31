@@ -15,14 +15,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import com.fluxdown.app.R
 import com.fluxdown.app.actions.LocalTaskActions
+import com.fluxdown.app.feature.settings.ContainerDaemonConfigPort
+import com.fluxdown.app.feature.settings.daemonWriteDetail
+import com.fluxdown.app.feature.settings.daemonWriteErrorText
 import com.fluxdown.app.i18n.str
 import com.fluxdown.app.AppContainer
 import com.fluxdown.app.shell.LocalAppContainer
-import com.fluxdown.core.host.HostErrorCode
 import com.fluxdown.core.host.HostException
 import com.fluxdown.core.protocol.HostMethod
-import com.fluxdown.core.protocol.WebhookConfigPort
-import com.fluxdown.core.protocol.WebhookConfigSnapshot
 import com.fluxdown.core.protocol.WebhookDeliveriesResponse
 import com.fluxdown.core.protocol.WebhookEndpoint
 import com.fluxdown.core.protocol.WebhookEndpointWriter
@@ -38,21 +38,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import java.text.DateFormat
 import java.util.Date
-
-/**
- * `WebhookEndpointWriter` 的生产端口：每次写入前都 `daemon.config.get` 取最新 `webhook.endpoints` 与 revision
- * （[cachedConfig] 恒为 null，不信任 store 快照——发布有合帧延迟），再 `daemon.config.patch {expectedRevision}`。
- */
-private class ContainerWebhookPort(private val container: AppContainer) : WebhookConfigPort {
-    override val cachedConfig: WebhookConfigSnapshot? = null
-
-    override suspend fun fetchConfig(): WebhookConfigSnapshot =
-        WebhookConfigSnapshot.fromJson(container.session.callJson(HostMethod.daemonConfigGet))
-
-    override suspend fun patchConfig(expectedRevision: Long, values: Map<String, String>) {
-        container.session.patchConfig(expectedRevision, values)
-    }
-}
 
 /** 「发送测试」的展示结果；行内测试归属发起的端点（[endpointId]）。 */
 internal class WebhookTestReport(val endpointId: String, val success: Boolean, val text: String)
@@ -100,23 +85,12 @@ internal class WebhookController(
     var clearing by mutableStateOf(false)
         private set
 
-    private val writer = WebhookEndpointWriter(ContainerWebhookPort(container))
+    private val writer = WebhookEndpointWriter(ContainerDaemonConfigPort(container))
 
     private fun text(id: Int, vararg args: Pair<String, Any?>) = context.str(id, *args)
 
-    /** 写回失败 → 反馈文案（Web `writeErrorText` ↔ GPUI `SettingsErrorKind`；校验失败附带具体原因）。 */
-    private fun writeErrorText(e: HostException): String = when (e.code) {
-        HostErrorCode.Unavailable, HostErrorCode.Timeout -> text(R.string.localServiceDisconnected)
-        HostErrorCode.Conflict -> text(R.string.localServiceConflict)
-        HostErrorCode.InvalidArgument -> {
-            val detail = detail(e)
-            if (detail.isEmpty()) text(R.string.localServiceInvalidArgument) else "${text(R.string.localServiceInvalidArgument)}: $detail"
-        }
-        else -> text(R.string.localServiceActionFailed)
-    }
-
-    /** 主机给出的细节（没有则空串）。`HostException.message` 缺省为 code 名，视为没有细节。 */
-    private fun detail(e: HostException): String = e.message.orEmpty().takeIf { it != e.code.name }.orEmpty()
+    /** 主机给出的细节（没有则空串）。 */
+    private fun detail(e: HostException): String = daemonWriteDetail(e)
 
     /** 测试 / 模拟失败：主机给出的细节优先，其次按码文案。 */
     private fun failureDetail(e: HostException): String = detail(e).ifEmpty { errorText(e) }
@@ -147,7 +121,7 @@ internal class WebhookController(
     } catch (e: CancellationException) {
         throw e
     } catch (e: HostException) {
-        overlays.toast(writeErrorText(e), FluxToastKind.Error)
+        overlays.toast(daemonWriteErrorText(context, e), FluxToastKind.Error)
         false
     }
 
@@ -223,7 +197,7 @@ internal class WebhookController(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: HostException) {
-                overlays.toast(writeErrorText(e), FluxToastKind.Error)
+                overlays.toast(daemonWriteErrorText(context, e), FluxToastKind.Error)
             } finally {
                 clearing = false
             }

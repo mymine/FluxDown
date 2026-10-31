@@ -81,6 +81,8 @@ pub struct FluxThemeState {
     diagnostics: Arc<[Diagnostic]>,
     /// 所选正文字号相对主题正文字号的倍率（未设置时为 1）。
     font_scale: f32,
+    /// 窗口根节点的缺字回退链（汉字黑体，见 `cjk` 模块）；`None` 时沿用平台系统回退。
+    font_fallbacks: Option<gpui::FontFallbacks>,
 }
 
 impl Global for FluxThemeState {}
@@ -145,6 +147,11 @@ impl FluxThemeState {
     /// 组件级 token（已按界面缩放）。
     pub fn components(&self) -> &ComponentTokens {
         &self.theme.components
+    }
+
+    /// 窗口根节点的缺字回退链；由每个窗口的 Root 插件挂到根文本样式上。
+    pub fn font_fallbacks(&self) -> Option<&gpui::FontFallbacks> {
+        self.font_fallbacks.as_ref()
     }
 
     /// 当前模式主题文件的解析诊断。
@@ -221,8 +228,10 @@ fn selection_documents(appearance: &AppearancePreferences, cx: &App) -> ThemeDoc
     }
 }
 
-/// 在 `gpui_component::init` 后安装默认主题。
+/// 在 `gpui_component::init` 后、创建任何窗口前安装默认主题，并注册把汉字回退链挂到每个
+/// 窗口根节点的 Root 插件。
 pub fn init(cx: &mut App) {
+    crate::cjk::register_root_plugin(cx);
     let appearance = AppearancePreferences::default();
     let documents = selection_documents(&appearance, cx);
     install(documents, appearance, None, cx);
@@ -338,6 +347,14 @@ fn install(
             &crate::available_font_families(cx),
         );
     }
+    let han_fonts = crate::cjk::plan(
+        crate::cjk::current_preference(cx),
+        &theme.base.typography.sans,
+        cx,
+    );
+    if let Some(primary) = han_fonts.primary {
+        theme.base.typography.sans = primary;
+    }
     // 行高下限取界面字体与等宽字体中较高的自然行高：两者都会出现在同一套行高 token 下。
     let typography = &theme.base.typography;
     let line_ratio = crate::fonts::natural_line_ratio(&typography.sans, cx)
@@ -364,6 +381,7 @@ fn install(
         theme,
         diagnostics: diagnostics.into(),
         font_scale,
+        font_fallbacks: han_fonts.fallbacks,
     });
 
     for handle in cx.windows() {

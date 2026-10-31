@@ -6,7 +6,7 @@ use uuid::Uuid;
 use super::{
     ActiveTaskEntry, BatchItemOutcome, BtConfig, CreateRejection, Db, DownloadManager,
     DownloadManagerConfig, EngineEvent, EventSink, MAIN_QUEUE_ID, META_PROBE_CONCURRENCY,
-    NewTaskSpec, ProxyConfig, TASK_CLIENT_CACHE_CAP,
+    NewTaskSpec, ProxyConfig,
 };
 
 #[derive(Default)]
@@ -717,50 +717,6 @@ async fn meta_probe_waits_for_a_gate_permit() {
             .await
             .is_ok(),
         "the probe starts once a permit is free"
-    );
-}
-
-#[tokio::test]
-async fn dedicated_clients_are_cached_by_policy_and_bounded() {
-    let (_db, manager, _sink) = fixture().await;
-    let proxy = ProxyConfig::default();
-    let cached = || {
-        manager
-            .task_clients
-            .lock()
-            .expect("client cache lock")
-            .len()
-    };
-    manager
-        .dedicated_client(&proxy, "ua-a", false)
-        .expect("build");
-    manager
-        .dedicated_client(&proxy, "ua-a", false)
-        .expect("cache hit");
-    assert_eq!(cached(), 1, "same policy reuses one client");
-    manager
-        .dedicated_client(&proxy, "ua-b", false)
-        .expect("build");
-    manager
-        .dedicated_client(&proxy, "ua-a", true)
-        .expect("build");
-    assert_eq!(cached(), 3, "UA and TLS policy are part of the key");
-
-    {
-        let mut cache = manager.task_clients.lock().expect("client cache lock");
-        let seed = manager.client.clone();
-        cache.clear();
-        for index in 0..TASK_CLIENT_CACHE_CAP {
-            cache.insert((format!("fp-{index}"), String::new(), false), seed.clone());
-        }
-    }
-    manager
-        .dedicated_client(&proxy, "ua-overflow", false)
-        .expect("build after overflow");
-    assert_eq!(
-        cached(),
-        1,
-        "an overflowing cache restarts instead of growing"
     );
 }
 

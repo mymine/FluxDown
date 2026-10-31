@@ -31,7 +31,7 @@ export const VALID_INTERCEPT_STAGES = [
 export type PluginPermission = (typeof VALID_PERMISSIONS)[number];
 
 export const VALID_EVENTS = ["onStart", "onError", "onDone", "onMetaProbed", "onCancel"] as const;
-export const VIEW_LOCATIONS = ["activity", "settings", "taskDetail", "window"] as const;
+export const VIEW_LOCATIONS = ["activity", "settings", "taskDetail", "window", "auth"] as const;
 
 export const WINDOW_SIZE_MIN = 240;
 export const WINDOW_SIZE_MAX = 4096;
@@ -421,6 +421,7 @@ function checkContributes(
     if (views.length > VIEWS_MAX) errors.push(`contributes.views 至多 ${VIEWS_MAX} 项`);
     const seen = new Set<string>();
     let settingsViews = 0;
+    let authViews = 0;
     for (const view of views) {
       if (!isObject(view)) {
         errors.push("view 须为对象");
@@ -440,6 +441,12 @@ function checkContributes(
       }
       if (view.location === "settings" && ++settingsViews > 1) {
         errors.push("location 为 settings 的 view 至多 1 个");
+      }
+      if (view.location === "auth") {
+        if (++authViews > 1) errors.push("location 为 auth 的 view 至多 1 个");
+        if (manifest.auth === undefined || manifest.auth === null) {
+          errors.push("location 为 auth 的 view 要求声明 auth");
+        }
       }
       const hasDesktop = view.desktop !== undefined && view.desktop !== null;
       if (view.portable !== undefined && typeof view.portable !== "boolean") {

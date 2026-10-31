@@ -6,17 +6,17 @@ import Testing
 struct PreferencesProtocolTests {
     // MARK: - 同步目录
 
-    @Test func syncCatalogMirrorsFiftyEightSpecs() {
-        // iOS 镜像 58 项：30 个 daemon 键 + 27 个偏好 / agent 键 + 集合范围键 `appearance.custom_themes`
-        // （Rust 目录 60 项，多出的 `ui.show_activity_account` 与 `appearance.file_icon_pack` 是 GPUI / Web 专属，
+    @Test func syncCatalogMirrorsSeventySevenSpecs() {
+        // iOS 镜像 77 项：49 个 daemon 键（含 19 个 `bt.guard.*`）+ 27 个偏好 / agent 键 + 集合范围键 `appearance.custom_themes`
+        // （Rust 目录 79 项，多出的 `ui.show_activity_account` 与 `appearance.file_icon_pack` 是 GPUI / Web 专属，
         // iOS 尚未镜像）。
-        #expect(SettingsCatalog.daemonSyncNames.count == 30)
+        #expect(SettingsCatalog.daemonSyncNames.count == 49)
         #expect(SettingsCatalog.syncedPreferenceKeys.count == 27)
-        #expect(SettingsCatalog.daemonSyncNames.count + SettingsCatalog.syncedPreferenceKeys.count + 1 == 58)
+        #expect(SettingsCatalog.daemonSyncNames.count + SettingsCatalog.syncedPreferenceKeys.count + 1 == 77)
         #expect(SettingsCatalog.syncedPreferenceKeys.contains("custom_categories"))
         #expect(!SettingsCatalog.syncedPreferenceKeys.contains(SettingsCatalog.customThemesScopeKey))
         #expect(SettingsCatalog.syncNameToDaemonKey["download.max_concurrent_tasks"] == "max_concurrent_tasks")
-        #expect(SettingsCatalog.syncNameToDaemonKey.count == 30)
+        #expect(SettingsCatalog.syncNameToDaemonKey.count == 49)
     }
 
     @Test func everySyncedDaemonKeyIsAWritableDaemonField() throws {
@@ -408,6 +408,33 @@ struct PreferencesProtocolTests {
         draft.regexText = #"  .*\.(epub|mobi)$ "#
         let entry = try CategoryRules.build(draft, nowMs: 1).get()
         #expect(entry.matchMode == "regex" && entry.regexPattern == #".*\.(epub|mobi)$"# && entry.extensions.isEmpty)
+    }
+
+    @Test func urlModeCarriesPatternRequiresItAndClearsOtherFields() throws {
+        var draft = CategoryDraft(existing: nil)
+        draft.name = "Site"
+        draft.matchMode = "url"
+        draft.extensionsText = "zip"
+        draft.regexText = "x"
+        draft.urlText = "   "
+        #expect(CategoryRules.build(draft, nowMs: 1) == .failure(.urlPatternRequired))
+        #expect(CategoryValidationError.urlPatternRequired.i18nKey == "urlPatternRequired")
+        draft.urlText = "  https://example.com/*  "
+        let entry = try CategoryRules.build(draft, nowMs: 1).get()
+        #expect(entry.matchMode == "url" && entry.urlPattern == "https://example.com/*")
+        #expect(entry.extensions.isEmpty && entry.regexPattern.isEmpty)
+
+        // 编辑既有网址分类：草稿带出模式与模式文本；未改动保存不丢规则，改动写入新值，切走模式清空。
+        var editing = CategoryDraft(existing: entry)
+        #expect(editing.matchMode == "url" && editing.urlText == "https://example.com/*")
+        editing.saveDir = "/mod"
+        #expect(try CategoryRules.build(editing, nowMs: 2).get().urlPattern == "https://example.com/*")
+        editing.urlText = "https://mirror.test/*"
+        #expect(try CategoryRules.build(editing, nowMs: 2).get().urlPattern == "https://mirror.test/*")
+        editing.matchMode = "extension"
+        editing.extensionsText = "zip"
+        let switched = try CategoryRules.build(editing, nowMs: 2).get()
+        #expect(switched.matchMode == "extension" && switched.urlPattern.isEmpty && switched.extensions == ["zip"])
     }
 
     @Test func builtinCategoriesKeepIdentityAndSkipRequiredChecks() throws {

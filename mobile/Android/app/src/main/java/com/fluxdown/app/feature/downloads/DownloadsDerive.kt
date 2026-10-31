@@ -56,7 +56,6 @@ internal class DeriveCache {
     val items = HashMap<String, Entry>()
     var categoriesRef: List<Category>? = null
     var index: CategoryIndex = CategoryIndex(Category.BUILTIN)
-    val categoryByName = HashMap<String, Category?>()
     var sortSig = 0
     var lastReorderMs = 0L
     var lastPos: Map<String, Int> = emptyMap()
@@ -87,7 +86,7 @@ private fun remoteItems(s: HostState, cache: DeriveCache): List<RemoteItem> {
         RemoteItem(
             task = t,
             name = name,
-            category = cache.categoryByName.getOrPut(name) { cache.index.categoryOf(name) },
+            category = cache.index.categoryOf(name, t.url),
             site = siteOfUrl(t.url),
             createdSec = t.createdAtSeconds,
         )
@@ -112,7 +111,6 @@ internal fun derive(input: DeriveInput, cache: DeriveCache, nowMs: Long, interac
     if (cache.categoriesRef !== s.categories) {
         cache.categoriesRef = s.categories
         cache.index = CategoryIndex(s.categories)
-        cache.categoryByName.clear()
         cache.items.clear()
         cache.remoteRaw = null
         cache.remoteCloud = null
@@ -245,10 +243,16 @@ private fun itemFor(t: Task, s: HostState, cache: DeriveCache, queuesById: Map<S
     val rt = s.runtime[t.taskId]
     val qo = s.queueOrder.orderOf(t.taskId)
     val boosted = s.priorityTaskId == t.taskId
-    val cat = cache.categoryByName.getOrPut(t.fileName) { cache.index.categoryOf(t.fileName) }
     val queue = queuesById[normQueue(t.queueId)]
 
     val prev = cache.items[t.taskId]
+    // 分类只取决于文件名与来源地址（网址规则）：二者未变就沿用上一行的分类，不在 10 Hz 派生里重算规则。
+    val prevTask = prev?.item?.task
+    val cat = if (prev != null && prevTask != null && prevTask.fileName == t.fileName && prevTask.url == t.url && prevTask.originUrl == t.originUrl) {
+        prev.item.category
+    } else {
+        cache.index.categoryOf(t.fileName, t.shareUrl)
+    }
     if (prev != null) {
         val it = prev.item
         if (it.task === t && prev.runtime === rt && it.speedDown == sd && it.speedUp == su &&
