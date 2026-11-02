@@ -51,6 +51,9 @@
 另见 AGENTS.md §4：quickjs-jit 与 gpui-shell 同版本、持有引擎的 actor 必须 drain `resolve_rx` / `plugin_retry_rx`、插件页面脚本只经 `userScripts`。
 
 - **QuickJS 抛 `null` 要按异常值识别为 OOM**：内存紧贴上限时 QuickJS 连 `"out of memory"` 错误对象都分配不出，改抛 `null`，字符串匹配的 `reclassify_oom` 认不出，该次 OOM 不计入熔断；必须在仍持有异常值时判定（代价：插件主动 `throw null` 也计 OOM） → `native/engine/src/plugin/quickjs.rs::caught_error`、回归 `null_exception_sentinel_counts_as_memory_limit_exceeded`。
+- **拦截器链必须显式按 identity 升序排序，不能依赖插件加载顺序**：目录遍历和去重都不保证 identity 顺序，后续插件会看到前一个插件改写后的请求，乱序会改变下载行为 → `native/engine/src/plugin/interceptors.rs::PluginManager::task_interceptor`；回归 `plugin::manager::tests::task_interceptors_follow_identity_order_not_load_order`。
+- **归档回调处于下载起跑 / 完成的等待路径，必须限制并发与耗时**：独立 `ARCHIVE_CONCURRENCY` 信号量最多运行 2 个实例，单次获取许可最多等待 3 秒，脚本执行预算为 5 秒；多个归档插件依次执行，延迟可累加，超时 / 内存超限计入现有熔断，不能把“纯本地回调”等同于零延迟 → `native/engine/src/plugin/quickjs.rs::{ARCHIVE_CONCURRENCY,invoke_archive}`、`native/engine/src/plugin/interceptors.rs::PluginManager::archive_folder`。
+- **QuickJS 宿主预置的 JSON 全局值不能再次 `JSON.parse`**：`set_json_global` 已把值解析成 JS 对象；再次 parse 会把对象转为 `"[object Object]"` 并让调用失败 → `native/engine/src/plugin/quickjs.rs::set_json_global`。
 - **外部工具子进程要补全登录 shell 的 PATH**：macOS 从 Dock / 访达启动只继承 `/usr/bin:/bin:/usr/sbin:/sbin`，yt-dlp 找不到 node / bun，带 Cookie 解析 YouTube 报 "The page needs to be reloaded"；取 PATH 的等待不计入插件脚本墙钟 → `native/engine/src/plugin/tool_path.rs::apply_full_path_env`（`read_login_shell_path` / `merge_path_lists`）。
 - **插件安装期校验必须覆盖拦截器入口脚本**：只校验主入口会让拦截器语法错误的插件装上后运行期才炸 → `native/engine/src/plugin/manager.rs`、回归 `native/engine/tests/engine/plugin_interceptors.rs::broken_interceptor_script_is_rejected_at_install`。
 - **resolve 占位期间的重复恢复必须直接忽略**：此时 DB 仍是 error(4)/paused，并非终态残留；不拦会移除占位并再起一个并发 resolve → `native/engine/src/download_manager.rs::has_pending_resolve`（`resume_task_inner` 的判定）。
@@ -62,10 +65,14 @@
 - **二段解析任务绝不能以原始链接起跑**：组成员 / 插件订阅条目的 `url` 是分享页，绑定被清空（卸载、旧版 fail-closed 行、忽略插件重试）后起跑会把 HTML 存成文件。起跑 / 恢复 / 解析回流都要先重绑、无插件即 fail-closed，`ignoreRetry` 对其拒绝 → `native/engine/src/download_manager.rs::{rebind_second_stage,fail_second_stage_unavailable}`、回归 `native/engine/tests/engine/plugin_state_freshness.rs`。
 - **预解析与建组必须用同一个插件**：成员任务曾在建组时按 `route_resolver` 重选（含非 multi 插件、字母序取首个），与预解析用的 `match_multi_resolver` 不一致就把 `resolverItem` 交给别的插件。客户端回传 `ResolvePreviewResponse.pluginId` → `CreateGroupRequest.resolverPluginId`（GPUI / Web / iOS） → `download_manager.rs::plugin_bind_resolver`。
 - **插件解析出的媒体直链常绑定解析时的出口 IP（googlevideo `ip=`、网盘签名链接），下载必须走同一出口**：Auto 下解析曾恒直连、下载却按先验 / 多路径 / 换路走代理，换路重试时还先重新解析（仍直连）再强制走代理，结果 403 且 403 不触发换路；站点规则又只按媒体链接匹配，`youtube.com` 规则管不到 googlevideo。现在解析按源链接制定出口计划并在 Auto 断网时换路重跑，下载以源链接定出口、Auto 下单路径钉在解析所用路径、禁用多网卡；Auto 换路判据来自 bridge 的类型化观测（被墙时多为墙钟超时而非插件抛错文案）→ `native/engine/src/plugin/call_egress.rs`、`native/engine/src/plugin/manager.rs::run_planned`、`native/engine/src/download_manager.rs::{resolve_egress_plan,absorb_resolve_egress,take_start_route}`，回归 `native/engine/tests/engine/plugin_resolve_egress.rs`。
+- **插件卸载必须删除该 identity 的全部安装副本，并在重载后核对无残留**：安装扫描只认 manifest 的 identity、不认目录名，`plugins/` 下目录名不同的同 identity 副本（手动解压的旧版本）也会被加载；`purge` 曾只删「第一个失败副本」或 `plugins/<identity>` 之一，重载后另一份重新出现而卸载报成功（要点两次；唯一副本目录名 ≠ identity 时永远删不掉）→ `native/engine/src/plugin/manager.rs::{purge,installed_copies_of}`、回归 `native/engine/tests/engine/plugin_purge_auth_flow.rs::uninstall_removes_*`。
 
 ## daemon / agent 本机服务
 
 另见 AGENTS.md §4：本机端口默认宽松显式严格（WSAEACCES 回退）、远程控制凭据与会话撤销、空闲静默、遥测只有两条匿名事件。
+
+- **云端 / LAN 接收任务必须在接收端填入本机分类路由，只有显式保存目录才禁用**：远端只传链接 / 文件名与可选目标目录，空目录及跨平台目录回退到默认目录时不能漏掉 daemon 建任务 RPC 的分类路由 → `native/agent/src/remote.rs::create_local_task`、`native/agent/src/link/service.rs::create_local_task`，回归 `cloud_receive_uses_preference_category_route_only_without_explicit_directory` / `receiver_falls_back_to_default_dir_and_retries_without_dir`。
+- **捕获确认必须显式传递用户禁用自动分类的意图**：仅比较目录值无法区分自动预填与用户手动选回同一目录，确认请求用 `disableCategoryRoute` 阻止 agent 在完成阶段重新启用分类 → `native/agent/src/capture.rs::resolve`、`crates/downloads/src/submission.rs`，回归 `manual_category_directory_disables_capture_route`。
 
 - **回环 daemon 的 HTTP 客户端必须 `.no_proxy()`**：否则会话凭据与文件字节会经环境 / 系统代理离开本机 → `native/agent/src/capture.rs::DaemonBlobClient::new`。
 - **macOS 上 reqwest 的「系统代理」不读 `ExceptionsList`**：hyper-util `Matcher::from_system` 只取 SCDynamicStore 的 HTTP / HTTPS 地址，直连名单只认 `NO_PROXY` 环境变量（GUI 进程没有）→ 回环、局域网、`.local` 全进代理；本机开 Clash 时 agent 连 127.0.0.1 的云端 / 更新 / 网关测试因此失败。agent 外网客户端一律经 `system_proxy::follow_system` 显式装配（环回恒直连 + `NO_PROXY` + 系统槽并入例外列表，其余照常走代理），不得裸用 reqwest 默认代理；引擎 System 模式同样把 `ExceptionsList` 归一化进 `no_proxy_list` → `native/agent/src/system_proxy.rs`（`LazyHttpClient`、`Network::SystemDefault`）、`native/engine/src/proxy_config.rs::parse_scutil_exceptions`、回归 `system_proxy_bypasses_only_exceptions_and_loopback`。
@@ -93,6 +100,8 @@
 - **弹层 / 滚动区的高度上限不能写固定 px**：行高（`density().nav_row` 等）随字体度量与界面缩放抬升，固定 `max_h(px(420.))` 在放大后装不下末行，「重置为默认列」被裁到滚动区底边外、看着像显示不全；上限按行高倍数推导，再按窗口可见高度收紧 → `crates/downloads/src/components/title_bar.rs`（`VIEW_MENU_MAX_BODY_ROWS`）。
 - **Windows 上汉字缺字回退按系统区域、不按应用语言，且 Windows 列字体用本地化名**：`.SystemUIFont` 在台湾版是正黑体（只覆盖繁体），简体专用字由 DirectWrite 按 zh-TW 回退到明体，界面割裂、细笔画破碎（#1003）；中文界面主字体按界面语言换成雅黑 UI / 正黑体 UI，并由 Root 插件给每个窗口根节点挂汉字回退链。判断字体是否安装不能拿英文名比 `all_font_names`（会是「微軟正黑體 UI」），改为解析后比族名 → `crates/theme/src/cjk.rs`、偏好推导 `crates/app/src/app.rs::han_font_preference`。
 - **按钮「进行中」转圈对本机 RPC 不可见、纯文字按钮 `.loading()` 不画转圈**：本机 RPC 常在一帧内返回，`loading` 真→假之间没有任何一帧被绘制，点了像没反应；gpui-component `Button::loading` 只替换前置图标，无图标按钮只变得不可点。手动点击的异步按钮一律用 `loading_button` / `loading_icon_button` / `BusyExt::busy` 画转圈，并在点击时 `BusyHold::start` 保证 ≥`MIN_BUSY_VISIBLE`（后台轮询 / 自动加载不启动，否则每轮都转）；设置 store 的 `call_with` / `cloud_call` 已内置，渲染读 `is_busy`，去重 / 自动加载闸门读 `in_flight` → `crates/components/src/busy.rs`、`crates/settings/src/store.rs::begin_busy`。
+- **划选不能按移动方向和文件拖出分家**：gpui 的 `on_drag` 超过 2px 就在冒泡阶段启动并 `stop_propagation`，随后再 `stop_active_drag` 也来不及——拖到窗口上沿或下沿的文件夹会被划选吃掉。按下位置决定手势：文件名列任意方向拖出已有文件，其他列划选，都不用修饰键 → `crates/downloads/src/components/task_table.rs::classify_row_press`、回归 `file_name_column_drags_the_file_and_other_columns_sweep`。
+- **行悬停操作浮层不得直接用半透明 `row_hover` / `accent` 作底**：默认最右列是「创建时间」，浮层从右侧留白列向左盖住末列；半透明底会让时间与图标叠成「双层字」。底色须 `surface.blend(选中/悬停)` 不透明，并加左侧渐隐；Web 同行用 surface + accent/row-hover 分层 + mask → `crates/downloads/src/components/task_table.rs::wrap_row_action_strip`、`web/src/pages/downloads/table/rowParts.tsx::RowActionsBar`。
 
 ## Web SPA
 

@@ -176,6 +176,9 @@ pub struct LoadedPlugin {
     intercept_cache: Option<String>,
     auth_cache: Option<String>,
     subscription_cache: Option<String>,
+    /// 归档入口绝对路径与非 dev 模式的源码缓存。
+    archive_entry: Option<PathBuf>,
+    archive_cache: Option<String>,
     /// `main` 入口绝对路径（若声明）。
     main_entry: Option<PathBuf>,
     /// 非 dev 模式的 `main` 源码缓存。
@@ -205,6 +208,13 @@ impl LoadedPlugin {
         match (&self.intercept_entry, self.dev) {
             (Some(p), true) => tokio::fs::read_to_string(p).await.ok(),
             (Some(_), false) => self.intercept_cache.clone(),
+            (None, _) => None,
+        }
+    }
+    async fn archive_source(&self) -> Option<String> {
+        match (&self.archive_entry, self.dev) {
+            (Some(path), true) => tokio::fs::read_to_string(path).await.ok(),
+            (Some(_), false) => self.archive_cache.clone(),
             (None, _) => None,
         }
     }
@@ -597,6 +607,11 @@ impl PluginManager {
         let resolver_entry = manifest.resolvers.first().map(|r| dir.join(&r.entry));
         let hooks_entry = manifest.hooks.as_ref().map(|h| dir.join(&h.entry));
         let intercept_entry = manifest.interceptors.as_ref().map(|i| dir.join(&i.entry));
+        let archive_entry = manifest
+            .contributes
+            .as_ref()
+            .and_then(|c| c.archive.as_ref())
+            .map(|p| dir.join(p));
         let auth_entry = manifest.auth.as_ref().map(|a| dir.join(&a.entry));
         let subscription_entry = manifest.subscriptions.first().map(|s| dir.join(&s.entry));
 
@@ -734,9 +749,29 @@ impl PluginManager {
         )
         .await
         .map_err(fail)?;
-        let (resolver_cache, hooks_cache, auth_cache, subscription_cache, intercept_cache) = if dev
+        let archive_source = read_entry(
+            dir,
+            manifest
+                .contributes
+                .as_ref()
+                .and_then(|c| c.archive.as_deref()),
+        )
+        .await
+        .map_err(fail)?;
+        if let Some(source) = archive_source.as_deref()
+            && let Err(error) = self.runtime.check_compile(source)
         {
-            (None, None, None, None, None)
+            return Err(fail(format!("archive 脚本编译失败: {error}")));
+        }
+        let (
+            resolver_cache,
+            hooks_cache,
+            auth_cache,
+            subscription_cache,
+            intercept_cache,
+            archive_cache,
+        ) = if dev {
+            (None, None, None, None, None, None)
         } else {
             (
                 resolver_source,
@@ -744,6 +779,7 @@ impl PluginManager {
                 auth_source,
                 subscription_source,
                 intercept_source,
+                archive_source,
             )
         };
 
@@ -787,11 +823,13 @@ impl PluginManager {
             resolver_entry,
             hooks_entry,
             intercept_entry,
+            archive_entry,
             auth_entry,
             subscription_entry,
             resolver_cache,
             hooks_cache,
             intercept_cache,
+            archive_cache,
             auth_cache,
             subscription_cache,
             main_entry,
@@ -1826,6 +1864,7 @@ impl PluginManager {
             p.auth_source().await,
             p.subscription_source().await,
             p.intercept_source().await,
+            p.archive_source().await,
         ]
         .into_iter()
         .flatten()
@@ -1892,39 +1931,85 @@ impl PluginManager {
 
     /// 删目录 + 清 `plugin.<identity>.` 前缀全部 config 键 + 重载。仅供
     /// [`Self::uninstall`] 使用。
+    ///
+    /// 安装目录扫描只认 manifest 的 identity、不认目录名，同一 identity 可能有多个
+    /// 安装副本（`plugins/<identity>` 之外还有手动解压、目录名不同的副本）。这里删除
+    /// 全部非 dev 副本；只删一个会让重载后剩下的副本重新出现、卸载却报成功。
     async fn purge(&self, identity: &str) -> Result<(), PluginError> {
-        // 删安装目录（dev 不删源，仅删配置键）。
-        let failed_plugin = self
-            .failed_plugins
-            .read()
-            .await
-            .iter()
-            .find(|plugin| plugin.identity == identity && !plugin.dev_mode)
-            .map(|plugin| (false, plugin.dir.to_path_buf()));
-        let dir = match &failed_plugin {
-            Some((true, _)) => None,
-            Some((false, dir)) => Some(dir.clone()),
-            None if is_valid_identity(identity) => Some(self.root.join(identity)),
-            None => {
-                return Err(PluginError::ManifestInvalid(
-                    "插件 identity 非法，拒绝拼接卸载路径".to_string(),
-                ));
+        // dev 不删源，仅删配置键；dev 登记若恰好指向安装根目录内，扫描会把它当作
+        // 安装副本一并删除（与被 dev 顶替的安装副本同一语义）。
+        let dirs = self.installed_copies_of(identity).await;
+        if dirs.is_empty() && !is_valid_identity(identity) {
+            return Err(PluginError::ManifestInvalid(
+                "插件 identity 非法，拒绝拼接卸载路径".to_string(),
+            ));
+        }
+        for dir in &dirs {
+            if let Err(error) = tokio::fs::remove_dir_all(dir).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                // 删除目录可能已部分成功，返回原错误前重建可执行快照。
+                self.load_all().await;
+                return Err(PluginError::Runtime(format!(
+                    "删除插件目录 {} 失败: {error}",
+                    dir.display()
+                )));
             }
-        };
-        if let Some(dir) = dir
-            && dir.exists()
-            && let Err(error) = tokio::fs::remove_dir_all(&dir).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            // 删除目录可能已部分成功，返回原错误前重建可执行快照。
-            self.load_all().await;
-            return Err(PluginError::Runtime(format!("删除插件目录失败: {error}")));
         }
         let result = self.purge_config(identity).await;
         // 配置枚举/删除失败也必须重载：安装目录已删除，不能继续消费旧 JS 缓存。
         // 重载只负责收尾，卸载仍返回配置清理的原始错误。
         self.load_all().await;
-        result
+        result?;
+        // 仍有同 identity 的副本（如另一条 dev 登记的 manifest 也声明了它）时如实报错，
+        // 不让 UI 显示「已卸载」而列表里还留着它。
+        let residual = self.installed_copies_of(identity).await;
+        let dev_residual = self
+            .plugins
+            .read()
+            .await
+            .iter()
+            .any(|p| p.dev && p.manifest.identity == identity)
+            || self
+                .failed_plugins
+                .read()
+                .await
+                .iter()
+                .any(|p| p.dev_mode && p.identity == identity);
+        if !residual.is_empty() || dev_residual {
+            return Err(PluginError::Runtime(format!(
+                "插件 {identity} 卸载后仍有残留副本，请检查插件目录与开发模式登记"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 该 identity 当前存在的全部安装副本目录（已加载 / 失败 / 被顶替的非 dev 副本，
+    /// 外加约定位置 `plugins/<identity>`），去重。
+    async fn installed_copies_of(&self, identity: &str) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut push = |dir: PathBuf| {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        };
+        for plugin in self.plugins.read().await.iter() {
+            if !plugin.dev && plugin.manifest.identity == identity {
+                push(plugin.dir.clone());
+            }
+        }
+        for plugin in self.failed_plugins.read().await.iter() {
+            if !plugin.dev_mode && plugin.identity == identity {
+                push(plugin.dir.to_path_buf());
+            }
+        }
+        if is_valid_identity(identity) {
+            let conventional = self.root.join(identity);
+            if conventional.exists() {
+                push(conventional);
+            }
+        }
+        dirs
     }
 
     async fn purge_config(&self, identity: &str) -> Result<(), PluginError> {
@@ -3171,11 +3256,13 @@ mod tests {
             resolver_entry: None,
             hooks_entry: None,
             intercept_entry: None,
+            archive_entry: None,
             auth_entry: None,
             subscription_entry: None,
             resolver_cache: None,
             hooks_cache: None,
             intercept_cache: None,
+            archive_cache: None,
             auth_cache: None,
             subscription_cache: None,
             main_entry: None,
@@ -3183,6 +3270,39 @@ mod tests {
             view_icons: Vec::new(),
             timeout_streak: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    #[tokio::test]
+    async fn task_interceptors_follow_identity_order_not_load_order() {
+        let (manager, _sink, root) = revoke_fixture().await;
+        let manager = Arc::new(manager);
+        let mut plugins = Vec::new();
+        for identity in ["z@last", "a@first"] {
+            let mut plugin = test_loaded_plugin(identity, false, "/unused");
+            plugin.manifest.permissions = vec!["intercept".to_string()];
+            plugin.manifest.interceptors = Some(
+                serde_json::from_value(serde_json::json!({
+                    "entry": "intercept.js",
+                    "stages": ["prepare"],
+                    "match": { "urls": ["https://example.com/*"] }
+                }))
+                .unwrap(),
+            );
+            plugins.push(plugin);
+        }
+        *manager.plugins.write().await = Arc::new(plugins);
+        let interceptor = manager
+            .task_interceptor("task", "https://example.com/file.bin", "")
+            .await;
+        let identities: Vec<_> = interceptor
+            .entries()
+            .iter()
+            .map(|entry| entry.identity.as_str())
+            .collect();
+        assert_eq!(identities, ["a@first", "z@last"]);
+        drop(interceptor);
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // 476#1：同 identity 的安装目录 + dev 注册只保留一条（dev 覆盖安装目录），
