@@ -34,7 +34,11 @@ public enum HostMethod {
     public static let daemonTaskResumeAll = "daemon.task.resumeAll"
     public static let daemonTaskRescan = "daemon.task.rescan"
     public static let daemonTaskSetSeedLimits = "daemon.task.setSeedLimits"
+    /// 修改 BT 任务选片方式（`SetTaskPiecePickingParams`，缺省字段不变）；不存在或非 BT 返回 `notFound`。
+    public static let daemonTaskSetPiecePicking = "daemon.task.setPiecePicking"
     public static let daemonTaskVerify = "daemon.task.verify"
+    /// 已完成任务落盘文件的哈希（`{taskId, algorithm}` → `{fileHash}`），结果同时记入任务 `fileHash`。
+    public static let daemonTaskHash = "daemon.task.hash"
     /// 批量暂停 / 恢复（`{taskIds}`）：整批只推一次任务快照；未知 id 忽略，空列表为空操作。
     public static let daemonTaskPauseMany = "daemon.task.pauseMany"
     public static let daemonTaskResumeMany = "daemon.task.resumeMany"
@@ -280,7 +284,7 @@ public enum HostMethod {
     public static let agentUpdateDownload = "agent.update.download"
     public static let agentUpdateInstall = "agent.update.install"
     public static let agentUpdateCancel = "agent.update.cancel"
-    /// 完成后关机：`{delaySecs}`；无活跃任务时拒绝（`InvalidArgument`）。
+    /// 定时关机 / 睡眠：`{delaySecs, action}` → `{armed}`；没有任务时立即倒计时，`delaySecs = 0` 仅有任务时受理。
     public static let agentPowerArm = "agent.power.arm"
     public static let agentPowerDisarm = "agent.power.disarm"
     public static let agentCloudNotifyGet = "agent.cloudNotify.get"

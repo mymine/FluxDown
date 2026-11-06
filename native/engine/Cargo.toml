@@ -47,7 +47,6 @@ thiserror = "2.0"
 tokio = { version = "1.45.0", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "fs", "net", "io-util", "process"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
-ts2mp4 = "0.3"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7"] }
 # 插件 zip 安装（跨桌面/服务端；仅 plugins feature 开启时启用）
@@ -56,6 +55,7 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 fs2 = "0.4.3"
 fluxdown_logfile = { version = "0.1.0", path = "../logfile" }
 psl = "2.1.245"
+ed25519-dalek = { version = "3", default-features = false, features = ["fast"], optional = true }
 
 [target."cfg(windows)".dependencies]
 librqbit = { version = "9", default-features = false, features = ["default-tls"], optional = true }
@@ -77,10 +77,11 @@ if-addrs = "0.15"
 
 [dev-dependencies]
 http = "1.4.0"
+ts2mp4 = "0.3"
 
 [features]
 # 默认关闭；desktop/server 构建显式开启，mobile（Android/iOS）保持关闭以免背 JS 引擎债。
-plugins = ["dep:rquickjs", "dep:zip"]
+plugins = ["dep:rquickjs", "dep:zip", "dep:ed25519-dalek"]
 # 组件托管安装（ffmpeg 下载/解压）；desktop/server 开启，mobile/CLI 关闭。
 components = ["dep:zip"]
 # P2P 能力（BitTorrent / eD2K）。默认开启；App Store 的 iOS 商店构建通过

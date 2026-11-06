@@ -44,6 +44,7 @@ use crate::lifecycle::Lifecycle;
 use crate::link::LinkService;
 use crate::platform::PlatformError;
 use crate::power::PowerService;
+use crate::private_plugin::PrivatePluginService;
 use crate::remote::{RemoteError, RemoteTaskService};
 use crate::server_mode::ServerHandle;
 use crate::shell::ShellState;
@@ -71,6 +72,7 @@ pub struct GatewayService {
     notify: Arc<CloudNotifyService>,
     capture: Arc<CaptureService>,
     blobs: Arc<DaemonBlobClient>,
+    private_plugins: PrivatePluginService,
     diagnostics: Arc<DiagnosticsService>,
     update: Arc<UpdateService>,
     state: Arc<tokio::sync::Mutex<crate::state::AgentState>>,
@@ -118,6 +120,8 @@ impl GatewayService {
             events.clone(),
             Arc::clone(&local.notifier),
         );
+        let private_plugins =
+            PrivatePluginService::new(Arc::clone(&cloud), Arc::clone(&daemon), Arc::clone(&blobs));
         Self {
             daemon,
             events,
@@ -128,6 +132,7 @@ impl GatewayService {
             notify,
             capture,
             blobs,
+            private_plugins,
             diagnostics,
             update,
             state,
@@ -272,10 +277,10 @@ impl GatewayService {
             }
             method::AGENT_POWER_ARM => {
                 let params = parse_params::<fluxdown_protocol::PowerArmParams>(request.params)?;
-                let armed = self
-                    .local
-                    .power
-                    .arm(std::time::Duration::from_secs(params.delay_secs));
+                let armed = self.local.power.arm(
+                    std::time::Duration::from_secs(params.delay_secs),
+                    params.action,
+                );
                 Ok(serde_json::json!({ "armed": armed }))
             }
             method::AGENT_POWER_DISARM => {
@@ -457,6 +462,17 @@ impl GatewayService {
                 let request =
                     parse_params::<fluxdown_protocol::PluginFavoriteSetRequest>(request.params)?;
                 cloud_value(self.cloud.set_plugin_favorite(request).await)
+            }
+            method::AGENT_PRIVATE_PLUGIN_LIST => {
+                self.private_plugins.list().await.and_then(to_value)
+            }
+            method::AGENT_PRIVATE_PLUGIN_INSTALL => {
+                let request =
+                    parse_params::<fluxdown_protocol::PrivatePluginInstallRequest>(request.params)?;
+                self.private_plugins
+                    .install(request)
+                    .await
+                    .and_then(to_value)
             }
             method::AGENT_REFERRAL_SUMMARY => {
                 cloud_value(self.cloud.referral("/summary", Method::GET, None).await)
@@ -2315,10 +2331,17 @@ impl GatewayService {
 ///   绕过签名替换封禁名单。
 /// - `daemon.bt.guard.evidence.drain`：弹出待上报证据；证据只能经 `bt_guard` 模块（遥测红线例外）
 ///   上报，任意客户端取走会让证据丢失，且泄露对端 IP 与 infohash。
+/// - `daemon.plugin.installPrivate`：来源标记 `private` 只能由 agent 在校验过 FluxCloud 票据包的
+///   sha256 之后写入；放开它等于让任意客户端把任意包标成「私有商店」来源。
+/// - `daemon.plugin.revokePrivate`：撤回清单与授权范围来自 FluxCloud 私有目录；任意客户端可借它把已装
+///   私有插件封锁为 `Revoked`（升级前不可再启用），或伪造 `scope` 解除既有封锁。
 fn internal_daemon_method(method_name: &str) -> bool {
     matches!(
         method_name,
-        method::DAEMON_BT_GUARD_CLOUD_APPLY | method::DAEMON_BT_GUARD_EVIDENCE_DRAIN
+        method::DAEMON_BT_GUARD_CLOUD_APPLY
+            | method::DAEMON_BT_GUARD_EVIDENCE_DRAIN
+            | method::DAEMON_PLUGIN_INSTALL_PRIVATE
+            | method::DAEMON_PLUGIN_REVOKE_PRIVATE
     )
 }
 
@@ -2399,7 +2422,12 @@ fn lane_for(method_name: &str) -> Lane {
             Lane::Daemon
         };
     }
-    if method_name == method::AGENT_CAPTURE_PREVIEW {
+    // 私有包安装 = 云端目录 + 下载（分钟级）+ daemon 安装：与慢 daemon 调用同道并发下发，
+    // 不占用串行的 Cloud 通道（登录 / 设备 / 同步等不能被它堵住）。目录 `list` 仍走 Cloud。
+    if matches!(
+        method_name,
+        method::AGENT_CAPTURE_PREVIEW | method::AGENT_PRIVATE_PLUGIN_INSTALL
+    ) {
         return Lane::DaemonSlow;
     }
     if method_name == method::AGENT_CAPTURE_CREATE_GROUP {
@@ -2412,7 +2440,7 @@ fn lane_for(method_name: &str) -> Lane {
     ) {
         return Lane::Icon;
     }
-    const CLOUD_PREFIXES: [&str; 10] = [
+    const CLOUD_PREFIXES: [&str; 11] = [
         "agent.auth.",
         "agent.profile.",
         "agent.device.",
@@ -2420,6 +2448,7 @@ fn lane_for(method_name: &str) -> Lane {
         "agent.order.",
         "agent.referral.",
         "agent.pluginFavorite.",
+        "agent.privatePlugin.",
         "agent.remote.",
         "agent.sync.",
         "agent.update.",
@@ -4197,6 +4226,26 @@ mod tests {
     #[tokio::test]
     async fn every_canonical_agent_method_reaches_a_real_dispatch_branch() {
         let harness = TestGateway::new("dispatch").await;
+        // An accepting loopback server avoids platform-dependent refused-connect latency.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind cloud fixture");
+        let address = listener.local_addr().expect("cloud fixture address");
+        let cloud_base = format!("http://{address}");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone();
+        let cloud_server = tokio::spawn(async move {
+            axum::serve(listener, axum::Router::new())
+                .with_graceful_shutdown(stop.cancelled_owned())
+                .await
+                .expect("serve cloud fixture");
+        });
+        harness
+            .service
+            .cloud
+            .set_endpoint(&cloud_base)
+            .await
+            .expect("set cloud fixture endpoint");
         let service = &harness.service;
 
         for (index, method_name) in fluxdown_protocol::method::ALL_METHODS
@@ -4208,6 +4257,8 @@ mod tests {
             // 版本检查会真的访问官方站点；用非法渠道让它在触网前返回 InvalidArgument。
             let params = if method_name == fluxdown_protocol::method::AGENT_UPDATE_CHECK {
                 serde_json::json!({ "channel": "offline-test" })
+            } else if method_name == fluxdown_protocol::method::AGENT_CLOUD_ENDPOINT_SET {
+                serde_json::json!({ "baseUrl": &cloud_base })
             } else {
                 serde_json::json!({})
             };
@@ -4232,10 +4283,13 @@ mod tests {
             }
         }
         harness.finish().await;
+        shutdown.cancel();
+        cloud_server.await.expect("join cloud fixture");
     }
 
     /// `daemon.bt.guard.cloud.apply` 携带「agent 已验签」的云名单、`daemon.bt.guard.evidence.drain` 弹出
-    /// 待上报证据：两者只有 agent 自己的 `bt_guard` 模块调用，经 Gateway 的任何会话（本机 UI、访问密钥、
+    /// 待上报证据、`daemon.plugin.{installPrivate,revokePrivate}` 只接受 agent 校验过的 FluxCloud 私有包 /
+    /// 撤回清单：它们只有 agent 自己的模块调用，经 Gateway 的任何会话（本机 UI、访问密钥、
     /// 配对设备）一律拒绝；其余 `daemon.bt.guard.*` 照常透传给 daemon。
     #[tokio::test]
     async fn bt_guard_internal_daemon_methods_are_denied_to_every_session_kind() {
@@ -4245,6 +4299,8 @@ mod tests {
         let internal = [
             method::DAEMON_BT_GUARD_CLOUD_APPLY,
             method::DAEMON_BT_GUARD_EVIDENCE_DRAIN,
+            method::DAEMON_PLUGIN_INSTALL_PRIVATE,
+            method::DAEMON_PLUGIN_REVOKE_PRIVATE,
         ];
         let forwarded = [
             method::DAEMON_BT_GUARD_STATE,
@@ -4522,9 +4578,15 @@ mod tests {
         for name in [
             fluxdown_protocol::method::AGENT_PLUGIN_FAVORITE_LIST,
             fluxdown_protocol::method::AGENT_PLUGIN_FAVORITE_SET,
+            fluxdown_protocol::method::AGENT_PRIVATE_PLUGIN_LIST,
         ] {
             assert!(matches!(lane_for(name), Lane::Cloud), "{name}");
         }
+        // 分钟级的私有包安装不占用串行的 Cloud 通道。
+        assert!(matches!(
+            lane_for(fluxdown_protocol::method::AGENT_PRIVATE_PLUGIN_INSTALL),
+            Lane::DaemonSlow
+        ));
     }
 
     #[tokio::test]

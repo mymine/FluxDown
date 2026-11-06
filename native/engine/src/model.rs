@@ -40,6 +40,42 @@ pub fn is_always_running_queue(queue_id: &str) -> bool {
     queue_id == MAIN_QUEUE_ID
 }
 
+/// Source-provided archive classification hints. These are descriptive metadata only:
+/// never credentials, URLs, or filesystem paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ArchiveMetadata {
+    pub platform: String,
+    pub media_kind: String,
+    pub creator_id: String,
+    pub creator_name: String,
+    pub series_id: String,
+    pub series_title: String,
+    pub collection_id: String,
+    pub collection_title: String,
+}
+
+/// Context passed to archive-folder plugins.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveContext {
+    pub file_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ArchiveMetadata>,
+    pub is_group: bool,
+    /// Bounded hexadecimal file prefix for host-side signed rule matching.
+    /// Never serialized to arbitrary plugin scripts.
+    #[serde(skip)]
+    pub header_hex: Option<String>,
+}
+
+/// Validated archive destination returned by a plugin, with legacy-shape provenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveDirectories {
+    pub components: Vec<String>,
+    pub legacy: bool,
+}
+
 /// 持久化任务信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskInfo {
@@ -69,6 +105,9 @@ pub struct TaskInfo {
     /// 任务结束时间，Unix seconds 时间戳（空 = 尚未完成）。
     /// 记录下载真正完成（status→3）的时刻，不含插件 hook 后处理耗时。
     pub completed_at: String,
+    /// 落盘文件的哈希记录，格式 `algo=hexhash`（空 = 尚未计算）。完成时由校验和
+    /// 校验或「下载完成后计算哈希」写入，也可按需计算；重新下载时清空。
+    pub file_hash: String,
     /// 配置的分段（线程）数。0 = 自动（segment_advisor 动态计算）。
     /// 供 UI 展示与「创建后改线程数」编辑；与运行时实际分片数可能不同。
     pub segments: i32,
@@ -100,6 +139,10 @@ pub struct TaskInfo {
     /// 在 torrent 加入 librqbit 会话时烘焙生效（下载开始 / 重启续种 /
     /// 句柄丢失后重新挂载）；已 live 的句柄不热改。
     pub seed_upload_limit_bps: i64,
+    /// BT 选片：按文件顺序下载（对齐 qBittorrent「按顺序下载」）。默认 false = 最稀有优先。
+    pub bt_sequential: bool,
+    /// BT 选片：先下载每个选中文件首尾各 1% 的块（对齐 qBittorrent「先下载首尾文件块」）。
+    pub bt_first_last_pieces_first: bool,
     /// Source page URL captured by the browser extension (empty = none).
     pub referrer: String,
     /// 所属任务组 ID（空 = 不属于任何组）。多文件任务组裂变/建组时写入；

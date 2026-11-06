@@ -43,6 +43,9 @@ import type {
   CloudReferralRecordsResult,
   CloudReferralSummary,
   CloudReferralValidateResult,
+  InstalledPlugin,
+  PrivatePluginInstallRequest,
+  PrivatePluginListDto,
   PluginFavoriteResultDto,
   PluginFavoriteSetRequest,
   PluginFavoritesDto,
@@ -256,6 +259,16 @@ const pluginFavorite = {
     call<PluginFavoriteResultDto>(METHOD.AGENT_PLUGIN_FAVORITE_SET, params),
 };
 
+/** 慢调用：agent 取票据 → 拉包 → 校验 → daemon 安装，与 `daemon.plugin.marketInstall` 同量级。 */
+const PRIVATE_INSTALL_TIMEOUT_MS = 120_000;
+
+/** FluxCloud 私有插件商店：目录（未登录 `signedIn=false`）与安装。 */
+const privatePlugin = {
+  list: () => call<PrivatePluginListDto>(METHOD.AGENT_PRIVATE_PLUGIN_LIST),
+  install: (params: PrivatePluginInstallRequest) =>
+    call<InstalledPlugin>(METHOD.AGENT_PRIVATE_PLUGIN_INSTALL, params, { timeoutMs: PRIVATE_INSTALL_TIMEOUT_MS }),
+};
+
 const capture = {
   submit: (params: CaptureSubmitParams) =>
     call<CaptureSubmitResult>(METHOD.AGENT_CAPTURE_SUBMIT, params),
@@ -291,7 +304,7 @@ const update = {
 };
 
 const power = {
-  /** 完成后关机；无活跃任务时被拒绝（invalidArgument）。 */
+  /** 定时关机 / 睡眠：没有任务时立即倒计时；`delaySecs = 0` 无任务时不受理（`armed: false`）。 */
   arm: (params: PowerArmParams) => call<PowerArmResult>(METHOD.AGENT_POWER_ARM, params),
   disarm: () => call<OkResult>(METHOD.AGENT_POWER_DISARM),
 };
@@ -351,6 +364,7 @@ export const agent = {
   order,
   referral,
   pluginFavorite,
+  privatePlugin,
   capture,
   diagnostics,
   update,

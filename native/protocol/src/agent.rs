@@ -472,6 +472,28 @@ pub struct PluginFavoriteResultDto {
     pub count: u64,
 }
 
+/// `agent.privatePlugin.list`：FluxCloud 私有商店中当前账号被授权的条目。
+///
+/// 未登录时不发任何云请求，返回 `signedIn:false` 与空列表；已登录但无授权同样是空列表。
+/// 条目复用 [`MarketEntryDto`]（`channel == "private"`，`mirrors` 恒空，`expiresAt` 为授权到期时间）。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PrivatePluginListDto {
+    pub signed_in: bool,
+    pub entries: Vec<crate::daemon::MarketEntryDto>,
+}
+
+/// `agent.privatePlugin.install`：`version` = 用户确认权限时看到的版本；云端当前可装版本不一致时
+/// 以 `marketVersionChanged` 拒绝，由客户端刷新目录后重新确认。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PrivatePluginInstallRequest {
+    pub plugin_id: String,
+    pub version: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
@@ -683,23 +705,40 @@ pub struct ShellStatusDto {
     pub global_shortcuts: crate::shortcuts::GlobalShortcutsStatusDto,
 }
 
-/// 完成后关机的调度状态（agent 拥有状态机与执行）。
+/// 定时电源操作：到点关机还是睡眠（挂起到内存）。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum PowerAction {
+    #[default]
+    Shutdown,
+    Sleep,
+}
+
+/// 定时关机 / 睡眠的调度状态（agent 拥有状态机与执行）。
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PowerStatusDto {
     /// 已排定的延迟（秒）；`None` = 未启用。
     pub armed_delay_secs: Option<u64>,
-    /// 全部任务结束、真正开始倒计时后的剩余秒数；等待任务完成阶段为 `None`。
+    /// 全部任务结束（或排定时本就没有任务）、真正开始倒计时后的剩余秒数；等待任务完成阶段为 `None`。
     pub countdown_remaining_secs: Option<u64>,
+    /// 已排定的操作；未启用时为默认值（旧 agent 缺省 = 关机）。
+    #[serde(default)]
+    pub action: PowerAction,
 }
 
-/// `agent.power.arm` 参数：全部任务完成后再等待 `delay_secs` 秒关机（0 = 立即）。
+/// `agent.power.arm` 参数：没有任务时立即开始倒计时，否则全部任务完成后再等待 `delay_secs`
+/// 秒执行 `action`。`delay_secs = 0`（完成后立即）只在有任务时接受。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PowerArmParams {
     pub delay_secs: u64,
+    /// 缺省 = 关机（旧客户端）。
+    #[serde(default)]
+    pub action: PowerAction,
 }
 
 /// agent 配置同步状态投影。
@@ -1535,8 +1574,8 @@ pub struct CategoryRuleDto {
 }
 
 impl CategoryRouteDto {
-    /// 由分类列表（已按 `position` 排序）构建路由；没有任何分类配置目录时为 `None`。
-    /// 「其他」无目录时，未配置目录的普通分类不影响结果，直接省略。
+    /// 由分类列表（已按 `position` 排序）构建已授权路由；即使没有分类规则也返回空规则路由，
+    /// 以便宿主在默认保存目录任务上运行插件归档分类。
     #[must_use]
     pub fn from_categories(categories: &[CustomCategoryDto]) -> Option<Self> {
         let visible = || categories.iter().filter(|category| category.visible);
@@ -1557,12 +1596,11 @@ impl CategoryRouteDto {
                 save_dir: category.save_dir.trim().to_owned(),
             })
             .collect::<Vec<_>>();
-        let routes = !other_dir.is_empty() || rules.iter().any(|rule| !rule.save_dir.is_empty());
-        routes.then_some(Self { rules, other_dir })
+        Some(Self { rules, other_dir })
     }
 
-    /// 由 `custom_categories` 偏好值（[`CUSTOM_CATEGORIES_PREF_KEY`] 对应的 JSON）构建路由；
-    /// 偏好缺失 / 无法解析 / 没有任何分类配置目录时为 `None`。
+    /// 由 `custom_categories` 偏好值构建路由；缺失或无法解析时也返回空规则路由，
+    /// 以授权默认保存目录任务使用插件归档分类。
     #[must_use]
     pub fn from_preference(value: Option<&serde_json::Value>) -> Option<Self> {
         Self::from_categories(&CustomCategoryDto::from_preference(value))
@@ -1650,7 +1688,10 @@ mod category_route_helper_tests {
 
     #[test]
     fn category_from_preference_reads_custom_categories_value() {
-        assert_eq!(CategoryRouteDto::from_preference(None), None);
+        assert_eq!(
+            CategoryRouteDto::from_preference(None),
+            Some(CategoryRouteDto::default())
+        );
         let mut categories = CustomCategoryDto::builtin_defaults();
         for category in &mut categories {
             if category.builtin_type.as_deref() == Some("other") {

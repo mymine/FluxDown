@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -33,13 +33,14 @@ use super::runtime::{
     ResolveResult, ScriptRuntime, SubscriptionRequest,
 };
 
+#[path = "archive_rules_manager.rs"]
+mod archive_rules_manager;
 #[path = "host_manager.rs"]
 mod host_manager;
 #[path = "interceptors.rs"]
 mod interceptors;
 #[path = "routing.rs"]
 pub mod routing;
-
 /// 连续超时/超内存达到该次数 → 自动熔断禁用。
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 
@@ -136,11 +137,16 @@ impl PluginLoadStatus {
     }
 }
 
-/// 安装前的启停相关 config 键快照（失败时原样恢复）。
+/// config 键 `plugin.<identity>.source` 的取值：FluxCloud 私有商店安装。键缺省 = 公开市场 / 本机包 /
+/// 旧版安装（兼容既有数据，不需要迁移）。公开市场路径（`MarketClient`、撤回轮询）不触碰该来源的插件。
+pub const SOURCE_PRIVATE: &str = "private";
+
+/// 安装前的启停与来源相关 config 键快照（失败时原样恢复）。
 struct InstallState {
     enabled: Option<String>,
     disabled_reason: Option<String>,
     revoked_version: Option<String>,
+    source: Option<String>,
 }
 
 /// 读取已安装目录 manifest 的版本（决定安装后的启停规则，读不到即安装失败）。
@@ -312,6 +318,8 @@ pub struct PluginInfo {
     pub package_revision: u64,
     /// 插件包绝对目录；仅已加载插件为 Some。
     pub package_dir: Option<String>,
+    /// 安装来源：空 = 公开市场 / 本机包 / 旧版安装（及 dev 副本）；[`SOURCE_PRIVATE`] = 私有商店。
+    pub source: String,
 }
 
 /// 目录或 dev 配置仍存在、但没有进入运行时快照的插件。
@@ -343,6 +351,8 @@ pub struct PluginManager {
     /// 串行化 `load_all`：扫描 + 整表替换非原子，交错的两次重载会用旧快照
     /// 覆盖新的启停/熔断状态。
     load_lock: tokio::sync::Mutex<()>,
+    /// 串行化安装（落盘 → 来源重查 → 写来源 → 加载），让「公开安装不得覆盖私有来源」的检查原子。
+    install_lock: tokio::sync::Mutex<()>,
     audit: super::audit::AuditLog,
     /// 常驻宿主（`main`）的运行态：宿主表、视图会话、定时器、任务端口。
     host: host_manager::HostState,
@@ -350,9 +360,19 @@ pub struct PluginManager {
     site_prompts: routing::SitePromptLocks,
     /// 插件包修订号（见 [`super::package_revision`]）。
     package_revisions: super::package_revision::PackageRevisions,
-    /// 串行化 [`Self::publish_state`]：快照与发射在同一把锁内，事件顺序即状态顺序，
-    /// 较旧的快照永远不会盖过较新的。
+    /// Serializes publication so state snapshots and emitted events stay ordered.
     publish_lock: tokio::sync::Mutex<()>,
+    /// Cache of validated archive rule packs; matching never performs I/O.
+    archive_rule_packs:
+        tokio::sync::RwLock<HashMap<String, Arc<super::archive_rules::VerifiedArchiveRules>>>,
+    /// Poll diagnostics stay in memory; unchanged rule checks never persist state.
+    archive_rule_status:
+        tokio::sync::RwLock<HashMap<String, archive_rules_manager::ArchiveRuleCache>>,
+    /// Per-plugin serialized signed archive-rule refreshes.
+    archive_rule_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Wakes the idle updater when a plugin's enabled rule feeds change.
+    archive_rule_updates_notify: Arc<tokio::sync::Notify>,
+    archive_rule_updates_started: AtomicBool,
     /// 全局出口来源（引擎装配时注入）：非任务调用（预解析 / 订阅 / 登录 / 宿主加速改写）
     /// 据此制定出口计划。未注入（单测里的 null bridge）时调用走 bridge 的全局出口、不换路。
     egress_source: std::sync::RwLock<Option<Arc<super::bridge::EngineBridge>>>,
@@ -427,7 +447,13 @@ impl PluginManager {
             host: host_manager::HostState::new(),
             site_prompts: routing::SitePromptLocks::default(),
             package_revisions: super::package_revision::PackageRevisions::new(),
+            archive_rule_locks: tokio::sync::Mutex::new(HashMap::new()),
+            archive_rule_packs: tokio::sync::RwLock::new(HashMap::new()),
+            archive_rule_status: tokio::sync::RwLock::new(HashMap::new()),
+            archive_rule_updates_notify: Arc::new(tokio::sync::Notify::new()),
+            archive_rule_updates_started: AtomicBool::new(false),
             publish_lock: tokio::sync::Mutex::new(()),
+            install_lock: tokio::sync::Mutex::new(()),
             egress_source: std::sync::RwLock::new(None),
         }
     }
@@ -463,6 +489,61 @@ impl PluginManager {
     /// 专用运行时 handle，供 off-actor worker spawn（禁止裸 tokio::spawn）。
     pub fn runtime_handle(&self) -> tokio::runtime::Handle {
         self.runtime.spawn_handle()
+    }
+    /// Start a weak-manager updater; it sleeps without periodic work when no signed feeds are enabled.
+    pub(crate) fn start_archive_rule_updates(self: &Arc<Self>) {
+        if self
+            .archive_rule_updates_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let notify = Arc::clone(&self.archive_rule_updates_notify);
+        self.runtime.spawn_handle().spawn(async move {
+            loop {
+                let Some(manager) = weak.upgrade() else {
+                    return;
+                };
+                let identities: Vec<String> = manager
+                    .plugins
+                    .read()
+                    .await
+                    .iter()
+                    .filter(|plugin| plugin.enabled)
+                    .filter_map(|plugin| {
+                        plugin
+                            .manifest
+                            .contributes
+                            .as_ref()
+                            .and_then(|contributes| contributes.archive_rules.as_ref())
+                            .filter(|rules| rules.update_url.is_some())
+                            .map(|_| plugin.manifest.identity.clone())
+                    })
+                    .collect();
+                if identities.is_empty() {
+                    drop(manager);
+                    notify.notified().await;
+                    continue;
+                }
+                for identity in identities {
+                    let Some(manager) = weak.upgrade() else {
+                        return;
+                    };
+                    if let Err(error) = manager.archive_rules_status(&identity, false).await {
+                        log_info!("[plugin] archive rules update for {identity} failed: {error}");
+                    }
+                }
+                let Some(manager) = weak.upgrade() else {
+                    return;
+                };
+                drop(manager);
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(24 * 60 * 60)) => {},
+                    _ = notify.notified() => {},
+                }
+            }
+        });
     }
 
     /// 宿主并发上限变化时同步 resolve 并发容量（见 [`ScriptRuntime::set_resolve_capacity`]）。
@@ -531,8 +612,13 @@ impl PluginManager {
 
         *self.plugins.write().await = Arc::new(deduped);
         *self.failed_plugins.write().await = Arc::new(failed);
+        self.archive_rule_status.write().await.clear();
+        // A new declaration must be revalidated before any cached rules can match.
+        self.archive_rule_packs.write().await.clear();
         // 宿主对账：被禁用 / 卸载 / manifest 或 main 源码变化的插件，其宿主立即释放。
         self.reconcile_hosts().await;
+        self.initialize_archive_rule_packs().await;
+        self.archive_rule_updates_notify.notify_one();
     }
 
     /// 加载单个插件目录。失败记 warn 并保留诊断信息（不阻塞其他插件）。
@@ -639,6 +725,19 @@ impl PluginManager {
                 Err(e) => Err(PluginError::ManifestInvalid(format!(
                     "sniffRules '{rules}' 读取失败: {e}"
                 ))),
+            };
+        }
+        if file_check.is_ok()
+            && let Some(rules) = manifest
+                .contributes
+                .as_ref()
+                .and_then(|contributes| contributes.archive_rules.as_ref())
+        {
+            file_check = match super::archive_rules::read_bounded(&dir.join(&rules.entry)).await {
+                Ok(bytes) => manifest.validate_archive_rules_content(|path| {
+                    (path == rules.entry).then(|| bytes.clone())
+                }),
+                Err(error) => Err(error),
             };
         }
         if file_check.is_ok()
@@ -1574,28 +1673,81 @@ impl PluginManager {
     // 安装 / 卸载 / 启停 / 设置
     // ---------------------------------------------------------------------
 
-    /// 从 zip 字节安装。
+    /// 从 zip 字节安装（本机包：来源标记清除）。
     pub async fn install_from_zip(&self, bytes: Vec<u8>) -> Result<String, PluginError> {
-        let outcome = super::install::install_from_zip_with_backup(&self.root, &bytes, |_| Ok(()))?;
-        self.finish_install_outcome(outcome).await
+        self.install_zip_serialized(bytes, |_| Ok(()), None, false)
+            .await
     }
 
     /// 与 [`Self::install_from_zip`] 相同，但在 manifest 校验通过后、替换旧版本前
     /// 先运行 `check_manifest`（市场安装用它核对包内 manifest 与索引条目一致）。
+    ///
+    /// `forbid_private`：公开市场路径声明「不得覆盖私有商店来源的插件」，在持有安装锁时重查
+    /// `plugin.<id>.source`，命中即回滚并返回 [`PluginError::PrivateSource`]（联网前的快速拒绝之外的原子兜底）。
     pub(crate) async fn install_from_zip_checked(
+        &self,
+        bytes: Vec<u8>,
+        forbid_private: bool,
+        check_manifest: impl FnOnce(&super::manifest::PluginManifest) -> Result<(), PluginError>,
+    ) -> Result<String, PluginError> {
+        self.install_zip_serialized(bytes, check_manifest, None, forbid_private)
+            .await
+    }
+
+    /// FluxCloud 私有商店安装：与 [`Self::install_from_zip_checked`] 相同的校验与回滚，
+    /// 成功后记录来源 `private`（与启停状态同一回滚边界）。
+    pub(crate) async fn install_private_checked(
         &self,
         bytes: Vec<u8>,
         check_manifest: impl FnOnce(&super::manifest::PluginManifest) -> Result<(), PluginError>,
     ) -> Result<String, PluginError> {
+        self.install_zip_serialized(bytes, check_manifest, Some(SOURCE_PRIVATE), false)
+            .await
+    }
+
+    /// 所有 zip 安装的唯一入口：`install_lock` 串行化「落盘 → 来源重查 → 写来源 → 加载」，
+    /// 公开安装与私有安装不可能交错。
+    async fn install_zip_serialized(
+        &self,
+        bytes: Vec<u8>,
+        check_manifest: impl FnOnce(&super::manifest::PluginManifest) -> Result<(), PluginError>,
+        source: Option<&'static str>,
+        forbid_private: bool,
+    ) -> Result<String, PluginError> {
+        let _serial = self.install_lock.lock().await;
         let outcome =
             super::install::install_from_zip_with_backup(&self.root, &bytes, check_manifest)?;
-        self.finish_install_outcome(outcome).await
+        if forbid_private {
+            let identity = outcome.identity().to_string();
+            let refusal = match self.is_private_source(&identity).await {
+                Ok(true) => Some(PluginError::PrivateSource(identity)),
+                Ok(false) => None,
+                Err(error) => Some(error),
+            };
+            if let Some(error) = refusal {
+                self.rollback_install_outcome(&outcome).await;
+                return Err(error);
+            }
+        }
+        self.finish_install_outcome(outcome, source).await
+    }
+
+    /// 已装插件是否来自私有商店（读 `plugin.<identity>.source`）。
+    pub async fn is_private_source(&self, identity: &str) -> Result<bool, PluginError> {
+        Ok(self
+            .db
+            .get_config(&format!("plugin.{identity}.source"))
+            .await
+            .map_err(|e| PluginError::Runtime(e.to_string()))?
+            .as_deref()
+            == Some(SOURCE_PRIVATE))
     }
 
     /// 从目录安装（不剥壳，path 须直接含 manifest.json）。
     pub async fn install_from_dir(&self, path: &Path) -> Result<String, PluginError> {
+        let _serial = self.install_lock.lock().await;
         let outcome = super::install::install_from_dir_with_backup(&self.root, path)?;
-        self.finish_install_outcome(outcome).await
+        self.finish_install_outcome(outcome, None).await
     }
 
     /// dev 安装（写 plugin.dev.<identity>=abs(path)，不拷贝）。
@@ -1709,8 +1861,9 @@ impl PluginManager {
     async fn finish_install_outcome(
         &self,
         outcome: super::install::InstallOutcome,
+        source: Option<&'static str>,
     ) -> Result<String, PluginError> {
-        let result = self.finish_install_outcome_inner(outcome).await;
+        let result = self.finish_install_outcome_inner(outcome, source).await;
         self.publish_state().await;
         result
     }
@@ -1718,6 +1871,7 @@ impl PluginManager {
     async fn finish_install_outcome_inner(
         &self,
         outcome: super::install::InstallOutcome,
+        source: Option<&'static str>,
     ) -> Result<String, PluginError> {
         let identity = outcome.identity().to_string();
         let previous_version = self.installed_version(&identity).await;
@@ -1735,7 +1889,12 @@ impl PluginManager {
                 return Err(error);
             }
         };
-        if let Err(error) = self.finish_install(&identity, &new_version, &prior).await {
+        // 来源标记与启停状态同属安装前快照：任一步失败都连同目录一起回滚。
+        let finished = match self.write_install_source(&identity, source).await {
+            Ok(()) => self.finish_install(&identity, &new_version, &prior).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = finished {
             // 升级失败恢复旧目录；新装失败只删本次新建的目录。设置/KV 与同 identity
             // 的 dev 登记不是这次安装写的，绝不能清；启停相关键恢复到安装前的值。
             self.restore_install_state(&identity, &prior).await;
@@ -1756,7 +1915,7 @@ impl PluginManager {
                 new_version.clone(),
                 format!("{previous} -> {new_version}"),
             ),
-            _ => self.audit_event(&identity, "install", new_version, ""),
+            _ => self.audit_event(&identity, "install", new_version, source.unwrap_or("")),
         }
         Ok(identity)
     }
@@ -1784,6 +1943,7 @@ impl PluginManager {
             enabled: get("enabled").await?,
             disabled_reason: get("disabled_reason").await?,
             revoked_version: get("revoked_version").await?,
+            source: get("source").await?,
         })
     }
 
@@ -1793,6 +1953,7 @@ impl PluginManager {
             ("enabled", &prior.enabled),
             ("disabled_reason", &prior.disabled_reason),
             ("revoked_version", &prior.revoked_version),
+            ("source", &prior.source),
         ] {
             let key = format!("plugin.{identity}.{suffix}");
             let result = match value {
@@ -1803,6 +1964,20 @@ impl PluginManager {
                 crate::logger::report_error("plugin", "restore_install_state", &error);
             }
         }
+    }
+
+    /// 写入（`Some`）或清除（`None`）`plugin.<identity>.source`：来源始终反映最近一次安装的渠道。
+    async fn write_install_source(
+        &self,
+        identity: &str,
+        source: Option<&'static str>,
+    ) -> Result<(), PluginError> {
+        let key = format!("plugin.{identity}.source");
+        match source {
+            Some(source) => self.db.set_config(&key, source).await,
+            None => self.db.delete_config(&key).await,
+        }
+        .map_err(|e| PluginError::Runtime(e.to_string()))
     }
 
     /// 安装共同后续：enabled 规则（按新包版本，先于加载写入）+ 整表重载 + compile 校验。
@@ -2126,26 +2301,76 @@ impl PluginManager {
             .and_then(|p| p.manifest.as_ref().map(|m| m.version.clone()))
     }
 
+    /// `list()` 展示用的来源标记；dev 副本恒为空，读取失败按公开来源展示并记录。
+    async fn listed_source(&self, identity: &str, dev: bool) -> String {
+        if dev {
+            return String::new();
+        }
+        match self.is_private_source(identity).await {
+            Ok(true) => SOURCE_PRIVATE.to_string(),
+            Ok(false) => String::new(),
+            Err(error) => {
+                crate::logger::report_error("plugin", "read_install_source", &error);
+                String::new()
+            }
+        }
+    }
+
     /// 按市场索引撤回已装插件：(identity, version) 命中即禁用（Revoked）并记录 revoked_version；
     /// 已记录但不再命中的只清除 revoked_version（保持禁用，由用户手动启用）。返回是否有变化。
+    /// 来源为私有商店的插件不在此列（它们的撤回只由 [`Self::apply_private_revocations`] 处理）。
     pub async fn apply_market_revocations(
         &self,
         revoked: &std::collections::HashSet<(String, String)>,
     ) -> Result<bool, PluginError> {
+        self.apply_revocations(revoked, false, None).await
+    }
+
+    /// 按 FluxCloud 私有目录的撤回清单禁用**来源为私有商店**的已装插件，语义同公开撤回
+    /// （`Revoked` 禁用、`revoked_version`、`PluginAutoDisabled`，被撤回版本不可再启用）。
+    ///
+    /// `scope` 是云端声明的「该账号曾有授权的插件集合」，只有它存在时清单才是该集合内插件的
+    /// **权威全集**，此时才允许解封：来源私有、`identity ∈ scope`、因私有撤回被封锁且记录的
+    /// `(identity, revoked_version) ∉ revoked` 的插件被解除封锁（运营已把 malicious 改回）。
+    /// 解封只清除 `revoked_version` 与 `Revoked` 标记：撤回会覆盖用户先前的启停原因，无法区分
+    /// 「撤回前是手动禁用」，所以保守地保持禁用（原因改为 `Manual`），由用户手动启用。
+    /// `scope = None`（旧版云端不下发）或插件在 scope 之外（例如换号登录）一律不解封，只增不清。
+    pub async fn apply_private_revocations(
+        &self,
+        revoked: &std::collections::HashSet<(String, String)>,
+        scope: Option<&std::collections::HashSet<String>>,
+    ) -> Result<bool, PluginError> {
+        self.apply_revocations(revoked, true, scope).await
+    }
+
+    /// `private` 选定作用的来源范围：`false` = 非私有来源（公开 / 本机包 / 旧版），`true` = 私有商店。
+    async fn apply_revocations(
+        &self,
+        revoked: &std::collections::HashSet<(String, String)>,
+        private: bool,
+        scope: Option<&std::collections::HashSet<String>>,
+    ) -> Result<bool, PluginError> {
         let loaded = self.plugins.read().await.clone();
         let failed = self.failed_plugins.read().await.clone();
-        let mut targets: Vec<(String, String)> = Vec::new();
+        let mut candidates: Vec<(String, String)> = Vec::new();
         for p in loaded.iter().filter(|p| !p.dev) {
-            targets.push((p.manifest.identity.clone(), p.manifest.version.clone()));
+            candidates.push((p.manifest.identity.clone(), p.manifest.version.clone()));
         }
         for p in failed.iter().filter(|p| !p.dev_mode) {
             if let Some(manifest) = &p.manifest {
-                targets.push((p.identity.clone(), manifest.version.clone()));
+                candidates.push((p.identity.clone(), manifest.version.clone()));
+            }
+        }
+        let mut targets: Vec<(String, String)> = Vec::with_capacity(candidates.len());
+        for (identity, version) in candidates {
+            if self.is_private_source(&identity).await? == private {
+                targets.push((identity, version));
             }
         }
 
         let mut newly_revoked: Vec<(String, String)> = Vec::new();
         let mut changed = false;
+        let mut lifted: Vec<(String, String)> = Vec::new();
         for (identity, version) in targets {
             let key = format!("plugin.{identity}.revoked_version");
             let recorded = self
@@ -2175,11 +2400,29 @@ impl PluginManager {
                     .map_err(|e| PluginError::Runtime(e.to_string()))?;
                 newly_revoked.push((identity, version));
                 changed = true;
-            } else if recorded.is_some() {
+            } else if !private && recorded.is_some() {
                 self.db
                     .delete_config(&key)
                     .await
                     .map_err(|e| PluginError::Runtime(e.to_string()))?;
+                changed = true;
+            } else if private
+                && let Some(recorded) = recorded
+                && scope.is_some_and(|scope| scope.contains(&identity))
+                && !revoked.contains(&(identity.clone(), recorded.clone()))
+            {
+                // 先降级为手动禁用、后清标记：中途失败时标记仍在，下一轮同步会重试；
+                // 标记已清而原因仍是 Revoked 的状态不会由本路径产生。
+                let (_, reason) = self.plugin_state(&identity).await;
+                if reason == DisabledReason::Revoked {
+                    self.write_enabled(&identity, false, DisabledReason::Manual)
+                        .await?;
+                }
+                self.db
+                    .delete_config(&key)
+                    .await
+                    .map_err(|e| PluginError::Runtime(e.to_string()))?;
+                lifted.push((identity, recorded));
                 changed = true;
             }
         }
@@ -2189,12 +2432,32 @@ impl PluginManager {
             self.publish_state().await;
         }
         for (identity, version) in newly_revoked {
-            self.audit_event(&identity, "revoked", version, "market revocation");
+            self.audit_event(
+                &identity,
+                "revoked",
+                version,
+                if private {
+                    "private revocation"
+                } else {
+                    "market revocation"
+                },
+            );
             self.sink.emit(EngineEvent::PluginAutoDisabled {
                 identity: identity.clone(),
                 reason: DisabledReason::Revoked.as_str().to_string(),
             });
-            log_info!("[plugin] {identity} 已被插件市场撤回，已自动禁用");
+            log_info!(
+                "[plugin] {identity} 已被{}撤回，已自动禁用",
+                if private {
+                    "私有商店"
+                } else {
+                    "插件市场"
+                }
+            );
+        }
+        for (identity, version) in lifted {
+            self.audit_event(&identity, "unrevoked", version, "private revocation lifted");
+            log_info!("[plugin] {identity} 的私有商店撤回已解除，保持禁用，可手动启用");
         }
         Ok(changed)
     }
@@ -2373,6 +2636,7 @@ impl PluginManager {
                 consent_pending_hosts: loaded_pending.1,
                 package_revision: self.package_revisions.get(&p.manifest.identity),
                 package_dir: Some(p.dir.to_string_lossy().into_owned()),
+                source: self.listed_source(&p.manifest.identity, p.dev).await,
             });
         }
         for p in failed_snapshot.iter() {
@@ -2461,6 +2725,7 @@ impl PluginManager {
                 consent_pending_hosts: failed_pending.1,
                 package_revision: self.package_revisions.get(&p.identity),
                 package_dir: None,
+                source: self.listed_source(&p.identity, p.dev_mode).await,
             });
         }
         out.sort_by(|a, b| a.identity.cmp(&b.identity));
@@ -2788,6 +3053,9 @@ fn validate_subscription_item(item: SubscriptionOutputItem) -> Result<ParsedItem
 /// [`ResolveRequest::resolver_item`] 非空）不可返回 `manifest`（防递归裂变，
 /// D6/§7.6）。全 fail-closed：任一违规整体拒绝该次 resolve 结果。
 fn validate_resolve_output(res: &ResolveResult, second_stage: bool) -> Result<(), PluginError> {
+    if let Some(metadata) = &res.archive_metadata {
+        validate_archive_metadata(metadata)?;
+    }
     if let Some(manifest) = &res.manifest {
         if second_stage {
             return Err(PluginError::InvalidOutput(
@@ -2873,7 +3141,34 @@ fn check_output_url(url: &str) -> Result<(), PluginError> {
 /// 字符（给 `save_dir` 前缀留余量，规避 Windows `MAX_PATH` 260 限制）；
 /// kind ∈ {"", "file"}；per-item variants ≤50，variant id/label 非空。
 /// fail-closed：任一条目违规拒绝整个 manifest（不做部分放行）。
+fn validate_archive_metadata(metadata: &crate::model::ArchiveMetadata) -> Result<(), PluginError> {
+    if !matches!(metadata.media_kind.as_str(), "" | "series" | "post") {
+        return Err(PluginError::InvalidOutput(
+            "archiveMetadata.mediaKind must be empty, series, or post".to_string(),
+        ));
+    }
+    for (field, value) in [
+        ("platform", &metadata.platform),
+        ("creatorId", &metadata.creator_id),
+        ("creatorName", &metadata.creator_name),
+        ("seriesId", &metadata.series_id),
+        ("seriesTitle", &metadata.series_title),
+        ("collectionId", &metadata.collection_id),
+        ("collectionTitle", &metadata.collection_title),
+    ] {
+        if value.len() > 180 || value.chars().any(char::is_control) {
+            return Err(PluginError::InvalidOutput(format!(
+                "archiveMetadata.{field} exceeds limit or contains controls"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_manifest(m: &ResolveManifest) -> Result<(), PluginError> {
+    if let Some(metadata) = &m.archive_metadata {
+        validate_archive_metadata(metadata)?;
+    }
     if m.items.is_empty() || m.items.len() > 1000 {
         return Err(PluginError::InvalidOutput(format!(
             "manifest items 数量非法: {}（须 1..=1000）",
@@ -3452,10 +3747,54 @@ mod tests {
             manifest: Some(ResolveManifest {
                 name: "share".into(),
                 items: vec![item("f1", "a.mp4", "sub")],
+                ..Default::default()
             }),
             ..Default::default()
         };
         assert!(validate_resolve_output(&res, false).is_ok());
+    }
+    #[test]
+    fn archive_metadata_is_validated_on_resolve_and_manifest() {
+        let valid = crate::model::ArchiveMetadata {
+            media_kind: "series".into(),
+            series_title: "Series".into(),
+            ..Default::default()
+        };
+        let direct = ResolveResult {
+            archive_metadata: Some(valid.clone()),
+            url: "https://cdn.example/file.mp4".into(),
+            ..Default::default()
+        };
+        assert!(validate_resolve_output(&direct, false).is_ok());
+        let invalid = crate::model::ArchiveMetadata {
+            media_kind: "unknown".into(),
+            ..Default::default()
+        };
+        assert!(
+            validate_resolve_output(
+                &ResolveResult {
+                    archive_metadata: Some(invalid),
+                    url: "https://cdn.example/file.mp4".into(),
+                    ..Default::default()
+                },
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_resolve_output(
+                &ResolveResult {
+                    manifest: Some(ResolveManifest {
+                        archive_metadata: Some(valid),
+                        items: vec![item("id", "file.mp4", "")],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                false
+            )
+            .is_ok()
+        );
     }
 
     /// manifest 与 url/variants/audioUrl 互斥 → 各自拒绝。
@@ -3690,6 +4029,430 @@ mod tests {
         );
         manager.load_all().await;
         (manager, sink, root)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn signed_archive_rules_seed_is_loaded_for_matching() {
+        let identity = "acme@archive-rules";
+        let root =
+            std::env::temp_dir().join(format!("fluxdown-archive-rules-{}", uuid::Uuid::new_v4()));
+        let plugin_dir = root.join(identity);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let payload = "{\"format\":\"fluxdown-archive-rules\",\"schemaVersion\":1,\"sequence\":1,\"rules\":[{\"id\":\"first\",\"folderName\":\"Series\",\"match\":{\"extensions\":[\"mkv\"]}}]}";
+        let signature = "887d638fd517b304863762f7bb28d77366d47ff9631e76a0ced3c8d7191edb4664863ac908417e4880cbff89df6cee94cbad21afe9429573694530d6920db402";
+        let public_key = "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
+        let envelope = format!(
+            "{{\"payload\":{},\"signature\":\"{}\"}}",
+            serde_json::to_string(payload).unwrap(),
+            signature
+        );
+        std::fs::write(plugin_dir.join("archive-rules.json"), envelope).unwrap();
+
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        let manager = PluginManager::new(
+            Arc::new(QuickJsScriptRuntime::new(1).unwrap()),
+            Arc::new(NullBridge),
+            db,
+            root.clone(),
+            "1.0.0".to_string(),
+            Arc::new(CaptureSink::default()),
+        );
+        let mut plugin = test_loaded_plugin(identity, false, &plugin_dir.to_string_lossy());
+        plugin.manifest.permissions.push("archive".to_string());
+        plugin.manifest.contributes = Some(crate::plugin::manifest::ContributesDecl {
+            archive_rules: Some(crate::plugin::manifest::ArchiveRulesDecl {
+                entry: "archive-rules.json".to_string(),
+                public_key: public_key.to_string(),
+                update_url: None,
+            }),
+            ..Default::default()
+        });
+        *manager.plugins.write().await = Arc::new(vec![plugin]);
+
+        manager.archive_rules_status(identity, false).await.unwrap();
+        let matched = manager
+            .archive_rule_match(
+                identity,
+                &crate::model::ArchiveContext {
+                    file_name: "episode.MKV".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            matched,
+            Some(("Series".to_string(), "first".to_string(), 1))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn signed_rule_pack(key: &ed25519_dalek::SigningKey, sequence: u64, id: &str) -> Vec<u8> {
+        use ed25519_dalek::Signer;
+
+        let payload = serde_json::json!({
+            "format": "fluxdown-archive-rules",
+            "schemaVersion": 1,
+            "sequence": sequence,
+            "rules": [{
+                "id": id,
+                "folderName": format!("Folder-{id}"),
+                "match": {"extensions": ["mkv"]}
+            }]
+        })
+        .to_string();
+        let signature = key.sign(payload.as_bytes());
+        serde_json::json!({
+            "payload": payload,
+            "signature": hex::encode(signature.to_bytes())
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_rule_public_key_rotation_resets_trust_watermark() {
+        use ed25519_dalek::SigningKey;
+
+        let identity = "acme@archive-rotate-key";
+        let root = std::env::temp_dir().join(format!(
+            "fluxdown-archive-rotate-key-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let plugin_dir = root.join(identity);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let old_key = SigningKey::from_bytes(&[11; 32]);
+        let new_key = SigningKey::from_bytes(&[13; 32]);
+        let old_public = hex::encode(old_key.verifying_key().to_bytes());
+        let new_public = hex::encode(new_key.verifying_key().to_bytes());
+        std::fs::write(
+            plugin_dir.join("archive-rules.json"),
+            signed_rule_pack(&old_key, 9, "old"),
+        )
+        .unwrap();
+
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        let manager = PluginManager::new(
+            Arc::new(QuickJsScriptRuntime::new(1).unwrap()),
+            Arc::new(NullBridge),
+            db,
+            root.clone(),
+            "1.0.0".to_string(),
+            Arc::new(CaptureSink::default()),
+        );
+        let mut plugin = test_loaded_plugin(identity, false, &plugin_dir.to_string_lossy());
+        plugin.manifest.permissions.push("archive".to_string());
+        plugin.manifest.contributes = Some(crate::plugin::manifest::ContributesDecl {
+            archive_rules: Some(crate::plugin::manifest::ArchiveRulesDecl {
+                entry: "archive-rules.json".to_string(),
+                public_key: old_public,
+                update_url: None,
+            }),
+            ..Default::default()
+        });
+        *manager.plugins.write().await = Arc::new(vec![plugin]);
+        let bootstrapped = manager.archive_rules_status(identity, false).await.unwrap();
+        assert_eq!(bootstrapped["sequence"], 9);
+
+        std::fs::write(
+            plugin_dir.join("archive-rules.json"),
+            signed_rule_pack(&new_key, 1, "rotated"),
+        )
+        .unwrap();
+        let mut plugin = test_loaded_plugin(identity, false, &plugin_dir.to_string_lossy());
+        plugin.manifest.permissions.push("archive".to_string());
+        plugin.manifest.contributes = Some(crate::plugin::manifest::ContributesDecl {
+            archive_rules: Some(crate::plugin::manifest::ArchiveRulesDecl {
+                entry: "archive-rules.json".to_string(),
+                public_key: new_public.clone(),
+                update_url: None,
+            }),
+            ..Default::default()
+        });
+        *manager.plugins.write().await = Arc::new(vec![plugin]);
+        manager.archive_rule_packs.write().await.remove(identity);
+        manager.archive_rule_status.write().await.remove(identity);
+
+        let rotated = manager.archive_rules_status(identity, false).await.unwrap();
+        assert_eq!(rotated["sequence"], 1);
+        assert_eq!(rotated["publicKey"], new_public);
+        let matched = manager
+            .archive_rule_match(
+                identity,
+                &crate::model::ArchiveContext {
+                    file_name: "episode.mkv".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            matched,
+            Some(("Folder-rotated".to_string(), "rotated".to_string(), 1))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn archive_rule_refresh_persists_only_verified_promotions() {
+        use ed25519_dalek::SigningKey;
+
+        let identity = "acme@archive-refresh";
+        let root =
+            std::env::temp_dir().join(format!("fluxdown-archive-refresh-{}", uuid::Uuid::new_v4()));
+        let plugin_dir = root.join(identity);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let public_key = hex::encode(signing_key.verifying_key().to_bytes());
+        let seed = signed_rule_pack(&signing_key, 1, "seed");
+        std::fs::write(plugin_dir.join("archive-rules.json"), &seed).unwrap();
+
+        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        let manager = PluginManager::new(
+            Arc::new(QuickJsScriptRuntime::new(1).unwrap()),
+            Arc::new(NullBridge),
+            db,
+            root.clone(),
+            "1.0.0".to_string(),
+            Arc::new(CaptureSink::default()),
+        );
+        let mut plugin = test_loaded_plugin(identity, false, &plugin_dir.to_string_lossy());
+        plugin.manifest.permissions.push("archive".to_string());
+        let declaration = crate::plugin::manifest::ArchiveRulesDecl {
+            entry: "archive-rules.json".to_string(),
+            public_key: public_key.clone(),
+            update_url: None,
+        };
+        plugin.manifest.contributes = Some(crate::plugin::manifest::ContributesDecl {
+            archive_rules: Some(declaration.clone()),
+            ..Default::default()
+        });
+        *manager.plugins.write().await = Arc::new(vec![plugin]);
+        manager.archive_rules_status(identity, false).await.unwrap();
+        // Reject even byte-identical writes: raw-value equality alone cannot prove idle silence.
+        for sql in [
+            "CREATE TRIGGER reject_archive_poll_insert BEFORE INSERT ON config \
+             BEGIN SELECT RAISE(ABORT, 'idle archive refresh attempted a config write'); END",
+            "CREATE TRIGGER reject_archive_poll_update BEFORE UPDATE ON config \
+             BEGIN SELECT RAISE(ABORT, 'idle archive refresh attempted a config write'); END",
+            "CREATE TRIGGER reject_archive_poll_delete BEFORE DELETE ON config \
+             BEGIN SELECT RAISE(ABORT, 'idle archive refresh attempted a config write'); END",
+        ] {
+            sqlx::query(sql).execute(manager.db.pool()).await.unwrap();
+        }
+
+        let cache_key = format!("plugin.{identity}.archive_rules.cache");
+        let watermark_key = format!("plugin.{identity}.archive_rules.watermark");
+        let original_cache = manager.db.get_config(&cache_key).await.unwrap().unwrap();
+        let original_watermark = manager
+            .db
+            .get_config(&watermark_key)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cache = manager
+            .archive_rule_status
+            .read()
+            .await
+            .get(identity)
+            .unwrap()
+            .clone();
+        let url = "https://updates.example.invalid/archive-rules.json";
+
+        manager
+            .process_archive_rule_update(
+                identity,
+                &declaration,
+                url,
+                &mut cache,
+                Err(PluginError::Runtime("offline".to_string())),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.db.get_config(&cache_key).await.unwrap().as_deref(),
+            Some(original_cache.as_str())
+        );
+        assert_eq!(
+            manager
+                .db
+                .get_config(&watermark_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(original_watermark.as_str())
+        );
+
+        manager
+            .process_archive_rule_update(
+                identity,
+                &declaration,
+                url,
+                &mut cache,
+                Ok(b"{invalid signature}".to_vec()),
+                15,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.db.get_config(&cache_key).await.unwrap().as_deref(),
+            Some(original_cache.as_str())
+        );
+        assert_eq!(
+            manager
+                .db
+                .get_config(&watermark_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(original_watermark.as_str())
+        );
+
+        manager
+            .process_archive_rule_update(
+                identity,
+                &declaration,
+                url,
+                &mut cache,
+                Ok(seed.clone()),
+                20,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cache.last_error, None);
+        assert_eq!(
+            manager.db.get_config(&cache_key).await.unwrap().as_deref(),
+            Some(original_cache.as_str())
+        );
+        assert_eq!(
+            manager
+                .db
+                .get_config(&watermark_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(original_watermark.as_str())
+        );
+
+        manager
+            .process_archive_rule_update(
+                identity,
+                &declaration,
+                url,
+                &mut cache,
+                Ok(signed_rule_pack(&signing_key, 1, "equivocation")),
+                30,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.db.get_config(&cache_key).await.unwrap().as_deref(),
+            Some(original_cache.as_str())
+        );
+        assert_eq!(
+            manager
+                .db
+                .get_config(&watermark_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(original_watermark.as_str())
+        );
+
+        for sql in [
+            "DROP TRIGGER reject_archive_poll_insert",
+            "DROP TRIGGER reject_archive_poll_update",
+            "DROP TRIGGER reject_archive_poll_delete",
+        ] {
+            sqlx::query(sql).execute(manager.db.pool()).await.unwrap();
+        }
+
+        let promoted = signed_rule_pack(&signing_key, 2, "promoted");
+        let verified = manager
+            .process_archive_rule_update(identity, &declaration, url, &mut cache, Ok(promoted), 40)
+            .await
+            .unwrap()
+            .expect("higher sequence must be promoted");
+        assert_eq!(cache.sequence, 2);
+        assert_eq!(cache.last_error, None);
+        let persisted_cache_raw = manager.db.get_config(&cache_key).await.unwrap().unwrap();
+        let persisted_cache: serde_json::Value =
+            serde_json::from_str(&persisted_cache_raw).unwrap();
+        assert_eq!(persisted_cache["sequence"], 2);
+        assert!(persisted_cache["lastCheckedAt"].is_null());
+        assert!(persisted_cache["lastError"].is_null());
+        let persisted_watermark: serde_json::Value = serde_json::from_str(
+            &manager
+                .db
+                .get_config(&watermark_key)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted_watermark["sequence"], 2);
+        assert_eq!(persisted_watermark["digest"], cache.digest);
+        manager
+            .archive_rule_packs
+            .write()
+            .await
+            .insert(identity.to_string(), Arc::new(verified));
+        manager
+            .archive_rule_status
+            .write()
+            .await
+            .insert(identity.to_string(), cache);
+        manager
+            .db
+            .set_config(&cache_key, "malformed")
+            .await
+            .unwrap();
+        let status = manager.archive_rules_status(identity, false).await.unwrap();
+        assert_eq!(status["sequence"], 2);
+        manager
+            .db
+            .set_config(&cache_key, &persisted_cache_raw)
+            .await
+            .unwrap();
+        std::fs::write(
+            plugin_dir.join("archive-rules.json"),
+            signed_rule_pack(&signing_key, 3, "bundled-upgrade"),
+        )
+        .unwrap();
+        manager.archive_rule_packs.write().await.remove(identity);
+        manager.archive_rule_status.write().await.remove(identity);
+        let upgraded = manager.archive_rules_status(identity, false).await.unwrap();
+        assert_eq!(upgraded["sequence"], 3);
+        let upgraded_watermark: serde_json::Value = serde_json::from_str(
+            &manager
+                .db
+                .get_config(&watermark_key)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(upgraded_watermark["sequence"], 3);
+        std::fs::write(
+            plugin_dir.join("archive-rules.json"),
+            b"invalid replacement",
+        )
+        .unwrap();
+        manager.archive_rule_status.write().await.remove(identity);
+        manager.initialize_archive_rule_packs().await;
+        assert!(
+            manager
+                .archive_rule_match(
+                    identity,
+                    &crate::model::ArchiveContext {
+                        file_name: "video.mkv".to_owned(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .is_none(),
+            "a failed declaration reload must not keep matching the old rule pack"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn revoked_set(identity: &str, version: &str) -> HashSet<(String, String)> {

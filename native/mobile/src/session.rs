@@ -274,6 +274,36 @@ pub(crate) fn routed_request(
     (request, routed)
 }
 
+/// Apply group category routing only when the caller supplied the private authorization hint.
+/// The hint is removed for every group request, including custom-directory / no-route requests.
+fn route_group_create_params(
+    params: &mut Value,
+    route: Option<&CategoryRouteDto>,
+) -> Result<(), FluxError> {
+    let Some(object) = params.as_object_mut() else {
+        return Ok(());
+    };
+    let offered = object
+        .remove("_offeredSaveDir")
+        .and_then(|value| value.as_str().map(str::to_owned));
+    let Some(offered) = offered else {
+        return Ok(());
+    };
+    let Some(route) = route else { return Ok(()) };
+    let Some(save_dir) = object.get("saveDir").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if !route.follows(save_dir, &offered) {
+        return Ok(());
+    }
+    let routed_dir = route.base_dir(save_dir, &offered);
+    object.insert("saveDir".to_owned(), Value::String(routed_dir));
+    let route_value = serde_json::to_value(route)
+        .map_err(|error| FluxError::internal(format!("encode category route failed: {error}")))?;
+    object.insert("categoryRoute".to_owned(), route_value);
+    Ok(())
+}
+
 /// 会话路由下命中的分类保存目录；无路由 / 无命中 / 命中分类未配置目录时为 `None`。
 fn category_save_dir_for(
     route: Option<&CategoryRouteDto>,
@@ -304,7 +334,12 @@ impl HostSession {
         method: String,
         params_json: Option<String>,
     ) -> Result<String, FluxError> {
-        let params = prepare_call(&method, params_json.as_deref())?;
+        let mut params = prepare_call(&method, params_json.as_deref())?;
+        if method == fluxdown_protocol::method::DAEMON_GROUP_CREATE
+            && let Some(value) = params.as_mut()
+        {
+            route_group_create_params(value, self.routes.borrow().as_ref())?;
+        }
         let value = self.ready_caller().await?.call(&method, params).await?;
         serde_json::to_string(&value)
             .map_err(|error| FluxError::internal(format!("encode {method} result failed: {error}")))
@@ -571,6 +606,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn group_routing_requires_offered_auto_directory_and_always_strips_hint() {
+        let mut follows = json!({
+            "saveDir": "/downloads",
+            "_offeredSaveDir": "/downloads"
+        });
+        super::route_group_create_params(&mut follows, Some(&route())).expect("route follows");
+        assert_eq!(follows["saveDir"], "/downloads");
+        assert_eq!(follows["categoryRoute"]["rules"][0]["saveDir"], "/pictures");
+        assert!(follows.get("_offeredSaveDir").is_none());
+
+        let mut custom = json!({
+            "saveDir": "/custom",
+            "_offeredSaveDir": "/downloads"
+        });
+        super::route_group_create_params(&mut custom, Some(&route())).expect("custom bypass");
+        assert_eq!(custom["saveDir"], "/custom");
+        assert!(custom.get("categoryRoute").is_none());
+        assert!(custom.get("_offeredSaveDir").is_none());
+
+        let mut no_route = json!({
+            "saveDir": "/downloads",
+            "_offeredSaveDir": "/downloads"
+        });
+        super::route_group_create_params(&mut no_route, None).expect("no host route");
+        assert_eq!(no_route["saveDir"], "/downloads");
+        assert!(no_route.get("categoryRoute").is_none());
+        assert!(no_route.get("_offeredSaveDir").is_none());
+    }
+
     fn routed(save_dir: &str, offered: Option<&str>) -> fluxdown_protocol::DaemonCreateTaskParams {
         let mut req = request("https://example.com/a.jpg");
         req.save_dir = save_dir.to_owned();
@@ -767,10 +832,21 @@ mod tests {
                 "r1".to_owned(),
                 SelectionOutcomeDto::Bt {
                     indices: vec![0, 2],
+                    save_dir: None,
                 },
             )
             .await
             .expect("resolve");
+        session
+            .resolve_selection(
+                "r1b".to_owned(),
+                SelectionOutcomeDto::Bt {
+                    indices: vec![1],
+                    save_dir: Some("/new".to_owned()),
+                },
+            )
+            .await
+            .expect("relocate");
         session
             .resolve_selection("r2".to_owned(), SelectionOutcomeDto::Cancelled)
             .await
@@ -791,11 +867,15 @@ mod tests {
         );
         assert_eq!(
             calls[1].1,
-            json!({ "requestId": "r2", "outcome": { "kind": "cancelled" } })
+            json!({ "requestId": "r1b", "outcome": { "kind": "bt", "indices": [1], "saveDir": "/new" } })
         );
-        assert_eq!(calls[2].0, "daemon.config.patch");
         assert_eq!(
             calls[2].1,
+            json!({ "requestId": "r2", "outcome": { "kind": "cancelled" } })
+        );
+        assert_eq!(calls[3].0, "daemon.config.patch");
+        assert_eq!(
+            calls[3].1,
             json!({ "expectedRevision": 7, "values": { "max_concurrent": "3" } })
         );
     }

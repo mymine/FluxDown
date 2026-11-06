@@ -136,10 +136,23 @@ pub enum DownloadsCommand {
         task_id: String,
         segments: i32,
     },
+    /// 修改 BT 任务选片（`daemon.task.setPiecePicking`）：缺省字段保持不变。
+    /// 每个任务一次调用；不存在或非 BT 返回 `notFound`。
+    SetPiecePicking {
+        task_id: String,
+        sequential: Option<bool>,
+        first_last_pieces_first: Option<bool>,
+    },
     /// 已完成 BT 任务的完整性校验（`daemon.task.verify`，慢方法）：结果为
     /// [`DownloadsResult::TaskVerify`]；同一任务校验在途时为 `conflict`。
     VerifyTask {
         task_id: String,
+    },
+    /// 已完成任务的文件哈希（`daemon.task.hash`，慢方法）：结果为
+    /// [`DownloadsResult::TaskHash`]；同一任务计算在途时为 `conflict`。
+    HashTask {
+        task_id: String,
+        algorithm: String,
     },
     /// BT 任务的分享材料（`daemon.task.torrentShare`）：结果为
     /// [`DownloadsResult::TorrentShare`]。
@@ -323,13 +336,16 @@ pub enum DownloadsResult {
     BtStatus(fluxdown_protocol::BtStatusDto),
     /// `BtGuardEvidence` 的名单条目与事件。
     BtGuardEvidence(BtGuardEvidence),
-    Preview(fluxdown_protocol::ResolvePreviewResponse),
+    /// Rare, metadata-heavy payload stays boxed so every command result remains small.
+    Preview(Box<fluxdown_protocol::ResolvePreviewResponse>),
     /// `FileIcon` 的 PNG 字节。
     FileIcon(Vec<u8>),
     /// `CreateMany` 的逐条结果（与请求条目同序）。
     CreateMany(fluxdown_protocol::DaemonCreateTasksResult),
     /// `VerifyTask` 的校验报告。
     TaskVerify(fluxdown_protocol::TaskVerifyResult),
+    /// `HashTask` 写入的文件哈希（`algo=hex`）。
+    TaskHash(fluxdown_protocol::TaskHashResult),
     /// `TorrentShare` 的磁力链接与（按需）已解码的 `.torrent` 字节。
     TorrentShare(TorrentShare),
 }

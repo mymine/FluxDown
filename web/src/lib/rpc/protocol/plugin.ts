@@ -62,6 +62,8 @@ export interface PluginContributionsDto {
   commands: PluginCommandDeclDto[];
   /** 是否贡献浏览器扩展嗅探规则。 */
   sniffRules: boolean;
+  /** Whether the plugin contributes signed archive classification rules. */
+  archiveRules: boolean;
   /** 浏览器页面脚本声明（授权 / 详情界面展示将在哪些网站运行脚本）。 */
   pageScripts: PluginPageScriptDeclDto[];
 }
@@ -76,6 +78,23 @@ export interface PluginPageScriptDeclDto {
 }
 
 /** 站点默认插件条目（`daemon.plugin.siteDefaults`，按 site 排序）。 */
+/** `daemon.plugin.archiveRules` parameters. */
+export interface PluginArchiveRulesParams {
+  identity: string;
+  refresh?: boolean;
+}
+
+/** Status of the publisher-signed classification pack; never includes rule contents. */
+export interface PluginArchiveRulesDto {
+  sequence: number;
+  ruleCount: number;
+  lastCheckedAt: number | null;
+  lastUpdatedAt: number | null;
+  lastError: string | null;
+  publicKey: string;
+  updateUrl: string | null;
+  automaticUpdates: boolean;
+}
 export interface PluginSiteDefaultDto {
   site: string;
   /** 当前默认插件 identity。 */
@@ -178,6 +197,8 @@ export interface PluginDto {
   packageDir?: string;
   /** 插件包修订号：包代码被替换（安装 / 升级 / dev 安装 / dev 重载）后变化，只做相等比较；旧 daemon 不下发。 */
   packageRevision?: number;
+  /** 安装来源：空 / 缺省 = 公开市场 / 本机包 / 旧版安装；`private` = FluxCloud 私有商店。 */
+  source?: string;
 }
 
 /** 插件平台登录请求。 */
@@ -228,6 +249,10 @@ export interface MarketEntryDto {
   permissions: string[];
   /** 插件桌面视图声明的网络主机。 */
   networkHosts: string[];
+  /** 渠道：公开市场条目缺省；FluxCloud 私有目录恒为 `private`。 */
+  channel?: string;
+  /** 私有条目的授权到期时间（RFC 3339）；缺省 / null = 永久。 */
+  expiresAt?: string | null;
 }
 
 /** daemon 托管组件标识。 */

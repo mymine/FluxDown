@@ -54,6 +54,41 @@ pub fn category_route_to_engine(
             .collect(),
         other_dir: route.other_dir,
         archive: None,
+        archive_metadata: None,
+    }
+}
+
+/// Convert root archive metadata across the engine/wire boundary.
+#[must_use]
+pub fn archive_metadata_to_dto(
+    value: fluxdown_engine::model::ArchiveMetadata,
+) -> fluxdown_protocol::daemon::ArchiveMetadataDto {
+    fluxdown_protocol::daemon::ArchiveMetadataDto {
+        platform: value.platform,
+        media_kind: value.media_kind,
+        creator_id: value.creator_id,
+        creator_name: value.creator_name,
+        series_id: value.series_id,
+        series_title: value.series_title,
+        collection_id: value.collection_id,
+        collection_title: value.collection_title,
+    }
+}
+
+/// Convert root archive metadata from the wire into the engine model.
+#[must_use]
+pub fn archive_metadata_to_engine(
+    value: fluxdown_protocol::daemon::ArchiveMetadataDto,
+) -> fluxdown_engine::model::ArchiveMetadata {
+    fluxdown_engine::model::ArchiveMetadata {
+        platform: value.platform,
+        media_kind: value.media_kind,
+        creator_id: value.creator_id,
+        creator_name: value.creator_name,
+        series_id: value.series_id,
+        series_title: value.series_title,
+        collection_id: value.collection_id,
+        collection_title: value.collection_title,
     }
 }
 
@@ -208,6 +243,7 @@ pub fn task_info_to_dto(task: TaskInfo) -> TaskDto {
         ignore_tls_errors: task.ignore_tls_errors,
         file_missing: task.file_missing,
         completed_at: task.completed_at,
+        file_hash: task.file_hash,
         referrer: task.referrer,
         group_id: task.group_id,
         rss_source_id: task.rss_source_id,
@@ -225,6 +261,8 @@ pub fn task_info_to_dto(task: TaskInfo) -> TaskDto {
         seed_time_limit_minutes: task.seed_time_limit_minutes,
         seed_inactive_time_limit_minutes: task.seed_inactive_time_limit_minutes,
         seed_upload_limit_bps: task.seed_upload_limit_bps,
+        bt_sequential: task.bt_sequential,
+        bt_first_last_pieces_first: task.bt_first_last_pieces_first,
     }
 }
 
@@ -587,6 +625,7 @@ pub fn plugin_info_to_dto(
         network_hosts: plugin.network_hosts,
         package_dir: plugin.package_dir,
         package_revision: plugin.package_revision,
+        source: plugin.source,
     }
 }
 
@@ -631,6 +670,7 @@ fn plugin_contributions_to_dto(
             })
             .collect(),
         sniff_rules: contributes.sniff_rules.is_some(),
+        archive_rules: contributes.archive_rules.is_some(),
         page_scripts: contributes
             .page_scripts
             .iter()
@@ -666,6 +706,36 @@ pub fn market_entry_to_dto(
         tags: entry.tags,
         permissions: entry.permissions,
         network_hosts: entry.network_hosts,
+        channel: None,
+        expires_at: None,
+    }
+}
+
+/// 将私有商店条目声明（`daemon.plugin.installPrivate`）还原为引擎条目：`mirrors` 恒空，
+/// `channel` / `expires_at` 是客户端展示字段，引擎不使用。
+#[cfg(feature = "plugins")]
+#[must_use]
+pub fn market_entry_from_dto(
+    dto: fluxdown_protocol::daemon::MarketEntryDto,
+) -> fluxdown_engine::plugin::MarketEntry {
+    fluxdown_engine::plugin::MarketEntry {
+        plugin_id: dto.plugin_id,
+        version: dto.version,
+        sequence: dto.sequence,
+        content_hash: dto.content_hash,
+        min_app_version: dto.min_app_version,
+        name: dto.name,
+        description: dto.description,
+        author: dto.author,
+        homepage: dto.homepage,
+        mirrors: Vec::new(),
+        publish_time: dto.publish_time,
+        yanked: dto.yanked,
+        tags: dto.tags,
+        permissions: dto.permissions,
+        network_hosts: dto.network_hosts,
+        sig_scheme: "none".to_owned(),
+        sigstore_bundle_ref: String::new(),
     }
 }
 

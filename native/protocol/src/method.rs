@@ -30,10 +30,18 @@ pub const DAEMON_TASK_PAUSE_ALL: &str = "daemon.task.pauseAll";
 pub const DAEMON_TASK_RESUME_ALL: &str = "daemon.task.resumeAll";
 pub const DAEMON_TASK_RESCAN: &str = "daemon.task.rescan";
 pub const DAEMON_TASK_SET_SEED_LIMITS: &str = "daemon.task.setSeedLimits";
+/// 修改 BT 任务的选片方式（`SetTaskPiecePickingParams`，缺省字段不变），活动任务热生效；
+/// 不存在或非 BT 的任务返回 `notFound`。
+pub const DAEMON_TASK_SET_PIECE_PICKING: &str = "daemon.task.setPiecePicking";
 /// 已完成 BT 任务的完整性校验（`{taskId}` → `TaskVerifyResult`）：按种子 piece 表全量
 /// 重哈希落盘数据，只读。慢方法：耗时与数据量成正比，同一任务同时只跑一个（`conflict`），
 /// 非已完成 BT 任务返回 `invalidArgument`，任务不存在返回 `notFound`。
 pub const DAEMON_TASK_VERIFY: &str = "daemon.task.verify";
+/// 已完成任务落盘文件的哈希（`DaemonTaskHashParams` → `TaskHashResult`）：读整个文件计算
+/// 摘要并记入任务的 `fileHash`（随任务行发布）。慢方法：耗时与文件大小成正比，同一任务同时
+/// 只跑一个（`conflict`）；未完成 / 文件丢失 / 产物不是单个文件返回 `invalidArgument`，计算
+/// 期间任务被重新下载返回 `taskStateConflict`，任务不存在返回 `notFound`。
+pub const DAEMON_TASK_HASH: &str = "daemon.task.hash";
 /// 本机做种（`DaemonSeedLocalParams` → `{taskId}`）：把 daemon 主机上已有的文件 / 文件夹
 /// （可选现成 `.torrent`）登记为已完成并开始做种。无现成种子时需要为数据做哈希，慢方法；
 /// BT 被禁用或路径 / 种子不匹配返回 `invalidArgument`。
@@ -103,6 +111,8 @@ pub const DAEMON_RSS_VALIDATE: &str = "daemon.rss.validate";
 pub const DAEMON_LINK_PROBE: &str = "daemon.link.probe";
 
 pub const DAEMON_PLUGIN_LIST: &str = "daemon.plugin.list";
+/// 查询或手动刷新已签名的插件分类规则（可能访问网络）。
+pub const DAEMON_PLUGIN_ARCHIVE_RULES: &str = "daemon.plugin.archiveRules";
 pub const DAEMON_PLUGIN_SNIFF_RULES: &str = "daemon.plugin.sniffRules";
 /// 插件页面脚本索引（`PluginPageScriptsDto`）：浏览器扩展据此注册 / 更新 / 注销用户脚本。
 pub const DAEMON_PLUGIN_PAGE_SCRIPTS: &str = "daemon.plugin.pageScripts";
@@ -118,6 +128,13 @@ pub const DAEMON_PLUGIN_RELOAD_DEV: &str = "daemon.plugin.reloadDev";
 pub const DAEMON_PLUGIN_UNINSTALL: &str = "daemon.plugin.uninstall";
 pub const DAEMON_PLUGIN_MARKET_LIST: &str = "daemon.plugin.marketList";
 pub const DAEMON_PLUGIN_MARKET_INSTALL: &str = "daemon.plugin.marketInstall";
+/// 安装 FluxCloud 私有商店的包（`PluginInstallPrivateParams`）：agent 已校验 sha256 的 blob，
+/// daemon 再核对 identity / version / contentHash / 权限声明并标记来源 `private`，不经公开索引。
+/// 仅 agent 自身调用（Gateway 拒绝透传）。
+pub const DAEMON_PLUGIN_INSTALL_PRIVATE: &str = "daemon.plugin.installPrivate";
+/// 按 FluxCloud 私有目录的撤回清单与授权范围 `scope` 禁用 / 解封已装私有插件（`PluginRevokePrivateParams`；
+/// `scope` 缺省 = 只增不清）。仅 agent 自身调用（Gateway 拒绝透传）。
+pub const DAEMON_PLUGIN_REVOKE_PRIVATE: &str = "daemon.plugin.revokePrivate";
 pub const DAEMON_PLUGIN_IGNORE_RETRY: &str = "daemon.plugin.ignoreRetry";
 /// 列出站点默认插件（多插件冲突的记忆选择，`Vec<PluginSiteDefaultDto>`）。
 pub const DAEMON_PLUGIN_SITE_DEFAULTS: &str = "daemon.plugin.siteDefaults";
@@ -291,6 +308,12 @@ pub const AGENT_REFERRAL_VALIDATE: &str = "agent.referral.validate";
 pub const AGENT_PLUGIN_FAVORITE_LIST: &str = "agent.pluginFavorite.list";
 /// 收藏 / 取消收藏单个插件 → `PluginFavoriteResultDto`。
 pub const AGENT_PLUGIN_FAVORITE_SET: &str = "agent.pluginFavorite.set";
+/// FluxCloud 私有插件商店：当前账号被授权的条目 → `PrivatePluginListDto`（未登录不发云请求）。
+/// 成功后 agent 把撤回清单（`yanked=malicious`）与 `scope` 经 `daemon.plugin.revokePrivate` 交给 daemon 禁用 / 解封已装私有插件。
+pub const AGENT_PRIVATE_PLUGIN_LIST: &str = "agent.privatePlugin.list";
+/// `PrivatePluginInstallRequest` → `InstalledPlugin`：download 票据 → 拉包 → sha256 钉住 →
+/// daemon blob → `daemon.plugin.installPrivate`。
+pub const AGENT_PRIVATE_PLUGIN_INSTALL: &str = "agent.privatePlugin.install";
 
 /// 云端推送状态 → `CloudNotifyStateDto`（读本机缓存；过期时后台刷新并经 `CloudNotifyChanged` 推送）。
 pub const AGENT_CLOUD_NOTIFY_GET: &str = "agent.cloudNotify.get";
@@ -363,7 +386,8 @@ pub const AGENT_UPDATE_DOWNLOAD: &str = "agent.update.download";
 pub const AGENT_UPDATE_INSTALL: &str = "agent.update.install";
 /// 取消进行中的下载与待安装请求，返回 `UpdateStatusDto`。
 pub const AGENT_UPDATE_CANCEL: &str = "agent.update.cancel";
-/// 完成后关机：`{delaySecs}`；无活跃任务时拒绝（`InvalidArgument`）。
+/// 定时关机 / 睡眠：`{delaySecs, action}` → `{armed}`；没有任务时立即开始倒计时，
+/// `delaySecs = 0` 只在有任务（活跃 / 排队 / 待重试）时接受，否则 `armed = false`。
 pub const AGENT_POWER_ARM: &str = "agent.power.arm";
 pub const AGENT_POWER_DISARM: &str = "agent.power.disarm";
 
@@ -421,7 +445,9 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_TASK_RESUME_ALL,
     DAEMON_TASK_RESCAN,
     DAEMON_TASK_SET_SEED_LIMITS,
+    DAEMON_TASK_SET_PIECE_PICKING,
     DAEMON_TASK_VERIFY,
+    DAEMON_TASK_HASH,
     DAEMON_TASK_SEED_LOCAL,
     DAEMON_TASK_TORRENT_SHARE,
     DAEMON_TASK_BT_STATUS,
@@ -470,6 +496,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_LINK_PROBE,
     DAEMON_PLUGIN_LIST,
     DAEMON_PLUGIN_SNIFF_RULES,
+    DAEMON_PLUGIN_ARCHIVE_RULES,
     DAEMON_PLUGIN_PAGE_SCRIPTS,
     DAEMON_PLUGIN_PAGE_SCRIPT_SOURCE,
     DAEMON_PLUGIN_AUTH,
@@ -481,6 +508,8 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_PLUGIN_UNINSTALL,
     DAEMON_PLUGIN_MARKET_LIST,
     DAEMON_PLUGIN_MARKET_INSTALL,
+    DAEMON_PLUGIN_INSTALL_PRIVATE,
+    DAEMON_PLUGIN_REVOKE_PRIVATE,
     DAEMON_PLUGIN_IGNORE_RETRY,
     DAEMON_PLUGIN_SITE_DEFAULTS,
     DAEMON_PLUGIN_SET_SITE_DEFAULT,
@@ -595,6 +624,8 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_REFERRAL_VALIDATE,
     AGENT_PLUGIN_FAVORITE_LIST,
     AGENT_PLUGIN_FAVORITE_SET,
+    AGENT_PRIVATE_PLUGIN_LIST,
+    AGENT_PRIVATE_PLUGIN_INSTALL,
     AGENT_CLOUD_NOTIFY_GET,
     AGENT_CLOUD_NOTIFY_REFRESH,
     AGENT_CLOUD_NOTIFY_SET_REPORTING,
@@ -647,10 +678,12 @@ pub const SLOW_DAEMON_METHODS: &[&str] = &[
     DAEMON_COMPONENT_LIST_VERSIONS,
     DAEMON_COMPONENT_INSTALL,
     DAEMON_PLUGIN_AUTH,
+    DAEMON_PLUGIN_ARCHIVE_RULES,
     DAEMON_PLUGIN_INSTALL,
     DAEMON_PLUGIN_INSTALL_DEV,
     DAEMON_PLUGIN_MARKET_LIST,
     DAEMON_PLUGIN_MARKET_INSTALL,
+    DAEMON_PLUGIN_INSTALL_PRIVATE,
     DAEMON_PLUGIN_VIEW_OPEN,
     DAEMON_PLUGIN_COMMAND,
     DAEMON_PLUGIN_INVOKE,
@@ -670,6 +703,7 @@ pub const SLOW_DAEMON_METHODS: &[&str] = &[
     DAEMON_DIAGNOSTICS_PROBE,
     DAEMON_DIAGNOSTICS_FIX_COMPONENT,
     DAEMON_TASK_VERIFY,
+    DAEMON_TASK_HASH,
     DAEMON_TASK_SEED_LOCAL,
     DAEMON_EGRESS_PLAN,
 ];

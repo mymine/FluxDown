@@ -8,6 +8,10 @@
 mod activity;
 #[path = "task_detail_bt.rs"]
 mod bt;
+#[path = "task_detail_hash.rs"]
+mod hash;
+#[path = "task_detail_source.rs"]
+mod source_page;
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -60,7 +64,9 @@ use crate::{
         SEED_LIMIT_FOLLOW_GLOBAL, SeedLimits,
     },
     model::{
-        DownloadTaskView, RowKey, TaskProtocol, TaskState, TaskStore, format_bytes,
+        DownloadTaskView, RowKey, TaskProtocol, TaskState, TaskStore,
+        file_hash::DEFAULT_HASH_ALGORITHM,
+        format_bytes,
         source_composition::{SourceKind, compose, format_percent},
         task_route::route_label,
     },
@@ -186,6 +192,20 @@ pub struct TaskDetailView {
     error_copied: u32,
     /// 日志「复制全部」按钮的反馈代次，语义同 `error_copied`。
     log_copied: u32,
+    /// 高级页「来源页」复制按钮的反馈代次，语义同 `error_copied`。
+    source_page_copied: u32,
+    /// 文件哈希算法选择。任务切换或行内 `fileHash` 算法变化时重置。
+    file_hash_algorithm: String,
+    /// 上次同步的任务 id，用来识别切换。
+    file_hash_task: Option<String>,
+    /// 上次同步的行内 `fileHash`，用来识别算法变化。
+    file_hash_noted: Option<String>,
+    /// 非零 = 复制按钮显示「已复制」。
+    file_hash_copied: u32,
+    /// 已为其排过「打开即计算」的任务 id：每次打开（含切换回来）只自动发起一次，失败后不反复重试。
+    file_hash_auto: Option<String>,
+    /// 打开即计算正在停留期（尚未发起请求）：行内照样显示「计算中」。
+    file_hash_pending: bool,
 }
 
 impl EventEmitter<TaskDetailEvent> for TaskDetailView {}
@@ -272,8 +292,9 @@ impl TaskDetailView {
             cx.notify();
         })
         .detach();
+        Self::observe_file_hash_inflight(cx);
 
-        let this = Self {
+        let mut this = Self {
             activity: ActivityFeed::new(task_id.clone()),
             bt: BtLive::default(),
             runtime: None,
@@ -310,7 +331,15 @@ impl TaskDetailView {
             seed_baseline: None,
             error_copied: 0,
             log_copied: 0,
+            source_page_copied: 0,
+            file_hash_algorithm: DEFAULT_HASH_ALGORITHM.to_owned(),
+            file_hash_task: None,
+            file_hash_noted: None,
+            file_hash_copied: 0,
+            file_hash_auto: None,
+            file_hash_pending: false,
         };
+        this.sync_file_hash(cx);
         Self::spawn_speed_ticker(cx);
         this
     }
@@ -371,6 +400,13 @@ impl TaskDetailView {
         self.closed = false;
         self.error_copied = 0;
         self.log_copied = 0;
+        self.source_page_copied = 0;
+        self.file_hash_algorithm = DEFAULT_HASH_ALGORITHM.to_owned();
+        self.file_hash_task = None;
+        self.file_hash_noted = None;
+        self.file_hash_copied = 0;
+        self.file_hash_auto = None;
+        self.file_hash_pending = false;
         self.seed_baseline = None;
         self.fetch_activity(cx);
         cx.notify();
@@ -460,6 +496,7 @@ impl TaskDetailView {
             self.close(cx);
             return;
         }
+        self.sync_file_hash(cx);
         cx.notify();
     }
 
@@ -1265,13 +1302,12 @@ impl TaskDetailView {
             return div().into_any_element();
         };
         let dto = self.current_dto();
-        let not_set = self.t(cx, "detailNotSet");
         let follow_global = self.t(cx, "detailFollowGlobal");
+        // 期望哈希只在填写过时展示（多数任务没有，「未设置」一行是噪音）。
         let checksum = dto
             .map(|dto| dto.checksum.clone())
             .filter(|value| !value.is_empty())
-            .map(SharedString::from)
-            .unwrap_or_else(|| not_set.clone());
+            .map(SharedString::from);
         let proxy = dto
             .map(|dto| dto.proxy_url.clone())
             .filter(|value| !value.is_empty())
@@ -1305,13 +1341,7 @@ impl TaskDetailView {
                                 .child(SharedString::from(row.name.clone())),
                         )
                     })
-                    .child(
-                        div()
-                            .text_size(tokens.typography.xs.size)
-                            .line_height(tokens.typography.xs.line_height)
-                            .text_color(tokens.colors.muted_foreground)
-                            .child(format!("{} · {}", row.protocol.label(), row.source_site())),
-                    )
+                    .child(self.render_source_line(&row, cx))
                     .when(boosted, |this| {
                         this.child(
                             div()
@@ -1393,7 +1423,12 @@ impl TaskDetailView {
                     )),
             )
             .child(detail_row(self.t(cx, "taskQueueLabel"), queue_label, cx))
-            .child(detail_row(self.t(cx, "taskChecksum"), checksum, cx))
+            .when_some(checksum, |this, checksum| {
+                this.child(detail_row(self.t(cx, "taskChecksum"), checksum, cx))
+            })
+            .when(row.state == TaskState::Completed, |this| {
+                this.child(self.render_file_hash_row(&row, cx))
+            })
             .child(detail_row(self.t(cx, "taskProxy"), proxy, cx));
         if let Some(route) = route {
             list = list.child(detail_row(self.t(cx, "taskRoute"), route, cx));
@@ -2254,11 +2289,8 @@ impl TaskDetailView {
             return div().into_any_element();
         };
         let dto = self.current_dto();
-        let referrer = if row.referrer.is_empty() {
-            self.t(cx, "detailNotSet")
-        } else {
-            SharedString::from(row.referrer.clone())
-        };
+        let referrer = SharedString::from(row.referrer.clone());
+        let referrer_is_web = row.source_page_url().is_some();
         let proxy = dto
             .map(|dto| dto.proxy_url.clone())
             .filter(|value| !value.is_empty())
@@ -2271,7 +2303,7 @@ impl TaskDetailView {
             .map(|route| route_label(route, self.translator.read(cx)));
         drop(row);
         let mut list = v_flex()
-            .child(detail_row(self.t(cx, "infoSourcePage"), referrer, cx))
+            .child(self.render_source_page_row(referrer, referrer_is_web, cx))
             .child(detail_row(self.t(cx, "taskProxy"), proxy, cx));
         if let Some(route) = route {
             list = list.child(detail_row(self.t(cx, "taskRoute"), route, cx));
@@ -2366,7 +2398,8 @@ impl gpui::Render for TaskDetailView {
 /// 详情键值表的一行：左列标签（xs、三级文字，固定宽度），右列值（sm、正文色、等宽数字）。
 /// 标签沿用正文行高，使两列首行垂直居中对齐；值过长时在值列内换行而不挤压标签。
 /// 任务详情（常规 / 做种 / 高级）与任务组概览共用，保证所有详情窗口同一种键值排版。
-pub(crate) fn detail_row(label: SharedString, value: impl IntoElement, cx: &App) -> Div {
+/// 标签通常是文字；「文件哈希」行把算法下拉放在标签位。
+pub(crate) fn detail_row(label: impl IntoElement, value: impl IntoElement, cx: &App) -> Div {
     let theme = active_theme(cx);
     let tokens = theme.tokens();
     h_flex()

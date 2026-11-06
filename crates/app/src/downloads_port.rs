@@ -331,6 +331,18 @@ impl AgentDownloadsPort {
                     method::DAEMON_TASK_SET_SEGMENTS,
                     serialize(fluxdown_protocol::SetTaskSegmentsParams { task_id, segments })?,
                 ),
+                DownloadsCommand::SetPiecePicking {
+                    task_id,
+                    sequential,
+                    first_last_pieces_first,
+                } => (
+                    method::DAEMON_TASK_SET_PIECE_PICKING,
+                    serialize(fluxdown_protocol::SetTaskPiecePickingParams {
+                        task_id,
+                        sequential,
+                        first_last_pieces_first,
+                    })?,
+                ),
                 DownloadsCommand::VerifyTask { task_id } => {
                     let result = client
                         .call(
@@ -339,6 +351,15 @@ impl AgentDownloadsPort {
                         )
                         .await?;
                     return Ok(DownloadsResult::TaskVerify(result));
+                }
+                DownloadsCommand::HashTask { task_id, algorithm } => {
+                    let result = client
+                        .call(
+                            method::DAEMON_TASK_HASH,
+                            Some(json!({ "taskId": task_id, "algorithm": algorithm })),
+                        )
+                        .await?;
+                    return Ok(DownloadsResult::TaskHash(result));
                 }
                 DownloadsCommand::TorrentShare {
                     task_id,
@@ -531,7 +552,7 @@ impl AgentDownloadsPort {
                                 .await?
                         }
                     };
-                    return Ok(DownloadsResult::Preview(preview));
+                    return Ok(DownloadsResult::Preview(Box::new(preview)));
                 }
                 DownloadsCommand::CreateGroup {
                     mut request,

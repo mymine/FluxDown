@@ -84,9 +84,11 @@ pub struct ExtensionsView {
 pub enum ExtensionsEvent {
     /// 打开插件某个视图的桌面界面（`contributes.views[].desktop`，window 位置）。
     OpenPluginView {
-        plugin: fluxdown_protocol::PluginDto,
+        plugin: Box<fluxdown_protocol::PluginDto>,
         view: String,
     },
+    /// 打开账户页（专属插件区的登录入口；登录页由宿主决定）。
+    OpenAccount,
 }
 
 impl EventEmitter<ExtensionsEvent> for ExtensionsView {}
@@ -112,11 +114,10 @@ impl ExtensionsView {
 
     /// 把控制器的最新插件列表推给已打开的对话框；断连期间列表不可信，保持上一份已知状态。
     fn sync_live_plugins(&self, cx: &mut Context<Self>) {
-        if self.controller.is_stale() {
-            return;
-        }
-        self.live_plugins
-            .update(cx, |live, cx| live.replace(self.controller.plugins(), cx));
+        let stale = self.controller.is_stale();
+        self.live_plugins.update(cx, |live, cx| {
+            live.replace(self.controller.plugins(), stale, cx);
+        });
     }
 
     /// 注入插件视图工厂（app 在装配时调用）。
@@ -134,6 +135,9 @@ impl ExtensionsView {
         self.plugins
             .market
             .favorites
+            .observe_session(snapshot.session.is_some());
+        self.plugins
+            .private
             .observe_session(snapshot.session.is_some());
         cx.notify();
     }
@@ -165,11 +169,13 @@ impl ExtensionsView {
         }
         // 登录 / 登出以增量事件到达：刷新收藏（星标、「我的收藏」）无需重进设置页。
         let session_changed = match event {
-            ServiceEvent::Agent(AgentEvent::SessionChanged(session)) => self
-                .plugins
-                .market
-                .favorites
-                .observe_session(session.is_some()),
+            ServiceEvent::Agent(AgentEvent::SessionChanged(session)) => {
+                let signed_in = session.is_some();
+                let favorites = self.plugins.market.favorites.observe_session(signed_in);
+                // 专属插件目录随登录态一起失效；两者各自记录登录态，不能短路。
+                let private = self.plugins.private.observe_session(signed_in);
+                favorites || private
+            }
             _ => false,
         };
         if ExtensionsController::replaces_plugins(event) {
@@ -192,6 +198,7 @@ impl ExtensionsView {
                 .to_owned(),
         );
         self.controller.mark_stale();
+        self.sync_live_plugins(cx);
         cx.notify();
     }
 

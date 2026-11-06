@@ -45,12 +45,16 @@ pub const FILE_MISSING_ACTIONS: &[&str] = &["keep", "delete"];
 pub const BT_SEED_LIMIT_OPERATORS: &[&str] = &["or", "and"];
 pub const BT_SEED_THEN_ACTIONS: &[&str] = &["stop", "delete", "delete_files"];
 pub const BT_MSE_MODES: &[&str] = &["disabled", "enabled", "forced"];
+/// 新建 BT 任务的默认选片方式：最稀有优先 / 按顺序下载。
+pub const BT_PIECE_ORDERS: &[&str] = &["rarest", "sequential"];
 /// BT 防吸血规则 / 云名单的执行模式。
 pub const BT_GUARD_MODES: &[&str] = &["off", "observe", "enforce"];
 /// BT 防吸血：下载中任务的动作上限。
 pub const BT_GUARD_DOWNLOADING_ACTIONS: &[&str] = &["observe", "throttle", "choke", "ban"];
 pub const PROXY_MODES: &[&str] = &["none", "system", "manual", "auto"];
 pub const PROXY_TYPES: &[&str] = &["http", "https", "socks4", "socks5"];
+/// 文件哈希算法（`hash_algorithm`、`daemon.task.hash`、任务 `fileHash` 的 `algo`）。
+pub const HASH_ALGORITHMS: &[&str] = &["md5", "sha1", "sha256", "sha512"];
 
 /// 单任务连接（线程）数上限：设置、队列默认值与新建任务共用；
 /// 与引擎 `segment_coordinator::MAX_SEGMENTS` 保持一致。
@@ -139,6 +143,13 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
     ),
     // 空闲（无活动/排队任务）时是否仍执行周期性文件跟踪扫描；默认关闭以免唤醒 NAS 硬盘。
     field("idle_file_scan", DaemonConfigKind::Bool, "false"),
+    // 下载完成后计算落盘文件的哈希（单文件产物；已由校验和校验得到哈希的任务不重复计算）。
+    field("hash_after_download", DaemonConfigKind::Bool, "false"),
+    field(
+        "hash_algorithm",
+        DaemonConfigKind::Enum(HASH_ALGORITHMS),
+        "sha256",
+    ),
     field("global_user_agent", DaemonConfigKind::Text, ""),
     field("default_queue_id", DaemonConfigKind::Text, ""),
     field("domain_conn_caps", DaemonConfigKind::ReadOnly, ""),
@@ -169,6 +180,18 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         "enabled",
     ),
     field("bt_custom_trackers", DaemonConfigKind::Text, ""),
+    // 新建 BT 任务的默认选片方式与「先下载首尾文件块」；只作用于此后新建的任务，
+    // 单个任务经 `daemon.task.setPiecePicking` 修改。
+    field(
+        "bt_piece_order",
+        DaemonConfigKind::Enum(BT_PIECE_ORDERS),
+        "rarest",
+    ),
+    field(
+        "bt_first_last_pieces_first",
+        DaemonConfigKind::Bool,
+        "false",
+    ),
     field("bt_tracker_sub_enabled", DaemonConfigKind::Bool, "true"),
     field("bt_tracker_sub_urls", DaemonConfigKind::Text, ""),
     field("bt_tracker_sub_cache", DaemonConfigKind::ReadOnly, ""),

@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db::Db;
 use crate::events::EventSink;
+use crate::file_hash::HashAlgorithm;
 use crate::logger::{log_info, log_warn};
 use crate::naming::{extract_filename, name_from_url, sanitize_filename};
 use crate::output;
@@ -483,13 +484,13 @@ impl DownloadParams {
 }
 
 /// 启动序幕（`download_manager::finalize_start_file_name`）用与下载相同的 client / spec
-/// 跑完 [`resolve_file_info_with_ua_fallback`] 后交给下载器的结果：序幕据此命名，
+/// 跑完 [`resolve_file_info_held`] 后交给下载器的结果：序幕据此命名，
 /// 下载器据此跳过自己的第二轮探测。仅在序幕与 `run_download` 之间即时传递，不跨暂停 / 续传保留。
 pub struct PreprobedInfo {
     pub info: FileInfo,
     /// 探测靠请求头自适应才通过时的适配后 spec；序幕已落库，下载器只需沿用。
     pub adapted: Option<RequestSpec>,
-    /// 单 GET 探测（[`resolve_file_info_held_get`]）保留下来的响应：已读完响应头、
+    /// 单请求探测（[`resolve_file_info_held`]）保留下来的响应：已读完响应头、
     /// body 未动，随后成为第一条数据连接（见 [`DownloadSpec::take_held_response`]）。
     /// `None` = 探测走的是 HEAD ∥ Range 路径或响应已不可用。
     pub held: Option<reqwest::Response>,
@@ -828,8 +829,8 @@ fn parse_captured_method(method: Option<&str>) -> reqwest::Method {
 }
 
 /// `tasks.request_method` 列值：GET / HEAD（含回退为 GET 的情形）记空串，其余记
-/// 规范化后的方法名。只记方法不记请求体——请求体常含一次性令牌（OneDrive 打包
-/// 下载的 `access_token`），重放还可能有副作用，因此恢复时据此明确拒绝而非改发 GET。
+/// 规范化后的方法名。只记方法不记请求体——请求体常带凭据（OneDrive 打包下载的
+/// `pacToken`），只在引擎内存保留供同进程重放；引擎重启后据此明确拒绝恢复，而非改发 GET。
 pub(crate) fn persisted_request_method(method: Option<&str>) -> String {
     let method = parse_captured_method(method);
     if method == reqwest::Method::GET || method == reqwest::Method::HEAD {
@@ -1541,8 +1542,9 @@ const POST_ONLY_TAG: &str = "post-only";
 pub const POST_ONLY_ENDPOINT_MESSAGE: &str =
     "This link only accepts POST requests (HTTP 405); start the download from the browser";
 
-/// 由浏览器 POST 请求发起的任务被恢复 / 重试时的错误文案：请求体不落库，无法重放，
-/// 改发 GET 必然被拒（或下到错误内容）。客户端按全文匹配本地化，改动须同步各端。
+/// 由浏览器 POST 请求发起的任务在引擎重启后被恢复 / 重试时的错误文案：请求体不落库、
+/// 内存副本已随进程消失，无法重放，改发 GET 必然被拒（或下到错误内容）。客户端按全文
+/// 匹配本地化，改动须同步各端。
 pub const POST_ONLY_RESUME_MESSAGE: &str = "This task was started by a browser POST request and cannot be resumed; start it again from the browser";
 
 /// 探测失败中「服务端主动拒绝」的类别，决定下一轮请求头如何自适应。
@@ -2072,19 +2074,20 @@ pub(crate) async fn resolve_file_info_with_ua_fallback(
     Ok((info, adapted))
 }
 
-/// 一次性 URL 友好的探测：只发【一个】与数据下载同规格的 plain GET（无 Range、无 HEAD），
-/// 响应头即文件元数据，响应本身原样保留作第一条数据连接。请求头自适应阶梯
-/// （UA / Referer / 质询）与 [`resolve_file_info_with_ua_fallback`] 相同——只有上一次被
-/// 拒绝后才会重发，被拒的请求本就没消耗下载令牌。
-pub(crate) async fn resolve_file_info_held_get(
+/// 一次性 URL / 表单端点友好的探测：只发【一个】与数据下载同规格的请求（GET 类为无 Range
+/// 的 plain GET，非 GET 为原 method + body），响应头即文件元数据，响应本身原样保留作第一条
+/// 数据连接——表单 POST 只向服务端提交一次。请求头自适应阶梯（UA / Referer / 质询）与
+/// [`resolve_file_info_with_ua_fallback`] 相同——只有上一次被拒绝后才会重发，被拒的请求
+/// 本就没消耗下载令牌。
+pub(crate) async fn resolve_file_info_held(
     client: &Client,
     url: &str,
     spec: &RequestSpec,
 ) -> Result<(FileInfo, Option<RequestSpec>, reqwest::Response), DownloadError> {
-    match adapt_probe_request(client, url, spec, ProbeKind::HeldGet, None).await? {
+    match adapt_probe_request(client, url, spec, ProbeKind::Held, None).await? {
         (info, adapted, Some(resp)) => Ok((info, adapted, resp)),
         (_, _, None) => Err(DownloadError::Other(
-            "single GET probe returned no response".to_string(),
+            "single probe request returned no response".to_string(),
         )),
     }
 }
@@ -2094,11 +2097,14 @@ pub(crate) async fn resolve_file_info_held_get(
 pub(crate) enum ProbeKind {
     /// HEAD ∥ `Range: bytes=0-0`，响应只读头。
     HeadAndRange,
-    /// 单个 plain GET，响应保留给数据下载。
-    HeldGet,
+    /// 单个与数据下载同规格的请求（GET 类 plain GET / 非 GET 原 method + body），响应保留给
+    /// 数据下载。
+    Held,
 }
 
-/// 探测重试 / 请求头自适应阶梯；`kind` 决定单轮探测怎么发。
+/// 探测重试 / 请求头自适应阶梯；`kind` 决定单轮探测怎么发。非 GET 请求一律按
+/// [`ProbeKind::Held`] 发：HEAD 不能携带请求体、POST + Range 未定义，而丢弃探测响应再
+/// 提交一次会让服务端把同一表单处理两遍（OneDrive 打包下载会重新打包整个 zip）。
 ///
 /// `path_signal`：每轮探测失败都上报其类别（断在传输层 / 拿到服务器应答）——
 /// Auto 探测竞速（[`crate::auto_probe`]）据此不等本路径的退避重试跑完就放出
@@ -2110,6 +2116,11 @@ pub(crate) async fn adapt_probe_request(
     kind: ProbeKind,
     path_signal: Option<&crate::auto_probe::PathSignal>,
 ) -> Result<(FileInfo, Option<RequestSpec>, Option<reqwest::Response>), DownloadError> {
+    let kind = if spec.is_get_like() {
+        kind
+    } else {
+        ProbeKind::Held
+    };
     let has_browser_ua = spec
         .extra_headers
         .keys()
@@ -2134,7 +2145,7 @@ pub(crate) async fn adapt_probe_request(
                     .await
                     .map(|info| (info, None))
             }
-            ProbeKind::HeldGet => resolve_file_info_held_get_once(client, url, attempt_spec)
+            ProbeKind::Held => resolve_file_info_held_once(client, url, attempt_spec)
                 .await
                 .map(|(info, resp)| (info, Some(resp))),
         };
@@ -2283,19 +2294,13 @@ fn send_error_desc(e: &DownloadError) -> String {
 
 /// `final_attempt`：本轮是否为重试循环的最后一轮——只在最后一轮才把「两路探测都
 /// 断在传输层」交给无 Range 的 plain GET 兜底（见下方 `(None, None)` 分支）。
+/// 只处理 GET 类请求：非 GET 由 [`adapt_probe_request`] 改走 [`ProbeKind::Held`]。
 async fn resolve_file_info_once(
     client: &Client,
     url: &str,
     spec: &RequestSpec,
     final_attempt: bool,
 ) -> Result<FileInfo, DownloadError> {
-    // 非 GET（form POST 等）：HEAD 通常返回 405 Method Not Allowed，POST + Range
-    // 在 HTTP 标准上未定义。改为只发一次原始 method+body 请求，从响应头读取
-    // 文件元数据后立即终止读取（drop response）。
-    if !spec.is_get_like() {
-        return resolve_file_info_non_get(client, url, spec).await;
-    }
-
     let cookies = spec.cookies.as_str();
     // --- Concurrent HEAD + GET probe ----------------------------------------
     // Fire both HEAD and GET Range:0-0 in parallel.  HEAD is faster when it
@@ -2785,24 +2790,30 @@ async fn resolve_file_info_plain_get_fallback(
     })
 }
 
-/// 单 GET 探测的一轮：发一个 plain GET，成功则从响应头派生 [`FileInfo`] 并连同【未读 body
-/// 的响应】一起返回。
+/// 单请求探测的一轮：GET 类发一个 plain GET、非 GET 发原 method + body，成功则从响应头
+/// 派生 [`FileInfo`] 并连同【未读 body 的响应】一起返回。
 ///
 /// 与 `resolve_file_info_once` 的区别：没有 HEAD、没有 `Range: bytes=0-0`——一次性签名 URL
-/// 的令牌在第一个 GET 就失效，探测请求不能先于真实数据请求消耗它。因此：
-/// - Range 能力不在此实测：仅当响应带 `Accept-Ranges: bytes`（与 coordinator 的裁决同一
-///   判据）、未压缩且长度已知时才声明支持，下载器随后按 hint 语义「单流先起、证实后升
-///   多段」；
+/// 的令牌在第一个 GET 就失效，表单端点每次提交都会重新处理，探测请求不能先于真实数据请求
+/// 消耗它们。因此：
+/// - Range 能力不在此实测：仅当 GET 类响应带 `Accept-Ranges: bytes`（与 coordinator 的裁决
+///   同一判据）、未压缩且长度已知时才声明支持，下载器随后按 hint 语义「单流先起、证实后升
+///   多段」；非 GET 恒不支持；
 /// - 响应头等待用 `tokio::time::timeout` 而非 `RequestBuilder::timeout`（后者会把 body
 ///   读取也算进总时限，数据连接会被 15s 截断）。
-async fn resolve_file_info_held_get_once(
+async fn resolve_file_info_held_once(
     client: &Client,
     url: &str,
     spec: &RequestSpec,
 ) -> Result<(FileInfo, reqwest::Response), DownloadError> {
+    let (method, label) = if spec.is_get_like() {
+        (reqwest::Method::GET, "plain GET")
+    } else {
+        (spec.method.clone(), spec.method.as_str())
+    };
     let sent = tokio::time::timeout(
         PROBE_TIMEOUT,
-        build_request(client, url, reqwest::Method::GET, spec).send(),
+        build_request(client, url, method, spec).send(),
     )
     .await;
     let resp = match sent {
@@ -2810,7 +2821,7 @@ async fn resolve_file_info_held_get_once(
             // 15s 内没有任何响应头：建连黑洞或上游挂起，链路层面的超时。
             return Err(DownloadError::Other(crate::net_failure::append_tag(
                 format!(
-                    "probes failed: plain GET=network-error: no response headers within {}s",
+                    "probes failed: {label}=network-error: no response headers within {}s",
                     PROBE_TIMEOUT.as_secs()
                 ),
                 Some(crate::net_failure::NetFailure::Timeout),
@@ -2818,12 +2829,13 @@ async fn resolve_file_info_held_get_once(
         }
         Ok(Err(e)) => {
             log_info!(
-                "[resolve] plain GET network error: {}{}",
+                "[resolve] {} network error: {}{}",
+                label,
                 e,
                 format_error_chain(e.source())
             );
             return Err(DownloadError::Other(crate::net_failure::append_tag(
-                format!("probes failed: plain GET={}", send_error_desc(&e)),
+                format!("probes failed: {label}={}", send_error_desc(&e)),
                 crate::net_failure::classify_download_error(&e),
             )));
         }
@@ -2833,12 +2845,13 @@ async fn resolve_file_info_held_get_once(
     if !resp.status().is_success() || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
         let desc = probe_status_desc(&resp);
         log_info!(
-            "[resolve] plain GET failed: status={}, url={}",
+            "[resolve] {} failed: status={}, url={}",
+            label,
             resp.status(),
             crate::logger::sanitize_log_str(resp.url().as_str())
         );
         return Err(DownloadError::Other(format!(
-            "probes failed: plain GET={desc}"
+            "probes failed: {label}={desc}"
         )));
     }
 
@@ -2865,7 +2878,8 @@ async fn resolve_file_info_held_get_once(
             spec.is_get_like() && accepts_ranges && !content_encoding_compressed && total_bytes > 0;
         let resolved = extract_filename(headers, url, resp.url().as_str());
         log_info!(
-            "[resolve] single GET url={} → name={}, size={}, range={}, ct={}",
+            "[resolve] single {} url={} → name={}, size={}, range={}, ct={}",
+            label,
             crate::logger::sanitize_log_str(url),
             resolved.name,
             total_bytes,
@@ -2933,14 +2947,14 @@ fn auto_race_probe_applies(p: &DownloadParams) -> bool {
         && crate::auto_probe::applies(p)
 }
 
-/// 本次启动能否用单 GET 探测代替 HEAD ∥ Range 探测：仅限 fresh、非 hint、无音轨对、
-/// 不带有界 Range 窗口的 HTTP(S) GET 类任务（HLS / DASH / FTP / 非 GET / 续传 / hint 任务
-/// 照旧）。启动序幕（`download_manager`）与 [`run_download`] 共用这一判据。
-pub(crate) fn single_get_probe_applies(p: &DownloadParams) -> bool {
+/// 本次启动能否用单请求探测（[`ProbeKind::Held`]）代替 HEAD ∥ Range 探测：仅限 fresh、
+/// 非 hint、无音轨对、不带有界 Range 窗口的 HTTP(S) 任务（HLS / DASH / FTP / 续传 / hint
+/// 任务照旧）。非 GET 任务（表单 POST 等）同样适用：探测发出的就是那唯一一次提交，响应
+/// 直接作为数据连接。启动序幕（`download_manager`）与 [`run_download`] 共用这一判据。
+pub(crate) fn held_probe_applies(p: &DownloadParams) -> bool {
     !p.is_resume
         && p.hint_file_size == 0
         && p.audio_url.is_none()
-        && p.spec.is_get_like()
         && p.spec.range_window_cap().is_none()
         && (p.url.starts_with("http://") || p.url.starts_with("https://"))
         && !crate::hls_downloader::is_hls_url(&p.url)
@@ -2955,91 +2969,38 @@ pub(crate) fn filename_looks_like_html(name: &str) -> bool {
     lower.ends_with(".html") || lower.ends_with(".htm") || lower.ends_with(".xhtml")
 }
 
-/// 非 GET 请求的元数据探测——只发送一次原始 method+body 请求，从响应头
-/// 提取文件名/大小/MIME，不读响应体（drop response 立即释放连接）。
+/// HTML 安全网文案的成因提示（接在「server returned HTML page …」之后）。
 ///
-/// 设计理由：
-///   - HEAD 对 POST 端点通常返回 405/501，且不能携带 body
-///   - POST + Range:bytes=0-0 在 HTTP 标准上未定义，服务端实现不一致
-///   - 多段下载（Range 分割）对 non-GET 不可靠，统一强制单流
-///
-/// 因此 supports_range 强制为 false，调用方据此选择单流路径。
-async fn resolve_file_info_non_get(
-    client: &Client,
-    url: &str,
-    spec: &RequestSpec,
-) -> Result<FileInfo, DownloadError> {
-    log_info!(
-        "[resolve-non-get] method={} url={} body_present={}",
-        spec.method,
-        crate::logger::sanitize_log_str(url),
-        spec.body.is_some()
-    );
-
-    let resp = build_request(client, url, spec.method.clone(), spec)
-        .timeout(PROBE_TIMEOUT)
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        return Err(DownloadError::Other(format!(
-            "non-GET probe returned status {}",
-            resp.status()
-        )));
+/// 响应终点与请求地址不同时点出终点（只含 scheme / host / path：query 常带令牌），
+/// 这通常是登录页或错误页——例如 OneDrive `download.aspx` 缺 Cookie 时 302 到
+/// `Authenticate.aspx`；否则按请求方法给通用提示。终点以含 `://` 的独立词元出现，
+/// `is_retriable_error` 的关键词判定会跳过它，路径里的偶然字样不改变重试判定。
+pub(crate) fn html_response_hint(
+    requested_url: &str,
+    final_url: Option<&reqwest::Url>,
+    method: &reqwest::Method,
+) -> String {
+    let redirected = final_url.filter(|url| {
+        !reqwest::Url::parse(requested_url).is_ok_and(|requested| requested == **url)
+    });
+    if let Some(url) = redirected {
+        // origin（scheme / host / port，不含 userinfo）+ path：query 与内嵌账号密码都不进文案。
+        let landing = format!("{}{}", url.origin().ascii_serialization(), url.path());
+        return format!(
+            "the request was redirected to {landing} (usually a sign-in or error page): \
+             the browser cookies or link token were not captured or are no longer valid"
+        );
     }
-
-    let final_url = resp.url().clone();
-    let headers = resp.headers().clone();
-    // drop(resp) 在此释放——我们只需头部，body 留给真正的下载阶段
-    drop(resp);
-
-    let total_bytes = headers
-        .get(reqwest::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(0);
-
-    let content_type = headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let resolved = extract_filename(&headers, url, final_url.as_str());
-    let (file_name, name_source) = (resolved.name, resolved.source);
-
-    let etag = headers
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let last_modified = headers
-        .get(reqwest::header::LAST_MODIFIED)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let content_encoding_compressed = detect_content_encoding(&headers).is_some();
-
-    log_info!(
-        "[resolve-non-get] resolved: name={}, size={}, ct={}",
-        file_name,
-        total_bytes,
-        content_type
-    );
-
-    Ok(FileInfo {
-        file_name,
-        name_source,
-        total_bytes,
-        // 非 GET 强制单流——POST + Range 在标准上未定义，服务端实现不一致
-        supports_range: false,
-        content_type,
-        etag,
-        last_modified,
-        content_encoding_compressed,
-    })
+    if *method == reqwest::Method::GET || *method == reqwest::Method::HEAD {
+        "the URL may be a redirect/transit page, an expired one-time link, or a form-POST \
+         endpoint accessed via GET"
+            .to_string()
+    } else {
+        format!(
+            "the server answered the submitted {method} request with a page instead of the file \
+             (the form token may no longer be accepted)"
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3757,18 +3718,6 @@ pub async fn run_download(mut params: DownloadParams) {
     }
 }
 
-/// Hex-digit length expected for each supported checksum algorithm's digest.
-/// Must stay in lockstep with the hashers dispatched in [`verify_checksum`].
-fn checksum_hex_len(algo: &str) -> Option<usize> {
-    match algo {
-        "md5" => Some(32),
-        "sha1" => Some(40),
-        "sha256" => Some(64),
-        "sha512" => Some(128),
-        _ => None,
-    }
-}
-
 /// Normalize a user-provided checksum spec into the canonical `algo=hex`
 /// form consumed by [`verify_checksum`].
 ///
@@ -3792,13 +3741,9 @@ pub fn normalize_checksum_spec(spec: &str) -> Result<String, String> {
     let algo_raw = spec[..sep].trim().to_lowercase();
     let hash_raw = spec[sep + 1..].trim();
 
-    let algo = match algo_raw.as_str() {
-        "sha-256" | "sha256" => "sha256",
-        "sha-512" | "sha512" => "sha512",
-        "sha-1" | "sha1" => "sha1",
-        "md5" => "md5",
-        other => return Err(format!("unsupported checksum algorithm: {}", other)),
-    };
+    let algorithm = HashAlgorithm::parse(&algo_raw)
+        .ok_or_else(|| format!("unsupported checksum algorithm: {}", algo_raw))?;
+    let algo = algorithm.as_str();
 
     // Strip a redundant "<algo>:" prefix pasted onto the hash itself — only
     // when it names the *same* algorithm already selected via `algo=`.
@@ -3821,7 +3766,7 @@ pub fn normalize_checksum_spec(spec: &str) -> Result<String, String> {
     if hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("checksum hash is not valid hex: {}", hash));
     }
-    let expected_len = checksum_hex_len(algo).unwrap_or(0);
+    let expected_len = algorithm.hex_len();
     if hash.len() != expected_len {
         return Err(format!(
             "checksum hash length mismatch for {}: expected {} hex chars, got {}",
@@ -3840,8 +3785,9 @@ pub fn normalize_checksum_spec(spec: &str) -> Result<String, String> {
 /// Supported algorithms: `sha-256`/`sha256`, `sha-512`/`sha512`, `sha-1`/`sha1`, `md5`.
 /// `spec` is passed through [`normalize_checksum_spec`] first, which also
 /// strips a redundant `<algo>:` prefix pasted onto the hash value.
-/// Returns `Ok(())` if the digest matches, or `Err(DownloadError::ChecksumMismatch)` if not.
-async fn verify_checksum(path: &Path, spec: &str) -> Result<(), DownloadError> {
+/// Returns the normalized `algo=hex` spec (= the file's hash record) if the digest
+/// matches, or `Err(DownloadError::ChecksumMismatch)` if not.
+async fn verify_checksum(path: &Path, spec: &str) -> Result<String, DownloadError> {
     let normalized = normalize_checksum_spec(spec).map_err(DownloadError::Other)?;
     let (algo, expected_hex) = normalized.split_once('=').ok_or_else(|| {
         DownloadError::Other(format!(
@@ -3849,69 +3795,18 @@ async fn verify_checksum(path: &Path, spec: &str) -> Result<(), DownloadError> {
             normalized
         ))
     })?;
-    let algo_owned = algo.to_string();
-    let expected_hex = expected_hex.to_string();
-
+    let algorithm = HashAlgorithm::parse(algo).ok_or_else(|| {
+        DownloadError::Other(format!(
+            "internal: unsupported normalized algorithm: {algo}"
+        ))
+    })?;
     let path_owned = path.to_path_buf();
-
-    let actual_hex = tokio::task::spawn_blocking(move || -> Result<String, DownloadError> {
-        use std::io::Read;
-        let mut file = std::fs::File::open(&path_owned)?;
-        let mut buf = vec![0u8; 1024 * 1024]; // 1 MiB read buffer
-        match algo_owned.as_str() {
-            "sha256" => {
-                use sha2::Digest;
-                let mut h = sha2::Sha256::new();
-                loop {
-                    let n = file.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    h.update(&buf[..n]);
-                }
-                Ok(hex::encode(h.finalize()))
-            }
-            "sha512" => {
-                use sha2::Digest;
-                let mut h = sha2::Sha512::new();
-                loop {
-                    let n = file.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    h.update(&buf[..n]);
-                }
-                Ok(hex::encode(h.finalize()))
-            }
-            "sha1" => {
-                use sha1::Digest;
-                let mut h = sha1::Sha1::new();
-                loop {
-                    let n = file.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    h.update(&buf[..n]);
-                }
-                Ok(hex::encode(h.finalize()))
-            }
-            "md5" => {
-                use md5::Digest;
-                let mut h = md5::Md5::new();
-                loop {
-                    let n = file.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    h.update(&buf[..n]);
-                }
-                Ok(hex::encode(h.finalize()))
-            }
-            _ => Err(DownloadError::Other("unreachable algo branch".to_string())),
-        }
+    let actual_hex = tokio::task::spawn_blocking(move || {
+        crate::file_hash::hash_file(&path_owned, algorithm, || false)
     })
     .await
-    .map_err(|e| DownloadError::Other(format!("checksum thread panicked: {}", e)))??;
+    .map_err(|e| DownloadError::Other(format!("checksum thread panicked: {}", e)))?
+    .map_err(|e| DownloadError::Other(format!("checksum: {e}")))?;
 
     if actual_hex != expected_hex {
         return Err(DownloadError::ChecksumMismatch(format!(
@@ -3919,7 +3814,7 @@ async fn verify_checksum(path: &Path, spec: &str) -> Result<(), DownloadError> {
             expected_hex, actual_hex
         )));
     }
-    Ok(())
+    Ok(normalized)
 }
 
 /// Run the segment advisor to compute the task's connection cap (Auto mode).
@@ -4030,8 +3925,8 @@ async fn run_download_inner(
     // 聚合与数据连接都用接管后的值。
     let preprobed = match preprobed {
         None if auto_race_probe_applies(p) => {
-            let kind = if single_get_probe_applies(p) {
-                ProbeKind::HeldGet
+            let kind = if held_probe_applies(p) {
+                ProbeKind::Held
             } else {
                 ProbeKind::HeadAndRange
             };
@@ -4068,7 +3963,7 @@ async fn run_download_inner(
     //          skip probe to preserve one-time tokens
     //    0   — no hint, run normal probe
     let mut applied_spec: Option<RequestSpec> = None;
-    // 单 GET 探测保留的首响应（见 [`resolve_file_info_held_get`]），稍后交给 `DownloadSpec`。
+    // 单请求探测保留的首响应（见 [`resolve_file_info_held`]），稍后交给 `DownloadSpec`。
     let mut held_response: Option<reqwest::Response> = None;
     let mut probed_decision = crate::intercept::drive::ProbedDecision::default();
     let info = if p.hint_file_size != 0 {
@@ -4152,12 +4047,17 @@ async fn run_download_inner(
             );
             applied_spec = adapted;
             (info, held)
-        } else if single_get_probe_applies(p) {
+        } else if held_probe_applies(p) {
             log_info!(
-                "[download] task {} resolving file info via a single GET...",
-                p.task_id
+                "[download] task {} resolving file info via a single {} request...",
+                p.task_id,
+                if p.spec.is_get_like() {
+                    "GET"
+                } else {
+                    p.spec.method.as_str()
+                }
             );
-            let (info, adapted, resp) = resolve_file_info_held_get(client, &p.url, &p.spec).await?;
+            let (info, adapted, resp) = resolve_file_info_held(client, &p.url, &p.spec).await?;
             if let Some(adapted_spec) = adapted {
                 persist_adapted_spec(&p.db, &p.task_id, &adapted_spec).await;
                 applied_spec = Some(adapted_spec);
@@ -4165,8 +4065,10 @@ async fn run_download_inner(
             (info, Some(resp))
         } else {
             log_info!("[download] task {} resolving file info...", p.task_id);
-            let (info, adapted) =
-                resolve_file_info_with_ua_fallback(client, &p.url, &p.spec).await?;
+            // 非 GET 在这里同样只提交一次：`adapt_probe_request` 把它改走单请求探测并交回
+            // 响应，作为数据连接（见 `download_single` 的 `use_held`）。
+            let (info, adapted, held) =
+                adapt_probe_request(client, &p.url, &p.spec, ProbeKind::HeadAndRange, None).await?;
             if let Some(adapted_spec) = adapted {
                 // 探测靠请求头自适应（去 UA / 补浏览器 UA / 补防盗链 Referer）才通过：
                 // 真实下载（含分段 worker）必须用同一份请求头，否则探测通过、下载 403；
@@ -4174,7 +4076,7 @@ async fn run_download_inner(
                 persist_adapted_spec(&p.db, &p.task_id, &adapted_spec).await;
                 applied_spec = Some(adapted_spec);
             }
-            (info, None)
+            (info, held)
         };
         held_response = held;
         log_info!(
@@ -4229,6 +4131,8 @@ async fn run_download_inner(
     // 切换到中性 UA 对其余分段 worker 与单流回退同时生效。
     let requested_segments = probed_decision.segments.unwrap_or(p.segment_count);
     let connection_cap = probed_decision.max_connections.unwrap_or(p.connection_cap);
+    // 单请求探测的响应终点（跟随重定向后），供下方 HTML 安全网点出被带去的页面。
+    let probe_final_url = held_response.as_ref().map(|resp| resp.url().clone());
     let spec_ref = std::sync::Arc::new(
         DownloadSpec::new(applied_spec.unwrap_or_else(|| p.spec.clone()))
             .with_connection_cap(connection_cap)
@@ -4256,9 +4160,8 @@ async fn run_download_inner(
             };
             if !filename_looks_like_html(expected) {
                 return Err(DownloadError::Other(format!(
-                    "server returned HTML page (Content-Type: {}) instead of the expected file — \
-                     the URL may be a redirect/transit page or a form-POST endpoint accessed via GET",
-                    mime
+                    "server returned HTML page (Content-Type: {mime}) instead of the expected file — {}",
+                    html_response_hint(&p.url, probe_final_url.as_ref(), &p.spec.method)
                 )));
             }
         }
@@ -4810,8 +4713,9 @@ async fn run_download_inner(
     // 故 file_len == effective_total_bytes 自然成立、不会误杀。
     if effective_total_bytes > 0 && !decompressed_single {
         if actual_use_segments {
-            // Multi-segment: file is pre-allocated via set_len() so metadata
-            // size always == total_bytes.  Check actual progress from DB instead.
+            // Multi-segment: file size is no progress signal — preallocated
+            // files are total_bytes up front, grow-on-write files (non-sparse
+            // filesystems) reach it once the tail lands.  Check DB progress.
             let segs = p.db.load_segments(&p.task_id).await?;
             let seg_total: i64 = segs.iter().map(|s| s.downloaded_bytes).sum();
             if seg_total < effective_total_bytes {
@@ -4939,18 +4843,30 @@ async fn run_download_inner(
         // 传输错误），此时残留一个完整大小、内容错误的临时文件毫无意义——既
         // 占用磁盘，又会让后续 resume 基于 existing_len 做出错误判断。删除它，
         // 让下次重试从干净状态开始。删除失败仅记日志，不掩盖原始 checksum 错误。
-        if let Err(e) = verify_checksum(&temp_path, &p.checksum).await {
-            if let Err(rm_err) = tokio::fs::remove_file(&temp_path).await {
-                log_info!(
-                    "[download] task {} checksum failed; could not remove corrupt temp {}: {}",
-                    p.task_id,
-                    temp_path.display(),
-                    rm_err
-                );
+        let verified = match verify_checksum(&temp_path, &p.checksum).await {
+            Ok(verified) => verified,
+            Err(e) => {
+                if let Err(rm_err) = tokio::fs::remove_file(&temp_path).await {
+                    log_info!(
+                        "[download] task {} checksum failed; could not remove corrupt temp {}: {}",
+                        p.task_id,
+                        temp_path.display(),
+                        rm_err
+                    );
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
         log_info!("[download] task {} checksum ok", p.task_id);
+        // 校验通过的摘要就是落盘文件的哈希：记为文件哈希，免去完成后再读一遍整个文件。
+        // 记录失败只影响展示（用户可再手动计算），不让已通过校验的下载失败。
+        if let Err(error) = p.db.set_task_file_hash(&p.task_id, &verified).await {
+            log_warn!(
+                "[download] task {} could not record verified file hash: {:#}",
+                p.task_id,
+                error
+            );
+        }
     }
 
     // F034: rename 前对临时文件做 sync_all，确保内核页缓存已持久化到存储介质。
@@ -5593,8 +5509,10 @@ async fn download_single_once(
 
     // Resume only when the original method is GET-like. POST + Range is not a
     // portable contract and most servers ignore it, which would corrupt an append.
-    // 单 GET 探测保留了首响应的 fresh 任务：直接从 0 消费该响应，不发 Range（一次性 URL）。
-    let use_held = !is_resume && spec.has_held_response();
+    // 单请求探测保留了首响应：直接从 0 消费该响应，不发 Range（一次性 URL / 表单只提交一次）。
+    // 保留响应只出现在 fresh 运行（GET 类）或非 GET 请求上；后者从不按 Range 续传，即使
+    // 任务以续传身份进入也必须消费它，否则同一表单会被再提交一次。
+    let use_held = spec.has_held_response();
     let want_resume = spec.current().is_get_like()
         && supports_range
         && !use_held
@@ -5846,11 +5764,13 @@ async fn download_single_once(
             && !filename_looks_like_html(expected_filename)
         {
             return Err(DownloadError::Other(format!(
-                "server returned HTML page (Content-Type: {}) for a non-HTML download — \
-                 aborting to avoid corrupting saved file. \
-                 Likely causes: form-POST URL accessed via GET, expired one-time CDN token, \
-                 or site requires authentication that the extension did not capture.",
-                mime
+                "server returned HTML page (Content-Type: {mime}) for a non-HTML download — \
+                 aborting to avoid corrupting saved file; {}",
+                html_response_hint(
+                    spec.route_url(url).as_deref().unwrap_or(url),
+                    Some(resp.url()),
+                    &used.method,
+                )
             )));
         }
     }
@@ -6539,7 +6459,7 @@ mod tests {
             .await
             .err()
             .expect("closed port must fail");
-        let held_get = super::resolve_file_info_held_get(&client, &url, &spec)
+        let held_get = super::resolve_file_info_held(&client, &url, &spec)
             .await
             .err()
             .expect("closed port must fail");
@@ -6576,6 +6496,55 @@ mod tests {
             None
         );
         assert_eq!(super::infer_origin_referrer("not-a-valid-url"), None);
+    }
+
+    /// HTML 安全网：被重定向到登录 / 错误页时点出终点（不带 query 里的令牌），且路径里
+    /// 偶然出现的 `timeout` 之类字样不能把这个永久性失败变成可自动重试。
+    #[test]
+    fn html_hint_names_the_redirect_landing_without_its_query() {
+        let landing = reqwest::Url::parse(
+            "https://user:pw@onedrive.live.com/personal/x/_layouts/15/Authenticate.aspx?Source=%2Fdl&tempauth=SECRET",
+        )
+        .unwrap();
+        let hint = super::html_response_hint(
+            "https://onedrive.live.com/personal/x/_layouts/15/download.aspx?UniqueId=1",
+            Some(&landing),
+            &reqwest::Method::GET,
+        );
+        assert!(
+            hint.contains("https://onedrive.live.com/personal/x/_layouts/15/Authenticate.aspx "),
+            "{hint}"
+        );
+        assert!(
+            !hint.contains("SECRET") && !hint.contains("Source=") && !hint.contains("pw@"),
+            "{hint}"
+        );
+
+        // 终点与请求地址相同（未发生重定向）时不得声称被重定向。
+        let same = "https://cdn.example.com/a.zip?sig=1";
+        let not_redirected = super::html_response_hint(
+            same,
+            Some(&reqwest::Url::parse(same).unwrap()),
+            &reqwest::Method::POST,
+        );
+        assert!(
+            !not_redirected.contains("redirected to"),
+            "{not_redirected}"
+        );
+
+        let timeout_path = reqwest::Url::parse("https://login.example.com/timeout/eof").unwrap();
+        let message = format!(
+            "server returned HTML page (Content-Type: text/html) instead of the expected file — {}",
+            super::html_response_hint(
+                "https://dl.example.com/f",
+                Some(&timeout_path),
+                &reqwest::Method::GET
+            )
+        );
+        assert!(
+            !crate::download_manager::is_retriable_error(&message),
+            "{message}"
+        );
     }
 
     #[test]
@@ -9680,8 +9649,8 @@ mod single_resume_tests {
                 user_agent: String::new(),
                 data_dir_override: Some(dir.clone()),
                 database_url: Some(format!(
-                    "sqlite://{}?mode=rwc",
-                    dir.join("route.db").display()
+                    "sqlite:{}?mode=rwc",
+                    dir.join("route.db").to_string_lossy().replace('\\', "/")
                 )),
             },
             Arc::new(NoopSink),

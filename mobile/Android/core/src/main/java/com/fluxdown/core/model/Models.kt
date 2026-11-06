@@ -65,6 +65,10 @@ data class Task(
     val seedingStatus: SeedingStatus = SeedingStatus.None,
     val seedingMessage: String = "",
     val seedingTimeSecs: Long = 0,
+    /** BT 选片：按顺序下载。缺省 / 旧快照为 false。 */
+    val btSequential: Boolean = false,
+    /** BT 选片：先下载首尾文件块。缺省 / 旧快照为 false。 */
+    val btFirstLastPiecesFirst: Boolean = false,
 ) {
     /** 复制链接：读 originUrl，空则回退 url（torrent 任务的 url 是哨兵）。 */
     val shareUrl: String get() = originUrl.ifEmpty { url }
@@ -187,7 +191,7 @@ data class SelectionRequest(
 
 sealed interface SelectionKind {
     data class Hls(val options: List<HlsOption>) : SelectionKind
-    data class Bt(val files: List<BtFile>) : SelectionKind
+    data class Bt(val files: List<BtFile>, val saveDir: String = "") : SelectionKind
     data class Variant(val options: List<VariantOption>) : SelectionKind
     /** 多个启用插件的解析器都匹配同一 URL：让用户选一个（`candidates` 按 identity 升序）。 */
     data class Plugin(val site: String, val url: String, val candidates: List<PluginCandidate>) : SelectionKind
@@ -225,7 +229,7 @@ data class VariantOption(
 
 sealed interface SelectionOutcome {
     data class Hls(val index: Int) : SelectionOutcome
-    data class Bt(val indices: List<Int>) : SelectionOutcome
+    data class Bt(val indices: List<Int>, val saveDir: String? = null) : SelectionOutcome
     data class Variant(val index: Int) : SelectionOutcome
     data class Plugin(val identity: String, val remember: Boolean) : SelectionOutcome
     data class FileExists(val action: FileExistsAction) : SelectionOutcome

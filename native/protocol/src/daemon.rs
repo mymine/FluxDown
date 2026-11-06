@@ -17,8 +17,12 @@ pub enum SelectionKind {
     Hls {
         options: Vec<HlsQualityOptionDto>,
     },
+    /// BT 文件选择。`save_dir` = 任务当前保存目录（主机路径，供选择窗预填；旧 daemon 缺省）。
+    #[serde(rename_all = "camelCase")]
     Bt {
         files: Vec<BtFileDto>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        save_dir: String,
     },
     Variant {
         options: Vec<ResolveVariantOptionDto>,
@@ -96,6 +100,30 @@ pub struct PluginSetSiteDefaultParams {
     #[serde(default)]
     pub identity: Option<String>,
 }
+/// `daemon.plugin.archiveRules`：读取已验证包状态；`refresh` 请求显式刷新。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PluginArchiveRulesParams {
+    pub identity: String,
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+/// Verified signed archive-rule pack status returned by `daemon.plugin.archiveRules`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PluginArchiveRulesDto {
+    pub sequence: u64,
+    pub rule_count: usize,
+    pub last_checked_at: Option<u64>,
+    pub last_updated_at: Option<u64>,
+    pub last_error: Option<String>,
+    pub public_key: String,
+    pub update_url: Option<String>,
+    pub automatic_updates: bool,
+}
 
 /// 文件已存在时可选的处理动作。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -122,8 +150,12 @@ pub enum SelectionOutcome {
     Hls {
         index: i32,
     },
+    /// 应答 [`SelectionKind::Bt`]：`save_dir` 非空且不同于任务当前目录时，引擎丢弃已暂存的
+    /// 数据、把任务改到该目录后重新开始；缺省 = 沿用当前目录。
     Bt {
         indices: Vec<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        save_dir: Option<String>,
     },
     Variant {
         index: i32,
@@ -275,6 +307,25 @@ pub struct DaemonSeedLocalParams {
     /// `true` = 该任务永不因分享率 / 时长 / 不活跃限制停止做种（任务级限制全部「不限制」）。
     #[serde(default)]
     pub unlimited: bool,
+}
+
+/// `daemon.task.hash` 参数。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonTaskHashParams {
+    pub task_id: String,
+    /// 摘要算法：[`crate::HASH_ALGORITHMS`] 之一（也接受 `sha-256` 等带连字符写法）。
+    pub algorithm: String,
+}
+
+/// `daemon.task.hash` 结果。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TaskHashResult {
+    /// 记入任务的哈希，格式同 [`TaskDto::file_hash`]。
+    pub file_hash: String,
 }
 
 /// `daemon.task.seedLocal` 结果。`duplicate = true` 表示同一个种子（info hash）已被另一任务
@@ -1151,6 +1202,11 @@ pub struct TaskDto {
     /// 记录下载真正完成（status→3）的时刻，不含插件 hook 后处理耗时。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub completed_at: String,
+    /// 落盘文件的哈希记录，格式 `algo=hexhash`（小写，`algo` ∈ [`crate::HASH_ALGORITHMS`]；
+    /// 空 = 尚未计算）。校验和校验通过、下载完成后自动计算或 `daemon.task.hash` 写入；
+    /// 重新下载时清空。只对 status=3 有意义。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub file_hash: String,
     /// Source page URL captured by the browser extension (empty = none).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub referrer: String,
@@ -1221,6 +1277,12 @@ pub struct TaskDto {
     /// 任务级做种上传限速（字节/秒），0 = 未设置（跟随全局）。
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub seed_upload_limit_bps: i64,
+    /// BT 选片：按文件顺序下载（qBittorrent「按顺序下载」）。false = 最稀有优先。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bt_sequential: bool,
+    /// BT 选片：先下载每个选中文件首尾各 1% 的块（qBittorrent「先下载首尾文件块」）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bt_first_last_pieces_first: bool,
 }
 
 // `TaskDto` 默认值字段不上线：二十万任务的全表传输里它们占了约三分之一字节。反序列化端
@@ -1580,6 +1642,10 @@ pub struct PluginDto {
     /// 桌面端据此重新挂载桌面脚本视图。旧 daemon 不下发时为 0。
     #[serde(default)]
     pub package_revision: u64,
+    /// 安装来源：空 = 公开市场 / 本机包 / 旧版安装；`"private"` = FluxCloud 私有商店
+    /// （不受公开市场更新 / 撤回影响，由私有目录单独对账）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
 }
 
 /// 插件贡献点（镜像 `engine::plugin::ContributesDecl`）。
@@ -1594,6 +1660,9 @@ pub struct PluginContributionsDto {
     /// 是否贡献浏览器扩展嗅探规则。
     #[serde(default)]
     pub sniff_rules: bool,
+    /// Whether the plugin contributes signed archive classification rules.
+    #[serde(default)]
+    pub archive_rules: bool,
     /// 浏览器页面脚本声明（供授权 / 详情界面展示将在哪些网站运行脚本）。
     #[serde(default)]
     pub page_scripts: Vec<PluginPageScriptDeclDto>,
@@ -1759,6 +1828,20 @@ pub struct SetTaskSegmentsParams {
     pub segments: i32,
 }
 
+/// `daemon.task.setPiecePicking` 参数：修改 BT 任务的选片方式（对齐 qBittorrent 右键
+/// 「按顺序下载」「先下载首尾文件块」）。缺省字段保持不变；两项都关 = 最稀有优先。
+/// 下载中的任务从下一个请求的块起生效，其余状态下次开始时生效。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SetTaskPiecePickingParams {
+    pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequential: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_last_pieces_first: Option<bool>,
+}
+
 /// `daemon.task.verify` 结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1845,6 +1928,12 @@ pub struct MarketEntryDto {
     /// 插件桌面视图声明的网络主机（授权界面展示）。
     #[serde(default)]
     pub network_hosts: Vec<String>,
+    /// 渠道标记：公开市场条目无此字段；FluxCloud 私有目录恒为 `"private"`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// 私有条目的授权到期时间（RFC 3339）；缺省 / `null` = 永久（公开条目恒缺省）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 /// 从市场安装请求体。
@@ -1857,6 +1946,39 @@ pub struct MarketInstallRequest {
     /// 由客户端刷新目录后重新确认。缺省 = 不钉版本。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+}
+
+/// `daemon.plugin.installPrivate` 参数：agent 已校验 sha256 的包 blob + FluxCloud 私有目录条目。
+///
+/// 条目 `channel` 必须为 `"private"`；`mirrors` 被忽略（私有包只经 agent 票据下载）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInstallPrivateParams {
+    pub blob_id: String,
+    pub entry: MarketEntryDto,
+}
+
+/// 一条私有插件撤回：`yanked == "malicious"` 的 `(pluginId, version)`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PrivateRevocationDto {
+    pub plugin_id: String,
+    pub version: String,
+}
+
+/// `daemon.plugin.revokePrivate` 参数：agent 从 FluxCloud 私有目录取得的撤回清单。
+///
+/// `scope`：云端声明的「该账号曾有授权的插件」全集；存在时 `revoked` 是 scope 内插件的权威全集，
+/// daemon 据此解封已不在清单里的私有撤回。缺省（旧版云端）= 只增不清，不解封。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRevokePrivateParams {
+    pub revoked: Vec<PrivateRevocationDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Vec<String>>,
 }
 
 /// `daemon.plugin.consent` 参数：`permissions` / `networkHosts` 必须与插件当前请求的集合完全相等。
@@ -1983,6 +2105,20 @@ pub struct GroupItemRequest {
     #[serde(default)]
     pub size: i64,
 }
+/// 插件提供的根媒体提示。只作为分类提示，不含凭据、URL 或路径。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase", default)]
+pub struct ArchiveMetadataDto {
+    pub platform: String,
+    pub media_kind: String,
+    pub creator_id: String,
+    pub creator_name: String,
+    pub series_id: String,
+    pub series_title: String,
+    pub collection_id: String,
+    pub collection_title: String,
+}
 
 /// 创建多文件任务组请求（`POST /api/v1/groups`）。`items` 不可为空
 /// （空数组 → 400）。
@@ -2031,6 +2167,12 @@ pub struct CreateGroupRequest {
     /// fail-closed 落库；空 = 旧客户端，引擎按预解析同一规则（仅 `multi` resolver）重新选择。
     #[serde(default)]
     pub resolver_plugin_id: String,
+    /// Root metadata shared by all selected members, never per item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_metadata: Option<ArchiveMetadataDto>,
+    /// Classification routing, omitted for callers using an explicit save directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_route: Option<crate::agent::CategoryRouteDto>,
     /// 组成员清单（不可为空，见本类型文档）。
     #[serde(default)]
     pub items: Vec<GroupItemRequest>,
@@ -2082,6 +2224,9 @@ pub struct ResolvePreviewResponse {
     pub plugin_id: String,
     #[serde(default)]
     pub items: Vec<PreviewItemDto>,
+    /// Root-level source metadata shared by all preview items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_metadata: Option<ArchiveMetadataDto>,
 }
 
 /// [`ResolvePreviewResponse::items`] 的单个清单条目。

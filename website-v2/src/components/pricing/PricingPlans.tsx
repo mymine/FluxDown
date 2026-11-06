@@ -3,11 +3,12 @@ import { ArrowRight, Check, Zap } from "lucide-react";
 import type { Lang } from "@/i18n/config";
 import { pricing } from "@/i18n/messages/pricing";
 import { BrandIcon } from "@/components/icons/brand";
-import { formatDate, formatMinor } from "@/components/pay/money";
+import { formatMinor } from "@/components/pay/money";
 import { PlanBadge, PlanRibbon } from "./PlanBadge";
 import WebPurchase from "./WebPurchase";
 import type { CloudPlan } from "./types";
 import { withBase } from "@/lib/base";
+import { cloudPromoCopy, isCloudPromoActive } from "@/lib/cloud-promo";
 
 interface Props {
   lang: Lang;
@@ -64,6 +65,7 @@ export default function PricingPlans({ lang, downloadHref, sourceHref }: Props) 
   } else if (catalog.state === "ready") {
     for (const plan of catalog.plans.filter((p) => !isCard(p))) cells.push(<CloudPlanCell key={plan.code} plan={plan} lang={lang} />);
   } else {
+    const promoOn = isCloudPromoActive();
     cells.push(
       <PlanShell key="fb-free" tag={t.cloudTag} name={t.fallback.freeName} price={t.free} desc={t.fallback.freeDesc} />,
       <PlanShell
@@ -72,6 +74,7 @@ export default function PricingPlans({ lang, downloadHref, sourceHref }: Props) 
         name={t.fallback.lifetimeName}
         price={t.tbd}
         period={t.oneTime}
+        note={promoOn ? cloudPromoCopy[lang].badge : undefined}
         desc={t.fallback.lifetimeDesc}
         features={t.fallback.lifetimeFeatures}
         featured
@@ -166,7 +169,6 @@ function CloudPlanCell({ plan, lang }: { plan: CloudPlan; lang: Lang }) {
       price={priceMinor === 0 ? t.free : formatMinor(priceMinor, plan.currency, lang)}
       strike={c != null && c.effectivePriceMinor < plan.priceMinor ? formatMinor(plan.priceMinor, plan.currency, lang) : undefined}
       period={priceMinor > 0 ? (isCard(plan) ? pricing[lang].cards.period(plan.billingPeriodDays ?? 0) : t.oneTime) : undefined}
-      note={c?.endAt ? t.campaignEnds(formatDate(c.endAt, lang)) : undefined}
       campaign={
         c && (
           <div className="mb-5 mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border border-accent/30 bg-accent-soft px-3 py-2 text-xs">
