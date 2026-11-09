@@ -54,8 +54,9 @@ impl CaptureOutcome {
 /// 捕获来源，决定是否需要用户确认。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureOrigin {
-    /// 本机用户显式交来的链接（系统打开链接、拖入）：直接建任务。
-    Direct,
+    /// 系统默认处理程序交来的链接（`magnet:` / `ed2k://` / 直链）：遵循「免打扰下载」偏好——
+    /// 开启时全选、不二次选择直接建任务；关闭时排入确认队列，由官方 UI 弹新建下载窗口。
+    SystemOpen,
     /// 浏览器扩展 / 用户脚本 / NMH 等外部接管：按「免打扰下载」偏好静默或确认。
     External,
     /// 需要用户过目的探测结果（剪贴板监听）：恒入确认队列。
@@ -226,10 +227,10 @@ impl CaptureService {
             .collect()
     }
 
-    /// 按来源分流：`Direct` 与开启免打扰的 `External` 直接提交 daemon，其余排入确认队列（外壳
+    /// 按来源分流：开启免打扰的 `SystemOpen` / `External` 直接提交 daemon，其余排入确认队列（外壳
     /// 控制循环据快照在没有 UI 时拉起官方 UI）。批量请求（换行连接的多 URL）先拆成逐条请求。
     ///
-    /// 保存目录优先级：捕获方指定 > 分类目录 > （仅静默）跟随上次 > daemon 默认（原生移动端 `SilentCapture` 同序）。
+    /// 保存目录优先级：捕获方指定 > 分类目录 > （仅 `External` 静默）跟随上次 > daemon 默认（原生移动端 `SilentCapture` 同序）。
     /// 捕获方未指定目录时分类目录由 daemon 按初始名与下载完成时的最终文件名确定（[`CategoryPlan`]）；
     /// 确认路径把按捕获名命中的分类目录写进待确认摘要，官方表单据此预填。
     pub async fn submit(
@@ -261,7 +262,7 @@ impl CaptureService {
         if requests.is_empty() {
             return Ok(json!({ "taskIds": [] }));
         }
-        if origin == CaptureOrigin::Direct {
+        if origin == CaptureOrigin::SystemOpen && policy.silent {
             return self.create_all(requests, None, true, None).await;
         }
         if origin == CaptureOrigin::External && policy.silent {
@@ -717,12 +718,20 @@ fn captured_create_request(request: DownloadRequest) -> CaptureCreate {
     }
 }
 
+/// 表单来源页非空且与捕获的来源页（去首尾空白）不同 = 用户改过，捕获的 `Referer` 头须让位。
+fn referrer_edited(form: &str, captured: &str) -> bool {
+    let form = form.trim();
+    !form.is_empty() && form != captured.trim()
+}
+
 /// 官方 UI 表单结果合并进捕获原请求（规则见 `CaptureResolveParams::request`）。
 ///
 /// 表单看不到的请求上下文（method / body / 音频轨）与事务身份（url）恒取捕获值；
 /// 表单留空的字段回退捕获值；请求头以捕获为底、表单同名覆盖，表单填了 UA 时去掉
-/// 捕获的 `User-Agent` 头。表单的 HTTP 认证原样保留：引擎对非空 `httpUser` 注入的
-/// `Authorization` 会覆盖捕获头，留空则沿用浏览器头 / 已保存站点凭据。
+/// 捕获的 `User-Agent` 头，表单来源页非空且与捕获的不同时去掉捕获的 `Referer` 头
+/// （引擎优先取请求头里的 `Referer`，不去掉则用户的修改不生效；留空或未改则保留浏览器
+/// 真实发出的 `Referer`，它可能与记录的来源页不同）。表单的 HTTP 认证原样保留：引擎对非空
+/// `httpUser` 注入的 `Authorization` 会覆盖捕获头，留空则沿用浏览器头 / 已保存站点凭据。
 fn merge_confirmed_request(
     captured: DownloadRequest,
     mut confirmed: CreateTaskRequest,
@@ -745,10 +754,14 @@ fn merge_confirmed_request(
     };
     fill_if_blank(&mut confirmed.save_dir, base.save_dir);
     fill_if_blank(&mut confirmed.cookies, base.cookies);
+    let referrer_edited = referrer_edited(&confirmed.referrer, &base.referrer);
     fill_if_blank(&mut confirmed.referrer, base.referrer);
     let mut headers = base.headers.unwrap_or_default();
     if !confirmed.user_agent.trim().is_empty() {
         headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
+    }
+    if referrer_edited {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("referer"));
     }
     for (name, value) in confirmed.headers.take().unwrap_or_default() {
         headers.retain(|existing, _| !existing.eq_ignore_ascii_case(&name));
@@ -796,10 +809,14 @@ fn merge_group_request(
     }
     request.source_url = base.url;
     fill_if_blank(&mut request.cookies, base.cookies);
+    let referrer_edited = referrer_edited(&request.referrer, &base.referrer);
     fill_if_blank(&mut request.referrer, base.referrer);
     let mut headers = base.headers.unwrap_or_default();
     if !request.user_agent.trim().is_empty() {
         headers.retain(|name, _| !name.eq_ignore_ascii_case("user-agent"));
+    }
+    if referrer_edited {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("referer"));
     }
     for (name, value) in request.extra_headers {
         headers.retain(|existing, _| !existing.eq_ignore_ascii_case(&name));
@@ -987,8 +1004,8 @@ mod tests {
 
     use super::{
         CaptureError, CaptureOrigin, CaptureService, CategoryPlan, DownloadRequest, ExternalPolicy,
-        captured_create_request, into_preview_request, merge_confirmed_request,
-        merge_group_request, pending_capture_dto, split_batch,
+        SILENT_DOWNLOAD_PREF, captured_create_request, into_preview_request,
+        merge_confirmed_request, merge_group_request, pending_capture_dto, split_batch,
     };
 
     fn preferences(
@@ -1044,6 +1061,32 @@ mod tests {
     async fn silent_external_capture_creates_directly_instead_of_prompting() {
         let capture = service(json!({ "download.silent_download": true }));
         let result = capture.submit(captured(), CaptureOrigin::External).await;
+        assert!(matches!(result, Err(super::CaptureError::Daemon(_))));
+        assert!(capture.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn system_open_follows_silent_download_preference() {
+        // 免打扰关闭：系统打开的链接入确认队列（弹新建下载窗口），不建任务。
+        let capture = service(json!({ "download.silent_download": false }));
+        let queued = capture
+            .submit(captured(), CaptureOrigin::SystemOpen)
+            .await
+            .expect("queued for confirmation");
+        assert_eq!(queued["transactionIds"].as_array().map(Vec::len), Some(1));
+        assert_eq!(capture.list().await.len(), 1);
+
+        // 偏好缺省视同关闭。
+        let capture = service(json!({}));
+        capture
+            .submit(captured(), CaptureOrigin::SystemOpen)
+            .await
+            .expect("queued for confirmation");
+        assert_eq!(capture.list().await.len(), 1);
+
+        // 免打扰开启：直接提交 daemon（断开的 daemon 下失败即证明走了建任务路径），不入队。
+        let capture = service(json!({ "download.silent_download": true }));
+        let result = capture.submit(captured(), CaptureOrigin::SystemOpen).await;
         assert!(matches!(result, Err(super::CaptureError::Daemon(_))));
         assert!(capture.list().await.is_empty());
     }
@@ -1614,12 +1657,20 @@ mod tests {
     async fn capture_notifications_preserve_single_intents_and_batch_boundaries() {
         tokio::time::timeout(Duration::from_secs(5), async {
             let (capture, mut calls, daemon_events, stop, server) = daemon_service().await;
+            capture.events.publish(AgentEvent::PreferencesChanged(
+                fluxdown_protocol::AgentPreferencesDto {
+                    revision: 1,
+                    values: [(SILENT_DOWNLOAD_PREF.to_owned(), json!(true))].into(),
+                },
+            ));
             let (mut events, _) = capture.events.subscribe_and_snapshot();
             let single = {
                 let capture = Arc::clone(&capture);
-                tokio::spawn(
-                    async move { capture.submit(get_capture(), CaptureOrigin::Direct).await },
-                )
+                tokio::spawn(async move {
+                    capture
+                        .submit(get_capture(), CaptureOrigin::SystemOpen)
+                        .await
+                })
             };
             let (request, reply) = calls.recv().await.expect("single create");
             assert_eq!(
@@ -1643,7 +1694,10 @@ mod tests {
                     let capture = Arc::clone(&capture);
                     tokio::spawn(async move {
                         capture
-                            .submit_many(vec![get_capture(), get_capture()], CaptureOrigin::Direct)
+                            .submit_many(
+                                vec![get_capture(), get_capture()],
+                                CaptureOrigin::SystemOpen,
+                            )
                             .await
                     })
                 };
@@ -2022,6 +2076,100 @@ mod tests {
             headers.get("Authorization").map(String::as_str),
             Some("Basic YTpi")
         );
+    }
+
+    fn captured_with_referer_header() -> DownloadRequest {
+        let mut request = get_capture();
+        request
+            .headers
+            .get_or_insert_default()
+            .insert("referer".to_owned(), "https://example.com/root/".to_owned());
+        request
+    }
+
+    fn referer_header(headers: &Option<HashMap<String, String>>) -> Option<&str> {
+        headers
+            .as_ref()?
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn edited_referrer_replaces_captured_referer_header() {
+        let merged = merge_confirmed_request(
+            captured_with_referer_header(),
+            form(json!({ "url": "", "referrer": "https://edited.example/other" })),
+        )
+        .request;
+        assert_eq!(merged.referrer, "https://edited.example/other");
+        assert_eq!(referer_header(&merged.headers), None);
+        // 表单自带 Referer 头仍按同名覆盖规则保留。
+        let merged = merge_confirmed_request(
+            captured_with_referer_header(),
+            form(json!({
+                "url": "",
+                "referrer": "https://edited.example/other",
+                "headers": { "Referer": "https://explicit.example/" },
+            })),
+        )
+        .request;
+        assert_eq!(
+            referer_header(&merged.headers),
+            Some("https://explicit.example/")
+        );
+    }
+
+    #[test]
+    fn unchanged_or_blank_referrer_keeps_captured_referer_header() {
+        for referrer in [
+            "",
+            "  ",
+            "https://example.com/page",
+            " https://example.com/page ",
+        ] {
+            let merged = merge_confirmed_request(
+                captured_with_referer_header(),
+                form(json!({ "url": "", "referrer": referrer })),
+            )
+            .request;
+            assert_eq!(
+                referer_header(&merged.headers),
+                Some("https://example.com/root/"),
+                "{referrer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_edited_referrer_replaces_captured_referer_header() {
+        let context = form(json!({ "url": "" }));
+        let mut edited = group();
+        edited.referrer = "https://edited.example/other".to_owned();
+        let merged = merge_group_request(captured_with_referer_header(), edited, &context)
+            .expect("merge edited group");
+        assert_eq!(merged.referrer, "https://edited.example/other");
+        assert!(
+            !merged
+                .extra_headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("referer"))
+        );
+        for referrer in ["", "https://example.com/page"] {
+            let mut kept = group();
+            kept.referrer = referrer.to_owned();
+            let merged = merge_group_request(captured_with_referer_header(), kept, &context)
+                .expect("merge kept group");
+            assert_eq!(
+                merged
+                    .extra_headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("referer"))
+                    .map(|(_, value)| value.as_str()),
+                Some("https://example.com/root/"),
+                "{referrer:?}"
+            );
+        }
     }
 
     /// 读到请求头结束与整个请求体为止，返回头部文本（小写化便于断言）。

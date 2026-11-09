@@ -501,7 +501,7 @@ async fn run_actor(
                         .await;
                     }
                     DaemonCommand::Shutdown { ack } => {
-                        selections.resolve_all_defaults();
+                        selections.resolve_all_for_shutdown();
                         cancel.cancel();
                         if ack.send(()).is_err() {
                             tracing::debug!("daemon shutdown caller disconnected before acknowledgement");
@@ -571,7 +571,7 @@ async fn run_actor(
         Ok(Err(error)) => tracing::error!(%error, "daemon speed history flush failed"),
         Err(_) => tracing::error!("daemon speed history flush timed out"),
     }
-    selections.resolve_all_defaults();
+    selections.resolve_all_for_shutdown();
     commands.close();
     while let Some(command) = commands.recv().await {
         match command {
@@ -1211,6 +1211,8 @@ async fn execute_operation(
         ActorOperation::PauseAll => {
             let mut ids = pause_all_task_ids(&engine.db).await?;
             ids.extend(engine.manager.retry_pending_task_ids());
+            // 重建连接 flush 窗口内的任务库里已是暂停态，不在上面的列表里。
+            ids.extend(engine.manager.pending_resume_task_ids());
             engine.manager.batch_pause_all(&ids).await;
         }
         ActorOperation::PauseTasks { task_ids } => {
@@ -2399,6 +2401,7 @@ async fn apply_live_config<'a>(
             .set_proxy_config(fluxdown_engine::proxy_config::ProxyConfig::from_config_map(
                 all,
             ))
+            .await
             .map_err(|error| ActorError::Operation(format!("{error:#}")))?;
     } else if keys.contains(&rules_key) {
         engine.manager.set_proxy_rules(

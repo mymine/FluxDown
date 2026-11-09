@@ -192,6 +192,8 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         DaemonConfigKind::Bool,
         "false",
     ),
+    // 「选择要下载的文件」对话框 60 秒无人答复时按默认（全部文件）开始；关闭后一直等用户选择。
+    field("bt_selection_auto_default", DaemonConfigKind::Bool, "true"),
     field("bt_tracker_sub_enabled", DaemonConfigKind::Bool, "true"),
     field("bt_tracker_sub_urls", DaemonConfigKind::Text, ""),
     field("bt_tracker_sub_cache", DaemonConfigKind::ReadOnly, ""),
@@ -375,7 +377,7 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
     // ── 受管组件手动路径（空 = 自动解析）──
     field("component.ffmpeg.path", DaemonConfigKind::Text, ""),
     field("component.ytdlp.path", DaemonConfigKind::Text, ""),
-    // 组件下载镜像基址（空 = 直连 GitHub）；只接受 https。
+    // 组件下载与插件市场（索引 / 插件包）的 GitHub 镜像基址（空 = 直连 GitHub）；只接受 https。
     field("component_mirror_base", DaemonConfigKind::Text, ""),
     // ── 日志 ──
     // 日志目录总大小上限（MB），daemon 启动与每次配置提交后应用到引擎 logger。

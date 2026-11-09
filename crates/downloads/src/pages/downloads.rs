@@ -524,12 +524,16 @@ impl DownloadView {
     }
 
     /// 「新建下载」表单的环境快照：保存目录 / 默认队列 / 线程数初值与队列候选；
-    /// 队列优先侧栏当前筛选（规则见 [`build_new_download_context`]）。
+    /// 队列、「下载到」设备优先侧栏当前筛选（规则见 [`build_new_download_context`]）。
     #[must_use]
     pub fn new_download_context(&self) -> NewDownloadContext {
         let controller = &self.controller;
         let selected_queue = match &self.selected_item {
             SidebarSelection::Queue(queue_id) => Some(queue_id.as_str()),
+            _ => None,
+        };
+        let selected_device = match &self.selected_item {
+            SidebarSelection::Device(id) => Some(id.as_str()),
             _ => None,
         };
         build_new_download_context(
@@ -538,6 +542,7 @@ impl DownloadView {
             controller.preferences(),
             controller.queues(),
             selected_queue,
+            selected_device,
             controller.other_devices(),
         )
     }
@@ -1026,12 +1031,33 @@ impl DownloadView {
         cx.notify();
     }
 
+    /// 「隐藏任务来源」偏好 → 表格副标题与停靠详情副标题。独立于 [`Self::load_view_prefs`] 的
+    /// 视图偏好去重：它是单独的偏好键，变化后只重画，不触发视图重算。
+    fn sync_hide_source(&mut self, cx: &mut Context<Self>) {
+        self.sync_detail_hide_source(cx);
+        let hide = self.controller.hide_task_source();
+        self.table_state.update(cx, |table, cx| {
+            if table.delegate_mut().set_hide_source(hide) {
+                cx.notify();
+            }
+        });
+    }
+
+    /// 只把「隐藏任务来源」偏好同步给停靠详情（切换 / 新建详情面板时用，表格不受影响）。
+    fn sync_detail_hide_source(&mut self, cx: &mut Context<Self>) {
+        let hide = self.controller.hide_task_source();
+        if let Some(detail) = self.detail.clone() {
+            detail.update(cx, |detail, cx| detail.set_hide_source(hide, cx));
+        }
+    }
+
     /// 偏好 → 表格视图设置；无偏好时用默认视图。
     ///
     /// 任何偏好键变化都会触发这里（`PreferencesChanged` 不区分键），只有视图偏好本身的持久化值
     /// 变了才重载：否则别的键（如命令面板使用记录）回流时，会用旧持久化值覆盖 300ms 防抖
     /// 窗口内尚未写回的本地改动，表现为切换密度 / 分组 / 详情面板「无效」。
     fn load_view_prefs(&mut self, cx: &mut Context<Self>) {
+        self.sync_hide_source(cx);
         let prefs = match self.controller.preference(VIEW_PREFS_KEY) {
             Some(value) if self.applied_view_prefs.as_ref() == Some(value) => return,
             Some(value) => {
@@ -1352,6 +1378,7 @@ impl DownloadView {
                 self.detail = Some(detail);
             }
         }
+        self.sync_detail_hide_source(cx);
         self.sync_detail_panel(cx);
         cx.notify();
     }

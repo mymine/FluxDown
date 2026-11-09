@@ -254,6 +254,7 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   text('bt_custom_trackers'),
   oneOf('bt_piece_order', 'rarest', BT_PIECE_ORDERS),
   bool('bt_first_last_pieces_first', 'false'),
+  bool('bt_selection_auto_default', 'true'),
   bool('bt_tracker_sub_enabled', 'true'),
   text('bt_tracker_sub_urls'),
   readOnly('bt_tracker_sub_cache'),
@@ -315,7 +316,7 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   // 受管组件手动路径（空 = 自动解析）
   text('component.ffmpeg.path'),
   text('component.ytdlp.path'),
-  // 组件下载镜像基址（空 = 直连 GitHub）；只接受 https
+  // 组件下载与插件市场（索引 / 插件包）的 GitHub 镜像基址（空 = 直连 GitHub）；只接受 https
   text('component_mirror_base'),
   // 日志目录总大小上限（MB）
   int('log_max_size_mb', '10', 1, 1024),
