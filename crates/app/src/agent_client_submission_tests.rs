@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use fluxdown_protocol::method;
 use futures_util::{SinkExt, StreamExt};
@@ -6,8 +6,8 @@ use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 use super::{
-    AgentClient, Bootstrap, ClientCommand, PreferenceWrites, ServiceBootstrap, Socket,
-    SubmissionTransport, run_connected,
+    AgentClient, AgentClientConfig, Bootstrap, ClientCommand, PreferenceWrites, ServiceBootstrap,
+    Socket, SubmissionTransport, run_connected,
 };
 use crate::downloads_port::AgentDownloadsPort;
 use fluxdown_ui_downloads::{
@@ -77,6 +77,10 @@ fn rpc_import_pause_failure_disconnect_and_resume_preserve_unsent_order() {
                 commands,
                 runtime: runtime.clone(),
                 bootstrap: Arc::new(ServiceBootstrap::new()),
+                config: AgentClientConfig {
+                    rpc_url: None,
+                    bearer_path: PathBuf::new(),
+                },
                 submissions: Arc::new(crate::downloads_port::SubmissionGate::default()),
             });
             let port = Arc::new(AgentDownloadsPort::new(client.clone()));
@@ -201,6 +205,10 @@ fn test_client(
             commands,
             runtime: runtime.clone(),
             bootstrap: Arc::new(ServiceBootstrap::new()),
+            config: AgentClientConfig {
+                rpc_url: None,
+                bearer_path: PathBuf::new(),
+            },
             submissions: Arc::new(crate::downloads_port::SubmissionGate::default()),
         }),
         receiver,
@@ -510,6 +518,7 @@ fn create_many_resends_same_batch_after_disconnect_without_pausing_the_gate() {
                         .collect(),
                     captures: Vec::new(),
                     category_route: None,
+                    last_category_mode: "auto".to_owned(),
                     offered_save_dir: String::new(),
                 },
                 move |command| submit_port.execute(command),
@@ -548,7 +557,8 @@ fn create_many_resends_same_batch_after_disconnect_without_pausing_the_gate() {
             assert_ne!(last["params"]["batchId"], batch_id);
             assert_eq!(last["params"]["items"].as_array().map(Vec::len), Some(1));
             reply(&mut peer, &last, many_reply(1)).await;
-            for _ in 0..2 {
+            // 上次目录、目录历史、分类模式记忆三条本机偏好。
+            for _ in 0..3 {
                 let preference = request(&mut peer, method::AGENT_PREFERENCES_PATCH).await;
                 reply(&mut peer, &preference, json!({"ok": true})).await;
             }

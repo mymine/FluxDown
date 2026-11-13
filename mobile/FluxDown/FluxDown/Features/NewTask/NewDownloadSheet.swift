@@ -150,6 +150,9 @@ private struct NewDownloadContent: View {
         .onChange(of: form.categoryPredictionKey, initial: true) {
             form.followCategory(session: container.session)
         }
+        .onChange(of: categoryOptions) {
+            form.reconcileCategory(options: categoryOptions, session: container.session)
+        }
         .interactiveDismissDisabled(form.isDirty || form.submitting)
         .fileImporter(
             isPresented: $showImporter,
@@ -399,9 +402,7 @@ private struct NewDownloadContent: View {
     private func destinationSection(_ entries: [UrlEntry]) -> some View {
         let options = categoryOptions
         return Section {
-            if !options.isEmpty {
-                categoryPicker(options)
-            }
+            categoryPicker(options)
             if container.isLocalHost {
                 LabeledContent(L("saveDir")) {
                     Text(form.saveDir.isEmpty ? LocalPaths.documents.path : form.saveDir)
@@ -431,7 +432,7 @@ private struct NewDownloadContent: View {
 
     // MARK: 分类
 
-    /// 能产生分类路由的分类（可见、非「全部」、目录非空）；没有具体分类时仍显示「自动 / 不分类」。
+    /// 能产生分类路由的分类（可见、非「全部」、目录非空）；空列表仍提供自动 / 不分类。
     private var categoryOptions: [CustomCategoryDto] {
         SaveDirCategoryState.options(CustomCategoryDto.fromPreference(state.preferences[CustomCategoryDto.preferenceKey]))
     }
@@ -774,7 +775,7 @@ private struct NewDownloadContent: View {
             return
         }
         #endif
-        createTasks(requests, startPaused: startPaused)
+        createTasks(requests, startPaused: startPaused, categoryMode: form.categoryState.mode)
     }
 
     #if FULL_FLAVOR
@@ -809,13 +810,13 @@ private struct NewDownloadContent: View {
                 FluxHaptic.soft.play()
                 path.append(.manifest(.daemon(preview: preview, sourceUrl: url), base))
             } else {
-                createTasks(requests, startPaused: startPaused)
+                createTasks(requests, startPaused: startPaused, categoryMode: base.categoryMode)
             }
         }
     }
     #endif
 
-    private func createTasks(_ requests: [CreateTaskRequest], startPaused: Bool) {
+    private func createTasks(_ requests: [CreateTaskRequest], startPaused: Bool, categoryMode: SaveDirCategoryMode) {
         form.submitting = true
         let session = container.session
         let toasts = container.toasts
@@ -830,6 +831,7 @@ private struct NewDownloadContent: View {
                     failure = error
                 }
             }
+            if !done.isEmpty { await session.rememberCategoryMode(categoryMode) }
             form.submitting = false
             if let failure {
                 reject()
@@ -948,6 +950,8 @@ private struct NewDownloadContent: View {
         }
         importingTorrent = true
         defer { importingTorrent = false }
+        let categoryMode = form.categoryState.mode
+        let session = container.session
         let outcome = await TorrentImport.submit(
             urls,
             container: container,
@@ -955,6 +959,7 @@ private struct NewDownloadContent: View {
             queueId: currentQueueId(state.queues),
             startPaused: false
         )
+        if outcome.created > 0 { await session.rememberCategoryMode(categoryMode) }
         if outcome.created > 0, form.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             close()
         }

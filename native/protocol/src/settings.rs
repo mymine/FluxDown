@@ -56,7 +56,7 @@ pub const MAX_SYNC_VALUE_BYTES: usize = 64 * 1024;
 /// 保留旧客户端云同步键，另含 GPUI 专属的 `ui.show_activity_*`、
 /// `custom_categories`（自定义分类，推送时剥离各设备不同的 `saveDir`）、[`CUSTOM_THEMES_KEY`]
 /// （自定义主题集合）与 [`FILE_ICON_PACK_KEY`]（GPUI / Web 文件图标包），共 59 个；
-/// 另含 19 个 `bt.guard.*`（BT 防吸血；`bt_guard_report_enabled` 设备本地，不进目录）。
+/// 另含 20 个 `bt.guard.*`（BT 防吸血；`bt_guard_report_enabled` 设备本地，不进目录）。
 pub const SYNC_SETTING_SPECS: &[SettingSpec] = &[
     spec!("appearance.theme_mode", Preferences),
     spec!("appearance.dark_theme", Preferences),
@@ -184,6 +184,7 @@ pub const SYNC_SETTING_SPECS: &[SettingSpec] = &[
     spec!("bt.guard.skip_lan", Daemon, "bt_guard_skip_lan"),
     spec!("bt.guard.ipv6_prefix", Daemon, "bt_guard_ipv6_prefix"),
     spec!("bt.guard.filter_urls", Daemon, "bt_guard_filter_urls"),
+    spec!("bt.guard.client_rules", Daemon, "bt_guard_client_rules"),
     spec!("bt.guard.cloud_enabled", Daemon, "bt_guard_cloud_enabled"),
     spec!("ed2k.enable_kad", Daemon, "ed2k_enable_kad"),
     spec!("ed2k.enable_upnp", Daemon, "ed2k_enable_upnp"),
@@ -497,7 +498,7 @@ fn integer_range(key: &str) -> (i64, i64) {
         "download.cdn_max_nodes" => (0, 8),
         "download.max_auto_retries" => (-1, 20),
         "download.auto_retry_delay_secs" => (0, 86_400),
-        "bt.guard.excess_ratio_pct" => (110, 1000),
+        "bt.guard.excess_ratio_pct" => (110, 2000),
         "bt.guard.min_torrent_mib" => (0, 1_048_576),
         "bt.guard.rewind_tolerance_pct" => (0, 100),
         "bt.guard.throttle_kib" => (1, 1_048_576),
@@ -522,14 +523,14 @@ mod tests {
 
     #[test]
     fn catalog_has_exact_unique_flutter_count_and_namespaced_daemon_mapping() {
-        assert_eq!(SYNC_SETTING_SPECS.len(), 81);
+        assert_eq!(SYNC_SETTING_SPECS.len(), 82);
         assert_eq!(
             SYNC_SETTING_SPECS
                 .iter()
                 .map(|spec| spec.key)
                 .collect::<HashSet<_>>()
                 .len(),
-            81
+            82
         );
         let spec = setting_spec("download.max_concurrent_tasks").expect("download spec");
         assert_eq!(spec.owner, SettingOwner::Daemon);
@@ -656,7 +657,7 @@ mod bt_guard_tests {
             .iter()
             .filter(|spec| spec.key.starts_with("bt.guard."))
             .collect();
-        assert_eq!(specs.len(), 19);
+        assert_eq!(specs.len(), 20);
         for spec in specs {
             assert_eq!(spec.owner, SettingOwner::Daemon, "{}", spec.key);
             assert_eq!(
@@ -679,7 +680,7 @@ mod bt_guard_tests {
     #[test]
     fn guard_ranges_match_daemon_catalog() {
         for (key, lo, hi) in [
-            ("excess_ratio_pct", 110_i64, 1000_i64),
+            ("excess_ratio_pct", 110_i64, 2000_i64),
             ("min_torrent_mib", 0, 1_048_576),
             ("rewind_tolerance_pct", 0, 100),
             ("throttle_kib", 1, 1_048_576),
@@ -728,6 +729,8 @@ mod bt_guard_tests {
         }
         assert!(validate_value("bt.guard.filter_urls", &json!("https://a\nhttps://b")).is_ok());
         assert!(validate_value("bt.guard.filter_urls", &json!(1)).is_err());
+        assert!(validate_value("bt.guard.client_rules", &json!("[]")).is_ok());
+        assert!(validate_value("bt.guard.client_rules", &json!([])).is_err());
     }
 
     #[test]

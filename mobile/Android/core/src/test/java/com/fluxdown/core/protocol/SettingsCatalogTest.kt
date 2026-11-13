@@ -13,8 +13,8 @@ class SettingsCatalogTest {
 
     @Test
     fun syncCatalogMatchesRustSpecCount() {
-        // SYNC_SETTING_SPECS（native/protocol/src/settings.rs）：51 个 daemon 键（含 19 个 bt.guard.*）+ 29 个偏好键 + 1 个集合范围键 = 81
-        assertEquals(51, SettingsCatalog.daemonSyncNames.size)
+        // SYNC_SETTING_SPECS（native/protocol/src/settings.rs）：52 个 daemon 键（含 20 个 bt.guard.*）+ 29 个偏好键 + 1 个集合范围键 = 82
+        assertEquals(52, SettingsCatalog.daemonSyncNames.size)
         assertEquals(29, SettingsCatalog.syncedPreferenceKeys.size)
         assertEquals(SettingsCatalog.daemonSyncNames.size, SettingsCatalog.syncNameToDaemonKey.size)
     }
@@ -22,10 +22,10 @@ class SettingsCatalogTest {
     @Test
     fun btGuardKeysMirrorContract() {
         val guard = SettingsCatalog.daemonFields.filter { it.key.startsWith("bt_guard_") }
-        // 20 个 daemon 键：19 个同步 + 设备本地上报开关
-        assertEquals(20, guard.size)
+        // 21 个 daemon 键：20 个同步 + 设备本地上报开关
+        assertEquals(21, guard.size)
         val synced = SettingsCatalog.daemonSyncNames.filterKeys { it.startsWith("bt_guard_") }
-        assertEquals(19, synced.size)
+        assertEquals(20, synced.size)
         synced.forEach { (daemonKey, syncName) ->
             assertEquals("bt.guard." + daemonKey.removePrefix("bt_guard_"), syncName)
         }
@@ -34,6 +34,9 @@ class SettingsCatalogTest {
         assertTrue(rejected("bt_guard_cloud_cache", "{}"))
         assertEquals("false", SettingsCatalog.defaultWire("bt_guard_report_enabled"))
         assertEquals("observe", SettingsCatalog.defaultWire("bt_guard_rule_lag"))
+        assertEquals("enforce", SettingsCatalog.defaultWire("bt_guard_rule_fingerprint"))
+        assertEquals("", SettingsCatalog.defaultWire("bt_guard_client_rules"))
+        assertEquals("bt.guard.client_rules", SettingsCatalog.daemonSyncNames["bt_guard_client_rules"])
         assertEquals("200", SettingsCatalog.defaultWire("bt_guard_excess_ratio_pct"))
         assertEquals("throttle", SettingsCatalog.defaultWire("bt_guard_downloading_max_action"))
     }
@@ -47,7 +50,7 @@ class SettingsCatalogTest {
         assertTrue(rejected("bt_guard_downloading_max_action", "off"))
         assertEquals("110", ok("bt_guard_excess_ratio_pct", "110"))
         assertTrue(rejected("bt_guard_excess_ratio_pct", "109"))
-        assertTrue(rejected("bt_guard_excess_ratio_pct", "1001"))
+        assertTrue(rejected("bt_guard_excess_ratio_pct", "2001"))
         assertEquals("0", ok("bt_guard_min_torrent_mib", "0"))
         assertTrue(rejected("bt_guard_min_torrent_mib", "1048577"))
         assertTrue(rejected("bt_guard_rewind_tolerance_pct", "101"))
@@ -114,6 +117,7 @@ class SettingsCatalogTest {
                 "bt_seed_ratio_limit" to "1.5",
                 "proxy_mode" to "manual",
                 "download.keep_awake" to "true",
+                "download.silent_auto_category" to "true",
                 "download.silent_skip_selection" to "1",
             ),
         )
@@ -123,9 +127,14 @@ class SettingsCatalogTest {
         assertEquals(JsonValue.of(1.5), plan.syncedPreferences["bt.seed_ratio_limit"])
         assertEquals(JsonValue.True, plan.syncedPreferences["download.keep_awake"])
         assertEquals("max_concurrent_tasks", plan.syncedDaemonKeys["download.max_concurrent_tasks"])
-        // 目录外的偏好只写本机
-        assertEquals(mapOf("download.silent_skip_selection" to JsonValue.True), plan.localPreferences)
-        assertFalse(plan.isEmpty)
+        assertEquals(mapOf(
+            "download.silent_skip_selection" to JsonValue.True,
+            "download.silent_auto_category" to JsonValue.True,
+        ), plan.localPreferences)
+        assertFalse(SettingsCatalog.isSynced("download.silent_auto_category"))
+        // 免打扰主开关与子开关并存：子开关的可见性与默认值都依赖它在目录里。
+        assertEquals("false", SettingsCatalog.defaultWire("download.silent_download"))
+        assertEquals("true", SettingsCatalog.defaultWire("download.silent_auto_category"))
     }
 
     @Test

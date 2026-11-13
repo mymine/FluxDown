@@ -7,14 +7,18 @@ import { PluginViewHost } from '../../plugins/view/PluginViewHost'
 import { useDownloads } from '../state'
 import { isSeeding } from '../model/task'
 import { AdvancedTab } from './AdvancedTab'
+import { BtFilesTab } from './BtFilesTab'
 import { BtPeersTab } from './BtPeersTab'
 import { BtTrackersTab } from './BtTrackersTab'
+import { Ed2kNetworkTab } from './Ed2kNetworkTab'
+import { Ed2kSourcesTab } from './Ed2kSourcesTab'
 import { GeneralTab } from './GeneralTab'
 import { LogTab } from './LogTab'
 import { SeedingTab } from './SeedingTab'
 import { SpeedTab } from './SpeedTab'
 import { GroupOverview } from './GroupOverview'
 import { useSpeedHistory } from './useSpeedHistory'
+import { btTaskRunning } from './btStatus'
 import type { DownloadTaskView } from '../model/task'
 
 /** 内置 tab 或插件 tab（`plugin:<identity>:<viewId>`）。 */
@@ -24,23 +28,32 @@ function TaskDetail({ view }: { view: DownloadTaskView }) {
   const t = useT()
   const [tab, setTab] = useState<DetailTab>('general')
   const isBt = view.protocol === 'bt'
+  const isEd2k = view.protocol === 'ed2k'
   const pluginTabs = usePluginDetailTabs()
   const pluginTab = pluginTabs.find((item) => item.value === tab)
-  // 插件 tab 随插件卸载 / 禁用消失时回到常规；seeding 仅 BT 任务有。
+  // 插件 tab 随插件卸载 / 禁用消失时回到常规；files / seeding / trackers / peers 仅 BT、ed2kSources / ed2kNetwork 仅 eD2K 任务有。
   const active: DetailTab =
-    ((tab === 'seeding' || tab === 'trackers' || tab === 'peers') && !isBt) ||
+    ((tab === 'files' || tab === 'seeding' || tab === 'trackers' || tab === 'peers') && !isBt) ||
+    ((tab === 'ed2kSources' || tab === 'ed2kNetwork') && !isEd2k) ||
     (tab.startsWith('plugin:') && !pluginTab)
       ? 'general'
       : tab
   const speedHistory = useSpeedHistory(view.taskId, view.state === 'downloading', active === 'speed')
   const items = [
     { value: 'general' as const, label: t('detailTabGeneral') },
+    ...(isBt ? [{ value: 'files' as const, label: t('btTabFiles') }] : []),
     { value: 'speed' as const, label: t('detailTabSpeed') },
     ...(isBt ? [{ value: 'seeding' as const, label: t('tabSeeding') }] : []),
     ...(isBt
       ? [
           { value: 'trackers' as const, label: t('btTabTrackers') },
           { value: 'peers' as const, label: t('btTabPeers') },
+        ]
+      : []),
+    ...(isEd2k
+      ? [
+          { value: 'ed2kSources' as const, label: t('ed2kTabSources') },
+          { value: 'ed2kNetwork' as const, label: t('ed2kTabNetwork') },
         ]
       : []),
     { value: 'log' as const, label: t('detailTabLog') },
@@ -54,10 +67,13 @@ function TaskDetail({ view }: { view: DownloadTaskView }) {
       </div>
       <div className="min-h-0 flex-1 overflow-auto p-3">
         {active === 'general' ? <GeneralTab view={view} /> : null}
+        {active === 'files' ? <BtFilesTab key={view.taskId} taskId={view.taskId} /> : null}
         {active === 'speed' ? <SpeedTab view={view} history={speedHistory} /> : null}
         {active === 'seeding' ? <SeedingTab view={view} /> : null}
-        {active === 'trackers' ? <BtTrackersTab taskId={view.taskId} /> : null}
+        {active === 'trackers' ? <BtTrackersTab taskId={view.taskId} running={btTaskRunning(view)} /> : null}
         {active === 'peers' ? <BtPeersTab taskId={view.taskId} state={view.state} seeding={isSeeding(view)} /> : null}
+        {active === 'ed2kSources' ? <Ed2kSourcesTab taskId={view.taskId} /> : null}
+        {active === 'ed2kNetwork' ? <Ed2kNetworkTab view={view} /> : null}
         {active === 'log' ? <LogTab taskId={view.taskId} /> : null}
         {active === 'advanced' ? <AdvancedTab view={view} /> : null}
         {pluginTab && active === pluginTab.value ? (

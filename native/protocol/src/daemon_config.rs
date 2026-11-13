@@ -47,6 +47,10 @@ pub const BT_SEED_THEN_ACTIONS: &[&str] = &["stop", "delete", "delete_files"];
 pub const BT_MSE_MODES: &[&str] = &["disabled", "enabled", "forced"];
 /// 新建 BT 任务的默认选片方式：最稀有优先 / 按顺序下载。
 pub const BT_PIECE_ORDERS: &[&str] = &["rarest", "sequential"];
+/// uTP 拥塞控制：LEDBAT（延迟敏感，主动给其他流量让路，BEP 29 的标准算法）/ CUBIC（只按丢包退让）。
+pub const BT_UTP_CONGESTIONS: &[&str] = &["ledbat", "cubic"];
+/// BT 代理来源：「代理」页的手动代理服务器 / 系统代理（建 BT 会话时检测）。
+pub const BT_PROXY_SOURCES: &[&str] = &["manual", "system"];
 /// BT 防吸血规则 / 云名单的执行模式。
 pub const BT_GUARD_MODES: &[&str] = &["off", "observe", "enforce"];
 /// BT 防吸血：下载中任务的动作上限。
@@ -179,6 +183,64 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         DaemonConfigKind::Enum(BT_MSE_MODES),
         "enabled",
     ),
+    // 每个种子同时上传给多少个对端（上传槽）：0 = 自动（按上传速率伸缩，至少 4 个）。
+    // 上限 = 引擎每个种子的 peer 上限（`bt_downloader.rs::BT_PEER_LIMIT`），再大没有意义。
+    // 设备本地：合适的槽数取决于本机上行带宽，不进云同步目录。
+    field(
+        "bt_upload_slots",
+        DaemonConfigKind::Integer { min: 0, max: 512 },
+        "0",
+    ),
+    // ── BT 连接（全部设备本地：取决于本机网络环境，不进云同步目录）──
+    // 本地节点发现（LSD，局域网多播）。
+    field("bt_enable_lsd", DaemonConfigKind::Bool, "true"),
+    field(
+        "bt_utp_congestion",
+        DaemonConfigKind::Enum(BT_UTP_CONGESTIONS),
+        "ledbat",
+    ),
+    // 全部 BT 任务合计的连接数上限（连接中 + 已连接）：0 = 不限。热生效，不重建会话。
+    field(
+        "bt_max_connections",
+        DaemonConfigKind::Integer {
+            min: 0,
+            max: 65_535,
+        },
+        "0",
+    ),
+    // 每个任务的连接数上限（连接中 + 已连接）。热生效，不重建会话。
+    field(
+        "bt_max_connections_per_torrent",
+        DaemonConfigKind::Integer { min: 1, max: 4096 },
+        "512",
+    ),
+    // HTTP 源（BEP 19 webseed）：种子 / 磁力自带的 HTTP 下载地址。
+    field("bt_enable_webseed", DaemonConfigKind::Bool, "true"),
+    // tracker 汇报策略（BEP 12，对齐 qBittorrent 的两项高级设置）：都关 = 逐层失败转移。
+    field("bt_announce_all_tiers", DaemonConfigKind::Bool, "true"),
+    field("bt_announce_all_trackers", DaemonConfigKind::Bool, "true"),
+    // BT 经代理出站（SOCKS5 / SOCKS4 / HTTP）；默认直连。`bt_proxy_source` 选代理来源：
+    // 「代理」页的手动代理服务器，或建 BT 会话时检测到的系统代理。
+    // `bt_proxy_peers` 关闭时只有 tracker 走代理，对端连接直连。
+    field("bt_proxy_enabled", DaemonConfigKind::Bool, "false"),
+    field(
+        "bt_proxy_source",
+        DaemonConfigKind::Enum(BT_PROXY_SOURCES),
+        "manual",
+    ),
+    field("bt_proxy_peers", DaemonConfigKind::Bool, "true"),
+    // I2P（经本机 I2P 路由的 SAM 桥）。`bt_i2p_mixed` = I2P 种子同时允许明网对端。
+    field("bt_i2p_enabled", DaemonConfigKind::Bool, "false"),
+    field("bt_i2p_sam_host", DaemonConfigKind::Text, "127.0.0.1"),
+    field(
+        "bt_i2p_sam_port",
+        DaemonConfigKind::Integer {
+            min: 1,
+            max: 65_535,
+        },
+        "7656",
+    ),
+    field("bt_i2p_mixed", DaemonConfigKind::Bool, "false"),
     field("bt_custom_trackers", DaemonConfigKind::Text, ""),
     // 新建 BT 任务的默认选片方式与「先下载首尾文件块」；只作用于此后新建的任务，
     // 单个任务经 `daemon.task.setPiecePicking` 修改。
@@ -276,10 +338,11 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         DaemonConfigKind::Enum(BT_GUARD_MODES),
         "observe",
     ),
+    // 名字规则默认直接执行；其余检测规则默认仅观察。
     field(
         "bt_guard_rule_fingerprint",
         DaemonConfigKind::Enum(BT_GUARD_MODES),
-        "observe",
+        "enforce",
     ),
     field(
         "bt_guard_cloud_mode",
@@ -290,7 +353,7 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         "bt_guard_excess_ratio_pct",
         DaemonConfigKind::Integer {
             min: 110,
-            max: 1000,
+            max: 2000,
         },
         "200",
     ),
@@ -338,6 +401,8 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         "64",
     ),
     field("bt_guard_filter_urls", DaemonConfigKind::Text, ""),
+    // 本机名字规则：JSON 数组（顺序即优先级），元素形态同云名单 `clientRules`。
+    field("bt_guard_client_rules", DaemonConfigKind::Text, ""),
     field("bt_guard_cloud_enabled", DaemonConfigKind::Bool, "true"),
     // 设备本地（不进云同步）：是否向 FluxCloud 上报命中规则的对端证据。
     field("bt_guard_report_enabled", DaemonConfigKind::Bool, "false"),
@@ -361,7 +426,10 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         DaemonConfigKind::ReadOnly,
         "0",
     ),
+    // Kad 引导节点订阅：每行一个 nodes.dat 地址，多源合并去重。
     field("ed2k_nodes_dat_url", DaemonConfigKind::Text, ""),
+    field("ed2k_nodes_dat_count", DaemonConfigKind::ReadOnly, "0"),
+    field("ed2k_nodes_dat_updated_at", DaemonConfigKind::ReadOnly, "0"),
     // ── 代理 ──
     field("proxy_mode", DaemonConfigKind::Enum(PROXY_MODES), "none"),
     field("proxy_type", DaemonConfigKind::Enum(PROXY_TYPES), "http"),
@@ -654,7 +722,7 @@ mod tests {
     fn bt_guard_keys_have_contract_ranges_and_defaults() {
         let ok = |k: &str, v: &str| normalize_daemon_config_value(k, v).is_ok();
         for (key, lo, hi) in [
-            ("bt_guard_excess_ratio_pct", 110, 1000),
+            ("bt_guard_excess_ratio_pct", 110, 2000),
             ("bt_guard_min_torrent_mib", 0, 1_048_576),
             ("bt_guard_rewind_tolerance_pct", 0, 100),
             ("bt_guard_throttle_kib", 1, 1_048_576),
@@ -674,7 +742,7 @@ mod tests {
             ("bt_guard_rule_rerequest", "observe"),
             ("bt_guard_rule_rewind", "observe"),
             ("bt_guard_rule_lag", "observe"),
-            ("bt_guard_rule_fingerprint", "observe"),
+            ("bt_guard_rule_fingerprint", "enforce"),
             ("bt_guard_cloud_mode", "observe"),
             ("bt_guard_excess_ratio_pct", "200"),
             ("bt_guard_min_torrent_mib", "64"),
@@ -687,6 +755,7 @@ mod tests {
             ("bt_guard_skip_lan", "true"),
             ("bt_guard_ipv6_prefix", "64"),
             ("bt_guard_filter_urls", ""),
+            ("bt_guard_client_rules", ""),
             ("bt_guard_cloud_enabled", "true"),
             ("bt_guard_report_enabled", "false"),
         ] {

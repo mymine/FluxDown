@@ -16,6 +16,8 @@ export const METHOD = {
   DAEMON_TASK_SPEED_HISTORY: 'daemon.task.speedHistory',
   /** BT 任务实况（`TaskIdParams` → `BtStatusDto`）：详情页 Tracker / 连接标签轮询；非 BT 任务 `invalidArgument`。 */
   DAEMON_TASK_BT_STATUS: 'daemon.task.btStatus',
+  /** eD2K 任务实况（`TaskIdParams` → `Ed2kStatusDto`）：详情页来源 / 网络标签轮询；非 eD2K 任务 `invalidArgument`。 */
+  DAEMON_TASK_ED2K_STATUS: 'daemon.task.ed2kStatus',
   DAEMON_TASK_CREATE: 'daemon.task.create',
   /** 批量建任务（`DaemonCreateTasksParams`）：整块一个事务、一次 `tasksChanged` 事件，按 `batchId` 幂等。 */
   DAEMON_TASK_CREATE_MANY: 'daemon.task.createMany',
@@ -27,6 +29,22 @@ export const METHOD = {
   DAEMON_TASK_SET_SEGMENTS: 'daemon.task.setSegments',
   /** BT 选块策略（`{taskId, sequential?, firstLastPiecesFirst?}`）；省略的字段保持不变。非 BT 或不存在返回 not-found。 */
   DAEMON_TASK_SET_PIECE_PICKING: 'daemon.task.setPiecePicking',
+  /** BT 文件表（`TaskIdParams` → `BtFilesDto`）：详情页「文件」页签轮询；非 BT 任务 `notFound`。 */
+  DAEMON_TASK_BT_FILES: 'daemon.task.btFiles',
+  /** BT 文件优先级（`SetTaskFilePrioritiesParams`，部分更新）。已完成 → `taskStateConflict`；无文件可下 → `invalidArgument`。 */
+  DAEMON_TASK_SET_FILE_PRIORITIES: 'daemon.task.setFilePriorities',
+  /** 重命名 BT 任务内的单个文件（`RenameBtFileParams`）。 */
+  DAEMON_TASK_RENAME_BT_FILE: 'daemon.task.renameBtFile',
+  /** 强制重新校验未完成的 BT 任务（`TaskIdParams`）；已完成 → `taskStateConflict`。 */
+  DAEMON_TASK_RECHECK: 'daemon.task.recheck',
+  /** 移动 BT 任务数据到新保存目录（`MoveTaskStorageParams`）。慢方法；目标已有同名文件 → `conflict`。 */
+  DAEMON_TASK_MOVE_STORAGE: 'daemon.task.moveStorage',
+  /** BT 任务级限速（`SetTaskBtLimitsParams`，缺省字段不变，0 = 不限）。 */
+  DAEMON_TASK_SET_BT_LIMITS: 'daemon.task.setBtLimits',
+  /** 超级做种开关（`SetTaskSuperSeedingParams`）。 */
+  DAEMON_TASK_SET_SUPER_SEEDING: 'daemon.task.setSuperSeeding',
+  /** 立即向 tracker 重新汇报（`TaskIdParams`）；任务未运行 → `taskStateConflict`。 */
+  DAEMON_TASK_REANNOUNCE: 'daemon.task.reannounce',
   DAEMON_TASK_DELETE: 'daemon.task.delete',
   DAEMON_TASK_PAUSE_ALL: 'daemon.task.pauseAll',
   DAEMON_TASK_RESUME_ALL: 'daemon.task.resumeAll',
@@ -139,6 +157,8 @@ export const METHOD = {
   DAEMON_EGRESS_PLAN: 'daemon.egress.plan',
 
   DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH: 'daemon.bt.trackerSubscription.refresh',
+  /** BT 监听端口与端口映射实况（无参 → `BtPortStatusDto`）：设置页「连接」可见时轮询。 */
+  DAEMON_BT_PORT_STATUS: 'daemon.bt.portStatus',
   DAEMON_BT_GUARD_STATE: 'daemon.bt.guard.state',
   DAEMON_BT_GUARD_ENTRIES_LIST: 'daemon.bt.guard.entries.list',
   DAEMON_BT_GUARD_ENTRIES_ADD: 'daemon.bt.guard.entries.add',
@@ -146,10 +166,17 @@ export const METHOD = {
   DAEMON_BT_GUARD_EVENTS_LIST: 'daemon.bt.guard.events.list',
   DAEMON_BT_GUARD_EXPORT: 'daemon.bt.guard.export',
   DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH: 'daemon.bt.guard.filterSources.refresh',
+  DAEMON_BT_GUARD_CLOUD_REFRESH: 'daemon.bt.guard.cloud.refresh',
   // 以下 agent 内部方法，Web 不得调用。
   DAEMON_BT_GUARD_CLOUD_APPLY: 'daemon.bt.guard.cloud.apply',
   DAEMON_BT_GUARD_EVIDENCE_DRAIN: 'daemon.bt.guard.evidence.drain',
   DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH: 'daemon.ed2k.serverSubscription.refresh',
+  /** Kad 节点（nodes.dat）订阅立即刷新（慢方法）→ `Ed2kNodesSubRefreshResponse`。 */
+  DAEMON_ED2K_NODES_SUBSCRIPTION_REFRESH: 'daemon.ed2k.nodesSubscription.refresh',
+  /** HighID / LowID 检测（`Ed2kIdCheckParams?`，慢方法，可达 ~30 s）→ `Ed2kNetworkDto`。 */
+  DAEMON_ED2K_ID_CHECK: 'daemon.ed2k.idCheck',
+  /** Kad 引导（`Ed2kKadBootstrapParams` → `Ed2kKadBootstrapDto`，慢方法 ~30 s）。 */
+  DAEMON_ED2K_KAD_BOOTSTRAP: 'daemon.ed2k.kadBootstrap',
   DAEMON_DIAGNOSTICS_DESCRIBE: 'daemon.diagnostics.describe',
   DAEMON_DIAGNOSTICS_PREPARE_LOG_EXPORT: 'daemon.diagnostics.prepareLogExport',
   /** agent Doctor 专用：daemon 内真实写入下载 / 数据目录并运行外部组件。 */

@@ -75,6 +75,8 @@ public enum SettingsCatalog {
     public static let btGuardDownloadingActions = ["observe", "throttle", "choke", "ban"]
     public static let btMseModes = ["disabled", "enabled", "forced"]
     public static let btPieceOrders = ["rarest", "sequential"]
+    public static let btUtpCongestions = ["ledbat", "cubic"]
+    public static let btProxySources = ["manual", "system"]
     public static let proxyModes = ["none", "system", "manual", "auto"]
     public static let proxyTypes = ["http", "https", "socks4", "socks5"]
     public static let themeModes = ["system", "light", "dark"]
@@ -114,6 +116,22 @@ public enum SettingsCatalog {
         daemon("bt_port_start", .integer(min: 1, max: 65_535), "6881"),
         daemon("bt_port_end", .integer(min: 1, max: 65_535), "6891"),
         daemon("bt_mse_mode", .choice(btMseModes), "enabled"),
+        daemon("bt_upload_slots", .integer(min: 0, max: 512), "0"),
+        // BT 连接（设备本地，不进云同步目录）
+        daemon("bt_enable_lsd", .bool, "true"),
+        daemon("bt_utp_congestion", .choice(btUtpCongestions), "ledbat"),
+        daemon("bt_max_connections", .integer(min: 0, max: 65_535), "0"),
+        daemon("bt_max_connections_per_torrent", .integer(min: 1, max: 4096), "512"),
+        daemon("bt_enable_webseed", .bool, "true"),
+        daemon("bt_announce_all_tiers", .bool, "true"),
+        daemon("bt_announce_all_trackers", .bool, "true"),
+        daemon("bt_proxy_enabled", .bool, "false"),
+        daemon("bt_proxy_source", .choice(btProxySources), "manual"),
+        daemon("bt_proxy_peers", .bool, "true"),
+        daemon("bt_i2p_enabled", .bool, "false"),
+        daemon("bt_i2p_sam_host", .text, "127.0.0.1"),
+        daemon("bt_i2p_sam_port", .integer(min: 1, max: 65_535), "7656"),
+        daemon("bt_i2p_mixed", .bool, "false"),
         daemon("bt_custom_trackers", .text, ""),
         daemon("bt_piece_order", .choice(btPieceOrders), "rarest"),
         daemon("bt_first_last_pieces_first", .bool, "false"),
@@ -139,9 +157,9 @@ public enum SettingsCatalog {
         daemon("bt_guard_rule_rerequest", .choice(btGuardModes), "observe"),
         daemon("bt_guard_rule_rewind", .choice(btGuardModes), "observe"),
         daemon("bt_guard_rule_lag", .choice(btGuardModes), "observe"),
-        daemon("bt_guard_rule_fingerprint", .choice(btGuardModes), "observe"),
+        daemon("bt_guard_rule_fingerprint", .choice(btGuardModes), "enforce"),
         daemon("bt_guard_cloud_mode", .choice(btGuardModes), "observe"),
-        daemon("bt_guard_excess_ratio_pct", .integer(min: 110, max: 1000), "200"),
+        daemon("bt_guard_excess_ratio_pct", .integer(min: 110, max: 2000), "200"),
         daemon("bt_guard_min_torrent_mib", .integer(min: 0, max: 1_048_576), "64"),
         daemon("bt_guard_rewind_tolerance_pct", .integer(min: 0, max: 100), "7"),
         daemon("bt_guard_throttle_kib", .integer(min: 1, max: 1_048_576), "32"),
@@ -152,6 +170,7 @@ public enum SettingsCatalog {
         daemon("bt_guard_skip_lan", .bool, "true"),
         daemon("bt_guard_ipv6_prefix", .integer(min: 48, max: 128), "64"),
         daemon("bt_guard_filter_urls", .text, ""),
+        daemon("bt_guard_client_rules", .text, ""),
         daemon("bt_guard_cloud_enabled", .bool, "true"),
         daemon("bt_guard_report_enabled", .bool, "false"),
         // ED2K
@@ -164,6 +183,8 @@ public enum SettingsCatalog {
         daemon("ed2k_server_sub_cache", .readOnly, ""),
         daemon("ed2k_server_sub_updated_at", .readOnly, "0"),
         daemon("ed2k_nodes_dat_url", .text, ""),
+        daemon("ed2k_nodes_dat_count", .readOnly, "0"),
+        daemon("ed2k_nodes_dat_updated_at", .readOnly, "0"),
         // 代理
         daemon("proxy_mode", .choice(proxyModes), "none"),
         daemon("proxy_type", .choice(proxyTypes), "http"),
@@ -204,6 +225,7 @@ public enum SettingsCatalog {
         pref("download.remember_last_save_dir", .bool, "false"),
         pref("download.notify_on_complete", .bool, "true"),
         pref("download.silent_download", .bool, "false"),
+        pref("download.silent_auto_category", .bool, "true"),
         pref("download.silent_skip_selection", .bool, "false"),
         pref("download.keep_awake", .bool, "false"),
     ]
@@ -286,6 +308,7 @@ public enum SettingsCatalog {
         "bt_guard_skip_lan": "bt.guard.skip_lan",
         "bt_guard_ipv6_prefix": "bt.guard.ipv6_prefix",
         "bt_guard_filter_urls": "bt.guard.filter_urls",
+        "bt_guard_client_rules": "bt.guard.client_rules",
         "bt_guard_cloud_enabled": "bt.guard.cloud_enabled",
         "ed2k_enable_kad": "ed2k.enable_kad",
         "ed2k_enable_upnp": "ed2k.enable_upnp",

@@ -110,6 +110,19 @@ import type {
   TaskSpeedHistoryDto,
   TaskSpeedHistoryQuery,
   BtStatusDto,
+  BtFilesDto,
+  BtPortStatusDto,
+  MoveTaskStorageParams,
+  RenameBtFileParams,
+  SetTaskBtLimitsParams,
+  SetTaskFilePrioritiesParams,
+  SetTaskSuperSeedingParams,
+  Ed2kIdCheckParams,
+  Ed2kKadBootstrapDto,
+  Ed2kKadBootstrapParams,
+  Ed2kNetworkDto,
+  Ed2kNodesSubRefreshResponse,
+  Ed2kStatusDto,
   TaskDeleteManyParams,
   TaskDeleteParams,
   TaskChangeUrlParams,
@@ -132,7 +145,7 @@ import type {
 /** 服务端逐源串行拉取镜像（每源 20s），最坏远超默认 30s。 */
 const SLOW_MIRROR_TIMEOUT_MS = 120_000;
 
-/** 读盘类慢方法（完整性校验、文件哈希、本机做种）耗时与数据量成正比。 */
+/** 读写盘类慢方法（完整性校验、文件哈希、本机做种、移动 BT 数据）耗时与数据量成正比。 */
 const SLOW_DISK_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 
 // `daemon.task.list` 在任务数超过 5000 时服务端报错（需分页），Web 不再封装：任务表一律来自
@@ -145,6 +158,7 @@ const task = {
   speedHistory: (params: TaskSpeedHistoryQuery) =>
     call<TaskSpeedHistoryDto | null>(METHOD.DAEMON_TASK_SPEED_HISTORY, params),
   btStatus: (params: TaskIdParams) => call<BtStatusDto>(METHOD.DAEMON_TASK_BT_STATUS, params),
+  ed2kStatus: (params: TaskIdParams) => call<Ed2kStatusDto>(METHOD.DAEMON_TASK_ED2K_STATUS, params),
   create: (params: DaemonCreateTaskParams) => call<CreatedTask>(METHOD.DAEMON_TASK_CREATE, params),
   /** 批量建任务：一块（≤512 条）共享同一份选项，整块一个事务，按 `batchId` 幂等。 */
   createMany: (params: DaemonCreateTasksParams) =>
@@ -160,6 +174,22 @@ const task = {
   /** BT 选块：只传本次切换的字段，另一项保持不变。 */
   setPiecePicking: (params: TaskSetPiecePickingParams) =>
     call<OkResult>(METHOD.DAEMON_TASK_SET_PIECE_PICKING, params),
+  /** BT 文件表（详情页「文件」页签轮询）。 */
+  btFiles: (params: TaskIdParams) => call<BtFilesDto>(METHOD.DAEMON_TASK_BT_FILES, params),
+  /** BT 文件优先级：只改列出的文件。 */
+  setFilePriorities: (params: SetTaskFilePrioritiesParams) =>
+    call<OkResult>(METHOD.DAEMON_TASK_SET_FILE_PRIORITIES, params),
+  renameBtFile: (params: RenameBtFileParams) => call<OkResult>(METHOD.DAEMON_TASK_RENAME_BT_FILE, params),
+  /** 强制重新校验（未完成 BT 任务）：daemon 受理即返回，校验在后台进行。 */
+  recheck: (params: TaskIdParams) => call<OkResult>(METHOD.DAEMON_TASK_RECHECK, params),
+  /** 移动 BT 数据：跨卷时耗时与数据量成正比，使用 6 小时超时。 */
+  moveStorage: (params: MoveTaskStorageParams) =>
+    call<OkResult>(METHOD.DAEMON_TASK_MOVE_STORAGE, params, { timeoutMs: SLOW_DISK_TIMEOUT_MS }),
+  /** 任务级限速：只传改动的字段。 */
+  setBtLimits: (params: SetTaskBtLimitsParams) => call<OkResult>(METHOD.DAEMON_TASK_SET_BT_LIMITS, params),
+  setSuperSeeding: (params: SetTaskSuperSeedingParams) =>
+    call<OkResult>(METHOD.DAEMON_TASK_SET_SUPER_SEEDING, params),
+  reannounce: (params: TaskIdParams) => call<OkResult>(METHOD.DAEMON_TASK_REANNOUNCE, params),
   delete: (params: TaskDeleteParams) => call<OkResult>(METHOD.DAEMON_TASK_DELETE, params),
   pauseAll: () => call<OkResult>(METHOD.DAEMON_TASK_PAUSE_ALL),
   resumeAll: () => call<OkResult>(METHOD.DAEMON_TASK_RESUME_ALL),
@@ -376,6 +406,8 @@ const bt = {
     refresh: () =>
       call<TrackerSubRefreshResponse>(METHOD.DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
   },
+  /** 监听端口与端口映射实况（设置页「连接」可见时轮询）。 */
+  portStatus: () => call<BtPortStatusDto>(METHOD.DAEMON_BT_PORT_STATUS),
   /** 防吸血。`cloud.apply` / `evidence.drain` 是 agent 内部方法，这里刻意不封装。 */
   guard: {
     state: () => call<BtGuardStateDto>(METHOD.DAEMON_BT_GUARD_STATE),
@@ -391,14 +423,27 @@ const bt = {
     /** 立即抓取全部过滤文件订阅（逐个 HTTP 拉取，可能较慢）。 */
     filterSourcesRefresh: () =>
       call<BtGuardFilterSourcesRefreshDto>(METHOD.DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
+    /** 请求立即检查云名单更新；结果经 `BtGuardChanged` 通知。 */
+    cloudRefresh: () => call<Record<string, never>>(METHOD.DAEMON_BT_GUARD_CLOUD_REFRESH),
   },
 };
+
+/** HighID / LowID 检测与 Kad 引导：最坏约 30 s。 */
+const ED2K_PROBE_TIMEOUT_MS = 60_000;
 
 const ed2k = {
   serverSubscription: {
     refresh: () =>
       call<Ed2kServerSubRefreshResponse>(METHOD.DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
   },
+  nodesSubscription: {
+    refresh: () =>
+      call<Ed2kNodesSubRefreshResponse>(METHOD.DAEMON_ED2K_NODES_SUBSCRIPTION_REFRESH, undefined, { timeoutMs: SLOW_MIRROR_TIMEOUT_MS }),
+  },
+  /** 省略参数 = auto（发 `{}`）。 */
+  idCheck: (params?: Ed2kIdCheckParams) => call<Ed2kNetworkDto>(METHOD.DAEMON_ED2K_ID_CHECK, params ?? {}, { timeoutMs: ED2K_PROBE_TIMEOUT_MS }),
+  kadBootstrap: (params: Ed2kKadBootstrapParams) =>
+    call<Ed2kKadBootstrapDto>(METHOD.DAEMON_ED2K_KAD_BOOTSTRAP, params, { timeoutMs: ED2K_PROBE_TIMEOUT_MS }),
 };
 
 const diagnostics = {

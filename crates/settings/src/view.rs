@@ -3,6 +3,7 @@
 //! 按分类与子 Tab 分区；宽视口使用双列分组卡片。
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use fluxdown_ui_components::{
     ControlExt as _, FluxIcon, nav_icon_color, segmented_tabs, sidebar_navigation_button,
@@ -11,7 +12,8 @@ use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     AnyView, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement, Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
+    ParentElement, Render, SharedString, Styled, Task, Window, div, prelude::FluentBuilder as _,
+    px,
 };
 use gpui_component::{
     Icon, WindowExt as _,
@@ -33,6 +35,8 @@ use crate::ui::{
 
 /// 分类导航列宽（与下载侧栏默认宽一致）。
 const SIDEBAR_WIDTH: f32 = 200.;
+/// BT 端口映射状态的轮询间隔。
+const PORT_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 「推介有奖」页的可见性：app 依「已登录 + 设备本地偏好」维护，设置窗口与搜索索引共用。
 #[derive(Debug, Default)]
@@ -98,6 +102,8 @@ pub struct SettingsView {
     selected: SharedString,
     /// 每个分类会话内记住的子 Tab id。
     tab_by_page: HashMap<SharedString, &'static str>,
+    /// BT「连接」页签可见且端口映射开启时的状态轮询；离开即丢弃（`Task` drop 即取消）。
+    port_status_poll: Option<Task<()>>,
 }
 
 impl SettingsView {
@@ -171,6 +177,7 @@ impl SettingsView {
             search,
             selected: SharedString::from("general"),
             tab_by_page: HashMap::new(),
+            port_status_poll: None,
         }
     }
 
@@ -234,7 +241,7 @@ impl SettingsView {
     /// 定位到设置项：切到目标分类与子 Tab；指向具体行时以行标题填入搜索框筛出该行，
     /// 指向分类 / Tab 时清空搜索。
     pub fn reveal(&mut self, target: &SettingsTarget, window: &mut Window, cx: &mut Context<Self>) {
-        self.selected = SharedString::from(target.page);
+        self.select_page(SharedString::from(target.page), cx);
         if !target.tab.is_empty() {
             self.tab_by_page
                 .insert(SharedString::from(target.page), target.tab);
@@ -243,6 +250,30 @@ impl SettingsView {
         self.search
             .update(cx, |search, cx| search.set_value(query, window, cx));
         cx.notify();
+    }
+
+    /// 端口映射状态行可见时每 [`PORT_STATUS_POLL_INTERVAL`] 拉一次，不可见即停。
+    /// 重叠请求由 store 的在途标记挡掉。
+    fn sync_port_status_poll(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if !visible {
+            self.port_status_poll = None;
+            return;
+        }
+        if self.port_status_poll.is_some() {
+            return;
+        }
+        let store = self.store.downgrade();
+        self.port_status_poll = Some(cx.spawn(async move |_, cx| {
+            loop {
+                let Ok(()) = store.update(cx, |store, cx| store.load_bt_port_status(cx)) else {
+                    // 设置存储已释放，结束轮询。
+                    return;
+                };
+                cx.background_executor()
+                    .timer(PORT_STATUS_POLL_INTERVAL)
+                    .await;
+            }
+        }));
     }
 
     fn render_nav_item(&self, page: &SettingsPage, cx: &mut Context<Self>) -> impl IntoElement {
@@ -261,10 +292,19 @@ impl SettingsView {
         )
         .on_click(cx.listener(move |this, _, _, cx| {
             if this.selected != key {
-                this.selected = key.clone();
-                cx.notify();
+                this.select_page(key.clone(), cx);
             }
         }))
+    }
+
+    /// 切换分类：清掉上一分类的页面级视图状态（展开 / 收起等），下次进入恢复默认。
+    fn select_page(&mut self, key: SharedString, cx: &mut Context<Self>) {
+        if self.selected != key {
+            self.store
+                .update(cx, |store, cx| store.clear_page_view_state(cx));
+        }
+        self.selected = key;
+        cx.notify();
     }
 
     fn render_sidebar(&self, pages: &[SettingsPage], cx: &mut Context<Self>) -> impl IntoElement {
@@ -499,6 +539,12 @@ impl Render for SettingsView {
             .iter()
             .find(|page| self.selected == page.key)
             .or_else(|| pages.first());
+        let port_status_visible = active.is_some_and(|page| {
+            page.key == "bt"
+                && self.active_tab_id(page) == "connection"
+                && self.store.read(cx).daemon_bool("bt_enable_upnp")
+        });
+        self.sync_port_status_poll(port_status_visible, cx);
 
         v_flex()
             .size_full()

@@ -21,6 +21,9 @@ pub mod bt_guard;
 /// 本机文件做种：为磁盘上已有的文件 / 文件夹生成或匹配种子并登记为做种任务。
 #[cfg(feature = "bt")]
 pub mod bt_local_seed;
+/// BT 任务数据搬移（`daemon.task.moveStorage`）：落盘动作与中断恢复日志。
+#[cfg(feature = "bt")]
+pub mod bt_move;
 /// BT 部分选择做种的 parts 边车（选中文件路径映射 + 跨文件边界字节）。
 #[cfg(feature = "bt")]
 pub mod bt_partfile;
@@ -32,6 +35,9 @@ pub mod bt_sparse;
 /// BT 任务运行时状态：peer 列表与 tracker 状态（tracker 状态经 tracing 旁路采集）。
 #[cfg(feature = "bt")]
 pub mod bt_status;
+/// BT 任务的逐文件状态：优先级 / 重命名表的落库格式、改动校验与「文件」页的行。
+#[cfg(feature = "bt")]
+pub mod bt_task_files;
 /// 已完成 BT 任务的完整性校验（按 piece 表重哈希落盘数据）。
 #[cfg(feature = "bt")]
 pub mod bt_verify;
@@ -111,6 +117,8 @@ pub mod site_auth;
 /// 任务整个下载期的速度曲线与统计（持久化，任务完成后可回看）。
 pub mod speed_history;
 pub mod speed_limiter;
+/// 界面速度的统一口径（固定窗口 + EMA），下载与 BT 上传共用。
+pub(crate) mod speed_meter;
 /// 通用订阅 provider 接口（RSS 与插件订阅共用）。
 pub mod subscription;
 pub mod task_activity;

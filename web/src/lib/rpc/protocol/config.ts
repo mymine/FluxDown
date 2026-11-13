@@ -157,6 +157,16 @@ export interface Ed2kServerSubRefreshResponse {
   error: string;
 }
 
+/** Kad 节点（nodes.dat）订阅刷新结果。 */
+export interface Ed2kNodesSubRefreshResponse {
+  success: boolean;
+  nodeCount: number;
+  okSources: number;
+  totalSources: number;
+  updatedAt: number;
+  error: string;
+}
+
 // ── 配置键目录（镜像 daemon_config.rs 的 DAEMON_CONFIG_FIELDS）──
 
 export const BT_SEED_TIME_UNITS = ['minutes', 'hours', 'days'] as const;
@@ -169,6 +179,10 @@ export const BT_SEED_THEN_ACTIONS = ['stop', 'delete', 'delete_files'] as const;
 export const BT_MSE_MODES = ['disabled', 'enabled', 'forced'] as const;
 /** 新建 BT 任务的默认选片方式：最稀有优先 / 按顺序下载。 */
 export const BT_PIECE_ORDERS = ['rarest', 'sequential'] as const;
+/** uTP 拥塞控制：LEDBAT（让路给其他流量）/ CUBIC（只按丢包退让）。 */
+export const BT_UTP_CONGESTIONS = ['ledbat', 'cubic'] as const;
+/** BT 代理来源：「代理」页的手动代理服务器 / 系统代理（建 BT 会话时检测）。 */
+export const BT_PROXY_SOURCES = ['manual', 'system'] as const;
 /** 防吸血规则 / 云名单模式。 */
 export const BT_GUARD_MODES = ['off', 'observe', 'enforce'] as const;
 /** 防吸血：下载中任务的动作上限。 */
@@ -251,6 +265,22 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   int('bt_port_start', '6881', 1, 65_535),
   int('bt_port_end', '6891', 1, 65_535),
   oneOf('bt_mse_mode', 'enabled', BT_MSE_MODES),
+  int('bt_upload_slots', '0', 0, 512),
+  // BT 连接（设备本地：不进云同步）
+  bool('bt_enable_lsd', 'true'),
+  oneOf('bt_utp_congestion', 'ledbat', BT_UTP_CONGESTIONS),
+  int('bt_max_connections', '0', 0, 65_535),
+  int('bt_max_connections_per_torrent', '512', 1, 4096),
+  bool('bt_enable_webseed', 'true'),
+  bool('bt_announce_all_tiers', 'true'),
+  bool('bt_announce_all_trackers', 'true'),
+  bool('bt_proxy_enabled', 'false'),
+  oneOf('bt_proxy_source', 'manual', BT_PROXY_SOURCES),
+  bool('bt_proxy_peers', 'true'),
+  bool('bt_i2p_enabled', 'false'),
+  text('bt_i2p_sam_host', '127.0.0.1'),
+  int('bt_i2p_sam_port', '7656', 1, 65_535),
+  bool('bt_i2p_mixed', 'false'),
   text('bt_custom_trackers'),
   oneOf('bt_piece_order', 'rarest', BT_PIECE_ORDERS),
   bool('bt_first_last_pieces_first', 'false'),
@@ -276,9 +306,9 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   oneOf('bt_guard_rule_rerequest', 'observe', BT_GUARD_MODES),
   oneOf('bt_guard_rule_rewind', 'observe', BT_GUARD_MODES),
   oneOf('bt_guard_rule_lag', 'observe', BT_GUARD_MODES),
-  oneOf('bt_guard_rule_fingerprint', 'observe', BT_GUARD_MODES),
+  oneOf('bt_guard_rule_fingerprint', 'enforce', BT_GUARD_MODES),
   oneOf('bt_guard_cloud_mode', 'observe', BT_GUARD_MODES),
-  int('bt_guard_excess_ratio_pct', '200', 110, 1000),
+  int('bt_guard_excess_ratio_pct', '200', 110, 2000),
   int('bt_guard_min_torrent_mib', '64', 0, 1_048_576),
   int('bt_guard_rewind_tolerance_pct', '7', 0, 100),
   int('bt_guard_throttle_kib', '32', 1, 1_048_576),
@@ -289,6 +319,7 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   bool('bt_guard_skip_lan', 'true'),
   int('bt_guard_ipv6_prefix', '64', 48, 128),
   text('bt_guard_filter_urls'),
+  text('bt_guard_client_rules'),
   bool('bt_guard_cloud_enabled', 'true'),
   // 设备本地：不进云同步
   bool('bt_guard_report_enabled', 'false'),
@@ -301,7 +332,10 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   text('ed2k_server_sub_urls'),
   readOnly('ed2k_server_sub_cache'),
   readOnly('ed2k_server_sub_updated_at', '0'),
+  // 设备本地：每行一个 nodes.dat 地址，不进云同步
   text('ed2k_nodes_dat_url'),
+  readOnly('ed2k_nodes_dat_count', '0'),
+  readOnly('ed2k_nodes_dat_updated_at', '0'),
   // 代理
   oneOf('proxy_mode', 'none', PROXY_MODES),
   oneOf('proxy_type', 'http', PROXY_TYPES),

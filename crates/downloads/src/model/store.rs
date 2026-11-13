@@ -70,6 +70,7 @@ pub(crate) struct TaskStore {
     /// 增量维护。
     pausable: Cell<usize>,
     resumable_seeds: Cell<usize>,
+    failed: Cell<usize>,
     paused_by_queue: RefCell<HashMap<String, usize>>,
 }
 
@@ -237,6 +238,10 @@ impl TaskStore {
         self.resumable_seeds.get()
     }
 
+    pub(crate) fn failed_count(&self) -> usize {
+        self.failed.get()
+    }
+
     /// 各队列里的暂停任务数（只含非零项）。
     pub(crate) fn paused_by_queue(&self) -> Ref<'_, HashMap<String, usize>> {
         self.paused_by_queue.borrow()
@@ -298,7 +303,7 @@ impl TaskStore {
                     Self::adjust(&self.resumable_seeds, add);
                 }
             }
-            TaskState::Failed => {}
+            TaskState::Failed => Self::adjust(&self.failed, add),
         }
         let mut bound = self.bound_counts.borrow_mut();
         if let Some(categories) = bound.categories.clone() {
@@ -314,6 +319,7 @@ impl TaskStore {
     fn rebuild_aggregates(&self, rows: &[DownloadTaskView]) {
         self.pausable.set(0);
         self.resumable_seeds.set(0);
+        self.failed.set(0);
         self.paused_by_queue.borrow_mut().clear();
         *self.bound_counts.borrow_mut() = BoundCounts::default();
         for row in rows {
@@ -527,6 +533,7 @@ fn same_view_fields(left: &DownloadTaskView, right: &DownloadTaskView) -> bool {
         && left.protocol == right.protocol
         && left.created_at_secs == right.created_at_secs
         && left.group_id == right.group_id
+        && left.save_dir == right.save_dir
         && left.to_device == right.to_device
         && left.seeding_status == right.seeding_status
         && left.file_missing == right.file_missing

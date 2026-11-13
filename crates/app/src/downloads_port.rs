@@ -167,7 +167,7 @@ fn is_non_idempotent_submission(command: &DownloadsCommand) -> bool {
         DownloadsCommand::Create(_)
             | DownloadsCommand::CreateGroup { .. }
             | DownloadsCommand::SubmitTorrentFile { .. }
-            | DownloadsCommand::SeedLocal { .. }
+            | DownloadsCommand::SeedLocal(_)
             | DownloadsCommand::Redownload(..)
     ) || matches!(command, DownloadsCommand::CaptureResolve(params) if params.accepted)
 }
@@ -193,8 +193,8 @@ impl DownloadsPort for AgentDownloadsPort {
             DownloadsCommand::CaptureResolve(params) => {
                 params.request.as_ref().map(|request| request.url.clone())
             }
-            DownloadsCommand::SubmitTorrentFile { path, .. }
-            | DownloadsCommand::SeedLocal { path, .. } => Some(path.clone()),
+            DownloadsCommand::SubmitTorrentFile { path, .. } => Some(path.clone()),
+            DownloadsCommand::SeedLocal(params) => Some(params.path.clone()),
             DownloadsCommand::Redownload(request, _) => Some(request.url.clone()),
             _ => None,
         };
@@ -277,8 +277,34 @@ impl AgentDownloadsPort {
                         .await?;
                     return Ok(DownloadsResult::BtStatus(status));
                 }
+                DownloadsCommand::BtFiles { task_id } => {
+                    let files = client
+                        .call(
+                            method::DAEMON_TASK_BT_FILES,
+                            Some(json!({ "taskId": task_id })),
+                        )
+                        .await?;
+                    return Ok(DownloadsResult::BtFiles(files));
+                }
+                DownloadsCommand::Ed2kStatus(params) => {
+                    let status: fluxdown_protocol::Ed2kStatusDto = client
+                        .call(method::DAEMON_TASK_ED2K_STATUS, Some(params))
+                        .await?;
+                    return Ok(DownloadsResult::Ed2kStatus(Box::new(status)));
+                }
+                DownloadsCommand::Ed2kIdCheck => {
+                    let network = client
+                        .call(method::DAEMON_ED2K_ID_CHECK, Some(json!({})))
+                        .await?;
+                    return Ok(DownloadsResult::Ed2kNetwork(network));
+                }
                 DownloadsCommand::BtGuardAddEntry(params) => {
                     (method::DAEMON_BT_GUARD_ENTRIES_ADD, serialize(params)?)
+                }
+                DownloadsCommand::BtGuardBanClient { value } => {
+                    return ban_client(&client, &value)
+                        .await
+                        .map(DownloadsResult::Value);
                 }
                 DownloadsCommand::BtGuardEvidence { ip_group } => {
                     let (entries_params, events_params) = evidence_params(&ip_group);
@@ -343,6 +369,27 @@ impl AgentDownloadsPort {
                         first_last_pieces_first,
                     })?,
                 ),
+                DownloadsCommand::SetFilePriorities(params) => {
+                    (method::DAEMON_TASK_SET_FILE_PRIORITIES, serialize(params)?)
+                }
+                DownloadsCommand::RenameBtFile(params) => {
+                    (method::DAEMON_TASK_RENAME_BT_FILE, serialize(params)?)
+                }
+                DownloadsCommand::RecheckTask { task_id } => {
+                    (method::DAEMON_TASK_RECHECK, json!({ "taskId": task_id }))
+                }
+                DownloadsCommand::MoveStorage(params) => {
+                    (method::DAEMON_TASK_MOVE_STORAGE, serialize(params)?)
+                }
+                DownloadsCommand::SetBtLimits(params) => {
+                    (method::DAEMON_TASK_SET_BT_LIMITS, serialize(params)?)
+                }
+                DownloadsCommand::SetSuperSeeding(params) => {
+                    (method::DAEMON_TASK_SET_SUPER_SEEDING, serialize(params)?)
+                }
+                DownloadsCommand::Reannounce { task_id } => {
+                    (method::DAEMON_TASK_REANNOUNCE, json!({ "taskId": task_id }))
+                }
                 DownloadsCommand::VerifyTask { task_id } => {
                     let result = client
                         .call(
@@ -387,20 +434,9 @@ impl AgentDownloadsPort {
                         },
                     ));
                 }
-                DownloadsCommand::SeedLocal {
-                    path,
-                    torrent_path,
-                    trackers,
-                    unlimited,
-                } => (
-                    method::DAEMON_TASK_SEED_LOCAL,
-                    serialize(fluxdown_protocol::DaemonSeedLocalParams {
-                        path,
-                        torrent_path,
-                        trackers,
-                        unlimited,
-                    })?,
-                ),
+                DownloadsCommand::SeedLocal(params) => {
+                    (method::DAEMON_TASK_SEED_LOCAL, serialize(*params)?)
+                }
                 DownloadsCommand::Delete {
                     task_id,
                     delete_files,
@@ -823,5 +859,52 @@ mod tests {
     fn torrent_without_form_options_omits_them() {
         let params = torrent_file_params("/tmp/a.torrent".to_owned(), true, None, None, None);
         assert_eq!(params, json!({ "path": "/tmp/a.torrent", "silent": true }));
+    }
+}
+
+/// 读最新配置 → 追加名字封禁规则 → 带版本写回；版本冲突时重取重放。
+async fn ban_client(
+    client: &AgentClient,
+    value: &str,
+) -> Result<Value, fluxdown_protocol::RpcErrorData> {
+    use fluxdown_protocol::{ApplicationErrorCode, DaemonConfigPatch, DaemonConfigSnapshot};
+    use fluxdown_ui_downloads::{BanClientEdit, CLIENT_RULES_KEY, append_ban_client_rule};
+    const MAX_CONFLICT_RETRIES: usize = 3;
+    let mut conflicts = 0;
+    loop {
+        let snapshot: DaemonConfigSnapshot = client
+            .call(method::DAEMON_CONFIG_GET, Some(json!({})))
+            .await?;
+        let current = snapshot
+            .values
+            .get(CLIENT_RULES_KEY)
+            .map_or("", String::as_str);
+        let next = match append_ban_client_rule(current, value) {
+            BanClientEdit::Added(next) => next,
+            BanClientEdit::Exists => return Ok(Value::Bool(false)),
+            BanClientEdit::Full => {
+                return Err(fluxdown_protocol::RpcErrorData::new(
+                    ApplicationErrorCode::InvalidArgument,
+                    false,
+                ));
+            }
+        };
+        let patch = DaemonConfigPatch {
+            expected_revision: snapshot.revision,
+            values: std::collections::BTreeMap::from([(CLIENT_RULES_KEY.to_owned(), next)]),
+        };
+        match client
+            .call::<_, Value>(method::DAEMON_CONFIG_PATCH, Some(patch))
+            .await
+        {
+            Ok(_) => return Ok(Value::Bool(true)),
+            Err(error)
+                if error.code == ApplicationErrorCode::Conflict
+                    && conflicts < MAX_CONFLICT_RETRIES =>
+            {
+                conflicts += 1;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }

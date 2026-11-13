@@ -52,6 +52,30 @@ pub const DAEMON_TASK_TORRENT_SHARE: &str = "daemon.task.torrentShare";
 /// BT 任务实况（`DaemonBtStatusParams` → `BtStatusDto`）：peer 列表与逐 tracker 汇报状态，
 /// 供详情页轮询（对齐 qBittorrent 的 Peers / Trackers 页签）。非 BT 任务返回 `invalidArgument`。
 pub const DAEMON_TASK_BT_STATUS: &str = "daemon.task.btStatus";
+/// BT 任务的文件表（`DaemonBtStatusParams` 同形 `{taskId}` → `BtFilesDto`，不含 padding 文件），
+/// 供详情页「文件」页签轮询。非 BT 任务返回 `notFound`。
+pub const DAEMON_TASK_BT_FILES: &str = "daemon.task.btFiles";
+/// 修改 BT 任务的文件优先级（`SetTaskFilePrioritiesParams`，部分更新）：`0` 不下载 / `1` 普通 /
+/// `6` 高 / `7` 最高，下载中从下一次领片起生效。已完成任务返回 `taskStateConflict`；会导致没有
+/// 任何文件要下载、下标越界或级别非法返回 `invalidArgument`。
+pub const DAEMON_TASK_SET_FILE_PRIORITIES: &str = "daemon.task.setFilePriorities";
+/// 重命名 BT 任务内的单个文件（`RenameBtFileParams`）：新路径是任务目录内的相对路径。
+pub const DAEMON_TASK_RENAME_BT_FILE: &str = "daemon.task.renameBtFile";
+/// 强制重新校验未完成的 BT 任务（`{taskId}`）：丢弃已有进度记录，按磁盘数据全量重哈希后回到
+/// 原状态。已完成任务返回 `taskStateConflict`（改用只读的 `daemon.task.verify`）。
+pub const DAEMON_TASK_RECHECK: &str = "daemon.task.recheck";
+/// 移动 BT 任务的数据到新的保存目录（`MoveTaskStorageParams`）并更新任务位置，完成后任务回到
+/// 原状态（下载 / 暂停 / 做种）。慢方法：跨卷移动耗时与数据量成正比；目标已有同名文件返回 `conflict`。
+pub const DAEMON_TASK_MOVE_STORAGE: &str = "daemon.task.moveStorage";
+/// 任务级 BT 限速（`SetTaskBtLimitsParams`，缺省字段不变，`0` = 不限），运行中立即生效。
+pub const DAEMON_TASK_SET_BT_LIMITS: &str = "daemon.task.setBtLimits";
+/// 超级做种开关（`SetTaskSuperSeedingParams`）：任务完成（做种）后才实际生效，可提前设置。
+pub const DAEMON_TASK_SET_SUPER_SEEDING: &str = "daemon.task.setSuperSeeding";
+/// 立即向 tracker 重新汇报（`{taskId}`）；任务当前不在运行返回 `taskStateConflict`。
+pub const DAEMON_TASK_REANNOUNCE: &str = "daemon.task.reannounce";
+/// eD2K 任务实况（`DaemonEd2kStatusParams` → `Ed2kStatusDto`）：源列表、查询过的服务器、Kad 节点
+/// 与本机网络状态（HighID / LowID、UPnP），供详情页轮询。非 eD2K 任务返回 `invalidArgument`。
+pub const DAEMON_TASK_ED2K_STATUS: &str = "daemon.task.ed2kStatus";
 /// 批量暂停 / 恢复（`{taskIds}`）：整批只推一次任务快照；未知 id 忽略，空列表为空操作。
 pub const DAEMON_TASK_PAUSE_MANY: &str = "daemon.task.pauseMany";
 pub const DAEMON_TASK_RESUME_MANY: &str = "daemon.task.resumeMany";
@@ -187,6 +211,8 @@ pub const DAEMON_CDN_CONFIG_APPLY: &str = "daemon.cdnConfig.apply";
 pub const DAEMON_EGRESS_PLAN: &str = "daemon.egress.plan";
 
 pub const DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH: &str = "daemon.bt.trackerSubscription.refresh";
+/// BT 监听端口与端口映射实况（无参 → `BtPortStatusDto`），供设置页轮询。
+pub const DAEMON_BT_PORT_STATUS: &str = "daemon.bt.portStatus";
 /// BT 防吸血状态总览（`BtGuardStateDto`）。
 pub const DAEMON_BT_GUARD_STATE: &str = "daemon.bt.guard.state";
 /// 过滤条目分页（`BtGuardEntriesListParams` → `BtGuardEntriesListDto`）。
@@ -201,12 +227,23 @@ pub const DAEMON_BT_GUARD_EVENTS_LIST: &str = "daemon.bt.guard.events.list";
 pub const DAEMON_BT_GUARD_EXPORT: &str = "daemon.bt.guard.export";
 /// 立即刷新过滤文件订阅（无参）。慢方法：会拉取网络。
 pub const DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH: &str = "daemon.bt.guard.filterSources.refresh";
+/// 请求立即检查云名单更新（无参 → `{}`）。daemon 只发出 `BtGuardCloudRefreshWanted`，拉取与验签由
+/// agent 完成，结果经 `BtGuardChanged` 通知；云名单未启用时不发。BT 会话未运行时同样可用。
+pub const DAEMON_BT_GUARD_CLOUD_REFRESH: &str = "daemon.bt.guard.cloud.refresh";
 /// 仅 agent 调用：已验签的云名单整层替换（`BtGuardCloudApplyParams` → `BtGuardCloudApplyDto`）。
 /// 慢方法：差异防护 + 整层重建 + 持久化。
 pub const DAEMON_BT_GUARD_CLOUD_APPLY: &str = "daemon.bt.guard.cloud.apply";
 /// 仅 agent 调用：弹出待上报证据（`BtGuardEvidenceDrainDto`）。
 pub const DAEMON_BT_GUARD_EVIDENCE_DRAIN: &str = "daemon.bt.guard.evidence.drain";
 pub const DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH: &str = "daemon.ed2k.serverSubscription.refresh";
+/// 立即刷新 Kad 节点（nodes.dat）订阅（无参 → `Ed2kNodesSubRefreshResponse`）。慢方法：会拉取网络。
+pub const DAEMON_ED2K_NODES_SUBSCRIPTION_REFRESH: &str = "daemon.ed2k.nodesSubscription.refresh";
+/// HighID / LowID 检测（`Ed2kIdCheckParams`，可省略 → `Ed2kNetworkDto`）：按目标报告当前会话，或用
+/// 真实监听端口（启用 UPnP 时先等映射结果）登录服务器取得分配的 ID 后断开。慢方法：会连接网络。
+pub const DAEMON_ED2K_ID_CHECK: &str = "daemon.ed2k.idCheck";
+/// Kad 引导（`Ed2kKadBootstrapParams` → `Ed2kKadBootstrapDto`）：向指定节点 / 网址取到的节点 /
+/// 已知节点发握手，报告应答情况并把存活节点并入已知节点缓存。慢方法：会连接网络。
+pub const DAEMON_ED2K_KAD_BOOTSTRAP: &str = "daemon.ed2k.kadBootstrap";
 pub const DAEMON_DIAGNOSTICS_DESCRIBE: &str = "daemon.diagnostics.describe";
 pub const DAEMON_DIAGNOSTICS_PREPARE_LOG_EXPORT: &str = "daemon.diagnostics.prepareLogExport";
 /// Doctor 动态探测：在 daemon 进程内真实写入各下载目录 / 数据目录并运行外部组件，
@@ -451,6 +488,15 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_TASK_SEED_LOCAL,
     DAEMON_TASK_TORRENT_SHARE,
     DAEMON_TASK_BT_STATUS,
+    DAEMON_TASK_BT_FILES,
+    DAEMON_TASK_SET_FILE_PRIORITIES,
+    DAEMON_TASK_RENAME_BT_FILE,
+    DAEMON_TASK_RECHECK,
+    DAEMON_TASK_MOVE_STORAGE,
+    DAEMON_TASK_SET_BT_LIMITS,
+    DAEMON_TASK_SET_SUPER_SEEDING,
+    DAEMON_TASK_REANNOUNCE,
+    DAEMON_TASK_ED2K_STATUS,
     DAEMON_TASK_PAUSE_MANY,
     DAEMON_TASK_RESUME_MANY,
     DAEMON_TASK_DELETE_MANY,
@@ -547,10 +593,15 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_BT_GUARD_EVENTS_LIST,
     DAEMON_BT_GUARD_EXPORT,
     DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH,
+    DAEMON_BT_GUARD_CLOUD_REFRESH,
     DAEMON_BT_GUARD_CLOUD_APPLY,
     DAEMON_BT_GUARD_EVIDENCE_DRAIN,
     DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH,
+    DAEMON_BT_PORT_STATUS,
     DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH,
+    DAEMON_ED2K_NODES_SUBSCRIPTION_REFRESH,
+    DAEMON_ED2K_ID_CHECK,
+    DAEMON_ED2K_KAD_BOOTSTRAP,
     DAEMON_DIAGNOSTICS_DESCRIBE,
     DAEMON_DIAGNOSTICS_PREPARE_LOG_EXPORT,
     DAEMON_DIAGNOSTICS_PROBE,
@@ -696,6 +747,9 @@ pub const SLOW_DAEMON_METHODS: &[&str] = &[
     DAEMON_WEBHOOK_TEST,
     DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH,
     DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH,
+    DAEMON_ED2K_NODES_SUBSCRIPTION_REFRESH,
+    DAEMON_ED2K_ID_CHECK,
+    DAEMON_ED2K_KAD_BOOTSTRAP,
     DAEMON_BT_GUARD_EXPORT,
     DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH,
     DAEMON_BT_GUARD_CLOUD_APPLY,
@@ -705,6 +759,7 @@ pub const SLOW_DAEMON_METHODS: &[&str] = &[
     DAEMON_TASK_VERIFY,
     DAEMON_TASK_HASH,
     DAEMON_TASK_SEED_LOCAL,
+    DAEMON_TASK_MOVE_STORAGE,
     DAEMON_EGRESS_PLAN,
 ];
 

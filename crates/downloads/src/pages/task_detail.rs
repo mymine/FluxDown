@@ -8,6 +8,10 @@
 mod activity;
 #[path = "task_detail_bt.rs"]
 mod bt;
+#[path = "task_detail_ed2k.rs"]
+mod ed2k;
+#[path = "task_detail_files.rs"]
+mod files;
 #[path = "task_detail_hash.rs"]
 mod hash;
 #[path = "task_detail_source.rs"]
@@ -50,6 +54,8 @@ use gpui_component::{
 
 use activity::ActivityFeed;
 use bt::BtLive;
+use ed2k::Ed2kLive;
+use files::BtFilesLive;
 
 use crate::{
     UserStartIntent,
@@ -104,32 +110,45 @@ pub enum DetailMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetailTab {
     General,
+    /// BT 任务的文件表（优先级 / 重命名）。
+    Files,
     Speed,
     Seeding,
     /// BT 任务的 tracker 汇报状态。
     Trackers,
     /// BT 任务的已连接 peer。
     Peers,
+    /// eD2K 任务的来源。
+    Ed2kSources,
+    /// eD2K 任务的服务器 / Kad / 本机网络。
+    Ed2kNetwork,
     Log,
     Advanced,
     /// 插件贡献的 tab，下标对应 `TaskDetailView::plugin_tabs`。
     Plugin(u16),
 }
 
-/// 可见 tab 顺序：内置 tab（做种仅 BT 任务）后接全部插件 tab。
-fn visible_tabs(is_bt: bool, plugin_tabs: usize) -> Vec<DetailTab> {
+/// 可见 tab 顺序：内置 tab（做种 / Tracker / 连接仅 BT 任务，来源 / 网络仅 eD2K 任务）后接
+/// 全部插件 tab。
+fn visible_tabs(protocol: Option<TaskProtocol>, plugin_tabs: usize) -> Vec<DetailTab> {
+    let is_bt = protocol == Some(TaskProtocol::Bt);
+    let is_ed2k = protocol == Some(TaskProtocol::Ed2k);
     let builtin = [
         DetailTab::General,
+        DetailTab::Files,
         DetailTab::Speed,
         DetailTab::Seeding,
         DetailTab::Trackers,
         DetailTab::Peers,
+        DetailTab::Ed2kSources,
+        DetailTab::Ed2kNetwork,
         DetailTab::Log,
         DetailTab::Advanced,
     ]
     .into_iter()
     .filter(move |tab| match tab {
-        DetailTab::Seeding | DetailTab::Trackers | DetailTab::Peers => is_bt,
+        DetailTab::Files | DetailTab::Seeding | DetailTab::Trackers | DetailTab::Peers => is_bt,
+        DetailTab::Ed2kSources | DetailTab::Ed2kNetwork => is_ed2k,
         _ => true,
     });
     let plugin = (0..u16::try_from(plugin_tabs).unwrap_or(u16::MAX)).map(DetailTab::Plugin);
@@ -177,6 +196,10 @@ pub struct TaskDetailView {
     activity: ActivityFeed,
     /// Tracker / 连接页签的 BT 实况轮询状态。
     bt: BtLive,
+    /// 来源 / 网络页签的 eD2K 实况轮询状态。
+    ed2k: Ed2kLive,
+    /// 文件页签的 BT 文件表轮询状态与选区。
+    bt_files: BtFilesLive,
     runtime: Option<TaskRuntimeDto>,
     activity_stale: bool,
     activity_online: bool,
@@ -300,6 +323,8 @@ impl TaskDetailView {
         let mut this = Self {
             activity: ActivityFeed::new(task_id.clone()),
             bt: BtLive::default(),
+            ed2k: Ed2kLive::default(),
+            bt_files: BtFilesLive::default(),
             runtime: None,
             activity_stale: false,
             activity_online: true,
@@ -371,6 +396,7 @@ impl TaskDetailView {
                         this.sample_speed(cx);
                         this.tick_speed_history(cx);
                         this.tick_bt_clock(cx);
+                        this.tick_ed2k_clock(cx);
                     })
                     .is_err()
                 {
@@ -392,6 +418,8 @@ impl TaskDetailView {
         self.dto = None;
         self.activity.switch_task(self.task_id.clone());
         self.bt.reset();
+        self.ed2k.reset();
+        self.bt_files.reset();
         self.activity_stale = false;
         self.speed_history.clear();
         self.speed_stats = None;
@@ -493,9 +521,13 @@ impl TaskDetailView {
     }
 
     fn is_bt(&self) -> bool {
+        self.task_protocol() == Some(TaskProtocol::Bt)
+    }
+
+    fn task_protocol(&self) -> Option<TaskProtocol> {
         self.store
             .get(&RowKey::Local(self.task_id.clone()))
-            .is_some_and(|row| row.protocol == TaskProtocol::Bt)
+            .map(|row| row.protocol)
     }
 
     fn t(&self, cx: &App, key: &str) -> SharedString {
@@ -508,14 +540,15 @@ impl TaskDetailView {
             cx.notify();
             return;
         }
-        if self
+        let Some(metadata_pending) = self
             .store
             .get(&RowKey::Local(self.task_id.clone()))
-            .is_none()
-        {
+            .map(|row| row.metadata_pending)
+        else {
             self.close(cx);
             return;
-        }
+        };
+        self.bt.observe_metadata_pending(metadata_pending);
         self.sync_file_hash(cx);
         cx.notify();
     }
@@ -560,6 +593,9 @@ impl TaskDetailView {
             self.runtime = controller.task_runtime(&self.task_id).cloned();
         }
         if snapshot.daemon_connected {
+            if !self.activity_online {
+                self.bt.rearm_general();
+            }
             self.activity_online = true;
             self.last_error = None;
             if self.activity.loaded() || self.activity_stale {
@@ -585,6 +621,9 @@ impl TaskDetailView {
     pub fn apply_event(&mut self, event: &ServiceEvent, cx: &mut Context<Self>) {
         if let ServiceEvent::Agent(AgentEvent::DaemonConnectionChanged(connected)) = event {
             if *connected {
+                if !self.activity_online {
+                    self.bt.rearm_general();
+                }
                 self.activity_online = true;
                 self.activity.reconnect();
                 self.activity_stale = false;
@@ -1063,10 +1102,13 @@ impl TaskDetailView {
     fn tab_label(&self, tab: DetailTab, cx: &App) -> SharedString {
         let key = match tab {
             DetailTab::General => "detailTabGeneral",
+            DetailTab::Files => "btTabFiles",
             DetailTab::Speed => "detailTabSpeed",
             DetailTab::Seeding => "tabSeeding",
             DetailTab::Trackers => "btTabTrackers",
             DetailTab::Peers => "btTabPeers",
+            DetailTab::Ed2kSources => "ed2kTabSources",
+            DetailTab::Ed2kNetwork => "ed2kTabNetwork",
             DetailTab::Log => "detailTabLog",
             DetailTab::Advanced => "detailTabAdvanced",
             DetailTab::Plugin(index) => {
@@ -1081,7 +1123,7 @@ impl TaskDetailView {
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = active_theme(cx).tokens().clone();
-        let tabs = visible_tabs(self.is_bt(), self.plugin_tabs.len());
+        let tabs = visible_tabs(self.task_protocol(), self.plugin_tabs.len());
         let labels: Vec<SharedString> = tabs.iter().map(|tab| self.tab_label(*tab, cx)).collect();
         let selected = tabs.iter().position(|tab| *tab == self.tab).unwrap_or(0);
         let this = cx.weak_entity();
@@ -1445,6 +1487,13 @@ impl TaskDetailView {
             .child(detail_row(self.t(cx, "taskQueueLabel"), queue_label, cx))
             .when_some(checksum, |this, checksum| {
                 this.child(detail_row(self.t(cx, "taskChecksum"), checksum, cx))
+            })
+            .when_some(self.bt_info_hash_v2(), |this, hash| {
+                this.child(detail_row(
+                    self.t(cx, "btInfoHashV2"),
+                    self.render_info_hash_v2(hash, cx),
+                    cx,
+                ))
             })
             .when(row.state == TaskState::Completed, |this| {
                 this.child(self.render_file_hash_row(&row, cx))
@@ -2374,12 +2423,21 @@ impl gpui::Render for TaskDetailView {
         if self.bt_tab_active() {
             self.bt_touch(cx);
         }
+        if self.tab == DetailTab::Files {
+            self.bt_files_touch(cx);
+        }
+        if self.ed2k_tab_active() {
+            self.ed2k_touch(cx);
+        }
         let body = match self.tab {
             DetailTab::General => self.render_general(cx),
+            DetailTab::Files => self.render_bt_files(cx),
             DetailTab::Speed => self.render_speed(cx),
             DetailTab::Seeding => self.render_seeding(cx),
             DetailTab::Trackers => self.render_bt_trackers(window, cx),
             DetailTab::Peers => self.render_bt_peers(window, cx),
+            DetailTab::Ed2kSources => self.render_ed2k_sources(window, cx),
+            DetailTab::Ed2kNetwork => self.render_ed2k_network(window, cx),
             DetailTab::Log => self.render_log(cx),
             DetailTab::Advanced => self.render_advanced(cx),
             DetailTab::Plugin(index) => self.render_plugin_tab(index, window, cx),
@@ -2758,7 +2816,7 @@ mod tests {
     #[test]
     fn plugin_tabs_follow_builtin_tabs() {
         assert_eq!(
-            visible_tabs(false, 2),
+            visible_tabs(None, 2),
             [
                 DetailTab::General,
                 DetailTab::Speed,
@@ -2769,9 +2827,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            visible_tabs(true, 0),
+            visible_tabs(Some(super::TaskProtocol::Bt), 0),
             [
                 DetailTab::General,
+                DetailTab::Files,
                 DetailTab::Speed,
                 DetailTab::Seeding,
                 DetailTab::Trackers,
@@ -2779,6 +2838,24 @@ mod tests {
                 DetailTab::Log,
                 DetailTab::Advanced,
             ]
+        );
+    }
+
+    #[test]
+    fn ed2k_tabs_only_on_ed2k_tasks() {
+        assert_eq!(
+            visible_tabs(Some(super::TaskProtocol::Ed2k), 0),
+            [
+                DetailTab::General,
+                DetailTab::Speed,
+                DetailTab::Ed2kSources,
+                DetailTab::Ed2kNetwork,
+                DetailTab::Log,
+                DetailTab::Advanced,
+            ]
+        );
+        assert!(
+            !visible_tabs(Some(super::TaskProtocol::Http), 0).contains(&DetailTab::Ed2kSources)
         );
     }
 

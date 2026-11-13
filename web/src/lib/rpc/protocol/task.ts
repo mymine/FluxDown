@@ -99,6 +99,10 @@ export interface TaskDto {
   btSequential: boolean;
   /** BT 先下载首尾分块（缺省 false；非 BT 恒 false）。 */
   btFirstLastPiecesFirst: boolean;
+  /** BT 任务级下载限速（字节/秒，`daemon.task.setBtLimits`）；0 = 不限。上传限速即 `seedUploadLimitBps`。 */
+  btDownloadLimitBps: number;
+  /** 超级做种（`daemon.task.setSuperSeeding`；缺省 false）。 */
+  btSuperSeeding: boolean;
   /** 持久化的加速路径字节。 */
   sourceBytes: TaskSourceBytesDto;
 }
@@ -241,6 +245,8 @@ export interface SeedLocalResult {
   taskId: string;
   duplicate?: boolean;
   existingName?: string;
+  /** 写出的 `.torrent` 路径（请求带了 `torrentOutput` 时）；缺省 = 无。 */
+  torrentPath?: string;
 }
 
 /** `daemon.task.torrentShare` 结果；`torrentB64` 仅在请求带回且库中有 .torrent 字节时出现。 */
@@ -249,6 +255,8 @@ export interface TorrentShareDto {
   name: string;
   magnet: string;
   torrentB64?: string;
+  /** v2 info hash（SHA-256，小写十六进制）；v1 种子 / 旧 daemon 缺省。 */
+  infoHashV2?: string;
 }
 
 export type TaskVerifyStatus = 'intact' | 'damaged' | 'unverifiable';
@@ -359,10 +367,18 @@ export interface BtTrackerDto {
   lastOkAt?: number;
   /** 下次 announce 的 unix 秒；0 / 缺省 = 未知。 */
   nextAnnounceAt?: number;
+  /** 所在层级（BEP 12，从 0 起）；0 / 缺省 = 第一层。 */
+  tier?: number;
+  /** tracker 报告的做种数；未知缺省（0 是事实，与缺省区分）。 */
+  seeders?: number;
+  /** tracker 报告的下载中对端数；未知缺省。 */
+  leechers?: number;
+  /** tracker 统计的完成次数（scrape `downloaded`）；未知缺省。 */
+  downloaded?: number;
 }
 
-/** 连接传输（`BtPeerDto.transport`）。 */
-export type BtPeerTransport = 'tcp' | 'utp' | 'socks';
+/** 连接传输（`BtPeerDto.transport`）：`http` = 经 HTTP 代理，`i2p` = I2P 隧道。 */
+export type BtPeerTransport = 'tcp' | 'utp' | 'socks' | 'http' | 'i2p';
 
 /** `daemon.task.btStatus` 的单个 peer（`BtPeerDto`），已按活跃度排序。 */
 export interface BtPeerDto {
@@ -408,6 +424,236 @@ export interface BtStatusDto {
   peerCounts: BtPeerCountsDto;
   trackers: BtTrackerDto[];
   peers: BtPeerDto[];
+  /** info hash（小写十六进制）：v1 / 混合为 SHA-1，纯 v2 为截断 SHA-256；未知 / 旧 daemon 缺省。 */
+  infoHash?: string;
+  /** v2 info hash（SHA-256）；v1 种子 / 旧 daemon 缺省。 */
+  infoHashV2?: string;
+  /** HTTP 源（BEP 19 webseed）实况；没有则缺省。 */
+  webSeeds?: BtWebSeedDto[];
+}
+
+/** HTTP 源状态（`BtWebSeedDto.state`）。 */
+export type BtWebSeedState = 'idle' | 'downloading' | 'backingOff' | 'disabled';
+
+/** 一个 HTTP 源（`BtWebSeedDto`）。 */
+export interface BtWebSeedDto {
+  url: string;
+  /** {@link BtWebSeedState} 之一；未知取值按原样保留（新 daemon 可能扩展）。 */
+  state: string;
+  /** 从它下载的字节；0 / 缺省。 */
+  downloaded?: number;
+  /** 最近一次错误；无则缺省。 */
+  message?: string;
+}
+
+/** `daemon.task.btFiles` 的一行（`BtTaskFileDto`）。 */
+export interface BtTaskFileDto {
+  /** 种子内文件下标（与 `BtFileDto.index` 同一编号）。 */
+  index: number;
+  /** 任务目录内的相对路径（`/` 分隔），已是重命名后的当前路径。 */
+  path: string;
+  size: number;
+  /** 已下载并校验通过的字节。 */
+  downloaded: number;
+  /** 见 `BT_FILE_PRIORITY_*`。 */
+  priority: number;
+}
+
+/** `daemon.task.btFiles` 结果（`BtFilesDto`，不含 padding 文件）。 */
+export interface BtFilesDto {
+  /** 能否改优先级 / 重命名：任务未完成且已取得元数据。 */
+  editable: boolean;
+  files: BtTaskFileDto[];
+}
+
+/** 端口映射状态（`BtPortMappingDto.state`）。 */
+export type BtPortMappingState = 'pending' | 'mapped' | 'failed';
+
+/** 一个端口的映射状态（`BtPortMappingDto`）；为 0 / 空串的可选字段不上线。 */
+export interface BtPortMappingDto {
+  /** `tcp` / `udp`。 */
+  protocol: string;
+  internalPort: number;
+  /** 路由器上的外部端口；0 / 缺省 = 未知。 */
+  externalPort?: number;
+  /** `upnp` / `natPmp` / `pcp`；尚未成功缺省。 */
+  method?: string;
+  /** 外网地址；未知缺省。 */
+  externalIp?: string;
+  /** {@link BtPortMappingState} 之一；未知取值原样保留。 */
+  state: string;
+  /** 失败原因；非失败缺省。 */
+  message?: string;
+}
+
+/** `daemon.bt.portStatus` 结果（`BtPortStatusDto`）。 */
+export interface BtPortStatusDto {
+  /** BT 会话是否在运行（没有 BT 任务时不创建会话）。 */
+  running: boolean;
+  /** 监听端口；0 / 缺省 = 未运行。 */
+  listenPort?: number;
+  mappings?: BtPortMappingDto[];
+}
+
+// ── eD2K 实况（native/protocol/src/daemon.rs `Ed2kStatusDto`）；标 `?` 的字段取默认值时不上线。──
+
+export type Ed2kIdKind = 'none' | 'low' | 'high';
+export type Ed2kUpnpStatus = 'disabled' | 'pending' | 'mapped' | 'failed';
+export type Ed2kTaskPhase = 'idle' | 'searching' | 'downloading' | 'waiting' | 'verifying';
+export type Ed2kPeerOrigin = 'server' | 'kad';
+export type Ed2kPeerState = 'known' | 'connecting' | 'queued' | 'transferring' | 'connected' | 'cooldown' | 'failed' | 'banned';
+export type Ed2kServerSource = 'manual' | 'subscription';
+export type Ed2kServerStatus = 'querying' | 'working' | 'notWorking';
+export type Ed2kKadPhase = 'idle' | 'bootstrapping' | 'findingNodes' | 'searching' | 'done';
+export type Ed2kKadNodeOrigin = 'bootstrap' | 'discovered';
+export type Ed2kKadNodeState = 'known' | 'queried' | 'responded';
+
+/** 本机 eD2K 网络（`daemon.task.ed2kStatus` 的 `network`，亦为 `daemon.ed2k.idCheck` 结果）。 */
+export interface Ed2kNetworkDto {
+  id: Ed2kIdKind;
+  /** 0 / 缺省 = 未登录。 */
+  clientId?: number;
+  /** `host:port`。 */
+  server?: string;
+  /** 0 / 缺省 = 监听器未启动。 */
+  listenPort?: number;
+  upnp: Ed2kUpnpStatus;
+  /** `upnp == failed` 时映射器给出的原因（英文原文）；其余缺省。 */
+  upnpError?: string;
+  externalIp?: string;
+  /** 全局设置 `ed2k_enable_upnp`。 */
+  upnpEnabled: boolean;
+  /** 全局设置 `ed2k_enable_kad`。 */
+  kadEnabled: boolean;
+  /** nodes.dat 缓存里的引导节点数。 */
+  kadNodes: number;
+  /** 可用服务器数（手填 + 订阅）。 */
+  serverCount: number;
+  /** 仅 idCheck 未能登录任何服务器时非空。 */
+  error?: string;
+}
+
+export interface Ed2kPeerCountsDto {
+  total: number;
+  transferring: number;
+  connected: number;
+  queued: number;
+  connecting: number;
+  cooldown: number;
+  failed: number;
+  banned: number;
+}
+
+/** 单个来源；HighID 源有 `addr`，LowID 源有 `lowId`。 */
+export interface Ed2kPeerDto {
+  addr?: string;
+  lowId?: number;
+  origin: Ed2kPeerOrigin;
+  state: Ed2kPeerState;
+  queueRank?: number;
+  client?: string;
+  nickname?: string;
+  downloaded?: number;
+  downBps?: number;
+  /** 对端持有的块数；缺省 = 未知。 */
+  parts?: number;
+  /** 正在下载的块序号（从 0 起）。 */
+  part?: number;
+  /** 最近一次失败原因（原始英文错误文本）。 */
+  message?: string;
+  /** 冷却结束 unix 秒。 */
+  retryAt?: number;
+}
+
+export interface Ed2kServerDto {
+  addr: string;
+  source: Ed2kServerSource;
+  status: Ed2kServerStatus;
+  /** 本机当前登录的会话服务器。 */
+  connected?: boolean;
+  /** 最近一次查询返回的源数。 */
+  sources?: number;
+  message?: string;
+  lastQueryAt?: number;
+}
+
+export interface Ed2kKadNodeDto {
+  /** `ip:udpPort`。 */
+  addr: string;
+  /** 32 位小写 hex。 */
+  id: string;
+  origin: Ed2kKadNodeOrigin;
+  state: Ed2kKadNodeState;
+  tcpPort?: number;
+  version?: number;
+}
+
+export interface Ed2kKadDto {
+  phase: Ed2kKadPhase;
+  bootstrapNodes: number;
+  responded: number;
+  discovered: number;
+  sources: number;
+  lastSearchAt?: number;
+  /** 按与文件哈希的 XOR 距离升序，至多 100 个。 */
+  nodes: Ed2kKadNodeDto[];
+}
+
+/** HighID / LowID 检测目标：auto = 有会话报告会话，否则同 list。 */
+export type Ed2kIdCheckTarget = 'auto' | 'session' | 'list' | 'server';
+
+/** `daemon.ed2k.idCheck` 参数；省略 / `{}` = auto。 */
+export interface Ed2kIdCheckParams {
+  target?: Ed2kIdCheckTarget;
+  /** `target = server` 时的 `host:port`（IP 或域名）。 */
+  server?: string;
+}
+
+/** Kad 引导来源：已知节点（nodes.dat 缓存）/ 网址 / 单个节点。 */
+export type Ed2kKadBootstrapSource = 'known' | 'url' | 'node';
+
+/** `daemon.ed2k.kadBootstrap` 参数。 */
+export interface Ed2kKadBootstrapParams {
+  source?: Ed2kKadBootstrapSource;
+  /** `source = node`：IP 或域名。 */
+  host?: string;
+  /** `source = node`：Kad UDP 端口。 */
+  port?: number;
+  /** `source = url`：nodes.dat 地址；空 = 用已配置的订阅地址。 */
+  url?: string;
+}
+
+/** `daemon.ed2k.kadBootstrap` 结果。 */
+export interface Ed2kKadBootstrapDto {
+  contacted: number;
+  responded: number;
+  discovered: number;
+  /** 引导后已知节点缓存里的节点数。 */
+  nodeCount: number;
+  /** 本次联系与发现的节点，应答的在前，至多 100 个。 */
+  nodes: Ed2kKadNodeDto[];
+  /** 没有可联系的节点时的原因。 */
+  error?: string;
+}
+
+/** `daemon.task.ed2kStatus` 结果；任务未在运行时 `phase = idle`、列表为空，`network` 仍有效。 */
+export interface Ed2kStatusDto {
+  phase: Ed2kTaskPhase;
+  /** unix 秒；0 / 缺省 = 未知。 */
+  nextSearchAt?: number;
+  fileHash: string;
+  partsTotal: number;
+  partsDone: number;
+  /** 当前生效的同时连接来源数 1..=8。 */
+  maxSources: number;
+  /** 任务的线程数设置（`daemon.task.setSegments` 写入值）；0 / 缺省 = 自动。 */
+  segments?: number;
+  network: Ed2kNetworkDto;
+  peerCounts: Ed2kPeerCountsDto;
+  /** 服务端已按活跃度排序。 */
+  peers: Ed2kPeerDto[];
+  servers: Ed2kServerDto[];
+  kad: Ed2kKadDto;
 }
 
 /** `daemon.task.speedHistory` 参数。 */

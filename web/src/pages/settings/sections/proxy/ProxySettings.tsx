@@ -1,4 +1,5 @@
-// 代理（crates/settings/src/sections/proxy.rs）：模式 / 系统代理只读信息 / 手动服务器（任何模式可编辑）/ 连通性测试 / 站点凭据。
+// 代理（crates/settings/src/sections/proxy.rs）：模式 / 系统代理只读信息 / 手动服务器（任何模式可编辑）/ 连通性测试 /
+// BitTorrent / 站点规则 / 站点凭据。
 
 import { useEffect, useState } from 'react'
 import { useT } from '../../../../i18n'
@@ -7,6 +8,8 @@ import type { ProxyTestRequest, SystemProxyDto } from '../../../../lib/rpc'
 import { enabledRuleCount } from '../../../../lib/proxyRules'
 import { Button } from '../../../../ui'
 import {
+  DaemonEnumRow,
+  DaemonSwitchRow,
   DaemonTextRow,
   DropdownField,
   SettingsPage,
@@ -14,9 +17,11 @@ import {
   SettingsSection,
   TextField,
   setDaemon,
+  useDaemonBool,
   useDaemonValue,
 } from '../../kit'
 import { InfoLine } from './InfoLine'
+import { btProxyHint } from './btProxy'
 import { ProxyRulesGroup } from './ProxyRulesGroup'
 import { SiteAuthGroup } from './SiteAuthGroup'
 
@@ -141,21 +146,40 @@ function SystemSection() {
   )
 }
 
-/** 手动服务器在任何模式下都可编辑：「自动」把它当备选路径，站点规则与任务的「手动代理」出口也读它。 */
+/**
+ * 手动服务器在任何模式下都可编辑：「自动」把它当备选路径，站点规则与任务的「手动代理」出口也读它。
+ * 非手动模式默认收起为一行摘要 + 展开按钮（GPUI `proxy.rs::manual_section`）；离开本页即恢复收起。
+ */
 function ManualSection({ active }: { active: boolean }) {
   const t = useT()
   const type = useDaemonValue('proxy_type')
+  const host = useDaemonValue('proxy_host').trim()
+  const port = useDaemonValue('proxy_port').trim()
+  const [expanded, setExpanded] = useState(false)
+  const open = active || expanded
+  const summary = host === '' ? t('proxyManualNotSet') : `${type.toUpperCase()} · ${port === '' ? host : `${host}:${port}`}`
   return (
     <SettingsSection title={t('proxyModeManual')} subtitle={t(active ? 'proxyModeManualDesc' : 'proxyManualKeptDesc')}>
-      <SettingsRow title={t('proxyType')}>
-        <DropdownField value={type} options={TYPES} aria-label={t('proxyType')} onValueChange={(next) => setDaemon('proxy_type', next)} />
-      </SettingsRow>
-      <DaemonTextRow configKey="proxy_host" titleKey="proxyHost" descKey="proxyHostPlaceholder" />
-      <PortRow />
-      <DaemonTextRow configKey="proxy_username" titleKey="proxyUsername" descKey="proxyUsernamePlaceholder" />
-      <PasswordRow />
-      <DaemonTextRow configKey="proxy_no_list" titleKey="proxyNoList" descKey="proxyNoListDesc" />
-      <TestConnectionRow source="manual" system={null} />
+      {active ? null : (
+        <SettingsRow title={t('proxyManualServer')} description={summary}>
+          <Button variant="outline" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>
+            {t(expanded ? 'proxyManualCollapse' : 'proxyManualExpand')}
+          </Button>
+        </SettingsRow>
+      )}
+      {open ? (
+        <>
+          <SettingsRow title={t('proxyType')}>
+            <DropdownField value={type} options={TYPES} aria-label={t('proxyType')} onValueChange={(next) => setDaemon('proxy_type', next)} />
+          </SettingsRow>
+          <DaemonTextRow configKey="proxy_host" titleKey="proxyHost" descKey="proxyHostPlaceholder" />
+          <PortRow />
+          <DaemonTextRow configKey="proxy_username" titleKey="proxyUsername" descKey="proxyUsernamePlaceholder" />
+          <PasswordRow />
+          <DaemonTextRow configKey="proxy_no_list" titleKey="proxyNoList" descKey="proxyNoListDesc" />
+          <TestConnectionRow source="manual" system={null} />
+        </>
+      ) : null}
     </SettingsSection>
   )
 }
@@ -168,6 +192,30 @@ function PasswordRow() {
     <SettingsRow title={t('proxyPassword')} description={t('proxyPasswordPlaceholder')}>
       <TextField type="password" value={value} aria-label={t('proxyPassword')} onCommit={(next) => setDaemon('proxy_password', next)} />
     </SettingsRow>
+  )
+}
+
+/** BitTorrent 走代理：总开关 + 代理来源 + 节点连接是否也走代理 + 一条提示。 */
+function BtProxySection() {
+  const t = useT()
+  const enabled = useDaemonBool('bt_proxy_enabled')
+  const hint = btProxyHint(
+    useDaemonValue('bt_proxy_source'),
+    useDaemonValue('proxy_type'),
+    useDaemonValue('proxy_host'),
+    useDaemonValue('proxy_port'),
+  )
+  return (
+    <SettingsSection title={t('proxyBtSection')}>
+      <DaemonSwitchRow configKey="bt_proxy_enabled" titleKey="btProxyEnabled" descKey="btProxyEnabledDesc" />
+      {enabled ? (
+        <>
+          <DaemonEnumRow configKey="bt_proxy_source" titleKey="btProxySource" descKey="btProxySourceDesc" labelPrefix="btProxySource" />
+          <DaemonSwitchRow configKey="bt_proxy_peers" titleKey="btProxyPeers" descKey="btProxyPeersDesc" />
+        </>
+      ) : null}
+      {enabled && hint !== null ? <InfoLine text={t(hint)} /> : null}
+    </SettingsSection>
   )
 }
 
@@ -202,6 +250,7 @@ export function ProxySettings() {
       ) : null}
       {current === 'system' ? <SystemSection /> : null}
       <ManualSection active={current === 'manual'} />
+      <BtProxySection />
       <ProxyRulesGroup />
       <SiteAuthGroup />
     </SettingsPage>

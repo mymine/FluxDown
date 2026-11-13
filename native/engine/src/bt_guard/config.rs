@@ -79,7 +79,7 @@ pub struct BtGuardConfig {
     pub rule_lag: RuleMode,
     pub rule_fingerprint: RuleMode,
     pub cloud_mode: RuleMode,
-    /// 110..=1000
+    /// 110..=2000
     pub excess_ratio_pct: u32,
     /// 0..=1048576
     pub min_torrent_mib: u64,
@@ -101,6 +101,8 @@ pub struct BtGuardConfig {
     pub cloud_enabled: bool,
     /// 证据上报开关（设备本地）：仅决定是否在内存累积待上报证据。
     pub report_enabled: bool,
+    /// 本机名字规则（`bt_guard_client_rules`），先于云名单规则匹配，不依赖云名单是否有效。
+    pub client_rules: Vec<super::cloud::ClientRule>,
 }
 
 impl Default for BtGuardConfig {
@@ -111,7 +113,8 @@ impl Default for BtGuardConfig {
             rule_rerequest: RuleMode::Observe,
             rule_rewind: RuleMode::Observe,
             rule_lag: RuleMode::Observe,
-            rule_fingerprint: RuleMode::Observe,
+            // 名字规则默认直接执行（用户 2026-11-12 决定）；其余规则默认仅观察。
+            rule_fingerprint: RuleMode::Enforce,
             cloud_mode: RuleMode::Observe,
             excess_ratio_pct: 200,
             min_torrent_mib: 64,
@@ -126,6 +129,7 @@ impl Default for BtGuardConfig {
             filter_urls: String::new(),
             cloud_enabled: true,
             report_enabled: false,
+            client_rules: Vec::new(),
         }
     }
 }
@@ -133,7 +137,7 @@ impl Default for BtGuardConfig {
 impl BtGuardConfig {
     /// 钳制到契约范围（daemon 校验之外的兜底，保证内部算术不溢出、不除零）。
     pub fn sanitized(mut self) -> Self {
-        self.excess_ratio_pct = self.excess_ratio_pct.clamp(110, 1000);
+        self.excess_ratio_pct = self.excess_ratio_pct.clamp(110, 2000);
         self.min_torrent_mib = self.min_torrent_mib.min(1_048_576);
         self.rewind_tolerance_pct = self.rewind_tolerance_pct.min(100);
         self.throttle_kib = self.throttle_kib.clamp(1, 1_048_576);
