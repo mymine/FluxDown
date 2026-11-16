@@ -1,8 +1,7 @@
-//! 任务编辑：「更换链接」与「修改线程数」对话框及其提交流程。
+//! 任务编辑：「更换链接」「修改线程数」与「编辑代理」对话框及其提交流程。
 //!
-//! 入口：下载页右键 / 应用菜单，以及任务详情「常规」页（停靠面板与独立窗口）。
-//! 命令成功后，失败态任务自动补发 `Resume`（改完立即重试）；暂停 / 等待保持原状态。
-//! `Resume` 只在编辑命令成功之后串行发出；失败与成功提示推送到打开对话框的窗口。
+//! 入口：下载页右键 / 应用菜单，以及任务详情「常规」页（停靠面板与独立详情窗口共用）。
+//! 失败与成功提示推送到打开对话框的窗口；代理变更的失败任务由 daemon 直接重试。
 
 use std::{rc::Rc, sync::Arc};
 
@@ -23,7 +22,7 @@ use gpui_component::{
 };
 
 use crate::{
-    actions::{ChangeSelectedSegments, ChangeSelectedUrl},
+    actions::{ChangeSelectedSegments, ChangeSelectedUrl, EditSelectedTask},
     components::{
         task_table::{TaskMenuFacts, task_menu_facts_for, url_has_prefix},
         threads_risk::{parse_segments_input, threads_risk_callout},
@@ -263,6 +262,8 @@ pub(crate) struct TaskEditTarget {
     pub(crate) port: Arc<dyn DownloadsPort>,
     pub(crate) strings: DownloadStrings,
     pub(crate) translator: Entity<Translator>,
+    pub(crate) categories: Vec<fluxdown_protocol::CustomCategoryDto>,
+    pub(crate) user_agent_presets: Vec<fluxdown_protocol::user_agent_presets::UserAgentPreset>,
 }
 
 impl TaskEditTarget {
@@ -401,8 +402,10 @@ fn submit_task_edit(
     let task_id = target.key.task_id().to_owned();
     let port = Arc::clone(&target.port);
     let translator = target.translator.clone();
-    let success_notice =
-        (kind == EditKind::SetSegments).then(|| target.strings.threads_changed.clone());
+    let success_notice = match kind {
+        EditKind::SetSegments => Some(target.strings.threads_changed.clone()),
+        EditKind::ChangeUrl => None,
+    };
     let handle = window.window_handle();
     let edit = port.execute(command);
     cx.spawn(async move |cx| {
@@ -454,6 +457,17 @@ impl DownloadView {
             port: Arc::clone(&self.port),
             strings: self.strings.clone(),
             translator: self.translator.clone(),
+            categories: self
+                .controller
+                .categories()
+                .visible()
+                .filter(|rule| rule.dto.builtin_type.as_deref() != Some("all"))
+                .map(|rule| rule.dto.clone())
+                .collect(),
+            user_agent_presets: fluxdown_protocol::user_agent_presets::from_preference(
+                self.controller
+                    .preference(fluxdown_protocol::user_agent_presets::PREF_KEY),
+            ),
         })
     }
 
@@ -478,6 +492,17 @@ impl DownloadView {
     ) {
         if let Some(target) = self.single_edit_target(cx) {
             open_change_segments_dialog(target, window, cx);
+        }
+    }
+    /// Unified task editor action.
+    pub(crate) fn on_edit_selected_task(
+        &mut self,
+        _: &EditSelectedTask,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(target) = self.single_edit_target(cx) {
+            crate::pages::task_properties::open_task_properties(target, window, cx);
         }
     }
 }

@@ -17,6 +17,7 @@ pub(crate) enum GroupCountTone {
 
 #[derive(Clone)]
 pub(crate) struct DownloadStrings {
+    pub(crate) task_edit_title: SharedString,
     pub(crate) category_archive: SharedString,
     pub(crate) category_audio: SharedString,
     pub(crate) category_document: SharedString,
@@ -115,7 +116,6 @@ pub(crate) struct DownloadStrings {
     pub(crate) change_url_label: SharedString,
     pub(crate) change_url_placeholder: SharedString,
     /// 右键「修改线程数」及其对话框（含「已下进度保留」说明与成功提示）。
-    pub(crate) edit_threads: SharedString,
     pub(crate) edit_threads_title: SharedString,
     pub(crate) edit_threads_hint: SharedString,
     pub(crate) edit_threads_label: SharedString,
@@ -327,13 +327,13 @@ impl DownloadStrings {
             change_url_title: shared(translator.text("webChangeUrlTitle")),
             change_url_label: shared(translator.text("webChangeUrlLabel")),
             change_url_placeholder: shared(translator.text("webChangeUrlPlaceholder")),
-            edit_threads: shared(translator.text("editThreads")),
             edit_threads_title: shared(translator.text("editThreadsTitle")),
             edit_threads_hint: shared(translator.text("editThreadsResetHint")),
             edit_threads_label: shared(translator.text("configuredThreads")),
             edit_threads_zero_hint: shared(translator.text("queueDefaultSegmentsHint")),
             edit_threads_invalid: shared(translator.text("editThreadsInvalid")),
             threads_changed: shared(translator.text("threadsChanged")),
+            task_edit_title: shared(translator.text("taskEditTitle")),
             seed_local_title: shared(translator.text("seedLocalTitle")),
             seed_local_desc: shared(translator.text("seedLocalDesc")),
             seed_local_path: shared(translator.text("seedLocalPath")),
@@ -1248,7 +1248,7 @@ mod tests {
     #[test]
     fn post_only_errors_are_localized_and_others_pass_through()
     -> Result<(), fluxdown_ui_i18n::I18nError> {
-        let catalog = std::sync::Arc::new(fluxdown_ui_i18n::I18nCatalog::load_embedded()?);
+        let catalog = fluxdown_ui_i18n::I18nCatalog::load_embedded()?;
         let translator = catalog.translator("en");
         let strings = DownloadStrings::from_translator(&translator);
         assert_eq!(
@@ -1268,7 +1268,7 @@ mod tests {
     #[test]
     fn preparing_status_is_labelled_consistently_across_surfaces()
     -> Result<(), fluxdown_ui_i18n::I18nError> {
-        let catalog = std::sync::Arc::new(fluxdown_ui_i18n::I18nCatalog::load_embedded()?);
+        let catalog = fluxdown_ui_i18n::I18nCatalog::load_embedded()?;
         let translator = catalog.translator("en");
         let strings = DownloadStrings::from_translator(&translator);
         let task = |status: i32, queue_key: Option<i64>| {

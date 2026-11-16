@@ -2,6 +2,7 @@
 //!
 //! 两端 crate 保持彼此独立；宿主只在边界调用本 crate 的命名函数。
 
+mod task_edit;
 use fluxdown_engine::downloader::CapturedRequestBody;
 use fluxdown_engine::model::{
     BtFileEntry, CdnNodeInfo, GroupInfo, HlsQualityOption, QueueInfo, QueueOrderEntry,
@@ -17,6 +18,7 @@ use fluxdown_protocol::daemon::{
 };
 #[cfg(feature = "components")]
 use fluxdown_protocol::daemon::{ComponentFfmpegStatus, ComponentVersions, ComponentYtdlpStatus};
+pub use task_edit::{task_edit_snapshot_to_dto, task_edit_to_engine, task_properties_to_dto};
 
 /// 将捕获请求体转换为引擎请求体。
 #[must_use]
@@ -55,6 +57,7 @@ pub fn category_route_to_engine(
         other_dir: route.other_dir,
         archive: None,
         archive_metadata: None,
+        archive_categories: route.archive_categories,
     }
 }
 
@@ -265,6 +268,7 @@ pub fn task_info_to_dto(task: TaskInfo) -> TaskDto {
         bt_first_last_pieces_first: task.bt_first_last_pieces_first,
         bt_download_limit_bps: task.bt_download_limit_bps,
         bt_super_seeding: task.bt_super_seeding,
+        properties: task_properties_to_dto(task.properties),
     }
 }
 
@@ -590,6 +594,21 @@ pub fn setting_field_to_dto(
         helper_script: field.helper_script,
         helper_label: field.helper_label,
         pattern: field.pattern,
+        localizations: field
+            .localizations
+            .into_iter()
+            .map(|(locale, text)| {
+                (
+                    locale,
+                    fluxdown_protocol::plugin_i18n::SettingLocalizationDto {
+                        title: text.title,
+                        description: text.description,
+                        helper_label: text.helper_label,
+                        options: text.options,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 

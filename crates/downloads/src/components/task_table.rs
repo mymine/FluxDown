@@ -455,6 +455,29 @@ pub(crate) struct TaskMenuFacts {
     pub(crate) is_seeding: bool,
     /// 已完成且做种已停止 / 达标（seeding_status 2..=7）、产物仍在：可继续（恢复做种）。
     pub(crate) can_resume_seeding: bool,
+    /// 「复制下载地址」能复制的链接种类（`DownloadTaskView::copyable_share_url`）。
+    pub(crate) share_link: ShareLink,
+}
+
+/// 任务「下载地址」的种类：决定「复制下载地址」是否有意义、是否与「复制磁力链接」重复。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShareLink {
+    /// 可复制的普通链接（http(s) / ftp / ed2k / RSS 的 `.torrent` 直链等）。
+    Url,
+    /// 用户添加时的 `magnet:` 原文。
+    Magnet,
+    /// 无可复制链接：本地导入的 `.torrent` 只有 `torrent-file://` 哨兵。
+    None,
+}
+
+impl ShareLink {
+    fn of(url: Option<&str>) -> Self {
+        match url {
+            None => Self::None,
+            Some(url) if url_has_prefix(url, &["magnet:"]) => Self::Magnet,
+            Some(_) => Self::Url,
+        }
+    }
 }
 
 /// 可「忽略插件重试」的插件失败错误消息前缀（引擎 `handle_resolve_ready`；二段解析任务
@@ -517,6 +540,27 @@ impl TaskMenuFacts {
     pub(crate) fn has_product_on_disk(&self) -> bool {
         self.is_local && self.state == TaskState::Completed && !self.file_missing
     }
+
+    /// 「复制下载地址」对单个任务有意义：有真实链接，且不与「复制磁力链接」重复
+    /// （本机 BT 任务的磁力原文由「复制磁力链接」给出，后者还带会话追加的 tracker）。
+    pub(crate) fn can_copy_url(&self) -> bool {
+        match self.share_link {
+            ShareLink::Url => true,
+            ShareLink::Magnet => !self.can_share_torrent(),
+            ShareLink::None => false,
+        }
+    }
+}
+
+/// 「复制下载地址」可见：单选按 [`TaskMenuFacts::can_copy_url`]；多选时「复制磁力链接」
+/// 不出现，磁力原文仍是批量复制的唯一途径，只要有一项能给出链接即显示（哨兵行复制时跳过）。
+fn copy_url_visible(selection: &[TaskMenuFacts]) -> bool {
+    match selection {
+        [only] => only.can_copy_url(),
+        _ => selection
+            .iter()
+            .any(|task| task.share_link != ShareLink::None),
+    }
 }
 
 /// 由任务行计算菜单事实：右键菜单、应用菜单与详情面板按钮共用同一事实源。
@@ -540,6 +584,7 @@ pub(crate) fn task_menu_facts_for(store: &TaskStore, key: &RowKey) -> Option<Tas
         bt_sequential: row.bt_sequential,
         bt_first_last_pieces_first: row.bt_first_last_pieces_first,
         bt_super_seeding: row.bt_super_seeding,
+        share_link: ShareLink::of(row.copyable_share_url()),
     })
 }
 
@@ -559,7 +604,8 @@ pub(crate) enum MenuEntry {
     /// 更换下载链接（单选；条件见 [`TaskMenuFacts::can_change_url`]）。
     ChangeUrl,
     /// 修改线程数（单选；条件见 [`TaskMenuFacts::can_change_segments`]）。
-    ChangeSegments,
+    /// Edit all supported properties of a single local task.
+    EditTask,
     /// 完整性校验（单选；条件见 [`TaskMenuFacts::can_verify_integrity`]）。
     VerifyIntegrity,
     /// 最稀有优先（本地未完成 BT；可多选。选中态见 [`piece_picking_order`]）。
@@ -654,8 +700,8 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
         if only.can_change_url() {
             items.push(MenuEntry::ChangeUrl);
         }
-        if only.can_change_segments() {
-            items.push(MenuEntry::ChangeSegments);
+        if only.is_local {
+            items.push(MenuEntry::EditTask);
         }
         if only.can_verify_integrity() {
             items.push(MenuEntry::VerifyIntegrity);
@@ -685,7 +731,9 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
     }) {
         items.push(MenuEntry::Redownload);
     }
-    items.push(MenuEntry::CopyUrl);
+    if copy_url_visible(selection) {
+        items.push(MenuEntry::CopyUrl);
+    }
     if let [only] = selection
         && only.can_share_torrent()
     {
@@ -818,9 +866,10 @@ fn single_local_bt(selection: &[TaskMenuFacts]) -> bool {
     matches!(selection, [only] if only.is_local && only.is_bt)
 }
 
-/// 「移动到…」：恰好一个本机 BT 任务（任意状态，含已完成 / 做种）。
+/// 「移动到…」：恰好一个本机任务（任意协议、任意状态，含已完成 / 做种）。BT 走 BT 会话搬移，
+/// 其余协议由 daemon 转统一编辑的搬移（`daemon.task.moveStorage`）。
 pub(crate) fn move_storage_visible(selection: &[TaskMenuFacts]) -> bool {
-    single_local_bt(selection)
+    matches!(selection, [only] if only.is_local)
 }
 
 /// 「任务限速…」：恰好一个本机 BT 任务。
@@ -1653,6 +1702,8 @@ impl DownloadTableDelegate {
         task.name_fold.contains(&self.query)
             || task.url_fold.contains(&self.query)
             || task.site_fold.contains(&self.query)
+            || task.category_fold.contains(&self.query)
+            || task.tags_fold.contains(&self.query)
             || self.group_name_matches(task)
     }
 
@@ -2190,10 +2241,15 @@ impl DownloadTableDelegate {
     }
 
     /// 指针移到 `row_ix`。返回选区是否变化。文件拖放进行时没有划选会话，本方法直接返回。
+    /// 没按着左键的移动说明会话的 mouse_up 被别处吞掉（#1123），此时直接收束会话。
     pub(super) fn drag_sweep_to(&mut self, row_ix: usize, event: &MouseMoveEvent) -> bool {
         let Some(sweep) = self.row_sweep.as_mut() else {
             return false;
         };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.row_sweep = None;
+            return false;
+        }
         if !sweep.active {
             let delta = event.position - sweep.origin_pos;
             if !sweep_past_slop(delta) {
@@ -2558,6 +2614,8 @@ impl DownloadTableDelegate {
         if !checkbox_pinned {
             let tooltip = self.strings.select_task_tooltip.clone();
             // 选择列只负责点进多选。拖出文件只在文件名列，避免和图标点击抢手势。
+            // 按下在本元素截断：行的划选不得由选择格启动。on_click 在 mouse_up 冒泡阶段会
+            // stop_propagation，行的 finish_row_sweep 收不到，会话就残留了（#1123）。
             return div()
                 .id(("download-task-select-cell", row_ix))
                 .group(SELECT_CELL_GROUP)
@@ -2586,6 +2644,7 @@ impl DownloadTableDelegate {
                             style.border_color(hover_border)
                         })),
                 )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(toggle)
                 .into_any_element();
         }
@@ -3189,10 +3248,10 @@ impl DownloadTableDelegate {
                 FluxIcon::Globe,
                 Box::new(crate::actions::ChangeSelectedUrl),
             ),
-            MenuEntry::ChangeSegments => menu.menu_with_icon(
-                self.strings.edit_threads.clone(),
-                FluxIcon::Layers,
-                Box::new(crate::actions::ChangeSelectedSegments),
+            MenuEntry::EditTask => menu.menu_with_icon(
+                self.strings.task_edit_title.clone(),
+                FluxIcon::Pen,
+                Box::new(crate::actions::EditSelectedTask),
             ),
             MenuEntry::VerifyIntegrity => menu.menu_with_icon(
                 self.strings.verify_integrity.clone(),
@@ -4791,7 +4850,7 @@ mod tests {
         statuses: &[i32],
         missing: &[usize],
     ) -> Result<DownloadTableDelegate, I18nError> {
-        let catalog = std::sync::Arc::new(I18nCatalog::load_embedded()?);
+        let catalog = I18nCatalog::load_embedded()?;
         let strings = DownloadStrings::from_translator(&catalog.translator("en"));
         let store = Rc::new(TaskStore::default());
         let rows = statuses
@@ -5539,6 +5598,122 @@ mod tests {
         assert!(!app.read(|cx| cx.has_active_drag()));
         win.simulate_mouse_up(at(other_x, 2), MouseButton::Left);
         assert_eq!(selected(&win).len(), 3);
+        Ok(())
+    }
+
+    /// 回归 #1123：初次点选择格（非多选状态）不得留下划选会话，否则之后不按键移动也会改选区。
+    #[test]
+    fn selection_cell_click_enters_multi_select_without_leaving_a_sweep() -> Result<(), I18nError> {
+        use gpui::{
+            AppContext as _, Context, Entity, IntoElement, Modifiers, MouseMoveEvent,
+            ParentElement as _, Pixels, Point, Render, Styled as _, TestApp, Window, div, point,
+            px,
+        };
+        use gpui_component::table::TableState;
+
+        struct Host {
+            table: Entity<TableState<DownloadTableDelegate>>,
+        }
+
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().flex().child(render_download_table(
+                    "select-cell-test-table",
+                    &self.table,
+                    cx,
+                ))
+            }
+        }
+
+        let delegate = delegate(&[3, 3, 3, 3])?;
+        let keys = delegate.visible_task_keys();
+        let mut app = TestApp::new();
+        app.update(|cx| {
+            gpui_component::init(cx);
+            fluxdown_ui_theme::init(cx);
+        });
+        let mut win = app.open_window(move |window, cx| Host {
+            table: cx.new(|cx| {
+                TableState::new(delegate, window, cx)
+                    .row_selectable(false)
+                    .col_selectable(false)
+            }),
+        });
+        for _ in 0..3 {
+            win.draw();
+            app.run_until_parked();
+        }
+
+        let (header, row, cell_x) = win.read(|host, cx| {
+            let delegate = host.table.read(cx).delegate();
+            (
+                f32::from(table_header_height(cx)),
+                f32::from(
+                    delegate
+                        .prefs
+                        .density
+                        .row_height(fluxdown_ui_theme::active_theme(cx).density()),
+                ),
+                delegate.selection_column_width() / 2.,
+            )
+        });
+        let at = |x: f32, row_ix: usize| -> Point<Pixels> {
+            point(px(x), px(header + row * (row_ix as f32 + 0.5)))
+        };
+
+        win.simulate_mouse_move(at(cell_x, 0));
+        win.simulate_click(at(cell_x, 0), gpui::MouseButton::Left);
+        win.read(|host, cx| {
+            let delegate = host.table.read(cx).delegate();
+            assert!(delegate.in_multi_select());
+            assert_eq!(delegate.selected_keys(), [keys[0].clone()]);
+            assert!(delegate.row_sweep.is_none());
+        });
+
+        // 没按键的移动不改选区。
+        for row_ix in [1, 3, 2] {
+            win.simulate_event(MouseMoveEvent {
+                position: at(cell_x + 200., row_ix),
+                modifiers: Modifiers::default(),
+                pressed_button: None,
+            });
+        }
+        win.read(|host, cx| {
+            let delegate = host.table.read(cx).delegate();
+            assert_eq!(delegate.selected_keys(), [keys[0].clone()]);
+            assert!(delegate.row_sweep.is_none());
+        });
+        Ok(())
+    }
+
+    /// 回归 #1123 的纵深防御：划选会话残留（漏掉 mouse_up）时，无按键移动立即收束会话。
+    #[test]
+    fn drag_sweep_ends_when_no_button_is_pressed() -> Result<(), I18nError> {
+        use gpui::{Modifiers, MouseButton, MouseMoveEvent, point, px};
+
+        let mut delegate = delegate(&[1, 1, 1, 1])?;
+        let stale = || super::RowSweep {
+            origin_ix: 0,
+            origin_pos: point(px(0.), px(0.)),
+            additive: false,
+            base: HashSet::new(),
+            active: false,
+        };
+        let moved = |pressed_button| MouseMoveEvent {
+            position: point(px(100.), px(100.)),
+            modifiers: Modifiers::default(),
+            pressed_button,
+        };
+
+        delegate.row_sweep = Some(stale());
+        assert!(!delegate.drag_sweep_to(2, &moved(None)));
+        assert!(delegate.row_sweep.is_none());
+        assert!(delegate.selected_tasks.is_empty());
+
+        // 按住左键时照常划选。
+        delegate.row_sweep = Some(stale());
+        assert!(delegate.drag_sweep_to(2, &moved(Some(MouseButton::Left))));
+        assert_eq!(delegate.selected_tasks.len(), 3);
         Ok(())
     }
 
@@ -6447,11 +6622,12 @@ mod tests {
 #[cfg(test)]
 mod context_menu_tests {
     use super::{
-        MenuEntry, PLUGIN_ERROR_PREFIX, PiecePickingOrder, TaskMenuFacts, context_menu_items,
-        force_recheck_visible, is_bt_url, is_replaceable_url, move_storage_visible,
-        piece_picking_checked, piece_picking_order, piece_picking_order_targets,
-        piece_picking_toggle_target, super_seeding_checked, super_seeding_targets,
-        super_seeding_toggle_target, super_seeding_visible, task_limits_visible, task_menu_entries,
+        MenuEntry, PLUGIN_ERROR_PREFIX, PiecePickingOrder, ShareLink, TaskMenuFacts,
+        context_menu_items, force_recheck_visible, is_bt_url, is_replaceable_url,
+        move_storage_visible, piece_picking_checked, piece_picking_order,
+        piece_picking_order_targets, piece_picking_toggle_target, super_seeding_checked,
+        super_seeding_targets, super_seeding_toggle_target, super_seeding_visible,
+        task_limits_visible, task_menu_entries,
     };
     use crate::model::TaskState;
 
@@ -6472,6 +6648,7 @@ mod context_menu_tests {
             file_missing: false,
             is_seeding: false,
             can_resume_seeding: false,
+            share_link: ShareLink::Url,
         }
     }
 
@@ -6530,28 +6707,6 @@ mod context_menu_tests {
         unknown.controllable = false;
         let mixed = context_menu_items(&[unknown, task(false, TaskState::Paused)]);
         assert!(mixed.contains(&MenuEntry::Delete));
-    }
-
-    #[test]
-    fn single_local_completed_task_shows_full_menu() {
-        let items = context_menu_items(&[task(true, TaskState::Completed)]);
-        assert_eq!(
-            items,
-            vec![
-                MenuEntry::Boost,
-                MenuEntry::OpenFile,
-                MenuEntry::OpenFolder,
-                MenuEntry::CopyFile,
-                MenuEntry::Rename,
-                MenuEntry::Redownload,
-                MenuEntry::CopyUrl,
-                MenuEntry::MoveToQueue,
-                MenuEntry::Separator,
-                MenuEntry::Delete,
-                MenuEntry::DeleteWithFiles,
-                MenuEntry::ShowDetail,
-            ]
-        );
     }
 
     #[test]
@@ -6722,32 +6877,27 @@ mod context_menu_tests {
     }
 
     #[test]
-    fn change_segments_needs_single_local_unfinished_non_bt_task() {
-        // 下载中也允许：引擎静默暂停 → 改 → 恢复。
+    fn task_editor_needs_single_local_task_including_completed_and_bt() {
         for state in [
             TaskState::Downloading,
             TaskState::Paused,
             TaskState::Failed,
             TaskState::Pending,
+            TaskState::Completed,
         ] {
             assert!(
-                context_menu_items(&[task(true, state)]).contains(&MenuEntry::ChangeSegments),
+                context_menu_items(&[task(true, state)]).contains(&MenuEntry::EditTask),
                 "{state:?}"
             );
         }
-        assert!(
-            !context_menu_items(&[task(true, TaskState::Completed)])
-                .contains(&MenuEntry::ChangeSegments)
-        );
         let mut bt = task(true, TaskState::Paused);
         bt.is_bt = true;
-        assert!(!context_menu_items(&[bt]).contains(&MenuEntry::ChangeSegments));
+        assert!(context_menu_items(&[bt]).contains(&MenuEntry::EditTask));
         assert!(
-            !context_menu_items(&[task(false, TaskState::Paused)])
-                .contains(&MenuEntry::ChangeSegments)
+            !context_menu_items(&[task(false, TaskState::Paused)]).contains(&MenuEntry::EditTask)
         );
         let pair = [task(true, TaskState::Paused), task(true, TaskState::Failed)];
-        assert!(!context_menu_items(&pair).contains(&MenuEntry::ChangeSegments));
+        assert!(!context_menu_items(&pair).contains(&MenuEntry::EditTask));
     }
 
     #[test]
@@ -6960,17 +7110,17 @@ mod context_menu_tests {
             );
         }
 
-        // 移动到… / 任务限速…：恰好一个本机 BT（含已完成 / 做种）。
+        // 移动到…：恰好一个本机任务（任意协议、任意状态）；任务限速…：恰好一个本机 BT。
+        let completed_http = task(true, TaskState::Completed);
+        for single in [unfinished, completed, http, completed_http] {
+            assert!(move_storage_visible(&[single]), "{single:?}");
+            assert!(context_menu_items(&[single]).contains(&MenuEntry::MoveStorage));
+        }
         for single in [unfinished, completed] {
-            assert!(move_storage_visible(&[single]));
             assert!(task_limits_visible(&[single]));
         }
-        for selection in [
-            &[remote][..],
-            &[http][..],
-            &[unfinished, completed][..],
-            &[][..],
-        ] {
+        assert!(!task_limits_visible(&[http]));
+        for selection in [&[remote][..], &[unfinished, completed][..], &[][..]] {
             assert!(!move_storage_visible(selection), "{selection:?}");
             assert!(!task_limits_visible(selection), "{selection:?}");
             let items = context_menu_items(selection);
@@ -7012,6 +7162,7 @@ mod context_menu_tests {
     fn torrent_share_entries_need_single_local_bt_task_in_any_state() {
         let mut bt = task(true, TaskState::Completed);
         bt.is_bt = true;
+        bt.share_link = ShareLink::Magnet;
         for state in [
             TaskState::Downloading,
             TaskState::Paused,
@@ -7023,11 +7174,10 @@ mod context_menu_tests {
             let items = context_menu_items(&[facts]);
             let at = items
                 .iter()
-                .position(|entry| *entry == MenuEntry::CopyUrl)
-                .expect("copy URL is always offered");
-            assert_eq!(items.get(at + 1), Some(&MenuEntry::CopyMagnet), "{state:?}");
+                .position(|entry| *entry == MenuEntry::CopyMagnet)
+                .expect("local BT offers copy magnet");
             assert_eq!(
-                items.get(at + 2),
+                items.get(at + 1),
                 Some(&MenuEntry::ExportTorrent),
                 "{state:?}"
             );
@@ -7046,26 +7196,33 @@ mod context_menu_tests {
     }
 
     #[test]
-    fn failed_local_task_menu_places_edit_entries_between_rename_and_redownload() {
-        assert_eq!(
-            context_menu_items(&[task(true, TaskState::Failed)]),
-            vec![
-                MenuEntry::Resume,
-                MenuEntry::Pause,
-                MenuEntry::Boost,
-                MenuEntry::OpenFolder,
-                MenuEntry::Rename,
-                MenuEntry::ChangeUrl,
-                MenuEntry::ChangeSegments,
-                MenuEntry::Redownload,
-                MenuEntry::CopyUrl,
-                MenuEntry::MoveToQueue,
-                MenuEntry::Separator,
-                MenuEntry::Delete,
-                MenuEntry::DeleteWithFiles,
-                MenuEntry::ShowDetail,
-            ]
-        );
+    fn copy_url_hides_where_it_duplicates_copy_magnet_or_has_no_link() {
+        let mut magnet = task(true, TaskState::Paused);
+        magnet.is_bt = true;
+        magnet.share_link = ShareLink::Magnet;
+        let mut imported = magnet;
+        imported.share_link = ShareLink::None;
+        let mut rss_torrent = magnet;
+        rss_torrent.share_link = ShareLink::Url;
+        let mut remote_magnet = magnet;
+        remote_magnet.is_local = false;
+
+        // 单选本机磁力任务：「复制磁力链接」已覆盖；导入的种子文件只有哨兵。
+        for facts in [magnet, imported] {
+            let items = context_menu_items(&[facts]);
+            assert!(!items.contains(&MenuEntry::CopyUrl), "{facts:?}");
+            assert!(items.contains(&MenuEntry::CopyMagnet), "{facts:?}");
+        }
+        // RSS / 网页来源的 .torrent 直链与磁力不同；远程任务没有「复制磁力链接」。
+        for facts in [rss_torrent, remote_magnet] {
+            assert!(
+                context_menu_items(&[facts]).contains(&MenuEntry::CopyUrl),
+                "{facts:?}"
+            );
+        }
+        // 多选没有「复制磁力链接」：磁力原文经「复制下载地址」批量复制，全是哨兵才隐藏。
+        assert!(context_menu_items(&[magnet, imported]).contains(&MenuEntry::CopyUrl));
+        assert!(!context_menu_items(&[imported, imported]).contains(&MenuEntry::CopyUrl));
     }
 
     #[test]

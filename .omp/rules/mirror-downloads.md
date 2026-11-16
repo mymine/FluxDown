@@ -53,6 +53,10 @@ interruptMode: never
 
 → Web `web/src/pages/downloads/model/taskEdit.ts::{canSetPiecePicking, pieceOrder, pieceOrderTargets, pieceSequentialParams, pieceOptionAllOn, pieceEndsParams}` + `table/menus.ts` + `model/actions.ts::{setPieceOrder, setFirstLastPieces}`；Android `actions/TaskActions.kt::piecePickingMenu`（单任务菜单 + 多选长按菜单）；iOS `FluxDomain/Protocol/Tasks.swift::PiecePickingMenu` + `Actions/TaskMenu.swift` / `Features/Downloads/DownloadsListScreen.swift`（只在 `FULL_FLAVOR` 编入）。GPUI `is_local` 排除的是云端远程任务行；移动端没有该行类型，**不用** `isLocalHost`（那只表示文件在这台手机上，会错藏正在控制的远端 PC）。移动端按 URL 小写判断 `magnet:` / `torrent-file://`，未完成才显示；批量切换逐任务捕获错误、全部尝试后再 toast 一次。各端测试覆盖同一组显示 / 顺序 / 勾选用例
 
+## `crates/downloads/src/components/task_table.rs::{ShareLink, TaskMenuFacts::can_copy_url, copy_url_visible}` + `model/mod.rs::DownloadTaskView::copyable_share_url`（「复制下载地址」：`torrent-file://` 哨兵无链接不显示、复制时跳过；单选本机 BT 的磁力原文交给「复制磁力链接」不重复显示；多选有一项可复制即显示；详情常规页按钮只藏哨兵）
+
+→ Web `web/src/pages/downloads/model/task.ts::copyableShareUrl` + `model/actions.ts::{canCopyUrls, copyUrls}` + `table/menus.ts` / `detail/GeneralTab.tsx`（`torrentShare.test.ts` 覆盖同组用例）；移动端没有「复制磁力链接」，不镜像
+
 ## `crates/downloads/src/model/dispatch.rs::remote_action_applies`（远程命令适用状态）
 
 → `web/src/pages/downloads/model/batchPlan.ts::remoteCan`；未知状态一律不可控制
@@ -93,9 +97,9 @@ interruptMode: never
 
 → `web/src/lib/fileHash.ts::{hashAlgorithmLabel, fileHashMatchesChecksum}` 逐条对齐（算法名去 `-` 小写归一、校验和只剥同算法 `<algo>:` 前缀、hex 忽略大小写；任一侧空 / 不可解析 / 算法不同 = 不比较），两端测试覆盖同一组用例；设置页算法下拉的四个技术名（`crates/settings/src/sections/download.rs` 本地映射）同此
 
-## `crates/downloads/src/model/bt_trackers.rs`（详情 Tracker 页：状态筛选标签 + 计数、表头三态排序，DHT 伪行固定不参与；稳定排序、缺省值垫底）
+## `crates/downloads/src/model/bt_trackers.rs`（详情 Tracker 页：状态筛选标签 + 计数、表头三态排序，DHT 伪行固定不参与；稳定排序、缺省值垫底。DHT 伪行 `dht_row` / `dht_nodes_text`：`BtStatusDto.dht` 状态 → 文案键 / 配色 / 悬停说明，运行且路由表非空才显示节点数，旧 daemon 或未知状态退回 `dhtEnabled`）
 
-→ `web/src/pages/downloads/detail/btStatus.ts::{trackerCounts, trackerView, nextTrackerSort}`：逐条对齐，两端测试共用 `crates/downloads/tests/fixtures/bt_tracker_view_cases.json`（改规则先改用例）；两端列表都虚拟化（GPUI `ListState` 可变行高、Web `useVirtualizer` + `measureElement`）
+→ `web/src/pages/downloads/detail/btStatus.ts::{trackerCounts, trackerView, nextTrackerSort, dhtRow, dhtNodesText}`：逐条对齐，两端测试共用 `crates/downloads/tests/fixtures/bt_tracker_view_cases.json` 与 `bt_dht_row_cases.json`（改规则先改用例）；两端列表都虚拟化（GPUI `ListState` 可变行高、Web `useVirtualizer` + `measureElement`）
 
 ## `crates/downloads/src/pages/task_detail_ed2k.rs`（详情「来源 / 网络」页签的纯函数：源状态 → 文案、冷却 / 下次找源是否在未来、「同时连接来源数」选项与当前值归一、LowID 源地址展示）
 

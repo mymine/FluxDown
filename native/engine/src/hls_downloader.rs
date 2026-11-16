@@ -2649,6 +2649,8 @@ async fn finalize_recording(
         audio_bytes,
     } = input;
 
+    let _local_work = crate::transfer_activity::LocalWorkGuard::new(p.sink.clone());
+
     // Save final progress
     let total_written = downloaded_bytes + audio_bytes;
     p.db.update_task_progress(&p.task_id, total_written).await?;
@@ -2975,41 +2977,77 @@ async fn remux_ts_to_mp4(
             }
         }
     }
+    if !is_fmp4 && ffmpeg.is_none() {
+        log_info!(
+            "[hls] task {} ffmpeg unavailable, using streaming remux",
+            task_id
+        );
+    }
     let cancel_inner = cancel.clone();
-    match tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
-        // fMP4:待改名的源就是 .ts 本身;否则转换产物先落 tmp。
-        let src = if is_fmp4 {
-            ts_owned.clone()
-        } else if ffmpeg_done {
-            mp4_tmp_inner.clone()
-        } else {
-            crate::ts_remux::remux_file(&ts_owned, &mp4_tmp_inner, &cancel_inner)?;
-            mp4_tmp_inner.clone()
-        };
-        // 原子占名(同 `downloader::claim_rename` 协议,此处在阻塞线程内走
-        // 同步 API):create_new 独占创建占位——dedup 与落盘之间若有并发
-        // 写者(同名 HTTP/BT 任务完成)抢得该名,后到者得 AlreadyExists,
-        // 决不覆盖;rename 覆盖的是自己的占位。失败清理占位与 tmp。
-        if let Err(e) = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&mp4_owned)
-            .map(drop)
-        {
-            // overwrite 模式:dedup 对已存在的普通 mp4 保留了原名,占名必然
-            // AlreadyExists——删除旧文件后重试占名一次(覆盖旧文件)。目标是
-            // 目录、删除失败或二次抢占时维持既有失败路径(保留 .ts)。
-            let overwrote = allow_overwrite
-                && e.kind() == std::io::ErrorKind::AlreadyExists
-                && mp4_owned.is_file()
-                && std::fs::remove_file(&mp4_owned).is_ok()
-                && std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&mp4_owned)
-                    .map(drop)
-                    .is_ok();
-            if !overwrote {
+    match tokio::task::spawn_blocking(
+        move || -> Result<Option<crate::ts_remux::Mp4Summary>, std::io::Error> {
+            // fMP4:待改名的源就是 .ts 本身;否则转换产物先落 tmp。
+            let mut summary = None;
+            let src = if is_fmp4 {
+                ts_owned.clone()
+            } else if ffmpeg_done {
+                mp4_tmp_inner.clone()
+            } else {
+                summary = Some(crate::ts_remux::remux_file(
+                    &ts_owned,
+                    &mp4_tmp_inner,
+                    &cancel_inner,
+                )?);
+                mp4_tmp_inner.clone()
+            };
+            // 原子占名(同 `downloader::claim_rename` 协议,此处在阻塞线程内走
+            // 同步 API):create_new 独占创建占位——dedup 与落盘之间若有并发
+            // 写者(同名 HTTP/BT 任务完成)抢得该名,后到者得 AlreadyExists,
+            // 决不覆盖;rename 覆盖的是自己的占位。失败清理占位与 tmp。
+            if let Err(e) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&mp4_owned)
+                .map(drop)
+            {
+                // overwrite 模式:dedup 对已存在的普通 mp4 保留了原名,占名必然
+                // AlreadyExists——删除旧文件后重试占名一次(覆盖旧文件)。目标是
+                // 目录、删除失败或二次抢占时维持既有失败路径(保留 .ts)。
+                let overwrote = allow_overwrite
+                    && e.kind() == std::io::ErrorKind::AlreadyExists
+                    && mp4_owned.is_file()
+                    && std::fs::remove_file(&mp4_owned).is_ok()
+                    && std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&mp4_owned)
+                        .map(drop)
+                        .is_ok();
+                if !overwrote {
+                    if !is_fmp4
+                        && let Err(error) = std::fs::remove_file(&mp4_tmp_inner)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        crate::logger::report_warning(
+                            "hls-download",
+                            "remove_temporary_file",
+                            &error,
+                        );
+                    }
+                    return Err(e);
+                }
+                log_info!(
+                    "[hls] overwrote existing '{}' (file_exists_behavior=overwrite)",
+                    mp4_owned.display()
+                );
+            }
+            if let Err(e) = std::fs::rename(&src, &mp4_owned) {
+                // 只清自己的占位与 tmp,fMP4 的源 .ts 是下载数据本身,绝不删。
+                if let Err(error) = std::fs::remove_file(&mp4_owned)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
+                }
                 if !is_fmp4
                     && let Err(error) = std::fs::remove_file(&mp4_tmp_inner)
                     && error.kind() != std::io::ErrorKind::NotFound
@@ -3018,36 +3056,18 @@ async fn remux_ts_to_mp4(
                 }
                 return Err(e);
             }
-            log_info!(
-                "[hls] overwrote existing '{}' (file_exists_behavior=overwrite)",
-                mp4_owned.display()
-            );
-        }
-        if let Err(e) = std::fs::rename(&src, &mp4_owned) {
-            // 只清自己的占位与 tmp,fMP4 的源 .ts 是下载数据本身,绝不删。
-            if let Err(error) = std::fs::remove_file(&mp4_owned)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
-            }
-            if !is_fmp4
-                && let Err(error) = std::fs::remove_file(&mp4_tmp_inner)
-                && error.kind() != std::io::ErrorKind::NotFound
-            {
-                crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
-            }
-            return Err(e);
-        }
-        Ok(())
-    })
+            Ok(summary)
+        },
+    )
     .await
     {
-        Ok(Ok(())) => {
+        Ok(Ok(summary)) => {
             if is_fmp4 {
                 log_info!("[hls] task {} fMP4 output renamed .ts -> .mp4", task_id);
+            } else if let Some(summary) = summary {
+                log_streaming_remux(task_id, &summary);
             } else {
-                let mode = if ffmpeg_done { "ffmpeg" } else { "streaming" };
-                log_info!("[hls] task {} remuxed TS -> MP4 ({})", task_id, mode);
+                log_info!("[hls] task {} remuxed TS -> MP4 (ffmpeg)", task_id);
             }
             Some(mp4_path)
         }
@@ -3081,6 +3101,36 @@ async fn remux_ts_to_mp4(
             }
             None
         }
+    }
+}
+
+/// 流式重封装后两条轨结束时刻允许的偏差;超过即记警告(音画不同步的早期信号)。
+const REMUX_TRACK_SKEW_WARN_MS: u64 = 100;
+
+fn log_streaming_remux(task_id: &str, summary: &crate::ts_remux::Mp4Summary) {
+    let Some(audio) = summary.audio else {
+        log_info!(
+            "[hls] task {} remuxed TS -> MP4 (streaming): video {} ms, no audio",
+            task_id,
+            summary.video_ms
+        );
+        return;
+    };
+    log_info!(
+        "[hls] task {} remuxed TS -> MP4 (streaming): video {} ms, audio {} ms AAC {} Hz {} ch",
+        task_id,
+        summary.video_ms,
+        audio.end_ms,
+        audio.sample_rate,
+        audio.channels
+    );
+    if summary.video_ms.abs_diff(audio.end_ms) > REMUX_TRACK_SKEW_WARN_MS {
+        log_warn!(
+            "[hls] task {} streaming remux track durations differ: video {} ms vs audio {} ms",
+            task_id,
+            summary.video_ms,
+            audio.end_ms
+        );
     }
 }
 
@@ -6196,8 +6246,8 @@ mod tests {
         assert!(!resume_is_usable(3, 100, 120, 10, false, true));
     }
 
-    /// 清单引出的每个请求都以用户清单 URL 为凭据锚点：Cookie 发往同站主机（含子域与其他
-    /// 端口），Authorization 只发往同源；跨站与 https → http 降级两者都不带。
+    /// 清单引出的请求均以用户清单 URL 为锚点：Cookie 按同站作用域，
+    /// 敏感头仅同源发送；普通自定义头跨站保留，凭据不随 https → http 降级。
     #[test]
     fn segment_credentials_follow_manifest_scope() {
         let mut identity = crate::downloader::RequestSpec::empty_get();
@@ -6210,7 +6260,10 @@ mod tests {
             .insert("Proxy-Authorization".to_string(), "Basic x".to_string());
         identity
             .extra_headers
-            .insert("X-Token".to_string(), "keep".to_string());
+            .insert("X-Token".to_string(), "private-token".to_string());
+        identity
+            .extra_headers
+            .insert("X-Editor".to_string(), "keep".to_string());
         let spec = crate::downloader::DownloadSpec::new(identity.clone());
         let ctx = HlsRequestCtx {
             spec: &spec,
@@ -6224,25 +6277,29 @@ mod tests {
                 has("cookie"),
                 has("authorization") && has("proxy-authorization"),
                 has("x-token"),
+                has("x-editor"),
             )
         };
 
-        assert_eq!(sent("https://www.site.example/seg0.ts"), (true, true, true));
+        assert_eq!(
+            sent("https://www.site.example/seg0.ts"),
+            (true, true, true, true)
+        );
         assert_eq!(
             sent("https://cdn.site.example/seg0.ts"),
-            (true, false, true)
+            (true, false, false, true)
         );
         assert_eq!(
             sent("https://www.site.example:8443/seg0.ts"),
-            (true, false, true)
+            (true, false, false, true)
         );
         assert_eq!(
             sent("https://cdn.other.example/seg0.ts"),
-            (false, false, true)
+            (false, false, false, true)
         );
         assert_eq!(
             sent("http://www.site.example/seg0.ts"),
-            (false, false, true)
+            (false, false, false, true)
         );
     }
 
@@ -6557,7 +6614,7 @@ v360.m3u8\n\
         let (address, _) = static_server(audio_routes()).await?;
         let dir = scratch_dir("audio_checkpoint_failure");
         let temp = dir.join("clip.audio.m4a.fdownloading");
-        let url = format!("sqlite://{}?mode=rwc", dir.join("checkpoint.db").display());
+        let url = crate::db::sqlite_url(&dir.join("checkpoint.db"));
         let db = crate::db::Db::connect(&url).await?;
         let pool = sqlx::AnyPool::connect(&url).await?;
         sqlx::query("CREATE TRIGGER fail_checkpoint BEFORE INSERT ON config WHEN NEW.key = 'hls_audio_resume_t-audio' AND NEW.value NOT LIKE '0:0:%' BEGIN SELECT RAISE(ABORT, 'checkpoint write failed'); END")

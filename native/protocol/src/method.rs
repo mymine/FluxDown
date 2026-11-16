@@ -25,6 +25,12 @@ pub const DAEMON_TASK_RENAME: &str = "daemon.task.rename";
 pub const DAEMON_TASK_CHANGE_URL: &str = "daemon.task.changeUrl";
 /// 修改任务线程数（`SetTaskSegmentsParams`），已下进度保留；完成或不存在的任务返回 `not-found`。
 pub const DAEMON_TASK_SET_SEGMENTS: &str = "daemon.task.setSegments";
+/// 修改任务代理并立即重建活跃连接（`SetTaskProxyParams`），不重启宿主。
+pub const DAEMON_TASK_SET_PROXY: &str = "daemon.task.setProxy";
+/// Redacted editable task settings (`{taskId}` → `TaskEditSnapshot`).
+pub const DAEMON_TASK_EDIT_INFO: &str = "daemon.task.editInfo";
+/// Validate and atomically apply a unified task property update.
+pub const DAEMON_TASK_EDIT: &str = "daemon.task.edit";
 pub const DAEMON_TASK_DELETE: &str = "daemon.task.delete";
 pub const DAEMON_TASK_PAUSE_ALL: &str = "daemon.task.pauseAll";
 pub const DAEMON_TASK_RESUME_ALL: &str = "daemon.task.resumeAll";
@@ -64,8 +70,9 @@ pub const DAEMON_TASK_RENAME_BT_FILE: &str = "daemon.task.renameBtFile";
 /// 强制重新校验未完成的 BT 任务（`{taskId}`）：丢弃已有进度记录，按磁盘数据全量重哈希后回到
 /// 原状态。已完成任务返回 `taskStateConflict`（改用只读的 `daemon.task.verify`）。
 pub const DAEMON_TASK_RECHECK: &str = "daemon.task.recheck";
-/// 移动 BT 任务的数据到新的保存目录（`MoveTaskStorageParams`）并更新任务位置，完成后任务回到
-/// 原状态（下载 / 暂停 / 做种）。慢方法：跨卷移动耗时与数据量成正比；目标已有同名文件返回 `conflict`。
+/// 移动任务数据到新的保存目录（`MoveTaskStorageParams`）并更新任务位置，完成后任务回到原状态
+/// （下载 / 暂停 / 做种）。BT 任务走 BT 会话搬移；HTTP / FTP / eD2K 等走统一编辑的搬移（含
+/// `.fdownloading` 续传文件与附属产物）。慢方法：跨卷移动耗时与数据量成正比；目标已有同名文件返回 `conflict`。
 pub const DAEMON_TASK_MOVE_STORAGE: &str = "daemon.task.moveStorage";
 /// 任务级 BT 限速（`SetTaskBtLimitsParams`，缺省字段不变，`0` = 不限），运行中立即生效。
 pub const DAEMON_TASK_SET_BT_LIMITS: &str = "daemon.task.setBtLimits";
@@ -105,6 +112,8 @@ pub const DAEMON_GROUP_DELETE: &str = "daemon.group.delete";
 
 pub const DAEMON_CONFIG_GET: &str = "daemon.config.get";
 pub const DAEMON_CONFIG_PATCH: &str = "daemon.config.patch";
+/// Preview/import text or export supported aria2-style native defaults (read-only).
+pub const DAEMON_CONFIG_ARIA2_OPTIONS: &str = "daemon.config.aria2Options";
 pub const DAEMON_CONFIG_PROXY_TEST: &str = "daemon.config.proxyTest";
 /// 站点代理规则草稿校验 + 「测试网址」解释（可能起 `scutil` 子进程，慢方法）。
 pub const DAEMON_CONFIG_PROXY_ROUTE: &str = "daemon.config.proxyRoute";
@@ -180,6 +189,8 @@ pub const DAEMON_PLUGIN_VIEW_EVENT: &str = "daemon.plugin.view.event";
 pub const DAEMON_PLUGIN_VIEW_CLOSE: &str = "daemon.plugin.view.close";
 /// 取会话当前 `{seq, tree}`（序号断档 / 重连后重新同步）。
 pub const DAEMON_PLUGIN_VIEW_SNAPSHOT: &str = "daemon.plugin.view.snapshot";
+/// Update one view session's client locale and re-render without resetting its state.
+pub const DAEMON_PLUGIN_VIEW_SET_LOCALE: &str = "daemon.plugin.view.setLocale";
 /// 会话续期（`{sessions: [...]}`）；90 s 无续期的会话会被关闭。
 pub const DAEMON_PLUGIN_VIEW_KEEPALIVE: &str = "daemon.plugin.view.keepalive";
 /// 执行插件命令（`{identity, command, taskIds}`）。慢方法：可能激活宿主。
@@ -425,6 +436,8 @@ pub const AGENT_UPDATE_INSTALL: &str = "agent.update.install";
 pub const AGENT_UPDATE_CANCEL: &str = "agent.update.cancel";
 /// 定时关机 / 睡眠：`{delaySecs, action}` → `{armed}`；没有任务时立即开始倒计时，
 /// `delaySecs = 0` 只在有任务（活跃 / 排队 / 待重试）时接受，否则 `armed = false`。
+/// 可选 `lowSpeed {thresholdBps, durationSecs}` 改为持续低速触发；必须有下载工作，
+/// 达标后固定 30 秒可取消倒计时，不使用 `delaySecs`。
 pub const AGENT_POWER_ARM: &str = "agent.power.arm";
 pub const AGENT_POWER_DISARM: &str = "agent.power.disarm";
 
@@ -477,6 +490,9 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_TASK_RENAME,
     DAEMON_TASK_CHANGE_URL,
     DAEMON_TASK_SET_SEGMENTS,
+    DAEMON_TASK_SET_PROXY,
+    DAEMON_TASK_EDIT_INFO,
+    DAEMON_TASK_EDIT,
     DAEMON_TASK_DELETE,
     DAEMON_TASK_PAUSE_ALL,
     DAEMON_TASK_RESUME_ALL,
@@ -518,6 +534,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_GROUP_DELETE,
     DAEMON_CONFIG_GET,
     DAEMON_CONFIG_PATCH,
+    DAEMON_CONFIG_ARIA2_OPTIONS,
     DAEMON_CONFIG_PROXY_TEST,
     DAEMON_CONFIG_PROXY_ROUTE,
     DAEMON_CONFIG_CONN_POLICY,
@@ -567,6 +584,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_PLUGIN_VIEW_EVENT,
     DAEMON_PLUGIN_VIEW_CLOSE,
     DAEMON_PLUGIN_VIEW_SNAPSHOT,
+    DAEMON_PLUGIN_VIEW_SET_LOCALE,
     DAEMON_PLUGIN_VIEW_KEEPALIVE,
     DAEMON_PLUGIN_COMMAND,
     DAEMON_PLUGIN_INVOKE,
@@ -760,6 +778,7 @@ pub const SLOW_DAEMON_METHODS: &[&str] = &[
     DAEMON_TASK_HASH,
     DAEMON_TASK_SEED_LOCAL,
     DAEMON_TASK_MOVE_STORAGE,
+    DAEMON_TASK_EDIT,
     DAEMON_EGRESS_PLAN,
 ];
 

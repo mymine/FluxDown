@@ -86,6 +86,8 @@ pub struct ArchiveResult {
     pub directories: Vec<String>,
     /// Legacy single-component output from existing plugins.
     pub folder_name: String,
+    /// Stable builtin category identifier; mutually exclusive with directory outputs.
+    pub category: String,
 }
 
 /// 一次平台登录动作。`action` 为 `begin`、`poll`、`cancel`、`logout` 或 `status`。
@@ -644,6 +646,10 @@ pub enum HostCall {
     ViewRefresh {
         session: String,
     },
+    ViewLocale {
+        session: String,
+        locale: String,
+    },
     ViewClose {
         session: String,
     },
@@ -742,6 +748,18 @@ pub trait HostEvents: Send + Sync {
         _session: &str,
         _options: super::images::ImageLoadOptions,
     ) -> Result<String, PluginError> {
+        Err(PluginError::Runtime(
+            "plugin images are unsupported".to_string(),
+        ))
+    }
+
+    /// Release a session-owned image after removing every use of its reference.
+    async fn image_release(
+        &self,
+        _identity: &str,
+        _session: &str,
+        _src: &str,
+    ) -> Result<(), PluginError> {
         Err(PluginError::Runtime(
             "plugin images are unsupported".to_string(),
         ))

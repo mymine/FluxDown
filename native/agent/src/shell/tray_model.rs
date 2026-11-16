@@ -53,9 +53,7 @@ impl TrayPresenter {
         let translator = port
             .as_ref()
             .and_then(|_| match I18nCatalog::load_embedded() {
-                Ok(catalog) => {
-                    Some(Arc::new(catalog).translator(&fluxdown_ui_i18n::system_locale()))
-                }
+                Ok(catalog) => Some(catalog.translator(&fluxdown_ui_i18n::system_locale())),
                 Err(error) => {
                     tracing::warn!(error = %error, "tray translations unavailable");
                     None
@@ -159,7 +157,9 @@ mod tests {
     use super::*;
 
     fn translator(locale: &str) -> Translator {
-        Arc::new(I18nCatalog::load_embedded().expect("embedded catalog")).translator(locale)
+        I18nCatalog::load_embedded()
+            .expect("embedded catalog")
+            .translator(locale)
     }
 
     #[test]
@@ -171,6 +171,7 @@ mod tests {
                 armed_delay_secs: Some(60),
                 countdown_remaining_secs: Some(65),
                 action: PowerAction::Shutdown,
+                ..PowerStatusDto::default()
             },
             icon: AppIconChoice::Default,
         };
@@ -210,6 +211,7 @@ mod tests {
                     armed_delay_secs: Some(0),
                     countdown_remaining_secs: Some(1),
                     action,
+                    ..PowerStatusDto::default()
                 },
                 icon: AppIconChoice::Default,
             };

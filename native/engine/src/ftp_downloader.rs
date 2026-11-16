@@ -1357,6 +1357,8 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
 
     // When total_bytes is unknown (server didn't report size), read actual file
     // size so the completion signal carries accurate byte counts.
+    let _local_work = crate::transfer_activity::LocalWorkGuard::new(p.sink.clone());
+
     let actual_total = if info.total_bytes > 0 {
         info.total_bytes
     } else {
@@ -2828,7 +2830,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         tokio::fs::create_dir_all(&dir).await?;
-        let db_url = format!("sqlite://{}?mode=rwc", dir.join("completion.db").display());
+        let db_url = crate::db::sqlite_url(&dir.join("completion.db"));
         let (port, _, _) = spawn_fake_ftp(false, false, b"completed-file")?;
         let mut engine = crate::Engine::new(
             crate::EngineConfig {
@@ -2915,7 +2917,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("fluxdown_ftp_server_time_{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&dir).await?;
-        let db_url = format!("sqlite://{}?mode=rwc", dir.join("server_time.db").display());
+        let db_url = crate::db::sqlite_url(&dir.join("server_time.db"));
         let (port, _, commands) = spawn_fake_ftp_with_mdtm(false, false, payload, mdtm)?;
         let mut engine = crate::Engine::new(
             crate::EngineConfig {

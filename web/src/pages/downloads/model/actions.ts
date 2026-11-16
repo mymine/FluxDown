@@ -20,7 +20,7 @@ import { toastRpcError } from '../../../lib/rpcToast'
 import { rpcErrorKind, rpcErrorText } from '../../../lib/rpcErrorText'
 import { planTaskCommand } from './batchPlan'
 import { folderAnchorMember } from './groupTree'
-import { PLUGIN_ERROR_PREFIX, shareUrl } from './task'
+import { PLUGIN_ERROR_PREFIX, copyableShareUrl } from './task'
 import { pieceEndsParams, pieceOrderTargets, pieceSequentialParams, superSeedingTargets } from './taskEdit'
 import type { DownloadTaskView } from './task'
 
@@ -163,8 +163,9 @@ export function isMovingStorage(taskId: string): boolean {
 }
 
 /**
- * 移动 BT 数据到新的保存目录（慢方法，进行中由调用方显示加载态）：完成后提示新位置；失败走统一错误 toast。
- * 目标与当前相同时 daemon 直接返回 ok，这里不另作判断。同一任务已有移动在进行时直接返回 false、不下发。
+ * 移动任务数据到新的保存目录（慢方法，进行中由调用方显示加载态）：BT 走 BT 会话搬移，其余协议由 daemon 转统一编辑的搬移。
+ * 完成后提示新位置；失败走统一错误 toast。目标与当前相同时 daemon 直接返回 ok，这里不另作判断。
+ * 同一任务已有移动在进行时直接返回 false、不下发。
  */
 export async function moveTaskStorage(taskId: string, saveDir: string): Promise<boolean> {
   if (movingStorage.has(taskId)) return false
@@ -238,10 +239,23 @@ export function redownloadViews(views: readonly DownloadTaskView[]): Promise<boo
 }
 
 export function copyUrls(views: readonly DownloadTaskView[]): void {
-  const urls = views.map(shareUrl).filter((url) => url !== '')
+  const urls = views.map(copyableShareUrl).filter((url) => url !== '')
   if (urls.length === 0) return
   copyText(urls.join('\n'))
   toast.key('urlCopied', 'success')
+}
+
+/**
+ * 「复制下载地址」可见（GPUI `copy_url_visible`）：单选要求有真实链接，且本机 BT 的磁力原文
+ * 交给「复制磁力链接」不重复显示；多选没有「复制磁力链接」，有一项可复制即显示。
+ */
+export function canCopyUrls(views: readonly DownloadTaskView[]): boolean {
+  const [only] = views
+  if (views.length === 1 && only !== undefined) {
+    const url = copyableShareUrl(only)
+    return url !== '' && !(canShareTorrent(views) && url.toLowerCase().startsWith('magnet:'))
+  }
+  return views.some((view) => copyableShareUrl(view) !== '')
 }
 
 /** 「复制磁力链接 / 导出 .torrent」：单选的本地 BT 任务（任意状态）。 */

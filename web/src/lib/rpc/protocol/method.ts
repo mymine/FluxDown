@@ -12,6 +12,8 @@ export const METHOD = {
 
   DAEMON_TASK_LIST: 'daemon.task.list',
   DAEMON_TASK_GET: 'daemon.task.get',
+  DAEMON_TASK_EDIT_INFO: 'daemon.task.editInfo',
+  DAEMON_TASK_EDIT: 'daemon.task.edit',
   DAEMON_TASK_ACTIVITY: 'daemon.task.activity',
   DAEMON_TASK_SPEED_HISTORY: 'daemon.task.speedHistory',
   /** BT 任务实况（`TaskIdParams` → `BtStatusDto`）：详情页 Tracker / 连接标签轮询；非 BT 任务 `invalidArgument`。 */
@@ -27,6 +29,8 @@ export const METHOD = {
   DAEMON_TASK_CHANGE_URL: 'daemon.task.changeUrl',
   /** 修改任务线程数（`{taskId, segments}`，≤0 = 自动），已下进度保留；完成或不存在的任务返回 not-found。 */
   DAEMON_TASK_SET_SEGMENTS: 'daemon.task.setSegments',
+  /** 更新未完成 HTTP/FTP 任务的代理（`{taskId, proxyUrl}`）。 */
+  DAEMON_TASK_SET_PROXY: 'daemon.task.setProxy',
   /** BT 选块策略（`{taskId, sequential?, firstLastPiecesFirst?}`）；省略的字段保持不变。非 BT 或不存在返回 not-found。 */
   DAEMON_TASK_SET_PIECE_PICKING: 'daemon.task.setPiecePicking',
   /** BT 文件表（`TaskIdParams` → `BtFilesDto`）：详情页「文件」页签轮询；非 BT 任务 `notFound`。 */
@@ -79,6 +83,7 @@ export const METHOD = {
 
   DAEMON_CONFIG_GET: 'daemon.config.get',
   DAEMON_CONFIG_PATCH: 'daemon.config.patch',
+  DAEMON_CONFIG_ARIA2_OPTIONS: 'daemon.config.aria2Options',
   DAEMON_CONFIG_PROXY_TEST: 'daemon.config.proxyTest',
   DAEMON_CONFIG_PROXY_ROUTE: 'daemon.config.proxyRoute',
   DAEMON_CONFIG_CONN_POLICY: 'daemon.config.connPolicy',
@@ -134,6 +139,7 @@ export const METHOD = {
   DAEMON_PLUGIN_VIEW_CLOSE: 'daemon.plugin.view.close',
   DAEMON_PLUGIN_VIEW_SNAPSHOT: 'daemon.plugin.view.snapshot',
   DAEMON_PLUGIN_VIEW_KEEPALIVE: 'daemon.plugin.view.keepalive',
+  DAEMON_PLUGIN_VIEW_SET_LOCALE: 'daemon.plugin.view.setLocale',
   DAEMON_PLUGIN_COMMAND: 'daemon.plugin.command',
   DAEMON_PLUGIN_INVOKE: 'daemon.plugin.invoke',
   DAEMON_PLUGIN_PAGE_INVOKE: 'daemon.plugin.pageInvoke',

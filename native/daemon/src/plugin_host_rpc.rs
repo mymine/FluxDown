@@ -111,6 +111,13 @@ impl DaemonService {
                     .ok_or_else(unknown_session)?;
                 to_value(PluginViewSnapshotDto { seq, tree })
             }
+            method::DAEMON_PLUGIN_VIEW_SET_LOCALE => {
+                let params = parse_params::<fluxdown_protocol::PluginViewLocaleParams>(params)?;
+                manager
+                    .set_view_locale(&params.session, params.locale)
+                    .map_err(|_| unknown_session())?;
+                Ok(json!({}))
+            }
             method::DAEMON_PLUGIN_VIEW_KEEPALIVE => {
                 let params = parse_params::<PluginViewKeepaliveParams>(params)?;
                 manager.keepalive(&params.sessions);
@@ -233,7 +240,7 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
 
     struct Fixture {
         service: Arc<DaemonService>,
-        frames: broadcast::Receiver<fluxdown_protocol::EventFrame>,
+        frames: broadcast::Receiver<std::sync::Arc<fluxdown_protocol::EventFrame>>,
         base: std::path::PathBuf,
     }
 
@@ -337,7 +344,7 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
                 .await
                 .expect("a plugin view frame arrives")
                 .expect("event channel open");
-            if let ServiceEvent::Daemon(DaemonEvent::PluginViewFrame(frame)) = frame.event {
+            if let ServiceEvent::Daemon(DaemonEvent::PluginViewFrame(frame)) = frame.event.clone() {
                 return frame;
             }
         }
@@ -367,12 +374,107 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_locale_changes_preserve_view_state_and_other_sessions() {
+        let mut f = fixture_with(
+            json!({
+                "identity": ID, "name": "Locales", "version": "1.0.0",
+                "main": { "entry": "main.js" },
+                "settings": [{
+                    "key": "quality", "title": "清晰度", "type": "string",
+                    "localizations": {"en": {"title": "Quality"}}
+                }],
+                "contributes": {
+                    "views": [{"id": "counter", "title": "Counter", "location": "activity"}]
+                }
+            }),
+            r#"
+flux.ui.view("counter", {
+  init: () => ({ n: 0 }),
+  render: (state, ctx) => flux.ui.h("stack", {},
+    flux.ui.h("text", { text: `${ctx.locale}:${state.n}` })),
+  event: (state) => { state.n += 1; }
+});
+"#,
+            &[],
+        )
+        .await;
+        let listed = call(&f, "daemon.plugin.list", json!({})).await.unwrap();
+        assert_eq!(
+            listed[0]["settings"][0]["localizations"]["en"]["title"],
+            "Quality"
+        );
+        let first = call(
+            &f,
+            "daemon.plugin.view.open",
+            json!({"identity": ID, "view": "counter", "locale": "en"}),
+        )
+        .await
+        .unwrap();
+        let second = call(
+            &f,
+            "daemon.plugin.view.open",
+            json!({"identity": ID, "view": "counter", "locale": "zh"}),
+        )
+        .await
+        .unwrap();
+        let session = first["session"].as_str().unwrap();
+        assert_eq!(first["tree"]["c"][0]["p"]["text"], "en:0");
+        assert_eq!(second["tree"]["c"][0]["p"]["text"], "zh:0");
+        press(&f, session, "press").await;
+        let changed = next_frame(&mut f).await;
+        assert_eq!(changed.session, session);
+        call(
+            &f,
+            "daemon.plugin.view.setLocale",
+            json!({"session": session, "locale": "zh-TW"}),
+        )
+        .await
+        .unwrap();
+        let localized = next_frame(&mut f).await;
+        assert_eq!(localized.session, session);
+        let snapshot = call(
+            &f,
+            "daemon.plugin.view.snapshot",
+            json!({"session": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot["tree"]["c"][0]["p"]["text"], "zh-TW:1");
+        let other = call(
+            &f,
+            "daemon.plugin.view.snapshot",
+            json!({"session": second["session"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(other["tree"]["c"][0]["p"]["text"], "zh:0");
+        call(
+            &f,
+            "daemon.plugin.view.setLocale",
+            json!({"session": session, "locale": "en"}),
+        )
+        .await
+        .unwrap();
+        let restored = next_frame(&mut f).await;
+        assert_eq!(restored.session, session);
+        let snapshot = call(
+            &f,
+            "daemon.plugin.view.snapshot",
+            json!({"session": session}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot["tree"]["c"][0]["p"]["text"], "en:1");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn image_resources_cross_js_and_authenticated_http_and_expire_on_close() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let f = fixture_with(
             json!({
                 "identity": ID, "name": "Images", "version": "1.0.0",
+                "permissions": ["auth"],
                 "main": { "entry": "main.js", "imageHosts": ["covers.example"] },
                 "contributes": {
                     "views": [{ "id": "counter", "title": "Cover", "location": "activity" }]
@@ -380,10 +482,27 @@ flux.rpc.handle("sum", async (a) => a.x + a.y);
             }),
             r#"
 flux.ui.view("counter", {
-  init: async (ctx) => ({
-    src: await ctx.images.load({ url: "https://covers.example/a.png", maxWidth: 16, maxHeight: 16 })
-  }),
-  render: (st) => flux.ui.h("image", { src: st.src, alt: "cover" }),
+  init: async (ctx) => {
+    const opts = { url: "https://covers.example/a.png", maxWidth: 16, maxHeight: 16 };
+    const src = await ctx.images.load(opts);
+    for (let i = 0; i < 200; i++) {
+      if (await ctx.images.load(opts) !== src) throw new Error("identical images must share a reference");
+    }
+    const batch = await Promise.all(Array.from({ length: 20 }, () => ctx.images.load(opts)));
+    if (batch.some(value => value !== src)) throw new Error("concurrent images must share a reference");
+    return { src };
+  },
+  render: (st) => st.src
+    ? flux.ui.h("image", { src: st.src, alt: "cover" })
+    : flux.ui.h("text", { text: "released" }),
+  event: async (st, ev, ctx) => {
+    if (ev.type === "release") {
+      const src = st.src;
+      st.src = null;
+      await ctx.images.release(src);
+      await flux.images.release({ session: ctx.session, src });
+    }
+  },
 });
 "#,
             &[],
@@ -398,7 +517,7 @@ flux.ui.view("counter", {
         f.service
             .plugin_manager()
             .unwrap()
-            .grant_consent(ID, &[], &["covers.example".to_owned()])
+            .grant_consent(ID, &["auth".to_owned()], &["covers.example".to_owned()])
             .await
             .unwrap();
         let opened = call(&f, "daemon.plugin.view.open", request.clone())
@@ -451,6 +570,16 @@ flux.ui.view("counter", {
         assert!(headers.contains("cache-control: no-store"));
         assert!(headers.contains("x-content-type-options: nosniff"));
         assert_eq!(&response[header_end..], bytes.as_ref());
+        press(&f, session, "release").await;
+        let response = get(address, &path, "image-test-token").await;
+        assert!(response.starts_with(b"HTTP/1.1 404"));
+        let other_session = other["session"].as_str().unwrap();
+        let other_id = other["tree"]["p"]["src"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("flux-image:")
+            .unwrap();
+        assert!(f.service.plugin_image(other_session, other_id).is_some());
         call(
             &f,
             "daemon.plugin.view.close",
@@ -797,7 +926,7 @@ flux.ui.view("gate", {
                 .await
                 .expect("plugin view events arrive")
                 .expect("event channel open");
-            match frame.event {
+            match frame.event.clone() {
                 ServiceEvent::Daemon(DaemonEvent::PluginViewFrame(frame))
                     if frame.session == session =>
                 {

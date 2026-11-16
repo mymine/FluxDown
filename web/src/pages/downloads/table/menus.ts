@@ -43,6 +43,7 @@ import {
   confirmDeleteWithFiles,
   confirmIgnorePluginRetry,
   copySourceLink,
+  canCopyUrls,
   copyUrls,
   copyMagnet,
   exportTorrent,
@@ -90,7 +91,7 @@ import { canPause, canResumeSeeding } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
 import { anyActive, anyResumable } from '../model/groupTree'
 import type { GroupCounts } from '../model/groupTree'
-import { openChangeSegments, openChangeUrl, openGroupDetail, openMoveStorage, openRename, openTaskLimits } from '../dialogs'
+import { openChangeSegments, openChangeUrl, openGroupDetail, openMoveStorage, openRename, openTaskEdit, openTaskLimits } from '../dialogs'
 
 type Translate = (key: string, params?: Record<string, string | number>) => string
 
@@ -208,6 +209,9 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
   if (only && canChangeUrl(only)) {
     entries.push({ type: 'item', key: 'change-url', label: t('webChangeUrl'), icon: Link2, onSelect: () => openChangeUrl(only.taskId) })
   }
+  if (only) {
+    entries.push({ type: 'item', key: 'edit-task', label: t('taskEditTitle'), icon: Pen, onSelect: () => openTaskEdit(only.taskId) })
+  }
   if (only && canChangeSegments(only)) {
     entries.push({
       type: 'item',
@@ -290,7 +294,9 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail, selecti
       onSelect: () => void redownloadViews(views),
     })
   }
-  entries.push({ type: 'item', key: 'copy-url', label: t('copyUrl'), icon: Copy, onSelect: () => copyUrls(views) })
+  if (canCopyUrls(views)) {
+    entries.push({ type: 'item', key: 'copy-url', label: t('copyUrl'), icon: Copy, onSelect: () => copyUrls(views) })
+  }
   if (only && canShareTorrent(views)) {
     entries.push({ type: 'item', key: 'copy-magnet', label: t('btCopyMagnet'), icon: Magnet, onSelect: () => void copyMagnet(only) })
     entries.push({ type: 'item', key: 'export-torrent', label: t('btExportTorrent'), icon: FileDown, onSelect: () => void exportTorrent(only) })

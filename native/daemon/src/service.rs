@@ -471,6 +471,31 @@ impl DaemonService {
                 })
                 .await
             }
+            method::DAEMON_TASK_SET_PROXY => {
+                let params = parse_params::<fluxdown_protocol::SetTaskProxyParams>(params)?;
+                self.execute_unit(ActorOperation::SetTaskProxy {
+                    task_id: params.task_id,
+                    proxy_url: params.proxy_url,
+                })
+                .await
+            }
+            method::DAEMON_TASK_EDIT_INFO => {
+                let params = parse_params::<IdParams>(params)?;
+                let snapshot = fluxdown_engine::task_edit::snapshot(&self.db, &params.id)
+                    .await
+                    .map_err(internal_error)?;
+                serde_json::to_value(fluxdown_engine_protocol::task_edit_snapshot_to_dto(
+                    snapshot,
+                ))
+                .map_err(|error| internal_error(format!("{error:#}")))
+            }
+            method::DAEMON_TASK_EDIT => {
+                let params = parse_params::<fluxdown_protocol::EditTaskParams>(params)?;
+                self.execute_unit(ActorOperation::EditTask(Box::new(
+                    fluxdown_engine_protocol::task_edit_to_engine(params),
+                )))
+                .await
+            }
             method::DAEMON_TASK_DELETE => {
                 let params = parse_params::<DeleteParams>(params)?;
                 self.execute_unit(ActorOperation::DeleteTask {
@@ -730,6 +755,42 @@ impl DaemonService {
             }
             method::DAEMON_CONFIG_GET => {
                 to_value(self.events.inspect(|snapshot| snapshot.config.clone()))
+            }
+            method::DAEMON_CONFIG_ARIA2_OPTIONS => {
+                use fluxdown_protocol::aria2_options::{
+                    Aria2OptionsRequest, Aria2OptionsResponse, export, parse,
+                };
+                let request = parse_params::<Aria2OptionsRequest>(params)?;
+                let snapshot = self.events.inspect(|snapshot| snapshot.config.clone());
+                let parsed = match request.text.as_deref() {
+                    Some(text) => parse(text),
+                    None => export(&snapshot.values).and_then(|text| parse(&text)),
+                };
+                let preview = parsed.and_then(|values| {
+                    // The eventual write repeats domain validation and checks the revision.
+                    crate::config::validate_config_patch(&values)
+                        .map_err(|error| error.to_string())?;
+                    let mut effective = snapshot.values.clone();
+                    effective.extend(values.clone());
+                    export(&effective).map(|text| (text, values))
+                });
+                let (text, values, error) = match preview {
+                    Ok((text, values)) => (text, values, None),
+                    Err(error) => (
+                        request.text.unwrap_or_default(),
+                        Default::default(),
+                        Some(error),
+                    ),
+                };
+                let defaults = export(&Default::default())
+                    .map_err(|error| internal_error(error.to_string()))?;
+                to_value(Aria2OptionsResponse {
+                    text,
+                    defaults,
+                    values,
+                    revision: snapshot.revision,
+                    error,
+                })
             }
             method::DAEMON_CONFIG_PATCH => {
                 let patch = parse_params::<DaemonConfigPatch>(params)?;
@@ -1451,6 +1512,7 @@ impl DaemonService {
             | method::DAEMON_PLUGIN_VIEW_EVENT
             | method::DAEMON_PLUGIN_VIEW_CLOSE
             | method::DAEMON_PLUGIN_VIEW_SNAPSHOT
+            | method::DAEMON_PLUGIN_VIEW_SET_LOCALE
             | method::DAEMON_PLUGIN_VIEW_KEEPALIVE
             | method::DAEMON_PLUGIN_COMMAND
             | method::DAEMON_PLUGIN_INVOKE
@@ -1460,6 +1522,7 @@ impl DaemonService {
             | method::DAEMON_PLUGIN_VIEW_EVENT
             | method::DAEMON_PLUGIN_VIEW_CLOSE
             | method::DAEMON_PLUGIN_VIEW_SNAPSHOT
+            | method::DAEMON_PLUGIN_VIEW_SET_LOCALE
             | method::DAEMON_PLUGIN_VIEW_KEEPALIVE
             | method::DAEMON_PLUGIN_COMMAND
             | method::DAEMON_PLUGIN_INVOKE
@@ -2468,6 +2531,7 @@ impl DaemonService {
             pending_tasks: u32::try_from(pending_tasks).unwrap_or(u32::MAX),
             total_download_bps: stats.total_download_bps,
             retry_pending_tasks: stats.retry_pending_tasks,
+            local_work_count: stats.local_work_count,
             total_upload_bps: stats.total_upload_bps,
             disk_free_bytes: fluxdown_engine::disk_space::available_space_checked(
                 std::path::PathBuf::from(&save_dir),
@@ -3230,6 +3294,102 @@ mod tests {
         );
         assert!(match_site_auth(store, "magnet:?xt=urn:btih:abc").is_none());
         assert!(match_site_auth("not json", "https://example.com/a.bin").is_none());
+    }
+
+    #[tokio::test]
+    async fn aria2_options_preview_is_read_only_and_preserves_omitted_settings() {
+        use fluxdown_protocol::{DaemonConfigSnapshot, DaemonSnapshot, method};
+
+        let dir = std::env::temp_dir().join(format!("fluxdown_aria2_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create directory");
+        let db = fluxdown_engine::db::Db::open(&dir)
+            .await
+            .expect("open database");
+        db.init_default_config("/tmp").await.expect("seed config");
+        let config = DaemonConfigSnapshot {
+            revision: 7,
+            values: std::collections::BTreeMap::from([
+                ("default_segments".into(), "12".into()),
+                ("global_user_agent".into(), "custom-agent".into()),
+            ]),
+        };
+        let events = crate::event_hub::DaemonEventHub::new(
+            DaemonSnapshot {
+                config: config.clone(),
+                ..Default::default()
+            },
+            32,
+        );
+        let selections = crate::selection::DaemonSelection::new(events.clone());
+        let blobs = std::sync::Arc::new(
+            crate::blob_store::BlobStore::open(dir.join("blobs"))
+                .await
+                .expect("open blobs"),
+        );
+        let service = DaemonService::new(
+            crate::service_hello("aria2-test", Vec::new()),
+            events.clone(),
+            selections,
+            blobs,
+            crate::actor::DaemonActorHandle::disconnected(),
+            db,
+            dir.clone(),
+            #[cfg(feature = "plugins")]
+            None,
+        );
+        let exported = service
+            .call_inner(
+                "aria2-test",
+                true,
+                method::DAEMON_CONFIG_ARIA2_OPTIONS,
+                Some(json!({})),
+            )
+            .await
+            .expect("export");
+        assert!(exported["text"].as_str().unwrap().contains("split=12"));
+        assert_eq!(exported["revision"], 7);
+        let preview = service
+            .call_inner(
+                "aria2-test",
+                true,
+                method::DAEMON_CONFIG_ARIA2_OPTIONS,
+                Some(json!({"text": "max-overall-download-limit=2M"})),
+            )
+            .await
+            .expect("preview");
+        assert_eq!(preview["values"], json!({"speed_limit_bytes": "2097152"}));
+        assert!(
+            preview["text"]
+                .as_str()
+                .unwrap()
+                .contains("user-agent=custom-agent")
+        );
+        assert_eq!(events.inspect(|snapshot| snapshot.config.clone()), config);
+        let error = service
+            .call_inner(
+                "aria2-test",
+                true,
+                method::DAEMON_CONFIG_ARIA2_OPTIONS,
+                Some(json!({"text": "split=8\nrpc-secret=secret"})),
+            )
+            .await
+            .expect("validation diagnostics cross the gateway as result data");
+        assert!(
+            error["error"].as_str().unwrap().contains("line 2:"),
+            "{error}"
+        );
+        assert_eq!(
+            error["values"],
+            json!({}),
+            "invalid draft must not yield a partial patch"
+        );
+        assert_eq!(events.inspect(|snapshot| snapshot.config.clone()), config);
+        drop(service);
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove directory");
     }
 
     #[tokio::test]

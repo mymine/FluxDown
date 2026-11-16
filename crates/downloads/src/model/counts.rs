@@ -279,6 +279,16 @@ mod tests {
     }
 
     #[test]
+    fn category_override_counts_match_filters_including_other() {
+        let categories = CategoryIndex::from_dtos(CustomCategoryDto::builtin_defaults());
+        for id in ["builtin_video", "builtin_other", "builtin_all", "missing"] {
+            let mut task = local(0, "archive.zip", 2, "main");
+            task.category_override = id.to_owned();
+            assert_equivalent(&categories, std::slice::from_ref(&task));
+        }
+    }
+
+    #[test]
     fn one_scan_matches_per_filter_counting_for_builtin_categories() {
         let categories = CategoryIndex::from_dtos(CustomCategoryDto::builtin_defaults());
         assert_equivalent(&categories, &sample_tasks());

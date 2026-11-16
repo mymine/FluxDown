@@ -358,7 +358,10 @@ pub(crate) struct DownloadTaskView {
     pub(crate) site_fold: String,
     pub(crate) referrer: String,
     pub(crate) save_dir: String,
+    pub(crate) category_override: String,
+    pub(crate) tags_fold: String,
     pub(crate) group_id: String,
+    pub(crate) category_fold: String,
     pub(crate) error_message: String,
     /// 该任务有待确认的「文件已存在」请求（任务表「待确认」角标）。
     pub(crate) conflict_pending: bool,
@@ -409,6 +412,15 @@ impl DownloadTaskView {
         view.referrer.clone_from(&task.referrer);
         view.save_dir.clone_from(&task.save_dir);
         view.group_id.clone_from(&task.group_id);
+        view.category_override.clone_from(&task.properties.category);
+        view.category_fold = task.properties.category.to_lowercase();
+        view.tags_fold = task
+            .properties
+            .tags
+            .iter()
+            .map(|tag| tag.to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
         view.error_message.clone_from(&task.error_message);
         view.file_missing = task.file_missing;
         view.file_hash.clone_from(&task.file_hash);
@@ -515,6 +527,9 @@ impl DownloadTaskView {
             referrer: String::new(),
             save_dir: String::new(),
             group_id: String::new(),
+            category_override: String::new(),
+            category_fold: String::new(),
+            tags_fold: String::new(),
             error_message: String::new(),
             conflict_pending: false,
             file_missing: false,
@@ -584,6 +599,13 @@ impl DownloadTaskView {
         } else {
             &self.origin_url
         }
+    }
+
+    /// 「复制下载地址」能给出的真实链接：本地导入的 `.torrent` 没有来源时 `share_url`
+    /// 是 `torrent-file://` 哨兵，对用户无意义，返回 `None`（空串同理）。
+    pub(crate) fn copyable_share_url(&self) -> Option<&str> {
+        let url = self.share_url();
+        (!url.is_empty() && !url.starts_with("torrent-file://")).then_some(url)
     }
 
     /// 来源站点：`referrer` host 为主，空则 url host。

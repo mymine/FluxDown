@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     source_changed INTEGER NOT NULL DEFAULT 0,
     category_route TEXT NOT NULL DEFAULT '',
     request_method TEXT NOT NULL DEFAULT '',
+    edit_properties TEXT NOT NULL DEFAULT '{}',
     queue_order INTEGER NOT NULL DEFAULT 0,
     uploaded_bytes BIGINT NOT NULL DEFAULT 0,
     uploaded_at_completion BIGINT NOT NULL DEFAULT 0,
@@ -433,6 +434,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     source_changed INTEGER NOT NULL DEFAULT 0,
     category_route TEXT NOT NULL DEFAULT '',
     request_method TEXT NOT NULL DEFAULT '',
+    edit_properties TEXT NOT NULL DEFAULT '{}',
     queue_order INTEGER NOT NULL DEFAULT 0,
     uploaded_bytes BIGINT NOT NULL DEFAULT 0,
     uploaded_at_completion BIGINT NOT NULL DEFAULT 0,
@@ -766,7 +768,7 @@ impl Drop for EngineWriteGuard {
     }
 }
 
-fn sqlite_url(path: &Path) -> String {
+pub(crate) fn sqlite_url(path: &Path) -> String {
     format!(
         "sqlite:{}?mode=rwc",
         path.to_string_lossy().replace('\\', "/")
@@ -867,10 +869,12 @@ fn task_from_row(row: &AnyRow) -> Result<TaskInfo, sqlx::Error> {
             proxy: row.try_get("src_proxy_bytes").unwrap_or_default(),
             nic: row.try_get("src_nic_bytes").unwrap_or_default(),
         },
+        properties: serde_json::from_str(row.try_get::<&str, _>("edit_properties")?)
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?,
     })
 }
 
-const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, file_hash, segments, queue_order, uploaded_bytes, uploaded_at_completion, seeding_status, seeding_message, seeding_time_secs, seed_ratio_limit_milli, seed_post_ratio_limit_milli, seed_time_limit_minutes, seed_inactive_time_limit_minutes, seed_upload_limit_bps, bt_sequential, bt_first_last_pieces_first, bt_download_limit_bps, bt_super_seeding, referrer, group_id, rss_source_id, origin_url, auto_route, src_cdn_bytes, src_proxy_bytes, src_nic_bytes";
+const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, file_hash, segments, queue_order, uploaded_bytes, uploaded_at_completion, seeding_status, seeding_message, seeding_time_secs, seed_ratio_limit_milli, seed_post_ratio_limit_milli, seed_time_limit_minutes, seed_inactive_time_limit_minutes, seed_upload_limit_bps, bt_sequential, bt_first_last_pieces_first, bt_download_limit_bps, bt_super_seeding, referrer, group_id, rss_source_id, origin_url, auto_route, src_cdn_bytes, src_proxy_bytes, src_nic_bytes, edit_properties";
 
 /// 新建任务的完整落库行（[`Db::insert_new_tasks`]）。
 ///
@@ -1417,6 +1421,51 @@ impl Db {
         })
     }
 
+    /// 空闲时归还 SQLite 连接池占着的内存，返回关闭的连接数（PostgreSQL 不处理，恒为 0）。
+    ///
+    /// 并发查询会把连接池撑到上限（5 条），之后这些连接一直常驻：每条各有一个 sqlx 工作线程、
+    /// 预编译语句缓存和按需增长到 `cache_size` 的页缓存。这里关闭除一条之外的全部**空闲**连接，
+    /// 再对留下的那条执行 `PRAGMA shrink_memory` 释放页缓存；正在使用的连接不受影响，下次并发
+    /// 查询按需重建。全程不读写磁盘：WAL 模式下只有最后一条连接关闭才会 checkpoint 并删除
+    /// `-wal` / `-shm`，因此始终留一条（与 `min_connections(1)` 的空闲静默约定一致）。
+    ///
+    /// # Errors
+    ///
+    /// 关闭连接或执行 `PRAGMA shrink_memory` 失败。
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), fluxdown_engine::db::DbError> {
+    /// use fluxdown_engine::db::Db;
+    /// let db = Db::connect("sqlite::memory:").await?;
+    /// let closed = db.release_idle_memory().await?;
+    /// assert_eq!(closed, 0);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn release_idle_memory(&self) -> Result<usize, DbError> {
+        if self.backend != Backend::Sqlite {
+            return Ok(0);
+        }
+        // 先把空闲连接全部拿在手里（`try_acquire` 只取空闲连接、从不新建），再决定去留。
+        let mut idle = Vec::new();
+        while let Some(connection) = self.pool.try_acquire() {
+            idle.push(connection);
+        }
+        let Some(mut kept) = idle.pop() else {
+            return Ok(0);
+        };
+        let closed = idle.len();
+        for connection in idle {
+            connection.close().await?;
+        }
+        sqlx::raw_sql("PRAGMA shrink_memory;")
+            .execute(&mut *kept)
+            .await?;
+        Ok(closed)
+    }
+
     /// 供同 crate 的子系统模块（如 [`crate::speed_history`]）执行自有表的查询。
     pub(crate) fn pool(&self) -> &sqlx::AnyPool {
         &self.pool
@@ -1719,6 +1768,8 @@ impl Db {
         // 浏览器 POST 接管任务的请求方法（空 = GET）。请求体（常含一次性令牌）不落库，
         // 恢复 / 重试时据此明确拒绝，而不是改发 GET。
         self.add_column_if_missing("tasks", "request_method", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("tasks", "edit_properties", "TEXT NOT NULL DEFAULT '{}'")
             .await?;
         Ok(())
     }
@@ -3749,6 +3800,34 @@ impl Db {
         let default_sub_urls = crate::tracker_subscription::default_subscription_urls();
         #[cfg(feature = "ed2k")]
         let default_ed2k_met_urls = crate::ed2k::server_subscription::default_server_met_urls();
+        // 每个安装只在端口键缺失时随机生成；已有配置（包括 eD2K 的 0）原样保留。
+        // BT 只缺一个边界时沿用另一个，避免把手动端口拼成无效范围。
+        #[cfg(feature = "bt")]
+        let default_bt_port = match self.get_config("bt_port_start").await? {
+            Some(port) => port,
+            None => self
+                .get_config("bt_port_end")
+                .await?
+                .unwrap_or_else(|| rand::random_range(49152u16..=65535).to_string()),
+        };
+        #[cfg(feature = "ed2k")]
+        let default_ed2k_port = self
+            .get_config("ed2k_listen_port")
+            .await?
+            .unwrap_or_else(|| {
+                #[cfg(feature = "bt")]
+                let bt_port = default_bt_port.parse::<u16>().ok();
+                #[cfg(feature = "bt")]
+                let port = loop {
+                    let port = rand::random_range(49152u16..=65535);
+                    if Some(port) != bt_port {
+                        break port;
+                    }
+                };
+                #[cfg(not(feature = "bt"))]
+                let port = rand::random_range(49152u16..=65535);
+                port.to_string()
+            });
         #[cfg_attr(
             not(any(feature = "bt", feature = "ed2k")),
             allow(unused_mut, clippy::useless_vec)
@@ -3823,8 +3902,8 @@ impl Db {
             ("bt_enable_dht", "true"),
             ("bt_enable_upnp", "true"),
             ("bt_enable_utp", "true"),
-            ("bt_port_start", "6881"),
-            ("bt_port_end", "6891"),
+            ("bt_port_start", &default_bt_port),
+            ("bt_port_end", &default_bt_port),
             // MSE 三态逃生开关（disabled/enabled/forced），无 UI，经 config API/CLI 可设。
             ("bt_mse_mode", "enabled"),
             ("bt_custom_trackers", ""),
@@ -3855,9 +3934,9 @@ impl Db {
             ("ed2k_server_sub_urls", &default_ed2k_met_urls),
             ("ed2k_server_sub_cache", ""),
             ("ed2k_server_sub_updated_at", "0"),
-            // eD2K 客户端：监听端口（0=OS 选）、UPnP 端口映射争取 HighID、
-            // Kad DHT 去中心化找源。UPnP/Kad 默认启用（best-effort，失败回退）。
-            ("ed2k_listen_port", "0"),
+            // eD2K 客户端：TCP 监听端口（首次随机固定，0=OS 每次选）、
+            // UPnP 争取 HighID、Kad DHT 去中心化找源。
+            ("ed2k_listen_port", &default_ed2k_port),
             ("ed2k_enable_upnp", "true"),
             ("ed2k_enable_kad", "true"),
             // Kad bootstrap：nodes.dat 订阅地址（每行一个，社区维护）+ 合并后的缓存
@@ -3870,6 +3949,8 @@ impl Db {
             ("ed2k_nodes_dat_count", "0"),
             ("ed2k_nodes_dat_updated_at", "0"),
         ]);
+        // 同一事务写入，避免首次启动中断后只留下 BT 范围的一个边界。
+        let mut transaction = self.pool.begin().await?;
         for (key, value) in &defaults {
             sqlx::query(
                 "INSERT INTO config (key, value) VALUES ($1, $2)
@@ -3877,9 +3958,10 @@ impl Db {
             )
             .bind(*key)
             .bind(*value)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         }
+        transaction.commit().await?;
         self.migrate_idle_file_scan_default_off().await?;
         self.migrate_completed_at_backfill().await?;
         #[cfg(feature = "ed2k")]
@@ -4230,6 +4312,16 @@ impl Db {
     pub async fn update_task_segments(&self, id: &str, segments: i32) -> Result<(), DbError> {
         sqlx::query("UPDATE tasks SET segments = $1 WHERE id = $2")
             .bind(segments)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Persist a task's proxy override; an empty value follows global routing.
+    pub async fn update_task_proxy(&self, id: &str, proxy_url: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE tasks SET proxy_url = $1 WHERE id = $2")
+            .bind(proxy_url)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -6095,6 +6187,44 @@ mod tests {
         )
         .await
         .expect("insert task");
+    }
+
+    /// 空闲收缩只关多余的空闲连接：留下的那条继续可用，WAL 不被 checkpoint 删除
+    /// （否则下次查询重建 `-wal` / `-shm`，空闲时唤醒 NAS 硬盘）。
+    #[tokio::test]
+    async fn release_idle_memory_keeps_one_connection_and_the_wal() {
+        let (db, dir) = open_test_db().await;
+        insert_task(&db, "before").await;
+        let held = futures_util::future::join_all((0..3).map(|_| db.pool.acquire()))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("three concurrent connections");
+        drop(held);
+        let size = db.pool.size();
+        assert!(size >= 3, "pool grew to {size}");
+        // 归还连接池是 drop 后异步完成的。
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while db.pool.num_idle() < size as usize {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connections return to the pool");
+
+        let closed = db.release_idle_memory().await.expect("release");
+        assert!(closed >= 2, "closed {closed}");
+        assert_eq!(db.pool.size(), 1);
+        assert!(
+            dir.join("flux_down.db-wal").exists(),
+            "the last connection stays open, so the WAL is not checkpointed away"
+        );
+        assert_eq!(db.release_idle_memory().await.expect("second release"), 0);
+
+        insert_task(&db, "after").await;
+        assert!(db.load_task_by_id("before").await.expect("read").is_some());
+        assert!(db.load_task_by_id("after").await.expect("read").is_some());
+        close_test_db(&db, dir).await;
     }
 
     /// 换源结算：仅换源后首次生效；大小（零容差）不一致即清空进度并改用新大小，
@@ -9992,6 +10122,112 @@ mod tests {
         );
         assert!(db.ack_cdn_report_lease("b1").await.expect("ack"));
         assert_eq!(db.peek_cdn_report_lease().await.expect("peek"), None);
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn default_listen_ports_survive_database_reopen() {
+        let (db, dir) = open_test_db().await;
+        db.init_default_config("/tmp").await.expect("init");
+        let config = db.get_all_config().await.expect("config");
+        #[cfg(feature = "bt")]
+        {
+            let port = config["bt_port_start"].parse::<u16>().expect("BT port");
+            assert!(port >= 1024, "default port must not require privileges");
+            assert_eq!(config["bt_port_start"], config["bt_port_end"]);
+        }
+        #[cfg(not(feature = "bt"))]
+        {
+            assert!(!config.contains_key("bt_port_start"));
+            assert!(!config.contains_key("bt_port_end"));
+        }
+        #[cfg(feature = "ed2k")]
+        {
+            let port = config["ed2k_listen_port"]
+                .parse::<u16>()
+                .expect("eD2K port");
+            assert!(port >= 1024, "default port must be fixed and unprivileged");
+            #[cfg(feature = "bt")]
+            assert_ne!(config["ed2k_listen_port"], config["bt_port_start"]);
+        }
+        #[cfg(not(feature = "ed2k"))]
+        assert!(!config.contains_key("ed2k_listen_port"));
+        db.pool.close().await;
+        let reopened = Db::open(&dir).await.expect("reopen");
+        reopened.init_default_config("/tmp").await.expect("restart");
+        let after = reopened.get_all_config().await.expect("config");
+        for key in ["bt_port_start", "bt_port_end", "ed2k_listen_port"] {
+            assert_eq!(config.get(key), after.get(key), "{key} changed on restart");
+        }
+        close_test_db(&reopened, dir).await;
+    }
+
+    #[tokio::test]
+    async fn default_listen_ports_preserve_existing_configuration() {
+        let (db, dir) = open_test_db().await;
+        for (start, end, ed2k) in [
+            ("6881", "6891", "0"),
+            ("16881", "56891", "0"),
+            ("52000", "52000", "53000"),
+        ] {
+            for (key, value) in [
+                ("bt_port_start", start),
+                ("bt_port_end", end),
+                ("ed2k_listen_port", ed2k),
+            ] {
+                db.set_config(key, value).await.expect("existing setting");
+            }
+            db.init_default_config("/tmp").await.expect("init");
+            let config = db.get_all_config().await.expect("config");
+            assert_eq!(config["bt_port_start"], start);
+            assert_eq!(config["bt_port_end"], end);
+            assert_eq!(config["ed2k_listen_port"], ed2k);
+        }
+        close_test_db(&db, dir).await;
+    }
+
+    #[cfg(feature = "bt")]
+    #[tokio::test]
+    async fn default_listen_ports_complete_partial_bt_range() {
+        let (db, dir) = open_test_db().await;
+        for (present, missing) in [
+            ("bt_port_start", "bt_port_end"),
+            ("bt_port_end", "bt_port_start"),
+        ] {
+            db.delete_config(missing).await.expect("missing boundary");
+            db.set_config(present, "52000")
+                .await
+                .expect("existing port");
+            db.init_default_config("/tmp").await.expect("init");
+            assert_eq!(
+                db.get_config(missing).await.expect("read"),
+                Some("52000".to_owned())
+            );
+        }
+        close_test_db(&db, dir).await;
+    }
+
+    #[cfg(feature = "bt")]
+    #[tokio::test]
+    async fn default_listen_ports_roll_back_incomplete_bt_range() {
+        let (db, dir) = open_test_db().await;
+        sqlx::query(
+            "CREATE TRIGGER reject_bt_port BEFORE INSERT ON config
+             WHEN NEW.key = 'bt_port_end' BEGIN SELECT RAISE(FAIL, 'reject port'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("trigger");
+        assert!(db.init_default_config("/tmp").await.is_err());
+        assert_eq!(db.get_config("bt_port_start").await.expect("read"), None);
+        assert_eq!(db.get_config("bt_port_end").await.expect("read"), None);
+        sqlx::query("DROP TRIGGER reject_bt_port")
+            .execute(&db.pool)
+            .await
+            .expect("drop trigger");
+        db.init_default_config("/tmp").await.expect("retry init");
+        let config = db.get_all_config().await.expect("config");
+        assert_eq!(config["bt_port_start"], config["bt_port_end"]);
         close_test_db(&db, dir).await;
     }
 

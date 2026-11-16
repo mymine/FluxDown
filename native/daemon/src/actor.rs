@@ -26,6 +26,9 @@ use crate::selection::DaemonSelection;
 /// 生产命令队列容量。
 pub const COMMAND_CAPACITY: usize = 64;
 
+/// 最后一次领域活动后静默多久收缩数据库连接池内存（见 `Db::release_idle_memory`）。
+const DB_MEMORY_TRIM_DELAY: Duration = Duration::from_secs(60);
+
 /// 本机做种任务的登记选项（`daemon.task.seedLocal`）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SeedLocalOptions {
@@ -36,6 +39,8 @@ pub struct SeedLocalOptions {
     /// 首次挂载不做哈希校验（数据可信或种子刚由这份数据生成）。
     pub skip_check: bool,
 }
+
+mod task_edit;
 
 /// actor 领域操作。
 pub enum ActorOperation {
@@ -78,7 +83,8 @@ pub enum ActorOperation {
     RecheckTask {
         task_id: String,
     },
-    /// 把 BT 任务的数据移动到新的保存目录（`daemon.task.moveStorage`，搬移在 actor 之外）。
+    /// 把任务数据移动到新的保存目录（`daemon.task.moveStorage`，搬移在 actor 之外）：
+    /// BT 任务走 BT 会话搬移，其余协议走统一编辑的搬移。
     MoveTaskStorage {
         task_id: String,
         save_dir: String,
@@ -126,6 +132,11 @@ pub enum ActorOperation {
         task_id: String,
         segments: i32,
     },
+    SetTaskProxy {
+        task_id: String,
+        proxy_url: String,
+    },
+    EditTask(Box<fluxdown_engine::task_edit::EditTask>),
     SetTaskPiecePicking {
         task_id: String,
         sequential: Option<bool>,
@@ -445,6 +456,11 @@ pub enum MaintenanceEvent {
         outcome: fluxdown_engine::download_manager::BtMoveOutcome,
         ack: oneshot::Sender<Result<ActorResult, ActorError>>,
     },
+    TaskEditWait(Box<task_edit::PendingEdit>),
+    TaskEditDone {
+        outcome: Box<fluxdown_engine::download_manager::TaskEditOutcome>,
+        ack: oneshot::Sender<Result<ActorResult, ActorError>>,
+    },
 }
 
 /// 一次 `daemon.task.moveStorage` 请求（等待下载循环退出期间在 actor 与定时重试之间往返）。
@@ -591,11 +607,18 @@ async fn run_actor(
     seeding_upload.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut queue_positions = tokio::time::interval(Duration::from_millis(250));
     queue_positions.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // 连接池空闲收缩：活动（命令 / 任务结束 / 维护提交等）后静默满 `DB_MEMORY_TRIM_DELAY`
+    // 才执行一次，之后停表直到下一次活动——空闲期没有额外唤醒，也不读写磁盘。启动装载
+    // 本身就是一次活动，所以初始即上弦。
+    let db_memory_trim = tokio::time::sleep(DB_MEMORY_TRIM_DELAY);
+    tokio::pin!(db_memory_trim);
+    let mut db_memory_trim_armed = true;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             Some(command) = commands.recv() => {
+                arm_db_memory_trim(db_memory_trim.as_mut(), &mut db_memory_trim_armed);
                 match command {
                     DaemonCommand::Execute { operation, ack } => {
                         dispatch_operation(
@@ -617,13 +640,18 @@ async fn run_actor(
                     }
                 }
             }
-            Some(done) = receivers.done.recv() => engine.manager.on_task_done(&done).await,
+            Some(done) = receivers.done.recv() => {
+                arm_db_memory_trim(db_memory_trim.as_mut(), &mut db_memory_trim_armed);
+                engine.manager.on_task_done(&done).await;
+            }
             Some(task_id) = receivers.retry.recv() => {
+                arm_db_memory_trim(db_memory_trim.as_mut(), &mut db_memory_trim_armed);
                 if engine.manager.is_task_in_error(&task_id).await {
                     engine.manager.resume_task_auto(&task_id).await;
                 }
             }
             Some(event) = receivers.plugin.recv() => {
+                arm_db_memory_trim(db_memory_trim.as_mut(), &mut db_memory_trim_armed);
                 match event {
                     #[cfg(feature = "plugins")]
                     PluginEvent::Resolve(outcome) => engine.manager.on_resolve_ready(*outcome).await,
@@ -634,15 +662,18 @@ async fn run_actor(
                 }
             }
             Some(event) = maintenance_rx.recv() => {
+                arm_db_memory_trim(db_memory_trim.as_mut(), &mut db_memory_trim_armed);
                 commit_maintenance(event, &mut engine, &events, &maintenance_tx).await;
             }
             Some(outcome) = receivers.file_hash.recv() => {
+                arm_db_memory_trim(db_memory_trim.as_mut(), &mut db_memory_trim_armed);
                 let task_id = outcome.task_id().to_owned();
                 if let Err(error) = engine.manager.commit_file_hash(outcome).await {
                     log_auto_file_hash_error(&task_id, &error);
                 }
             }
             Some(ids) = receivers.missing_cleanup.recv() => {
+                arm_db_memory_trim(db_memory_trim.as_mut(), &mut db_memory_trim_armed);
                 // 删除事实由 delete_tasks_batch 自己发布（TasksDeleted），无需再推全量快照。
                 if let Err(error) = batch_delete_result(
                     engine.manager.delete_tasks_batch(&ids, false).await,
@@ -656,14 +687,25 @@ async fn run_actor(
                     engine.manager.spawn_file_scan();
                 }
             }
-            _ = queue_schedule.tick() => engine.manager.tick_queue_schedules().await,
+            _ = queue_schedule.tick() => {
+                engine.manager.tick_queue_schedules().await;
+                engine.manager.tick_task_schedules().await;
+            },
             _ = queue_positions.tick() => engine.manager.flush_queue_positions(),
             _ = rss_poll.tick() => engine.manager.tick_rss_sources(),
             event = receive_rss_event(&mut rss_events), if rss_events.is_some() => {
+                arm_db_memory_trim(db_memory_trim.as_mut(), &mut db_memory_trim_armed);
                 if let Some(event) = event { engine.manager.on_rss_event(event).await; }
             }
             _ = seeding.tick() => engine.manager.tick_seeding_evaluation().await,
             _ = seeding_upload.tick() => engine.manager.tick_seeding_upload().await,
+            () = &mut db_memory_trim, if db_memory_trim_armed => {
+                db_memory_trim_armed = false;
+                // 下载 / 排队期间连接一直在用，收缩只会来回重建；最后一个任务结束会重新上弦。
+                if !engine.manager.has_pending_downloads() {
+                    release_idle_db_memory(&engine.db).await;
+                }
+            }
         }
     }
 
@@ -701,6 +743,20 @@ async fn run_actor(
     }
 }
 
+/// 领域活动后把连接池空闲收缩推迟到 `DB_MEMORY_TRIM_DELAY` 之后。
+fn arm_db_memory_trim(timer: std::pin::Pin<&mut tokio::time::Sleep>, armed: &mut bool) {
+    timer.reset(tokio::time::Instant::now() + DB_MEMORY_TRIM_DELAY);
+    *armed = true;
+}
+
+async fn release_idle_db_memory(db: &fluxdown_engine::db::Db) {
+    match db.release_idle_memory().await {
+        Ok(0) => {}
+        Ok(closed) => tracing::debug!(closed, "released idle database connections"),
+        Err(error) => tracing::warn!(%error, "releasing idle database memory failed"),
+    }
+}
+
 /// 本构建没有对应协议后端（`bt` / `ed2k` feature 关闭）：明确拒绝 tracker / eD2K
 /// 订阅这类只对该协议有意义的维护操作，而不是静默成功。
 #[cfg(not(all(feature = "bt", feature = "ed2k")))]
@@ -727,6 +783,11 @@ async fn dispatch_operation(
     maintenance_tx: &mpsc::UnboundedSender<MaintenanceEvent>,
 ) {
     match operation {
+        ActorOperation::EditTask(params) => {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            let result = engine.manager.begin_task_edit(*params).await;
+            task_edit::step(result, ack, deadline, engine, maintenance_tx).await;
+        }
         #[cfg(feature = "plugins")]
         ActorOperation::ResolvePreview {
             url,
@@ -1090,30 +1151,37 @@ async fn dispatch_operation(
             });
         }
         ActorOperation::MoveTaskStorage { task_id, save_dir } => {
-            #[cfg(feature = "bt")]
-            start_bt_move(
-                engine,
-                maintenance_tx,
-                BtMoveRequest {
-                    task_id,
-                    save_dir,
-                    resume_after: false,
-                    deadline: tokio::time::Instant::now() + BT_MOVE_STOP_TIMEOUT,
-                    ack,
-                },
-            )
-            .await;
-            #[cfg(not(feature = "bt"))]
-            {
-                let _ = (task_id, save_dir);
-                if ack
-                    .send(Err(ActorError::InvalidArgument(
-                        UNSUPPORTED_PROTOCOL_MESSAGE.to_owned(),
-                    )))
-                    .is_err()
-                {
-                    tracing::debug!("storage move caller disconnected before rejection");
+            // 非 BT 任务（HTTP / FTP / eD2K / HLS…）走统一编辑的搬移：同一套
+            // 「停写入 → 复制发布 → 落库 → 删源」与中断恢复日志。
+            match fluxdown_engine::task_edit::storage_move(&engine.db, &task_id, &save_dir).await {
+                Ok(Some(patch)) => {
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                    let result = engine.manager.begin_task_edit(patch).await;
+                    task_edit::step(result, ack, deadline, engine, maintenance_tx).await;
                 }
+                Ok(None) => {
+                    #[cfg(feature = "bt")]
+                    start_bt_move(
+                        engine,
+                        maintenance_tx,
+                        BtMoveRequest {
+                            task_id,
+                            save_dir,
+                            resume_after: false,
+                            deadline: tokio::time::Instant::now() + BT_MOVE_STOP_TIMEOUT,
+                            ack,
+                        },
+                    )
+                    .await;
+                    #[cfg(not(feature = "bt"))]
+                    task_edit::reply(
+                        ack,
+                        Err(ActorError::InvalidArgument(
+                            UNSUPPORTED_PROTOCOL_MESSAGE.to_owned(),
+                        )),
+                    );
+                }
+                Err(error) => task_edit::reply(ack, Err(task_edit::edit_error(error))),
             }
         }
         ActorOperation::WebhookTest { endpoint_json } => {
@@ -1574,6 +1642,19 @@ async fn execute_operation(
             // 非活跃任务引擎只改库不推事件：补一次快照让客户端看到新线程数。
             engine.manager.send_tasks_snapshot().await;
         }
+        ActorOperation::SetTaskProxy { task_id, proxy_url } => {
+            engine
+                .manager
+                .set_task_proxy(&task_id, &proxy_url)
+                .await
+                .map_err(|error| match error.as_str() {
+                    "not-found" => ActorError::NotFound,
+                    "task-completed" => ActorError::TaskStateConflict(error),
+                    "invalid-proxy" | "protocol-unsupported" => ActorError::InvalidArgument(error),
+                    _ => ActorError::Operation(error),
+                })?;
+            engine.manager.send_tasks_snapshot().await;
+        }
         ActorOperation::SetTaskPiecePicking {
             task_id,
             sequential,
@@ -1890,6 +1971,11 @@ async fn execute_operation(
         | ActorOperation::WebhookTest { .. }
         | ActorOperation::TestProxy { .. }
         | ActorOperation::MoveTaskStorage { .. } => unreachable!("handled off actor"),
+        ActorOperation::EditTask(_) => {
+            return Err(ActorError::Operation(
+                "task property saves require deferred dispatch".to_owned(),
+            ));
+        }
         ActorOperation::WebhookDeliveries => {
             return Ok(ActorResult::WebhookDeliveries(engine.webhook_deliveries()));
         }
@@ -2126,6 +2212,24 @@ async fn commit_maintenance(
                     Ok(_) => tracing::debug!("storage move caller disconnected before result"),
                 }
             }
+        }
+        MaintenanceEvent::TaskEditWait(pending) => {
+            let task_edit::PendingEdit {
+                session,
+                deadline,
+                ack,
+            } = *pending;
+            let result = engine.manager.continue_task_edit(session).await;
+            task_edit::step(result, ack, deadline, engine, maintenance_tx).await;
+        }
+        MaintenanceEvent::TaskEditDone { outcome, ack } => {
+            let result = engine
+                .manager
+                .finish_task_edit(*outcome)
+                .await
+                .map(|()| ActorResult::Unit)
+                .map_err(task_edit::edit_error);
+            task_edit::reply(ack, result);
         }
     }
 }
@@ -2607,10 +2711,26 @@ async fn commit_ed2k_refresh(
 fn bt_status_to_dto(
     view: fluxdown_engine::bt_status::BtStatusView,
 ) -> fluxdown_protocol::BtStatusDto {
-    use fluxdown_engine::bt_status::{TrackerSource, TrackerState, WebSeedState};
-    use fluxdown_protocol::{BtTrackerDto, BtTrackerSource, BtTrackerStatus};
+    use fluxdown_engine::bt_status::{DhtStatus, TrackerSource, TrackerState, WebSeedState};
+    use fluxdown_protocol::{BtDhtDto, BtDhtState, BtTrackerDto, BtTrackerSource, BtTrackerStatus};
+    let state = |state: BtDhtState| BtDhtDto {
+        state,
+        ..BtDhtDto::default()
+    };
+    let dht = match view.dht {
+        DhtStatus::Disabled => state(BtDhtState::Disabled),
+        DhtStatus::Private => state(BtDhtState::Private),
+        DhtStatus::Idle => state(BtDhtState::Idle),
+        DhtStatus::Unavailable => state(BtDhtState::Unavailable),
+        DhtStatus::Running(nodes) => BtDhtDto {
+            state: BtDhtState::Running,
+            nodes_v4: nodes.ipv4,
+            nodes_v6: nodes.ipv6,
+        },
+    };
     fluxdown_protocol::BtStatusDto {
         dht_enabled: view.dht_enabled,
+        dht: Some(dht),
         peer_counts: fluxdown_protocol::BtPeerCountsDto {
             live: view.counts.live,
             connecting: view.counts.connecting,
@@ -4703,6 +4823,132 @@ mod tests {
         }
     }
 
+    /// `daemon.task.moveStorage` 对非 BT 任务（这里是已完成的 eD2K ISO）走统一编辑的搬移：
+    /// 文件挪到新目录、任务位置落库；目标已有同名文件返回 `Conflict` 且原文件不动。
+    #[tokio::test]
+    async fn move_storage_relocates_completed_non_bt_task() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_daemon_move_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create move test dir");
+        let dir_text = dir.to_string_lossy().into_owned();
+        let mut engine = fluxdown_engine::Engine::new(
+            fluxdown_engine::EngineConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: dir_text.clone(),
+                app_data_dir: dir_text.clone(),
+                bt_config: fluxdown_engine::bt_config::BtConfig::default(),
+                proxy_config: fluxdown_engine::proxy_config::ProxyConfig::default(),
+                user_agent: String::new(),
+                data_dir_override: Some(dir.clone()),
+                database_url: None,
+            },
+            std::sync::Arc::new(fluxdown_engine::NoopSink),
+            std::sync::Arc::new(fluxdown_engine::NoopSelection),
+        )
+        .await
+        .expect("construct engine");
+        let events =
+            crate::event_hub::DaemonEventHub::new(fluxdown_protocol::DaemonSnapshot::default(), 32);
+        let (maintenance_tx, mut maintenance_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine
+            .db
+            .insert_task(
+                "ed2k",
+                "ed2k://|file|disc.iso|7|0123456789abcdef0123456789abcdef|/",
+                "disc.iso",
+                &dir_text,
+                1,
+                0,
+                "",
+                "",
+                "",
+                3,
+            )
+            .await
+            .expect("insert task");
+        tokio::fs::write(dir.join("disc.iso"), b"payload")
+            .await
+            .expect("write landed file");
+
+        let mut move_to = async |target: &std::path::Path| {
+            let (ack, mut response) = tokio::sync::oneshot::channel();
+            super::dispatch_operation(
+                ActorOperation::MoveTaskStorage {
+                    task_id: "ed2k".to_owned(),
+                    save_dir: target.to_string_lossy().into_owned(),
+                },
+                ack,
+                &mut engine,
+                &events,
+                &maintenance_tx,
+            )
+            .await;
+            loop {
+                tokio::select! {
+                    result = &mut response => break result.expect("move acknowledged"),
+                    Some(event) = maintenance_rx.recv() => {
+                        super::commit_maintenance(event, &mut engine, &events, &maintenance_tx)
+                            .await;
+                    }
+                }
+            }
+        };
+
+        let occupied = dir.join("occupied");
+        tokio::fs::create_dir_all(&occupied)
+            .await
+            .expect("create occupied dir");
+        tokio::fs::write(occupied.join("disc.iso"), b"other")
+            .await
+            .expect("write conflicting file");
+        assert!(matches!(
+            move_to(&occupied).await,
+            Err(ActorError::Conflict(_))
+        ));
+        assert_eq!(
+            tokio::fs::read(dir.join("disc.iso"))
+                .await
+                .expect("source kept"),
+            b"payload"
+        );
+
+        let target = dir.join("移动 硬盘");
+        assert!(matches!(
+            move_to(&target).await,
+            Ok(super::ActorResult::Unit)
+        ));
+        assert_eq!(
+            tokio::fs::read(target.join("disc.iso"))
+                .await
+                .expect("moved file"),
+            b"payload"
+        );
+        assert!(
+            !dir.join("disc.iso").exists(),
+            "source removed after commit"
+        );
+        let task = engine
+            .db
+            .load_task_by_id("ed2k")
+            .await
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(task.save_dir, target.to_string_lossy());
+        assert_eq!(task.status, 3, "completed task stays completed");
+
+        drop(engine);
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await {
+            eprintln!("actor move test directory removal failed: {error}");
+        }
+    }
+
     /// `daemon.task.hash`：已完成单文件任务经 off-actor 计算、maintenance 回流写回并返回
     /// `algo=hex`；未完成 / 目录产物 / 不存在分别映射为参数错误 / 参数错误 / NotFound；
     /// 计算期间被重新下载的结果不写回（TaskStateConflict），哈希记录随重新下载清空。
@@ -5041,6 +5287,7 @@ mod tests {
                     save_dir: images_text.clone(),
                 }],
                 other_dir: String::new(),
+                ..Default::default()
             }),
         };
         let results = match execute_operation(operation, &mut engine, &events).await {

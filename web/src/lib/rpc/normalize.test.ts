@@ -56,6 +56,7 @@ const DEFAULTS = {
   btDownloadLimitBps: 0,
   btSuperSeeding: false,
   sourceBytes: { cdnBytes: 0, proxyBytes: 0, nicBytes: 0 },
+  properties: { downloadLimitBps: 0, userAgent: '', authRef: '', category: '', tags: [], scheduledAt: 0 },
 }
 
 describe('normalizeTask', () => {
@@ -74,6 +75,7 @@ describe('normalizeTask', () => {
         seedUploadLimitBps: 1024,
         sourceBytes: { cdnBytes: 1, proxyBytes: 2, nicBytes: 3 },
         queueOrder: 7,
+        properties: { downloadLimitBps: 2048, userAgent: 'FluxDown/test', authRef: 'test::https://example.test:443', category: 'builtin_video', tags: ['归档'], scheduledAt: 4102444800 },
       }),
     )
     expect(task.errorMessage).toBe('boom')
@@ -85,6 +87,14 @@ describe('normalizeTask', () => {
     expect(task.seedUploadLimitBps).toBe(1024)
     expect(task.sourceBytes).toEqual({ cdnBytes: 1, proxyBytes: 2, nicBytes: 3 })
     expect(task.queueOrder).toBe(7)
+    expect(task.properties).toEqual({
+      downloadLimitBps: 2048,
+      userAgent: 'FluxDown/test',
+      authRef: 'test::https://example.test:443',
+      category: 'builtin_video',
+      tags: ['归档'],
+      scheduledAt: 4102444800,
+    })
   })
 
   test('BT 任务级限速 / 超级做种：旧 daemon 不下发 → 0 / false；上线值原样保留', () => {

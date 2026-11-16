@@ -180,7 +180,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         bearer_path: token_path,
     };
 
-    let catalog = Arc::new(I18nCatalog::load_embedded()?);
+    let catalog = I18nCatalog::load_embedded()?;
     let translator = catalog.translator(&system_locale());
     let locale = component_locale(translator.locale()).to_owned();
 
@@ -233,8 +233,10 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         }
         crate::logging::install_ui_watchdog(cx);
         crate::app_icon::install(cx);
-        // 先定汉字字体偏好再装主题：首次安装即用对的主字体与回退链，不重装第二次。
+        // 先定汉字字体偏好与系统文本大小再装主题：首次安装即用对的主字体、回退链与字号，不重装第二次。
         fluxdown_ui_theme::set_han_font_preference(han_font_preference(&translator), cx);
+        #[cfg(windows)]
+        crate::text_scale::sync(cx);
         fluxdown_ui_theme::init(cx);
         gpui_component::set_locale(&locale);
         let translator = cx.new(|_| translator);

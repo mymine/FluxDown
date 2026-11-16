@@ -7,6 +7,7 @@ pub(crate) mod about;
 pub(crate) mod api;
 mod app_icon;
 pub(crate) mod appearance;
+mod aria2_options;
 mod auto_quantity;
 pub(crate) mod bt;
 mod bt_guard;
@@ -38,6 +39,7 @@ pub(crate) mod site_auth;
 mod sound;
 pub(crate) mod subscription;
 pub(crate) mod user_agent;
+mod user_agent_presets_dialog;
 pub(crate) mod webhook;
 pub(crate) mod webhook_dialog;
 

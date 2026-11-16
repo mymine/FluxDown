@@ -15,6 +15,20 @@ export interface DaemonConfigPatch {
   values: Record<string, string>;
 }
 
+/** aria2-style supported-options editor preview / export contract. */
+export interface Aria2OptionsRequest {
+  text?: string;
+}
+
+export interface Aria2OptionsResponse {
+  text: string;
+  defaults: string;
+  values: Record<string, string>;
+  revision: number;
+  /** Validation diagnostics remain result data so gateways preserve line/key details. */
+  error?: string;
+}
+
 /** daemon 运行状态投影。 */
 export interface DaemonRuntimeStatsDto {
   activeTasks: number;
@@ -25,6 +39,8 @@ export interface DaemonRuntimeStatsDto {
   saveDir: string;
   /** 「等待自动重试」的任务数（自动重试 / 备用链路 / 插件重试已排程、尚未重新派发）；旧 daemon 不返回。 */
   retryPendingTasks?: number;
+  /** Local verification/finalization jobs; missing or null is unknown, not safe zero. */
+  localWorkCount?: number | null;
 }
 
 export interface ProxyTestRequest {

@@ -9,3 +9,4 @@ export {
   openRename,
   openTaskLimits,
 } from './store'
+export { openTaskEdit, closeTaskEdit } from './store'

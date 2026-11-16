@@ -1,6 +1,59 @@
 // 任务相关 DTO（daemon.rs TaskDto / CreateTaskRequest、task_activity.rs）。
 import type { CategoryRouteDto } from './agent';
 import type { RpcErrorData } from './error';
+/** Persistent editor properties projected on TaskDto; omitted by legacy hosts. */
+export interface TaskPropertiesDto {
+  downloadLimitBps: number;
+  userAgent: string;
+  authRef: string;
+  category: string;
+  tags: string[];
+  scheduledAt: number;
+}
+
+export interface TaskEditCapabilities {
+  request: boolean;
+  proxy: boolean;
+  storage: boolean;
+  rename: boolean;
+  segments: boolean;
+  schedule: boolean;
+}
+
+/** Edit snapshot never returns cookie values; secret headers are represented by ********. */
+export interface TaskEditSnapshot {
+  taskId: string;
+  url: string;
+  revision: string;
+  saveDir: string;
+  fileName: string;
+  proxyUrl: string;
+  segments: number;
+  properties: TaskPropertiesDto;
+  headers: Record<string, string>;
+  cookiesConfigured: boolean;
+  capabilities: TaskEditCapabilities;
+}
+
+export interface EditTaskParams {
+  taskId: string;
+  expectedRevision: string;
+  saveDir?: string;
+  fileName?: string;
+  proxyUrl?: string;
+  segments?: number;
+  downloadLimitBps?: number;
+  userAgent?: string;
+  cookies?: string;
+  headers?: Record<string, string>;
+  authRef?: string;
+  category?: string;
+  tags?: string[];
+  scheduledAt?: number;
+}
+
+export const SECRET_HEADER_PLACEHOLDER = '********';
+
 
 /** `TaskDto.status` 取值。 */
 export const TASK_STATUS = {
@@ -51,6 +104,8 @@ export interface TaskDto {
   errorMessage: string;
   /** Unix 秒级时间戳（字符串）。 */
   createdAt: string;
+  /** Optional on old daemon versions. */
+  properties?: TaskPropertiesDto;
   /** 单任务代理 URL（空 = 使用全局代理）。 */
   proxyUrl: string;
   /** 命名队列 ID（空 = 默认队列）。 */
@@ -72,7 +127,7 @@ export interface TaskDto {
   rssSourceId: string;
   /** 展示用原始来源链接（空 = 用 `url`）；`.torrent` 任务的 `url` 是 `torrent-file://local` 哨兵。 */
   originUrl: string;
-  /** Auto 路由或站点规则标签：`direct` / `proxy:cached` / `rule:custom` 等（空 = 非 Auto 且未命中规则）。 */
+  /** 任务出口链路标签：Auto `direct` / `proxy:cached:manual`、规则 `rule:custom`、全局 `global:manual`、任务级 `task:proxy`、BT `bt:all:system` 等（空 = 尚未启动过）。 */
   autoRoute: string;
   /** 队列内启动顺序（0 = 未显式排序）。 */
   queueOrder: number;
@@ -234,6 +289,12 @@ export interface DaemonCreateTaskParams {
   /** 分类目录路由：`request.saveDir` 为未命中时的基准目录，引擎按初始名与完成时的最终文件名定落点。 */
   categoryRoute?: CategoryRouteDto | null;
 }
+/** `daemon.task.setProxy` 参数；空 `proxyUrl` = 跟随全局代理与站点规则。 */
+export interface SetTaskProxyParams {
+  taskId: string;
+  proxyUrl: string;
+}
+
 
 /** `daemon.task.create` 结果。 */
 export interface CreatedTask {
@@ -418,9 +479,22 @@ export interface BtPeerCountsDto {
   dead: number;
 }
 
+/** 任务视角的 DHT 状态（`BtDhtState`）；未知取值（新 daemon 扩展）按设置开关显示。 */
+export type BtDhtState = 'disabled' | 'private' | 'idle' | 'unavailable' | 'running' | 'unknown';
+
+/** `BtStatusDto.dht`：DHT 实况；节点数为会话级（所有 BT 任务共享），非 `running` 为 0。 */
+export interface BtDhtDto {
+  state: BtDhtState;
+  nodesV4: number;
+  nodesV6: number;
+}
+
 /** `daemon.task.btStatus` 结果（`BtStatusDto`）；非 BT 任务返回 `invalidArgument`。 */
 export interface BtStatusDto {
+  /** 设置里的 DHT 开关（旧客户端只认它）。 */
   dhtEnabled: boolean;
+  /** DHT 实况；旧 daemon 缺省（退回只看 `dhtEnabled`）。 */
+  dht?: BtDhtDto;
   peerCounts: BtPeerCountsDto;
   trackers: BtTrackerDto[];
   peers: BtPeerDto[];

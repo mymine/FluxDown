@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   canChangeSegments,
   canChangeUrl,
+  canEditTaskProxy,
   canForceRecheck,
   canMoveStorage,
   canRename,
@@ -11,6 +12,7 @@ import {
   canVerifyIntegrity,
   isBtUrl,
   isReplaceableUrl,
+  isValidTaskProxyUrl,
   limitKibText,
   parseLimitKib,
   parseTaskSegments,
@@ -25,8 +27,8 @@ import {
 } from './taskEdit'
 import type { TaskState, TaskSource } from './task'
 
-function facts(state: TaskState, over: { source?: TaskSource; url?: string } = {}) {
-  return { source: over.source ?? 'local', state, url: over.url ?? 'https://example.com/a.bin' } as const
+function facts(state: TaskState, over: { source?: TaskSource; url?: string; protocol?: 'http' | 'bt' | 'ed2k' | 'ftp' | 'hls' } = {}) {
+  return { source: over.source ?? 'local', state, url: over.url ?? 'https://example.com/a.bin', protocol: over.protocol ?? 'http' } as const
 }
 
 describe('重命名可用性', () => {
@@ -68,6 +70,29 @@ describe('更换链接可用性', () => {
     }
     // 引擎 `task_url_protocol` 不接受 ftps://。
     expect(canChangeUrl(facts('failed', { url: 'ftps://a/b' }))).toBe(false)
+  })
+})
+describe('任务代理编辑可用性', () => {
+  test('本地未完成 HTTP/FTP URL 可用，包含插件与流任务', () => {
+    for (const state of ['downloading', 'paused', 'pending', 'failed'] as const) {
+      expect(canEditTaskProxy(facts(state))).toBe(true)
+      expect(canEditTaskProxy(facts(state, { protocol: 'hls', url: 'https://video.example/stream.m3u8' }))).toBe(true)
+      expect(canEditTaskProxy(facts(state, { protocol: 'ftp', url: 'ftp://files.example/a' }))).toBe(true)
+    }
+    expect(canEditTaskProxy(facts('completed'))).toBe(false)
+    expect(canEditTaskProxy(facts('paused', { source: 'remote' }))).toBe(false)
+    expect(canEditTaskProxy(facts('paused', { protocol: 'bt', url: 'https://example.com/file' }))).toBe(false)
+    expect(canEditTaskProxy(facts('paused', { protocol: 'ed2k', url: 'https://example.com/file' }))).toBe(false)
+    expect(canEditTaskProxy(facts('paused', { url: 'magnet:?xt=urn:btih:abc' }))).toBe(false)
+  })
+
+  test('验证支持的代理 URL 与 direct/system 哨兵', () => {
+    for (const value of ['', '  ', 'direct://', 'system://', 'http://proxy.test:8080', 'http://proxy.test:80', 'https://proxy.test:443', 'socks4://proxy.test:1080', 'socks4a://proxy.test:1080', 'socks5://user:pass@proxy.test:1080', 'socks5h://proxy.test:1080']) {
+      expect(isValidTaskProxyUrl(value)).toBe(true)
+    }
+    for (const value of ['ftp://proxy.test:21', 'socks://proxy.test:1080', 'http://', 'http://proxy.test:0', 'http://proxy.test/path', 'http://proxy.test?q=1', 'http://proxy.test#frag', 'HTTP://proxy.test:80', 'http://proxy.test', '://proxy.test']) {
+      expect(isValidTaskProxyUrl(value)).toBe(false)
+    }
   })
 })
 
@@ -189,14 +214,16 @@ describe('BT 运维菜单项', () => {
     expect(canForceRecheck([row('paused', { url: magnet, source: 'remote' })])).toBe(false)
   })
 
-  test('移动到 / 任务限速：恰好一个本地 BT 任务，任意状态', () => {
+  test('移动到：恰好一个本地任务，任意协议与状态；任务限速：恰好一个本地 BT 任务', () => {
     for (const state of ['pending', 'downloading', 'paused', 'completed', 'failed'] as const) {
       expect(canMoveStorage([row(state, { url: magnet })])).toBe(true)
+      expect(canMoveStorage([row(state)])).toBe(true)
+      expect(canMoveStorage([row(state, { url: 'ed2k://|file|a.iso|1|h|/' })])).toBe(true)
       expect(canSetTaskLimits([row(state, { url: torrent })])).toBe(true)
     }
     expect(canMoveStorage([])).toBe(false)
     expect(canMoveStorage([row('paused', { url: magnet }), row('paused', { url: magnet })])).toBe(false)
-    expect(canMoveStorage([row('paused')])).toBe(false)
+    expect(canMoveStorage([row('completed', { source: 'remote' })])).toBe(false)
     expect(canSetTaskLimits([row('paused', { url: magnet, source: 'remote' })])).toBe(false)
     expect(canSetTaskLimits([row('paused', { url: 'ed2k://|file|a|1|h|/' })])).toBe(false)
   })
