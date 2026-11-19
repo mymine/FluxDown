@@ -40,6 +40,8 @@ pub(crate) struct DownloadStrings {
     pub(crate) delete: SharedString,
     pub(crate) delete_task: SharedString,
     pub(crate) delete_task_and_file: SharedString,
+    pub(crate) clear_task_file: SharedString,
+    pub(crate) clear_task_file_confirmation: SharedString,
     pub(crate) clean_stale_tasks: SharedString,
     pub(crate) clean_stale_tasks_description: SharedString,
     delete_confirm_with_file: SharedString,
@@ -67,6 +69,9 @@ pub(crate) struct DownloadStrings {
     pub(crate) pause_all: SharedString,
     pub(crate) resume: SharedString,
     pub(crate) resume_all: SharedString,
+    /// 右键菜单：可继续 / 可停止的全是做种任务时，「继续」「暂停」改用做种措辞。
+    pub(crate) resume_seeding: SharedString,
+    pub(crate) stop_seeding: SharedString,
     /// 状态栏批量按钮禁用时的 tooltip：说明为什么当前不可点。
     pub(crate) pause_all_unavailable: SharedString,
     pub(crate) resume_all_unavailable: SharedString,
@@ -272,6 +277,8 @@ impl DownloadStrings {
             delete: shared(translator.text(keys::DELETE)),
             delete_task: shared(translator.text("deleteTask")),
             delete_task_and_file: shared(translator.text("deleteTaskAndFile")),
+            clear_task_file: shared(translator.text("clearTaskFile")),
+            clear_task_file_confirmation: shared(translator.text("clearTaskFileConfirmation")),
             clean_stale_tasks: shared(translator.text("cleanStaleTasks")),
             clean_stale_tasks_description: shared(translator.text("cleanStaleTasksDesc")),
             delete_confirm_with_file: shared(translator.text("deleteConfirmDescWithFile")),
@@ -285,6 +292,8 @@ impl DownloadStrings {
             pause_all: shared(translator.text("pauseAll")),
             resume: shared(translator.text(keys::RESUME)),
             resume_all: shared(translator.text("resumeAll")),
+            resume_seeding: shared(translator.text("seedingResume")),
+            stop_seeding: shared(translator.text("btSeedStopSeeding")),
             pause_all_unavailable: shared(translator.text("pauseAllUnavailable")),
             resume_all_unavailable: shared(translator.text("resumeAllUnavailable")),
             resume_all_queue_stopped: shared(translator.text("resumeAllQueueStopped")),
@@ -761,6 +770,7 @@ pub(crate) struct NewDownloadStrings {
     pub(crate) threads_custom_hint: SharedString,
     pub(crate) rename: SharedString,
     pub(crate) rename_placeholder: SharedString,
+    pub(crate) name_auto: SharedString,
     pub(crate) advanced: SharedString,
     pub(crate) http_auth: SharedString,
     pub(crate) http_auth_desc: SharedString,
@@ -882,6 +892,7 @@ impl NewDownloadStrings {
             )),
             rename: shared(translator.text("renameOptional")),
             rename_placeholder: shared(translator.text("autoDetectFilename")),
+            name_auto: shared(translator.text("auto")),
             advanced: shared(translator.text("taskProxyAdvanced")),
             http_auth: shared(translator.text("taskHttpAuth")),
             http_auth_desc: shared(translator.text("taskHttpAuthDesc")),
@@ -1110,11 +1121,13 @@ pub(crate) fn error_text(
     use fluxdown_protocol::{ApplicationErrorCode, ErrorReason};
     let reason_key = error.reason.and_then(|reason| match reason {
         ErrorReason::TargetDeviceOffline => Some("errReasonTargetDeviceOffline"),
+        ErrorReason::RemoteTaskGone => Some("errReasonRemoteTaskGone"),
         ErrorReason::TaskStateConflict => Some("errReasonTaskStateConflict"),
         ErrorReason::TaskDeviceMismatch => Some("errReasonTaskDeviceMismatch"),
         ErrorReason::SaveDirUnavailable => Some("errReasonSaveDirUnavailable"),
         ErrorReason::TaskFilesInUse => Some("errReasonTaskFilesInUse"),
         ErrorReason::TaskFilesNotDeleted => Some("errReasonTaskFilesNotDeleted"),
+        ErrorReason::BrowserRequestRequired => Some("taskErrorPostOnlyResume"),
         ErrorReason::CloudUnreachable => Some("accountErrorNetwork"),
         ErrorReason::SessionExpired => Some("errReasonSessionExpired"),
         ErrorReason::DeviceUntrusted => Some("accountSessionRevokedUntrusted"),
@@ -1257,6 +1270,15 @@ mod tests {
         );
         assert_eq!(
             strings.task_error_text(&format!("{}\n", super::POST_ONLY_RESUME_MESSAGE)),
+            translator.text("taskErrorPostOnlyResume")
+        );
+        let error = fluxdown_protocol::RpcErrorData::new(
+            fluxdown_protocol::ApplicationErrorCode::Conflict,
+            false,
+        )
+        .with_reason(fluxdown_protocol::ErrorReason::BrowserRequestRequired);
+        assert_eq!(
+            super::error_text(&translator, &error),
             translator.text("taskErrorPostOnlyResume")
         );
         assert_eq!(strings.task_error_text("disk full"), "disk full");
