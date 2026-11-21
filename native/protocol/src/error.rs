@@ -15,6 +15,9 @@ pub const INTERNAL_ERROR_CODE: i32 = -32603;
 /// FluxDown 应用错误使用的 JSON-RPC code。
 pub const APPLICATION_ERROR_CODE: i32 = -32000;
 
+/// Marker for HTTP 403 responses when RSS image proxy validation is unavailable.
+pub const RSS_IMAGE_PROXY_UNVERIFIABLE_HEADER: &str = "x-fluxdown-rss-image-proxy-unverifiable";
+
 /// 稳定应用错误码。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -109,8 +112,12 @@ pub enum ErrorReason {
     TaskFilesInUse,
     /// 删除任务：任务文件无法删除（权限 / 磁盘 / 清理超时等）；任务记录已保留。
     TaskFilesNotDeleted,
+    /// 文件清理尚未完成，必须从原保存位置恢复清理后才能编辑路径。
+    TaskFileClearPending,
     /// 重新下载：浏览器接管的请求必须由浏览器重新发起。
     BrowserRequestRequired,
+    /// RSS 图片：代理出口无法校验图片目标。
+    RssImageProxyUnverifiable,
     /// 局域网配对：配对码错误或已过期。
     PairingCodeInvalid,
     /// 局域网配对：配对会话不存在或已过期。

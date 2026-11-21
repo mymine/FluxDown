@@ -1031,6 +1031,40 @@ impl DaemonService {
                     Err(error) => Err(actor_error(error)),
                 }
             }
+            method::DAEMON_RSS_GET_IMAGE => {
+                use base64::Engine as _;
+                let params = parse_params::<RssImageParams>(params)?;
+                let url = self
+                    .db
+                    .rss_item(&params.source_id, &params.guid)
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?
+                    .and_then(|item| item.image_urls)
+                    .and_then(|urls| urls.into_iter().nth(usize::from(params.index)))
+                    .ok_or_else(|| internal_error("RSS image unavailable".to_owned()))?;
+                let png = fluxdown_engine::rss::preview::load(&self.egress, &url)
+                    .await
+                    .map_err(|error| {
+                        let message = "RSS image could not be loaded";
+                        if error.is::<fluxdown_engine::rss::preview::ProxyDestinationUnverifiable>()
+                        {
+                            RpcErrorObject::application(
+                                message,
+                                RpcErrorData::new(ApplicationErrorCode::Unavailable, false)
+                                    .with_reason(
+                                        fluxdown_protocol::ErrorReason::RssImageProxyUnverifiable,
+                                    ),
+                            )
+                        } else {
+                            // Clients only show a generic failure; keep the cause diagnosable.
+                            fluxdown_engine::log_warn!("[rss] image preview failed: {error:#}");
+                            internal_error(message.to_owned())
+                        }
+                    })?;
+                Ok(serde_json::json!({
+                    "pngBase64": base64::engine::general_purpose::STANDARD.encode(png)
+                }))
+            }
             method::DAEMON_RSS_GET_ITEMS => {
                 let params = parse_params::<RssSourceIdParams>(params)?;
                 let items = self
@@ -2679,6 +2713,14 @@ struct RssSourceIdParams {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RssImageParams {
+    source_id: String,
+    guid: String,
+    index: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RssItemActionParams {
     source_id: String,
     #[serde(default)]
@@ -2974,6 +3016,13 @@ fn actor_error(error: ActorCallError) -> RpcErrorObject {
             message,
             RpcErrorData::new(ApplicationErrorCode::Conflict, false),
         ),
+        ActorCallError::Operation(error @ ActorError::TaskFileClearPending) => {
+            RpcErrorObject::application(
+                error.to_string(),
+                RpcErrorData::new(ApplicationErrorCode::Conflict, false)
+                    .with_reason(fluxdown_protocol::ErrorReason::TaskFileClearPending),
+            )
+        }
         ActorCallError::Operation(ActorError::BrowserRequestRequired) => {
             RpcErrorObject::application(
                 fluxdown_engine::downloader::POST_ONLY_RESUME_MESSAGE,

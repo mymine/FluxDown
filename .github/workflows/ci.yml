@@ -228,12 +228,13 @@ jobs:
       - name: cargo nextest
         run: cargo nextest run --locked --no-tests=pass ${{ matrix.packages }}
 
-      - name: Scheduled quit stops agent and daemon
+      - name: Local agent and daemon end-to-end tests
         if: matrix.name == 'agent'
         run: |
           cargo build --locked -p fluxdown_daemon --bin fluxdownd
           FLUXDOWN_TEST_DAEMON_BIN="$PWD/target/debug/fluxdownd" \
-            cargo nextest run --locked -p fluxdown_agent --test local_stack_recovery --run-ignored=only -E 'test(=scheduled_quit_stops_daemon_then_agent_and_tells_clients_not_to_reconnect)'
+            cargo nextest run --locked -p fluxdown_agent --test local_stack_recovery --run-ignored=only \
+            -E 'test(=scheduled_quit_stops_daemon_then_agent_and_tells_clients_not_to_reconnect) | test(=rss_image_proxy_denial_survives_daemon_and_agent_transports)'
 
   web:
     name: Web SPA (lint + test + build)
@@ -350,7 +351,7 @@ jobs:
         run: >-
           ./gradlew --no-daemon -Pfluxdown.abis=arm64-v8a -Pfluxdown.ciMavenCentralMirror=true
           :core:testDebugUnitTest :fluxui:testDebugUnitTest :bridge:testDebugUnitTest
-          :app:assembleDebug :app:lintDebug
+          :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
 
   # 发布对齐：iOS 核心（fluxdown_mobile）只在 ios-sideload / ios-testflight 打包时交叉编译，
   # Linux 门禁覆盖不到 Apple 移动目标的 cfg（librqbit 等依赖在 iOS 上的条件编译）。两种 flavor 与 build-core.sh 同参数，
