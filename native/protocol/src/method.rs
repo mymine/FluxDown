@@ -138,6 +138,7 @@ pub const DAEMON_SITE_AUTH_CLEAR: &str = "daemon.siteAuth.clear";
 pub const DAEMON_SITE_AUTH_MATCH: &str = "daemon.siteAuth.match";
 pub const DAEMON_RUNTIME_STATS: &str = "daemon.runtime.stats";
 pub const DAEMON_FS_LIST: &str = "daemon.fs.list";
+pub const DAEMON_FS_DEFAULT_FILE_EXISTS: &str = "daemon.fs.defaultFileExists";
 
 pub const DAEMON_RSS_LIST_SOURCES: &str = "daemon.rss.listSources";
 pub const DAEMON_RSS_GET_ITEMS: &str = "daemon.rss.getItems";
@@ -420,6 +421,11 @@ pub const AGENT_PLATFORM_SET_APP_ICON: &str = "agent.platform.setAppIcon";
 pub const AGENT_PLATFORM_APP_ICON_IMAGE: &str = "agent.platform.appIconImage";
 /// `{}` → `{ "ok": true }`：为桌面界面进程现有窗口补设当前应用图标（Windows / X11；其余平台无操作）。
 pub const AGENT_PLATFORM_SYNC_WINDOW_ICONS: &str = "agent.platform.syncWindowIcons";
+/// `{}` → `browser_extension::BrowserExtensionStatusDto`：本机 Chrome / Edge / Firefox 与 FluxDown 扩展的安装状态。
+pub const AGENT_PLATFORM_BROWSER_EXTENSION_STATUS: &str = "agent.platform.browserExtensionStatus";
+/// `browser_extension::BrowserExtensionInstallParams` → `browser_extension::BrowserExtensionInstallResult`：
+/// 登记指向商店的外部扩展（平台支持时）并在目标浏览器打开安装页；未检测到浏览器为 `NotFound`。
+pub const AGENT_PLATFORM_INSTALL_BROWSER_EXTENSION: &str = "agent.platform.installBrowserExtension";
 /// `SoundPreviewParams` → `{ "ok": true }`：由 agent 在本机播放一次提示音偏好值（`off` / `system` / `file:<绝对路径>`）。
 pub const AGENT_SOUND_PREVIEW: &str = "agent.sound.preview";
 pub const AGENT_CAPTURE_SUBMIT: &str = "agent.capture.submit";
@@ -565,6 +571,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_SITE_AUTH_MATCH,
     DAEMON_RUNTIME_STATS,
     DAEMON_FS_LIST,
+    DAEMON_FS_DEFAULT_FILE_EXISTS,
     DAEMON_RSS_LIST_SOURCES,
     DAEMON_RSS_GET_ITEMS,
     DAEMON_RSS_GET_IMAGE,
@@ -739,6 +746,8 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_PLATFORM_SET_APP_ICON,
     AGENT_PLATFORM_APP_ICON_IMAGE,
     AGENT_PLATFORM_SYNC_WINDOW_ICONS,
+    AGENT_PLATFORM_BROWSER_EXTENSION_STATUS,
+    AGENT_PLATFORM_INSTALL_BROWSER_EXTENSION,
     AGENT_SOUND_PREVIEW,
     AGENT_CAPTURE_SUBMIT,
     AGENT_CAPTURE_SUBMIT_TORRENT_FILE,
@@ -792,6 +801,7 @@ pub const SLOW_DAEMON_METHODS: &[&str] = &[
     DAEMON_BT_GUARD_FILTER_SOURCES_REFRESH,
     DAEMON_BT_GUARD_CLOUD_APPLY,
     DAEMON_FS_LIST,
+    DAEMON_FS_DEFAULT_FILE_EXISTS,
     DAEMON_DIAGNOSTICS_PROBE,
     DAEMON_DIAGNOSTICS_FIX_COMPONENT,
     DAEMON_TASK_VERIFY,

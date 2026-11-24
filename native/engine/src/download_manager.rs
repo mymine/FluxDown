@@ -52,6 +52,7 @@ mod bt_storage_ops;
 mod group_dirs;
 #[cfg(feature = "plugins")]
 mod resolve_route;
+mod retention_grace;
 mod task_properties;
 pub use boost::BoostError;
 #[cfg(feature = "bt")]
@@ -129,6 +130,68 @@ async fn handle_task_panic(
         crate::log_error!("[download] PANIC in task {}: {}", task_id, msg);
     }
     persist_task_failure(task_id, msg, db, progress_tx).await;
+}
+
+const MAX_DOWNLOAD_FAILURE_REASON_BYTES: usize = 512;
+
+fn download_failure_reason(message: &str) -> String {
+    static LINKS: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r#"(?i)(?:[a-z][a-z0-9+.-]*://|magnet:\?)[^\s<>"']+"#)
+        });
+    let links = match &*LINKS {
+        Ok(links) => links,
+        // Never log the original reason when link redaction is unavailable.
+        Err(_) => return "failure reason withheld: link redaction unavailable".to_owned(),
+    };
+    // Redact before truncation. Download errors may embed signed links with
+    // arbitrary parameter names, so do not keep any part of a matched link.
+    let mut reason = crate::logger::sanitize_log_str(message);
+    if let std::borrow::Cow::Owned(redacted) = links.replace_all(&reason, "[LINK REDACTED]") {
+        reason = redacted;
+    }
+    let unsafe_char = |ch: char| {
+        ch.is_control()
+            || matches!(
+                ch,
+                '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            )
+    };
+    if reason.contains(unsafe_char) {
+        reason = reason.replace(unsafe_char, " ");
+    }
+    if reason.len() > MAX_DOWNLOAD_FAILURE_REASON_BYTES {
+        let mut end = MAX_DOWNLOAD_FAILURE_REASON_BYTES - '…'.len_utf8();
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+        reason.push('…');
+    }
+    reason
+}
+
+fn log_terminal_task_failure(task: &crate::model::TaskInfo, generation: u64, auto_retries: u32) {
+    let transport_failure = crate::net_failure::tag_of(&task.error_message);
+    let http_status = extract_http_status(&task.error_message);
+    let protocol = if is_bt_url(&task.url) {
+        "bt"
+    } else if is_ed2k_url(&task.url) {
+        "ed2k"
+    } else {
+        crate::intercept::protocol_kind(&task.url, false).as_str()
+    };
+    tracing::error!(
+        task_id = %task.task_id,
+        protocol,
+        auto_retries,
+        downloaded_bytes = task.downloaded_bytes,
+        generation,
+        ?transport_failure,
+        ?http_status,
+        reason = %download_failure_reason(&task.error_message),
+        "download failed"
+    );
 }
 
 async fn persist_task_failure(
@@ -468,11 +531,19 @@ fn without_urls(msg: &str) -> String {
         .collect()
 }
 
+/// A failed speculative full GET cannot resume its own transfer.
+fn requires_manual_resume(msg: &str) -> bool {
+    msg.starts_with(crate::downloader::RANGE_RESTART_FAILED_PREFIX)
+}
+
 /// 判断错误信息是否属于可自动重试的瞬时网络错误。
 /// 排除永久性错误（404、403、checksum 等），仅重试网络层问题。HTTP 下载器
 /// 的文案带类型化分类标签（平台 / 语言无关），有标签即以标签为准；无标签
 /// 的文案（其余协议、旧库存量）回退英文关键词。
 pub(crate) fn is_retriable_error(msg: &str) -> bool {
+    if requires_manual_resume(msg) {
+        return false;
+    }
     if let Some(failure) = crate::net_failure::tag_of(msg) {
         return failure.retriable_same_path();
     }
@@ -1178,6 +1249,9 @@ async fn deferred_file_cleanup(
     // 配合下载器内新增的早期 cancel 检查已能覆盖绝大多数残留窗口。
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let path = PathBuf::from(&save_dir).join(&file_name);
+    if !is_bt_url(&url) {
+        downloader::clean_http_restart_for_task(Path::new(&save_dir), &task_id).await;
+    }
     if is_bt_url(&url) {
         if delete_files && is_safe_file_name(&file_name) {
             if path.is_dir() {
@@ -1318,6 +1392,36 @@ const DELETE_FILE_CONCURRENCY: usize = 64;
 const RETENTION_PURGE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// 保留期清理每轮删除的任务数上限（逐块调用 `delete_tasks_batch`，避免一次占住 actor 过久）。
 const RETENTION_PURGE_CHUNK: i64 = 200;
+
+/// `-1` = 立即，`0` = 永不，正数夹到 3650 天。协议拒绝小于 -1 的值；这里把
+/// 任何负数都收成立即，避免运行时把坏值当成「从不」。
+fn normalize_retention_days(days: i32) -> i32 {
+    if days < 0 { -1 } else { days.clamp(0, 3650) }
+}
+
+/// 保留期截止的 Unix 秒。立即模式禁止用 `now - days * 86400`（`-1` 会下溢或
+/// 变成「一天后」），截止点取现在之后，让 `completed_at < cutoff` 选中全部已完成记录。
+fn retention_cutoff_secs(days: i32, now_secs: u64) -> i64 {
+    if days < 0 {
+        return i64::try_from(now_secs.saturating_add(1)).unwrap_or(i64::MAX);
+    }
+    let age = u64::from(u32::try_from(days).unwrap_or(0)).saturating_mul(86_400);
+    i64::try_from(now_secs.saturating_sub(age)).unwrap_or(i64::MAX)
+}
+
+/// 把「再清一次已完成记录」投给宿主。满 = 已有一次在排队；关闭 = 宿主没取接收端。
+fn request_retention_purge(tx: &mpsc::Sender<()>) {
+    if let Err(error) = tx.try_send(()) {
+        match error {
+            mpsc::error::TrySendError::Full(()) => {
+                tracing::debug!("retention purge already queued");
+            }
+            mpsc::error::TrySendError::Closed(()) => {
+                log_info!("[manager] retention purge notify dropped: receiver closed");
+            }
+        }
+    }
+}
 
 /// [`DownloadManager::delete_tasks_batch`] 的结果。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1531,10 +1635,13 @@ fn keep_first_cleanup_error(first: &mut Option<std::io::Error>, result: std::io:
 /// 删除一个被删任务的磁盘文件：BT 的最终产物与 staging 目录；其余协议的临时文件、
 /// 独立音轨与最终产物；以及登记的衍生产物。
 async fn remove_deleted_task_files(
-    #[cfg_attr(not(feature = "bt"), allow(unused_variables))] task_id: &str,
+    task_id: &str,
     files: &DeleteFiles,
 ) -> Result<(), downloader::DownloadError> {
     let mut first_error = None;
+    if !files.is_bt {
+        downloader::clean_http_restart_for_task(Path::new(&files.save_dir), task_id).await;
+    }
     let path = PathBuf::from(&files.save_dir).join(&files.file_name);
     let removes_final =
         files.delete_files && files.owns_final && is_safe_file_name(&files.file_name);
@@ -1879,6 +1986,7 @@ async fn probe_start_meta(params: &mut DownloadParams) -> crate::meta_prober::Pr
             ) => r,
         };
     }
+    let probe_started = std::time::Instant::now();
     let resolved = if crate::auto_probe::applies(params) {
         // Auto 多路径：起飞路径不及时应答 / 断在传输层时并行放出备选路径，
         // 胜出路径就地接管 params（client、代理配置、路由上下文与标签）。
@@ -1908,6 +2016,12 @@ async fn probe_start_meta(params: &mut DownloadParams) -> crate::meta_prober::Pr
     };
     match resolved {
         Ok((info, adapted, held)) => {
+            tracing::info!(
+                task_id = %params.task_id,
+                elapsed_ms = probe_started.elapsed().as_millis(),
+                outcome = "ready",
+                "HTTP probe completed"
+            );
             if let Some(adapted_spec) = &adapted {
                 downloader::persist_adapted_spec(&params.db, &params.task_id, adapted_spec).await;
             }
@@ -1920,10 +2034,12 @@ async fn probe_start_meta(params: &mut DownloadParams) -> crate::meta_prober::Pr
             meta
         }
         Err(error) => {
-            log_info!(
-                "[download] task {} prelude probe failed: {}",
-                params.task_id,
-                error
+            tracing::info!(
+                task_id = %params.task_id,
+                elapsed_ms = probe_started.elapsed().as_millis(),
+                transport_failure = ?crate::net_failure::classify_download_error(&error),
+                outcome = "failed",
+                "HTTP probe completed"
             );
             params.preprobed = Some(Err(error));
             crate::meta_prober::ProbedMeta::default()
@@ -2777,6 +2893,8 @@ struct TaskSpeedState {
     last_transfer_bytes: Option<i64>,
     /// 已观测、尚未随转发帧交给宿主（`EngineEvent::TaskTransferred`）的接收字节。
     unsent_transfer_bytes: i64,
+    /// Staged transfer is in flight until a terminal frame re-anchors progress.
+    staged_download: bool,
     /// Latest downloaded_bytes seen (transfer-baseline settlement).
     latest_bytes: i64,
     /// Resolved file_name (latched from the first non-empty update).
@@ -3987,6 +4105,46 @@ fn apply_resolve_to_queued(queued: &mut QueuedTask, res: crate::plugin::ResolveR
     };
     queued.range_supported = res.range_supported;
 }
+#[cfg(feature = "plugins")]
+#[derive(Debug)]
+pub enum PluginRetryEvent {
+    Retry { task_id: String, delay_ms: u64 },
+    FailurePending { task_id: String, generation: u64 },
+    FailureSettled { task_id: String, generation: u64 },
+}
+
+// Normal hooks have a 5s budget. Several callbacks (or a long-running
+// authorized hook) can exceed this deadline; it is diagnostic only.
+#[cfg(feature = "plugins")]
+const PLUGIN_FAILURE_DIAGNOSTIC_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(feature = "plugins")]
+struct PendingFailureDiagnostic {
+    generation: u64,
+    warned: bool,
+    observer: JoinHandle<()>,
+}
+
+#[cfg(feature = "plugins")]
+impl Drop for PendingFailureDiagnostic {
+    fn drop(&mut self) {
+        // The observer owns join handles, not the callbacks: aborting it
+        // detaches those tasks, leaving their ability to request retries intact.
+        self.observer.abort();
+    }
+}
+
+#[cfg(feature = "plugins")]
+fn log_pending_task_failure(task: &TaskInfo, generation: u64, trigger: &'static str) {
+    tracing::warn!(
+        task_id = %task.task_id,
+        generation,
+        trigger,
+        reason = %download_failure_reason(&task.error_message),
+        "download attempt failed; plugin retry decision pending"
+    );
+}
+
 pub struct DownloadManager {
     db: Db,
     client: Client,
@@ -4128,13 +4286,23 @@ pub struct DownloadManager {
     /// 避免不必要地唤醒 NAS/网络盘；窗口聚焦、手动重扫等主动触发路径
     /// 不受此项影响，恒会执行。
     idle_file_scan: bool,
-    /// 已完成任务记录保留天数（config `completed_record_retention_days`，
-    /// 0 = 永不清理）。超期的「已完成」记录（只删记录不删文件，做种中跳过）
+    /// 已完成记录保留（config `completed_record_retention_days`）：
+    /// `-1` = 下载成功后立刻只删记录，`0` = 永不，`1..=3650` = 天数。
     /// 由 [`DownloadManager::purge_expired_completed_records`] 在被动事件上顺带清理，
     /// 无独立定时器（空闲静默契约）。
-    completed_record_retention_days: u32,
+    completed_record_retention_days: i32,
     /// 上次执行保留期清理的单调时刻，用于去抖（见 `RETENTION_PURGE_DEBOUNCE`）。
     last_retention_purge: Option<std::time::Instant>,
+    /// 做种在 actor 外落入停止原因，或宽限到期时通知宿主再清一次。
+    retention_purge_tx: mpsc::Sender<()>,
+    /// 上述通知的接收端（仅取一次，交给 actor loop）。
+    retention_purge_rx: Option<mpsc::Receiver<()>>,
+    /// 刚完成 / 刚停止做种的任务在宽限内不删，让各端快照先看到最终状态。
+    retention_grace: retention_grace::RetentionGrace,
+    /// 宽限时长；测试缩短它。
+    retention_grace_period: std::time::Duration,
+    /// 已安排的宽限到期唤醒时刻，避免每次清理都多起一个等待任务。
+    retention_wake_at: Option<std::time::Instant>,
     /// Boost 模式当前优先任务 ID。None = 无优先任务。变化时持久化到 config
     /// `boost_state`，重启后由 `resume_on_start` 处理（见 `boost.rs`）。
     priority_task_id: Option<String>,
@@ -4261,9 +4429,11 @@ pub struct DownloadManager {
     resolve_rx: Option<mpsc::UnboundedReceiver<ResolveOutcome>>,
     /// 插件 onError 命令式重试意图通道（bridge → actor `plugin_request_retry`）。
     #[cfg(feature = "plugins")]
-    plugin_retry_tx: mpsc::UnboundedSender<(String, u64)>,
+    plugin_retry_tx: mpsc::UnboundedSender<PluginRetryEvent>,
     #[cfg(feature = "plugins")]
-    plugin_retry_rx: Option<mpsc::UnboundedReceiver<(String, u64)>>,
+    plugin_retry_rx: Option<mpsc::UnboundedReceiver<PluginRetryEvent>>,
+    #[cfg(feature = "plugins")]
+    pending_failure_diagnostics: HashMap<String, PendingFailureDiagnostic>,
     /// resolve 等待中的任务（start 携 QueuedTask，resume 为标记）。
     #[cfg(feature = "plugins")]
     pending_resolve: HashMap<String, PendingResolve>,
@@ -4290,6 +4460,17 @@ pub struct DownloadManagerConfig {
     pub proxy_config: ProxyConfig,
     pub user_agent: String,
 }
+/// 从磁盘重新挂载做种的起步结果。
+#[cfg(feature = "bt")]
+enum ReseedStart {
+    /// 已写成排队做种，校验在 BT runtime 上继续。
+    Started,
+    /// 无法挂载（没有种子字节）。停止原因保持调用方写入的回退态。
+    DecidedStop,
+    /// 排队态没写上，状态没变。
+    Unmarked,
+}
+
 impl DownloadManager {
     pub fn new(
         db: Db,
@@ -4328,6 +4509,7 @@ impl DownloadManager {
         let (done_tx, done_rx) = mpsc::channel(8192);
         let (retry_tx, retry_rx) = mpsc::channel(32);
         let (missing_cleanup_tx, missing_cleanup_rx) = mpsc::channel(8);
+        let (retention_purge_tx, retention_purge_rx) = mpsc::channel(8);
         let (file_hash_tx, file_hash_rx) = mpsc::unbounded_channel();
         #[cfg(feature = "plugins")]
         let (resolve_tx, resolve_rx) = mpsc::unbounded_channel();
@@ -4403,6 +4585,11 @@ impl DownloadManager {
             idle_file_scan: true,
             completed_record_retention_days: 0,
             last_retention_purge: None,
+            retention_purge_tx,
+            retention_purge_rx: Some(retention_purge_rx),
+            retention_grace: retention_grace::RetentionGrace::default(),
+            retention_grace_period: retention_grace::RETENTION_GRACE,
+            retention_wake_at: None,
             priority_task_id: None,
             auto_paused_ids: Vec::new(),
             auto_retry_counts: HashMap::new(),
@@ -4463,6 +4650,8 @@ impl DownloadManager {
             #[cfg(feature = "plugins")]
             plugin_retry_rx: Some(plugin_retry_rx),
             #[cfg(feature = "plugins")]
+            pending_failure_diagnostics: HashMap::new(),
+            #[cfg(feature = "plugins")]
             pending_resolve: HashMap::new(),
             #[cfg(feature = "plugins")]
             resume_applied: HashMap::new(),
@@ -4493,6 +4682,13 @@ impl DownloadManager {
     /// 通道会被填满，扫描侧的 `try_send` 静默失败——行为安全。
     pub fn take_missing_cleanup_rx(&mut self) -> Option<mpsc::Receiver<Vec<String>>> {
         self.missing_cleanup_rx.take()
+    }
+
+    /// 取出「再清一次已完成记录」的通知接收端（做种在 actor 外落入停止原因，或宽限
+    /// 到期）。宿主 actor 收到后调用 [`Self::purge_requested_completed_records`]。
+    /// 宿主不取时通道会被填满，通知侧记下失败——下一次完成 / 重扫仍会清理。
+    pub fn take_retention_purge_rx(&mut self) -> Option<mpsc::Receiver<()>> {
+        self.retention_purge_rx.take()
     }
 
     /// 取出「下载完成后计算哈希」的结果回流接收端：宿主 actor 收到后调用
@@ -4544,7 +4740,7 @@ impl DownloadManager {
 
     /// 暴露 plugin_retry_tx 供 bridge 构造（onError 命令式重试意图通道）。
     #[cfg(feature = "plugins")]
-    pub fn plugin_retry_sender(&self) -> mpsc::UnboundedSender<(String, u64)> {
+    pub fn plugin_retry_sender(&self) -> mpsc::UnboundedSender<PluginRetryEvent> {
         self.plugin_retry_tx.clone()
     }
 
@@ -4556,7 +4752,7 @@ impl DownloadManager {
 
     /// 交出 plugin_retry 接收端给 actor loop。
     #[cfg(feature = "plugins")]
-    pub fn take_plugin_retry_rx(&mut self) -> Option<mpsc::UnboundedReceiver<(String, u64)>> {
+    pub fn take_plugin_retry_rx(&mut self) -> Option<mpsc::UnboundedReceiver<PluginRetryEvent>> {
         self.plugin_retry_rx.take()
     }
 
@@ -5656,6 +5852,121 @@ impl DownloadManager {
         }
     }
 
+    #[cfg(feature = "plugins")]
+    fn defer_failure_diagnostic(
+        &mut self,
+        task_id: &str,
+        generation: u64,
+        work: Vec<JoinHandle<()>>,
+        deadline: tokio::time::Instant,
+    ) {
+        let tx = self.plugin_retry_tx.clone();
+        let worker_task_id = task_id.to_owned();
+        // Observe from the engine runtime, even if the plugin runtime stalls.
+        let observer = tokio::spawn(async move {
+            let callbacks = async {
+                for job in work {
+                    if let Err(error) = job.await
+                        && error.is_panic()
+                    {
+                        tracing::warn!("plugin failure callback panicked");
+                    }
+                }
+            };
+            tokio::pin!(callbacks);
+            if tokio::time::timeout_at(deadline, &mut callbacks)
+                .await
+                .is_err()
+            {
+                if tx
+                    .send(PluginRetryEvent::FailurePending {
+                        task_id: worker_task_id.clone(),
+                        generation,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                callbacks.await;
+            }
+            // A callback's retry send precedes its completion. Keep settlement
+            // after all such sends, even if the diagnostic deadline expired.
+            if tx
+                .send(PluginRetryEvent::FailureSettled {
+                    task_id: worker_task_id,
+                    generation,
+                })
+                .is_err()
+            {
+                tracing::debug!("plugin retry receiver closed");
+            }
+        });
+        self.pending_failure_diagnostics.insert(
+            task_id.to_owned(),
+            PendingFailureDiagnostic {
+                generation,
+                warned: false,
+                observer,
+            },
+        );
+    }
+
+    #[cfg(feature = "plugins")]
+    async fn current_failure_for_diagnostic(&self, task_id: &str) -> Option<TaskInfo> {
+        if self.active_tasks.contains_key(task_id) || self.retry_scheduled.contains_key(task_id) {
+            return None;
+        }
+        match self.db.load_task_by_id(task_id).await {
+            Ok(task) => task
+                .filter(|task| task.status == 4 && task.error_message != CANCELLED_ERROR_MESSAGE),
+            Err(error) => {
+                crate::logger::report_error(
+                    "download",
+                    "load task failure for diagnostics",
+                    &error,
+                );
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "plugins")]
+    pub async fn handle_plugin_retry_event(&mut self, event: PluginRetryEvent) {
+        let (task_id, generation, settled) = match event {
+            PluginRetryEvent::Retry { task_id, delay_ms } => {
+                self.plugin_request_retry(&task_id, delay_ms).await;
+                return;
+            }
+            PluginRetryEvent::FailurePending {
+                task_id,
+                generation,
+            } => (task_id, generation, false),
+            PluginRetryEvent::FailureSettled {
+                task_id,
+                generation,
+            } => (task_id, generation, true),
+        };
+        if !self
+            .pending_failure_diagnostics
+            .get(&task_id)
+            .is_some_and(|pending| pending.generation == generation && (settled || !pending.warned))
+        {
+            return;
+        }
+        if settled {
+            self.pending_failure_diagnostics.remove(&task_id);
+        }
+        if let Some(task) = self.current_failure_for_diagnostic(&task_id).await {
+            if settled {
+                let retries = self.auto_retry_counts.get(&task_id).copied().unwrap_or(0);
+                log_terminal_task_failure(&task, generation, retries);
+            } else if let Some(pending) = self.pending_failure_diagnostics.get_mut(&task_id) {
+                log_pending_task_failure(&task, generation, "callback_deadline");
+                pending.warned = true;
+            }
+        }
+    }
+
     /// 插件 onError 命令式重试（actor 上下文，复用 auto_retry 账本限流）。
     #[cfg(feature = "plugins")]
     pub async fn plugin_request_retry(&mut self, task_id: &str, delay_ms: u64) {
@@ -5685,7 +5996,9 @@ impl DownloadManager {
                 return;
             }
         };
-        let Some(queue_id) = task.filter(|t| t.status == 4).map(|t| t.queue_id) else {
+        let Some(task) =
+            task.filter(|t| t.status == 4 && !requires_manual_resume(&t.error_message))
+        else {
             return;
         };
         if from_interceptor {
@@ -5709,7 +6022,7 @@ impl DownloadManager {
             }
             *count += 1;
         }
-        self.retry_schedule(task_id, queue_id);
+        self.retry_schedule(task_id, task.queue_id);
         let tx = self.retry_tx.clone();
         let tid = task_id.to_string();
         tokio::spawn(async move {
@@ -6014,9 +6327,11 @@ impl DownloadManager {
     /// 防止用户明确取消的下载被自动重启。
     pub async fn is_task_in_error(&self, task_id: &str) -> bool {
         match self.db.load_task_by_id(task_id).await {
-            Ok(task) => {
-                task.is_some_and(|t| t.status == 4 && t.error_message != CANCELLED_ERROR_MESSAGE)
-            }
+            Ok(task) => task.is_some_and(|t| {
+                t.status == 4
+                    && t.error_message != CANCELLED_ERROR_MESSAGE
+                    && !requires_manual_resume(&t.error_message)
+            }),
             Err(error) => {
                 crate::logger::report_warning(
                     "download-manager",
@@ -6162,11 +6477,12 @@ impl DownloadManager {
         self.hash_after_download = algorithm;
     }
 
-    /// 更新已完成记录保留天数（config `completed_record_retention_days`，0 = 永不）。
+    /// 更新已完成记录保留（config `completed_record_retention_days`）。
+    /// `-1` = 成功后立刻只删记录，`0` = 永不，正数 = 天数（超过 3650 按 3650）。
     /// 同时清除去抖时刻，使随后的 [`DownloadManager::purge_expired_completed_records`]
     /// 立即生效。
-    pub fn set_completed_record_retention_days(&mut self, days: u32) {
-        self.completed_record_retention_days = days;
+    pub fn set_completed_record_retention_days(&mut self, days: i32) {
+        self.completed_record_retention_days = normalize_retention_days(days);
         self.last_retention_purge = None;
     }
 
@@ -6975,13 +7291,17 @@ impl DownloadManager {
                             seeding_message: reason.message().to_string(),
                             seeding_time_secs: t.seeding_time_secs,
                         });
+                        self.hold_retention_grace([task_id.as_str()]);
                     }
                 }
             }
         }
         // 停止释放了槽位——立即再平衡，让排队的做种者补位。
+        // 达限停止已把 1/8 写成停止原因：再清一次，否则立即模式要等下次完成或重扫。
+        // 刚停的这几条在宽限里，到期唤醒后再删。
         if had_stops {
             self.reconcile_seeding_slots().await;
+            self.purge_after_seeding_stopped().await;
         }
         // 会话空闲宽限的周期复查点：复用本 tick，不新增宿主的 select 分支。
         self.recheck_bt_session_paused_grace().await;
@@ -7039,6 +7359,7 @@ impl DownloadManager {
                     0,
                 )
                 .await;
+                self.notify_retention_purge(&task_id);
                 continue;
             }
             if let Err(error) = self
@@ -7762,7 +8083,10 @@ impl DownloadManager {
         );
         if !carry_over {
             // 没有要接回的任务：新会话在下一次 BT 活动时惰性创建。
+            // 做种已写成「会话释放」，不再做种的已完成记录在宽限到期后可以清。
             std::thread::spawn(move || bt.shutdown());
+            self.hold_retention_grace(seeders.iter().map(String::as_str));
+            self.purge_after_seeding_stopped().await;
             return;
         }
         // 旧会话的引用在纯同步线程释放并等它结束：它是最后一个引用时，旧 runtime
@@ -7777,6 +8101,8 @@ impl DownloadManager {
             Ok(false) => log_info!("[manager] rebuild BT session: old session drop panicked"),
             Err(error) => {
                 crate::logger::report_error("download-manager", "shut down BT session", &error);
+                // 关停没确认。写回排队，下一轮启动还能续；没写上的只跳过这一轮。
+                self.defer_reseed_then_purge(&seeders).await;
                 return;
             }
         }
@@ -7784,31 +8110,61 @@ impl DownloadManager {
         // 4. 新配置建会话，把重建前的做种与下载接回去。
         if let Err(e) = self.ensure_bt_session().await {
             log_info!(
-                "[manager] rebuild BT session: init failed, seeders stay released: {}",
+                "[manager] rebuild BT session: init failed, seeders stay pending: {}",
                 e
             );
-            for tid in &seeders {
-                self.emit_progress_from_db(tid, 3, released.as_i32(), released.message(), 0)
-                    .await;
-            }
+            self.defer_reseed_then_purge(&seeders).await;
             return;
         }
         let Some(bt) = self.bt_session.clone() else {
+            // ensure 成功后不应为空；没拿到会话就不能挂载，同样写回排队。
+            self.defer_reseed_then_purge(&seeders).await;
             return;
         };
+        let mut unmarked = Vec::new();
         match self.db.load_tasks_by_ids(&seeders).await {
             Ok(tasks) => {
-                for task in tasks.iter().filter(|task| task.status == 3) {
-                    self.spawn_reseed_from_disk(bt.clone(), task).await;
+                let by_id: HashMap<&str, &TaskInfo> = tasks
+                    .iter()
+                    .map(|task| (task.task_id.as_str(), task))
+                    .collect();
+                let mut pending = Vec::new();
+                for id in &seeders {
+                    match by_id.get(id.as_str()) {
+                        Some(task) if task.status == 3 => {
+                            if matches!(
+                                self.spawn_reseed_from_disk(bt.clone(), task).await,
+                                ReseedStart::Unmarked
+                            ) {
+                                unmarked.push(id.clone());
+                            }
+                        }
+                        // 未完成任务不在已完成清理范围内。
+                        Some(_) => {}
+                        None => pending.push(id.clone()),
+                    }
                 }
+                unmarked.extend(self.mark_pending_reseed(&pending).await);
             }
-            Err(error) => crate::logger::report_error(
-                "download-manager",
-                "load released seeders for reseed",
-                &error,
-            ),
+            Err(error) => {
+                crate::logger::report_error(
+                    "download-manager",
+                    "load released seeders for reseed",
+                    &error,
+                );
+                self.batch_resume(&paused_downloads).await;
+                self.defer_reseed_then_purge(&seeders).await;
+                return;
+            }
         }
         self.batch_resume(&paused_downloads).await;
+        // 写成排队的被查询排除。只跳过没写上的 id；已落成停止原因的等宽限到期再清。
+        self.hold_retention_grace(seeders.iter().map(String::as_str));
+        self.purge_expired_completed_records_except(
+            self.completed_record_retention_days < 0,
+            &unmarked,
+        )
+        .await;
     }
 
     /// 无 BT 后端：没有会话可释放；仅把排队中的 BT 项落回暂停（沿用禁用路径）。
@@ -8362,7 +8718,11 @@ impl DownloadManager {
     pub async fn on_task_done(&mut self, done: &TaskDone) {
         self.handle_task_done(done).await;
         self.reconcile_priority().await;
-        self.purge_expired_completed_records(false).await;
+        // 完成帧刚发出：本任务先进宽限，各端快照看到 status=3 之后才删（见
+        // `retention_grace`）。立即模式不再等 10 分钟去抖，其余已到期的记录照常清。
+        self.hold_retention_grace([done.task_id.as_str()]);
+        let immediate = self.completed_record_retention_days < 0;
+        self.purge_expired_completed_records(immediate).await;
     }
 
     async fn handle_task_done(&mut self, done: &TaskDone) {
@@ -8442,6 +8802,8 @@ impl DownloadManager {
         // 仅在 generation 匹配（确实是这一轮 spawn 失败）时触发，防止 stale 信号误触发。
         let max_retries = self.max_auto_retries;
         if generation_matched && let Ok(Some(task)) = self.db.load_task_by_id(task_id).await {
+            #[cfg(feature = "plugins")]
+            self.pending_failure_diagnostics.remove(task_id);
             // 重复种子占位任务：引擎在 add 前 / AlreadyManaged 兜底时打了
             // DB 标记（见 bt_downloader::mark_duplicate_torrent）。不算失败
             // ——删除占位行（不进自动重试 / 插件 onError / task.failed
@@ -8496,7 +8858,13 @@ impl DownloadManager {
             }
             // 本轮是否已排程恢复——决定 `task.failed` 是否应立即发出。
             let mut retry_pending = false;
+            let terminal_failure =
+                task.status == 4 && task.error_message != CANCELLED_ERROR_MESSAGE;
+            #[cfg(feature = "plugins")]
+            let mut terminal_failure = terminal_failure;
+            let manual_resume = requires_manual_resume(&task.error_message);
             if task.status == 4
+                && !manual_resume
                 && self.proxy_config.mode == ProxyMode::Auto
                 && task.proxy_url.is_empty()
                 // 站点规则与协议固定出口不参与 Auto 换路：否则会把其失败归因到 Auto，
@@ -8589,11 +8957,11 @@ impl DownloadManager {
                         }
                         AutoFailoverTarget::Direct => "直连",
                     };
-                    log_info!(
-                        "[manager] auto-proxy: task {} host {} 传输失败，立即换{}重试（每链路一次，不占通用重试配额）",
+                    tracing::debug!(
                         task_id,
                         host,
-                        label
+                        route = label,
+                        "transport failed; retrying on alternate route"
                     );
                     self.auto_failover_pending
                         .insert(task_id.to_string(), target);
@@ -8632,17 +9000,12 @@ impl DownloadManager {
                     let delay_secs = base
                         .saturating_mul(attempt as u64)
                         .min(MAX_AUTO_RETRY_DELAY_SECS);
-                    log_info!(
-                        "[manager] auto-retry {}/{} for task {} in {}s (error: {})",
-                        attempt,
-                        if max_retries == -1 {
-                            "∞".to_string()
-                        } else {
-                            max_retries.to_string()
-                        },
+                    tracing::debug!(
                         task_id,
+                        attempt,
+                        max_retries,
                         delay_secs,
-                        task.error_message
+                        "task retry scheduled"
                     );
                     let tx = self.retry_tx.clone();
                     let tid = task_id.to_string();
@@ -8655,12 +9018,6 @@ impl DownloadManager {
                     });
                     retry_pending = true;
                     self.retry_schedule(task_id, task.queue_id.clone());
-                } else {
-                    log_info!(
-                        "[manager] auto-retry exhausted for task {} ({} attempts), staying in error",
-                        task_id,
-                        max_retries
-                    );
                 }
             }
             // 跳过采纳的已有文件不是本任务产物：不打来源标记、不触发插件 onDone
@@ -8739,13 +9096,14 @@ impl DownloadManager {
                     })
                     .await;
                 } else if task.status == 4 {
-                    pm.notify(crate::plugin::PluginEvent::Error {
-                        task_id: task_id.to_string(),
-                        url: task.url.clone(),
-                        message: task.error_message.clone(),
-                    })
-                    .await;
-                    if !is_bt_url(&task.url) && !is_ed2k_url(&task.url) {
+                    let mut work = pm
+                        .track_failure_notification(crate::plugin::PluginEvent::Error {
+                            task_id: task_id.to_string(),
+                            url: task.url.clone(),
+                            message: task.error_message.clone(),
+                        })
+                        .await;
+                    if !manual_resume && !is_bt_url(&task.url) && !is_ed2k_url(&task.url) {
                         let ic = self.task_interceptor(task_id, &task.url, &task.url).await;
                         if crate::intercept::wants(
                             ic.as_ref(),
@@ -8768,7 +9126,7 @@ impl DownloadManager {
                                 task_id.to_string(),
                             );
                             let retry_task_id = task_id.to_string();
-                            pm.runtime_handle().spawn(async move {
+                            work.push(pm.runtime_handle().spawn(async move {
                                 let delay = crate::intercept::drive::run_failed(
                                     ic.as_ref(),
                                     &notes,
@@ -8783,7 +9141,13 @@ impl DownloadManager {
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                                         .insert(retry_task_id.clone());
-                                    if retry_tx.send((retry_task_id.clone(), delay)).is_err() {
+                                    if retry_tx
+                                        .send(PluginRetryEvent::Retry {
+                                            task_id: retry_task_id.clone(),
+                                            delay_ms: delay,
+                                        })
+                                        .is_err()
+                                    {
                                         retry_marks
                                             .lock()
                                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -8791,10 +9155,23 @@ impl DownloadManager {
                                         tracing::debug!("plugin retry receiver closed");
                                     }
                                 }
-                            });
+                            }));
                         }
                     }
+                    if terminal_failure && !retry_pending && !work.is_empty() {
+                        terminal_failure = false;
+                        self.defer_failure_diagnostic(
+                            task_id,
+                            generation,
+                            work,
+                            tokio::time::Instant::now() + PLUGIN_FAILURE_DIAGNOSTIC_DELAY,
+                        );
+                    }
                 }
+            }
+            if terminal_failure && !retry_pending {
+                let retries = self.auto_retry_counts.get(task_id).copied().unwrap_or(0);
+                log_terminal_task_failure(&task, generation, retries);
             }
 
             // 文件哈希：校验和校验通过时下载器已把哈希写进库，但完成只经进度帧发布（不含
@@ -9027,13 +9404,49 @@ impl DownloadManager {
         !self.active_tasks.is_empty() || !self.pending_queue.is_empty()
     }
 
+    /// 分类归档还没搬完的任务。授权已消耗，行被删后不会再搬。
+    #[cfg(all(feature = "bt", feature = "plugins"))]
+    async fn in_flight_bt_archive_ids(&self) -> HashSet<String> {
+        self.bt_archive_results
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(not(all(feature = "bt", feature = "plugins")))]
+    async fn in_flight_bt_archive_ids(&self) -> HashSet<String> {
+        std::future::ready(HashSet::new()).await
+    }
+
     /// 清理超过保留期的「已完成」任务**记录**（`completed_record_retention_days`）：
-    /// 只删记录、永不删文件，做种中 / 排队做种的任务跳过。保留期为 0 时什么都不做。
+    /// 只删记录、永不删文件，做种中 / 排队做种的任务跳过。保留期为 0 时什么都不做；
+    /// `-1` 的截止点取现在之后，因此全部已完成且非做种的记录都入选。
+    /// 仍在 `active_tasks` 的任务一律跳过：下载器可能已经把 status 写成完成，
+    /// 但完成通知和插件 onDone 还没跑；本任务自己的 `on_task_done` 在
+    /// `handle_task_done` 里摘掉条目后，随后的清理仍会删它。
+    /// `bt_archive_results` 里的 id 也跳过：分类授权已经消耗，搬完（结果移出
+    /// map，且 `finish_bt_move` 已返回）之后的清理才删。
+    /// 宽限内的 id（刚完成 / 刚停止做种，见 `retention_grace`）同样跳过，并安排一次
+    /// 到期唤醒，宿主收到后经 [`Self::purge_requested_completed_records`] 再清。
     ///
-    /// 无独立定时器：由进程启动、任务完成、`daemon.task.rescan`、设置变更四条被动
-    /// 路径调用。`force = false` 时受 [`RETENTION_PURGE_DEBOUNCE`] 去抖；设置变更与
-    /// 启动传 `true`。返回本次删除的记录数。
+    /// 无独立定时器：由进程启动、任务完成、`daemon.task.rescan`、设置变更，以及做种
+    /// 落入停止原因后调用。`force = false` 时受 [`RETENTION_PURGE_DEBOUNCE`] 去抖；
+    /// 设置变更、启动与立即模式的完成路径传 `true`。返回本次删除的记录数。
+    /// 删除失败的记录留在库里，本轮不再重选。
     pub async fn purge_expired_completed_records(&mut self, force: bool) -> usize {
+        self.purge_expired_completed_records_except(force, &[])
+            .await
+    }
+
+    /// 同 [`Self::purge_expired_completed_records`]，但 `protect` 里的 id 本轮不删。
+    /// 只用于排队做种没写上的 id。写上的由 `seeding_status = 8` 被查询排除，不靠这次参数。
+    async fn purge_expired_completed_records_except(
+        &mut self,
+        force: bool,
+        protect: &[String],
+    ) -> usize {
         let days = self.completed_record_retention_days;
         if days == 0 {
             return 0;
@@ -9049,16 +9462,22 @@ impl DownloadManager {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        let cutoff =
-            i64::try_from(now.saturating_sub(u64::from(days) * 86_400)).unwrap_or(i64::MAX);
+        let cutoff = retention_cutoff_secs(days, now);
+        let archiving = self.in_flight_bt_archive_ids().await;
+        let protected: HashSet<&str> = protect.iter().map(String::as_str).collect();
+        let (in_grace, grace_release) = self.retention_grace.pending(std::time::Instant::now());
+        let mut after_completed_at = String::new();
+        let mut after_id = String::new();
+        let mut paged = false;
         let mut purged = 0;
         loop {
-            let ids = match self
+            let after = paged.then_some((after_completed_at.as_str(), after_id.as_str()));
+            let rows = match self
                 .db
-                .list_expired_completed_task_ids(cutoff, RETENTION_PURGE_CHUNK)
+                .list_expired_completed_task_ids_after(cutoff, RETENTION_PURGE_CHUNK, after)
                 .await
             {
-                Ok(ids) => ids,
+                Ok(rows) => rows,
                 Err(error) => {
                     crate::logger::report_error(
                         "download-manager",
@@ -9068,8 +9487,24 @@ impl DownloadManager {
                     break;
                 }
             };
-            if ids.is_empty() {
+            let Some((last_id, last_completed_at)) = rows.last() else {
                 break;
+            };
+            after_id.clone_from(last_id);
+            after_completed_at.clone_from(last_completed_at);
+            paged = true;
+            let ids: Vec<String> = rows
+                .into_iter()
+                .map(|(id, _)| id)
+                .filter(|id| {
+                    !self.active_tasks.contains_key(id)
+                        && !protected.contains(id.as_str())
+                        && !archiving.contains(id.as_str())
+                        && !in_grace.contains(id.as_str())
+                })
+                .collect();
+            if ids.is_empty() {
+                continue;
             }
             match self.delete_tasks_batch(&ids, false).await {
                 Ok(outcome) => {
@@ -9090,11 +9525,69 @@ impl DownloadManager {
             }
         }
         if purged > 0 {
-            log_info!(
-                "[manager] retention: purged {purged} completed record(s) older than {days} day(s)"
-            );
+            if days < 0 {
+                log_info!("[manager] retention: purged {purged} completed record(s) immediately");
+            } else {
+                log_info!(
+                    "[manager] retention: purged {purged} completed record(s) older than {days} day(s)"
+                );
+            }
+        }
+        if let Some(release) = grace_release {
+            self.schedule_retention_wake(release);
         }
         purged
+    }
+
+    /// 做种从活动 / 排队落入停止原因之后调用（调用方先把刚停的 id 放进宽限）。
+    /// 非零保留期顺带清理已完成记录；立即模式跳过去抖，否则刚停止的做种要等下一次
+    /// 完成或重扫才消失。
+    async fn purge_after_seeding_stopped(&mut self) {
+        if self.completed_record_retention_days == 0 {
+            return;
+        }
+        self.purge_expired_completed_records(self.completed_record_retention_days < 0)
+            .await;
+    }
+
+    /// 宿主收到 `retention_purge` 通知后调用：做种在 actor 外落入停止原因，或宽限
+    /// 到期。跳过去抖；保留期为 0 时什么都不做。
+    pub async fn purge_requested_completed_records(&mut self) {
+        self.purge_expired_completed_records(true).await;
+    }
+
+    /// 刚完成 / 刚停止做种的记录进宽限：这段时间内清理不删它们。
+    fn hold_retention_grace<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        self.retention_grace.hold(ids, self.retention_grace_period);
+    }
+
+    /// 在 `release` 时刻经通道唤醒宿主再清一次。已有不晚于它、尚未到点的唤醒就不重复安排；
+    /// 那次唤醒的清理会为剩下的宽限再安排下一次。
+    fn schedule_retention_wake(&mut self, release: std::time::Instant) {
+        let now = std::time::Instant::now();
+        if self
+            .retention_wake_at
+            .is_some_and(|at| at > now && at <= release)
+        {
+            return;
+        }
+        self.retention_wake_at = Some(release);
+        let tx = self.retention_purge_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(release)).await;
+            request_retention_purge(&tx);
+        });
+    }
+
+    /// 停止帧已发出的 `task_id` 进宽限，并通知宿主再清一次已完成记录。
+    /// 接收端未取或已满时记下原因，不阻塞调用方。
+    #[cfg(feature = "bt")]
+    fn notify_retention_purge(&self, task_id: &str) {
+        self.hold_retention_grace([task_id]);
+        if self.completed_record_retention_days == 0 {
+            return;
+        }
+        request_retention_purge(&self.retention_purge_tx);
     }
 
     /// Normalize seeding state left over from a previous session.
@@ -9162,13 +9655,53 @@ impl DownloadManager {
         stale
     }
 
+    /// 续种还没决定。写回排队做种，让过期查询和下一轮 [`Self::reset_stale_seeding`]
+    /// 都能看到，直到自动续种被关掉，或某次挂载落成停止原因。返回没写上的 id。
+    #[cfg(feature = "bt")]
+    async fn mark_pending_reseed(&self, ids: &[String]) -> Vec<String> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        log_info!(
+            "[manager] reseed deferred for {} task(s); queued until the next mount",
+            ids.len()
+        );
+        let mut unmarked = Vec::new();
+        for id in ids {
+            if let Err(error) = self.db.set_task_seeding_queued(id).await {
+                crate::logger::report_error("download-manager", "persist pending reseed", &error);
+                unmarked.push(id.clone());
+                continue;
+            }
+            self.emit_progress_from_db(id, 3, SEEDING_STATUS_QUEUED, SEEDING_QUEUED_MESSAGE, 0)
+                .await;
+        }
+        unmarked
+    }
+
+    /// 写回排队后再清理。写上的被查询排除；没写上的只在这一轮跳过。
+    #[cfg(feature = "bt")]
+    async fn defer_reseed_then_purge(&mut self, ids: &[String]) {
+        let unmarked = self.mark_pending_reseed(ids).await;
+        self.purge_expired_completed_records_except(
+            self.completed_record_retention_days < 0,
+            &unmarked,
+        )
+        .await;
+    }
+
     /// 启动自动续种（config `bt_auto_reseed`，默认开）：上次退出时仍在
     /// 做种/排队、且已完成（status=3）的任务，重启后自动重新挂载进
     /// librqbit 继续做种。挂载失败由 [`Self::spawn_reseed_from_disk`] 的
-    /// 现有回退兜底（保持 UserStopped + 失败原因）；无可续任务时不创建
-    /// BT 会话，会话创建失败时全部保持停止态。
+    /// 现有回退兜底（保持调用方写入的停止原因）；无可续任务时不创建 BT 会话。
+    ///
+    /// 返回没能写成排队做种的 id。空表示可以按保留期清理：明确关闭了自动续种，
+    /// 或每个未决候选都已写成排队（查询会排除），或挂载已落成停止原因。
+    /// 配置读取失败、会话创建失败时先写回排队，只把没写上的 id 返回。
     #[cfg(feature = "bt")]
-    async fn auto_reseed_on_start(&mut self, stale: Vec<TaskInfo>) {
+    async fn auto_reseed_on_start(&mut self, stale: Vec<TaskInfo>) -> Vec<String> {
+        let candidates: Vec<TaskInfo> = stale.into_iter().filter(|t| t.status == 3).collect();
+        let ids: Vec<String> = candidates.iter().map(|t| t.task_id.clone()).collect();
         let enabled = match self.db.get_config("bt_auto_reseed").await {
             Ok(value) => value.is_none_or(|v| v != "0" && v != "false"),
             Err(error) => {
@@ -9177,32 +9710,34 @@ impl DownloadManager {
                     "read automatic reseeding setting",
                     &error,
                 );
-                return;
+                return self.mark_pending_reseed(&ids).await;
             }
         };
-        if !enabled {
-            return;
-        }
-        let candidates: Vec<TaskInfo> = stale.into_iter().filter(|t| t.status == 3).collect();
-        if candidates.is_empty() {
-            return;
+        if !enabled || candidates.is_empty() {
+            return Vec::new();
         }
         if let Err(e) = self.ensure_bt_session().await {
             log_info!("[manager] auto reseed: BT session init failed: {}", e);
-            return;
+            return self.mark_pending_reseed(&ids).await;
         }
         let Some(bt) = self.bt_session.clone() else {
-            return;
+            return self.mark_pending_reseed(&ids).await;
         };
         let stopped = crate::bt_seeding::SeedingStopReason::UserStopped;
+        let mut unmarked = Vec::new();
         for t in candidates {
-            // 行已被 reset_stale_seeding 归一化为 UserStopped；副本同步该
-            // 状态，挂载失败回退时才不会把过期的 active/queued 写回去。
+            let id = t.task_id.clone();
             let mut task = t;
             task.seeding_status = stopped.as_i32();
             task.seeding_message = stopped.message().to_string();
-            self.spawn_reseed_from_disk(bt.clone(), &task).await;
+            if matches!(
+                self.spawn_reseed_from_disk(bt.clone(), &task).await,
+                ReseedStart::Unmarked
+            ) {
+                unmarked.push(id);
+            }
         }
+        unmarked
     }
 
     pub async fn load_and_send_all_tasks(&mut self) {
@@ -9274,6 +9809,8 @@ impl DownloadManager {
                         );
                         match self.db.delete_task(tid).await {
                             Ok(sources) => {
+                                #[cfg(feature = "plugins")]
+                                self.pending_failure_diagnostics.remove(tid);
                                 self.broadcast_deleted_rss_sources(sources).await;
                                 orphans.swap(removed, index);
                                 removed += 1;
@@ -9582,12 +10119,19 @@ impl DownloadManager {
             self.spawn_file_scan();
             self.purge_expired_completed_records(true).await;
             // 残留做种态先归一化为 UserStopped（崩溃安全底线），随后按
-            // `bt_auto_reseed` 决定是否自动重新挂载做种。
+            // `bt_auto_reseed` 决定是否自动重新挂载。会话或配置失败时
+            // auto_reseed 把做种态写回排队，查询和下一轮启动都能看到。
             #[cfg(feature = "bt")]
-            {
+            let reseed_unmarked = {
                 let stale = self.reset_stale_seeding().await;
-                self.auto_reseed_on_start(stale).await;
-            }
+                self.auto_reseed_on_start(stale).await
+            };
+            #[cfg(not(feature = "bt"))]
+            let reseed_unmarked: Vec<String> = Vec::new();
+            // 写上排队的被查询排除。这里只跳过没写上的 id。明确关闭自动续种
+            // 或挂载已落成停止原因的记录在这一轮删掉。
+            self.purge_expired_completed_records_except(true, &reseed_unmarked)
+                .await;
             // 启动恢复只是把上次的占用状态接回来，不是「队列开始」，静默登记占用。
             self.restoring_on_start = true;
             self.resume_on_start(reset_ids).await;
@@ -11638,12 +12182,16 @@ impl DownloadManager {
             self.resolved_egress.remove(&task_id);
             // Lazily initialise the shared BT session.
             if let Err(e) = self.ensure_bt_session().await {
-                crate::log_error!("[manager] failed to init BT session: {}", e);
-                if let Err(db_error) = self
-                    .db
-                    .update_task_status(&task_id, 4, &e.to_string())
-                    .await
-                {
+                let message = e.to_string();
+                tracing::error!(
+                    task_id,
+                    generation = spawn_gen,
+                    protocol = "bt",
+                    stage = "session_start",
+                    reason = %download_failure_reason(&message),
+                    "download failed"
+                );
+                if let Err(db_error) = self.db.update_task_status(&task_id, 4, &message).await {
                     crate::logger::report_error(
                         "download-manager",
                         "persist BT session initialization error",
@@ -11657,7 +12205,7 @@ impl DownloadManager {
                         downloaded_bytes: 0,
                         total_bytes: 0,
                         status: 4,
-                        error_message: e.to_string(),
+                        error_message: message,
                         file_name: String::new(),
                         segment_details: None,
                         ..Default::default()
@@ -12419,6 +12967,14 @@ impl DownloadManager {
                         0,
                     )
                     .await;
+                    // 停止帧刚发出，记录先进宽限；task.paused 也要在删除前发出。
+                    self.hold_retention_grace([task_id]);
+                    if notify {
+                        self.emit_paused_webhook(task_id).await;
+                    }
+                    self.purge_after_seeding_stopped().await;
+                    self.sync_queue_occupancy();
+                    return;
                 }
                 s if s == SeedingStopReason::UserStopped.as_i32() => {
                     // Already paused by the user — idempotent no-op.
@@ -13014,6 +13570,8 @@ impl DownloadManager {
                     crate::logger::report_error("download-manager", "persist task state", &error);
                     return;
                 }
+                #[cfg(feature = "plugins")]
+                self.pending_failure_diagnostics.remove(task_id);
                 // Notify the host: task is now queued (pending), not actively resuming.
                 // Without this signal, the UI keeps all tasks stuck in "resuming" status
                 // even though only max_concurrent are actually downloading.
@@ -13069,6 +13627,8 @@ impl DownloadManager {
 
     /// Internal: actually spawn the resume (no concurrency check).
     async fn do_resume_task(&mut self, task_id: &str) {
+        #[cfg(feature = "plugins")]
+        self.pending_failure_diagnostics.remove(task_id);
         // 插件惰性解析守卫（体首，协议判定前）：命中 resolver 且非再入 → off-actor
         // resolve 后经 resume_applied 再入；对称占位防 resumeAll 并发双 resolve。
         // `resume_applied` 条目无条件在此取走：resolve 窗口内插件被卸载会清空 DB 绑定，
@@ -13349,9 +13909,16 @@ impl DownloadManager {
             self.resolved_egress.remove(task_id);
             // Lazily initialise the shared BT session.
             if let Err(e) = self.ensure_bt_session().await {
-                crate::log_error!("[manager] failed to init BT session for resume: {}", e);
-                if let Err(db_error) = self.db.update_task_status(task_id, 4, &e.to_string()).await
-                {
+                let message = e.to_string();
+                tracing::error!(
+                    task_id,
+                    generation = spawn_gen,
+                    protocol = "bt",
+                    stage = "session_resume",
+                    reason = %download_failure_reason(&message),
+                    "download failed"
+                );
+                if let Err(db_error) = self.db.update_task_status(task_id, 4, &message).await {
                     crate::logger::report_error(
                         "download-manager",
                         "persist resumed BT session initialization error",
@@ -13365,7 +13932,7 @@ impl DownloadManager {
                         downloaded_bytes: 0,
                         total_bytes: 0,
                         status: 4,
-                        error_message: e.to_string(),
+                        error_message: message,
                         file_name: String::new(),
                         segment_details: None,
                         ..Default::default()
@@ -14166,6 +14733,9 @@ impl DownloadManager {
                 lock_reserved(&self.reserved_temp_paths).remove(&reserved);
             }
             let path = PathBuf::from(&t.save_dir).join(&t.file_name);
+            if !is_bt_url(&t.url) {
+                downloader::clean_http_restart_for_task(Path::new(&t.save_dir), task_id).await;
+            }
 
             if is_bt_url(&t.url) {
                 #[cfg(feature = "bt")]
@@ -14411,6 +14981,8 @@ impl DownloadManager {
                 return Err(DeleteTaskError::Record(error.into()));
             }
         }
+        #[cfg(feature = "plugins")]
+        self.pending_failure_diagnostics.remove(task_id);
         #[cfg(feature = "bt")]
         if let Some(bt) = &self.bt_session {
             bt.clear_web_seeds(task_id).await;
@@ -14605,6 +15177,8 @@ impl DownloadManager {
                 Ok(sources) => {
                     for task_id in &deleted {
                         self.replayable_requests.remove(task_id);
+                        #[cfg(feature = "plugins")]
+                        self.pending_failure_diagnostics.remove(task_id);
                         #[cfg(feature = "bt")]
                         if let Some(bt) = &self.bt_session {
                             bt.clear_web_seeds(task_id).await;
@@ -15663,7 +16237,11 @@ impl DownloadManager {
     /// 期间任务显示为排队做种（附校验说明），失败回退停止态并附原因。
     /// 中途崩溃残留的排队态由下次启动的 `reset_stale_seeding` 兜底。
     #[cfg(feature = "bt")]
-    async fn spawn_reseed_from_disk(&self, bt: Arc<SharedBtSession>, task: &TaskInfo) {
+    async fn spawn_reseed_from_disk(
+        &self,
+        bt: Arc<SharedBtSession>,
+        task: &TaskInfo,
+    ) -> ReseedStart {
         let stopped_status = task.seeding_status;
         let stopped_message = task.seeding_message.clone();
         let task_id = task.task_id.clone();
@@ -15688,7 +16266,7 @@ impl DownloadManager {
                 );
                 self.emit_progress_from_db(&task_id, 3, stopped_status, &stopped_message, 0)
                     .await;
-                return;
+                return ReseedStart::DecidedStop;
             }
             TorrentSource::TorrentFileBytes(bytes)
         };
@@ -15738,7 +16316,7 @@ impl DownloadManager {
         // 校验中提示：复用排队做种态（附说明），结束后被真实状态覆盖。
         if let Err(error) = self.db.set_task_seeding_queued(&task_id).await {
             crate::logger::report_error("download-manager", "persist task state", &error);
-            return;
+            return ReseedStart::Unmarked;
         }
         self.emit_progress_from_db(
             &task_id,
@@ -15760,6 +16338,9 @@ impl DownloadManager {
         // 旧会话登记，由 `invalidate_bt_session` 在新会话上统一重新挂载。
         let reseed_guard = bt.begin_reseed(&task_id);
         let closing = bt.closing_token();
+        let purge_tx = self.retention_purge_tx.clone();
+        let grace = self.retention_grace.clone();
+        let grace_period = self.retention_grace_period;
         bt.clone().runtime_handle().spawn(async move {
             let _reseed_guard = reseed_guard;
             let readd = tokio::select! {
@@ -15820,6 +16401,8 @@ impl DownloadManager {
                                         .await {
                                         crate::logger::report_error("download-manager", "persist task state", &error);
                                     }
+                                // 写库前就进宽限：写完到发出停止帧之间的清理也不能删。
+                                grace.hold([task_id.as_str()], grace_period);
                                 if let Err(error) = db
                                     .update_task_seeding_status(
                                         &task_id,
@@ -15828,6 +16411,8 @@ impl DownloadManager {
                                     )
                                     .await {
                                     crate::logger::report_error("download-manager", "persist task state", &error);
+                                } else {
+                                    request_retention_purge(&purge_tx);
                                 }
                                 emit_seeding_progress(
                                     &db,
@@ -15878,15 +16463,20 @@ impl DownloadManager {
                         tracing::debug!(delete_files, "cleared pending deletion after reseed failed");
                     }
                     // 回退停止态：状态码保留原停止原因，说明换成失败原因。
+                    // 写库前就进宽限：写完到发出停止帧之间的清理也不能删。
+                    grace.hold([task_id.as_str()], grace_period);
                     if let Err(error) = db
                         .update_task_seeding_status(&task_id, stopped_status, &msg)
                         .await {
                         crate::logger::report_error("download-manager", "persist task state", &error);
+                    } else {
+                        request_retention_purge(&purge_tx);
                     }
                     emit_seeding_progress(&db, &sink, &task_id, stopped_status, &msg).await;
                 }
             }
         });
+        ReseedStart::Started
     }
 
     /// Resume a task using a pre-loaded TaskInfo row (avoids redundant DB query).
@@ -16185,6 +16775,17 @@ impl DownloadManager {
 
     /// 取消所有在途任务并等待下载 task 与 BT/DHT 持久化退出。
     pub async fn shutdown(&mut self) {
+        // The actor stops consuming plugin retry events when shutdown begins.
+        // Diagnose unresolved failures without waiting for, or classifying
+        // as terminal, a retry decision the actor has not processed.
+        #[cfg(feature = "plugins")]
+        for (task_id, pending) in std::mem::take(&mut self.pending_failure_diagnostics) {
+            if !pending.warned
+                && let Some(task) = self.current_failure_for_diagnostic(&task_id).await
+            {
+                log_pending_task_failure(&task, pending.generation, "shutdown");
+            }
+        }
         // 做种时长平时只在状态迁移/顺带写/30 分钟兜底时落库，正常关机在此结算。
         #[cfg(feature = "bt")]
         self.flush_seed_times().await;
@@ -17885,6 +18486,7 @@ pub async fn progress_reporter(
                 speed_from_transfer,
                 last_transfer_bytes: None,
                 unsent_transfer_bytes: 0,
+                staged_download: false,
                 latest_bytes: update.downloaded_bytes,
                 file_name: String::new(),
                 cached_segments: None,
@@ -17939,6 +18541,7 @@ pub async fn progress_reporter(
             state.unsent_transfer_bytes = state.unsent_transfer_bytes.saturating_add(fresh.max(0));
             state.last_transfer_bytes = Some(transfer);
         }
+        state.staged_download |= update.staged_download;
 
         // -----------------------------------------------------------------
         // Fixed-window speed calculation
@@ -18165,6 +18768,15 @@ pub async fn progress_reporter(
                         bytes: std::mem::take(&mut state.unsent_transfer_bytes),
                     });
                 }
+                if state.staged_download && matches!(update.status, 2..=4) {
+                    // All staged traffic was accounted above. The terminal
+                    // value may restore the old checkpoint, not represent I/O.
+                    sink.emit(EngineEvent::TaskTransferBaseline {
+                        task_id: update.task_id.clone(),
+                        downloaded_bytes: update.downloaded_bytes,
+                        previous_downloaded_bytes: None,
+                    });
+                }
                 sink.emit(EngineEvent::TaskProgress {
                     task_id: update.task_id.clone(),
                     status: update.status,
@@ -18270,7 +18882,7 @@ pub async fn progress_reporter(
         // block the progress consumption loop.  Under high throughput (many
         // HTTP segments + BT) the channel would back-pressure and stall BT
         // progress reporting if we awaited each DB write synchronously.
-        if update.status == 1 {
+        if update.status == 1 && !update.staged_download {
             let task_last_save = last_db_save.entry(update.task_id.clone()).or_insert(now);
             if task_last_save.elapsed().as_secs() >= downloader::DB_SAVE_INTERVAL_SECS {
                 let db_clone = db.clone();
@@ -19187,6 +19799,271 @@ mod tests {
         (mgr, retry_rx)
     }
 
+    #[cfg(feature = "plugins")]
+    #[derive(Clone, Default)]
+    struct FailureDiagnosticLog(Arc<Mutex<Vec<u8>>>);
+
+    #[cfg(feature = "plugins")]
+    impl std::io::Write for FailureDiagnosticLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "plugins")]
+    impl FailureDiagnosticLog {
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            let log = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || log.clone())
+                    .with_max_level(tracing::Level::WARN)
+                    .with_ansi(false)
+                    .with_target(false)
+                    .without_time()
+                    .finish(),
+            )
+        }
+
+        fn text(&self) -> String {
+            std::str::from_utf8(&self.0.lock().expect("log buffer"))
+                .expect("UTF-8 log")
+                .to_owned()
+        }
+    }
+
+    #[cfg(feature = "plugins")]
+    async fn diagnostic_manager(
+        tasks: &[(&str, &str)],
+    ) -> (DownloadManager, mpsc::Receiver<String>) {
+        let (mgr, retry_rx) = manager_with_retry_pending(&[]).await;
+        for &(id, reason) in tasks {
+            mgr.db
+                .insert_task(
+                    id,
+                    "https://example.com/file",
+                    "file",
+                    "",
+                    4,
+                    1,
+                    "",
+                    "",
+                    "",
+                    0,
+                )
+                .await
+                .expect("insert task");
+            mgr.db
+                .update_task_status(id, 4, reason)
+                .await
+                .expect("persist failure reason");
+        }
+        (mgr, retry_rx)
+    }
+
+    #[cfg(feature = "plugins")]
+    async fn next_diagnostic_event(
+        rx: &mut mpsc::UnboundedReceiver<PluginRetryEvent>,
+    ) -> PluginRetryEvent {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("failure observer responded")
+            .expect("plugin event")
+    }
+
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn download_failure_diagnostics_warn_then_log_terminal_result_after_callback_timeout() {
+        let reason = format!(
+            "could not allocate output: no space left on device\r\n\
+             Authorization: Bearer fixture-auth\n\
+             https://example.com/file?unusual=fixture-link\u{1b}\u{2028} {} private-tail",
+            "界".repeat(200)
+        );
+        let (mut mgr, _retry_rx) = diagnostic_manager(&[("failed-task", &reason)]).await;
+        let mut events = mgr.take_plugin_retry_rx().expect("plugin events");
+        let log = FailureDiagnosticLog::default();
+        let _subscriber = log.capture();
+
+        let (release, held) = oneshot::channel::<()>();
+        mgr.defer_failure_diagnostic(
+            "failed-task",
+            7,
+            vec![
+                tokio::spawn(async {}),
+                tokio::spawn(async move {
+                    held.await.expect("release callback");
+                    // Like an ordinarily timed-out plugin hook, this completes
+                    // without a retry after its own timeout is handled.
+                    assert!(
+                        tokio::time::timeout_at(
+                            tokio::time::Instant::now(),
+                            std::future::pending::<()>(),
+                        )
+                        .await
+                        .is_err()
+                    );
+                }),
+            ],
+            tokio::time::Instant::now(),
+        );
+        assert!(!log.text().contains("download failed"));
+        mgr.handle_plugin_retry_event(next_diagnostic_event(&mut events).await)
+            .await;
+        let pending = log.text();
+        assert!(pending.contains("WARN"), "{pending}");
+        assert!(
+            pending.contains("plugin retry decision pending"),
+            "{pending}"
+        );
+        assert!(pending.contains("callback_deadline"), "{pending}");
+        assert!(!pending.contains("download failed"), "{pending}");
+
+        release.send(()).expect("callback is still alive");
+        mgr.handle_plugin_retry_event(next_diagnostic_event(&mut events).await)
+            .await;
+        mgr.handle_plugin_retry_event(PluginRetryEvent::FailureSettled {
+            task_id: "failed-task".to_owned(),
+            generation: 7,
+        })
+        .await;
+        let logs = log.text();
+        let terminal: Vec<_> = logs
+            .lines()
+            .filter(|line| line.contains("download failed"))
+            .collect();
+        assert_eq!(terminal.len(), 1, "{logs}");
+        assert!(terminal[0].contains("ERROR"), "{logs}");
+        assert!(terminal[0].contains("no space left on device"), "{logs}");
+        assert!(terminal[0].contains("Authorization: [REDACTED]"), "{logs}");
+        assert!(terminal[0].contains("[LINK REDACTED]"), "{logs}");
+        assert!(terminal[0].contains('…'), "{logs}");
+        for private in [
+            "fixture-auth",
+            "fixture-link",
+            "private-tail",
+            "\u{1b}",
+            "\u{2028}",
+        ] {
+            assert!(!logs.contains(private), "{logs}");
+        }
+        assert_eq!(logs.lines().count(), 2, "{logs}");
+        assert!(download_failure_reason(&reason).len() <= MAX_DOWNLOAD_FAILURE_REASON_BYTES);
+    }
+
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn download_failure_diagnostics_keep_late_plugin_retry_and_suppress_terminal_error() {
+        let (mut mgr, mut retries) =
+            diagnostic_manager(&[("retry-task", "server rejected probe")]).await;
+        let mut events = mgr.take_plugin_retry_rx().expect("plugin events");
+        let sender = mgr.plugin_retry_sender();
+        let log = FailureDiagnosticLog::default();
+        let _subscriber = log.capture();
+
+        let (release, held) = oneshot::channel::<()>();
+        mgr.defer_failure_diagnostic(
+            "retry-task",
+            9,
+            vec![tokio::spawn(async move {
+                held.await.expect("release callback");
+                sender
+                    .send(PluginRetryEvent::Retry {
+                        task_id: "retry-task".to_owned(),
+                        delay_ms: 0,
+                    })
+                    .expect("deliver onError retry");
+            })],
+            tokio::time::Instant::now(),
+        );
+        mgr.handle_plugin_retry_event(next_diagnostic_event(&mut events).await)
+            .await;
+        assert!(log.text().contains("plugin retry decision pending"));
+        release.send(()).expect("callback is still alive");
+
+        for _ in 0..2 {
+            mgr.handle_plugin_retry_event(next_diagnostic_event(&mut events).await)
+                .await;
+        }
+        let task_id = tokio::time::timeout(Duration::from_secs(5), retries.recv())
+            .await
+            .expect("scheduled retry");
+        assert_eq!(task_id.as_deref(), Some("retry-task"));
+        let logs = log.text();
+        assert_eq!(
+            logs.matches("plugin retry decision pending").count(),
+            1,
+            "{logs}"
+        );
+        assert!(!logs.contains("download failed"), "{logs}");
+    }
+
+    #[cfg(feature = "plugins")]
+    #[tokio::test]
+    async fn download_failure_diagnostics_flush_unreported_failures_and_forget_deleted_tasks() {
+        let (mut mgr, _retries) = diagnostic_manager(&[
+            ("already-warned", "first failure"),
+            ("at-shutdown", "second failure"),
+            ("deleted-one", "deleted failure"),
+            ("deleted-batch", "deleted batch failure"),
+        ])
+        .await;
+        let mut events = mgr.take_plugin_retry_rx().expect("plugin events");
+        let log = FailureDiagnosticLog::default();
+        let _subscriber = log.capture();
+
+        let now = tokio::time::Instant::now();
+        for (task_id, deadline) in [
+            ("already-warned", now),
+            ("at-shutdown", now + Duration::from_secs(3600)),
+            ("deleted-one", now + Duration::from_secs(3600)),
+            ("deleted-batch", now + Duration::from_secs(3600)),
+        ] {
+            mgr.defer_failure_diagnostic(
+                task_id,
+                1,
+                vec![tokio::spawn(std::future::pending::<()>())],
+                deadline,
+            );
+        }
+        mgr.handle_plugin_retry_event(next_diagnostic_event(&mut events).await)
+            .await;
+        mgr.delete_task("deleted-one", false)
+            .await
+            .expect("delete one");
+        let batch = mgr
+            .delete_tasks_batch(&["deleted-batch".to_owned()], false)
+            .await
+            .expect("delete batch");
+        assert_eq!((batch.deleted, batch.failed), (1, 0));
+        assert_eq!(mgr.pending_failure_diagnostics.len(), 2);
+
+        mgr.shutdown().await;
+        assert!(mgr.pending_failure_diagnostics.is_empty());
+        let logs = log.text();
+        assert_eq!(
+            logs.matches("plugin retry decision pending").count(),
+            2,
+            "{logs}"
+        );
+        for expected in [
+            "already-warned",
+            "at-shutdown",
+            "second failure",
+            "shutdown",
+        ] {
+            assert!(logs.contains(expected), "{logs}");
+        }
+        for unexpected in ["deleted-one", "deleted-batch", "download failed"] {
+            assert!(!logs.contains(unexpected), "{logs}");
+        }
+    }
+
     /// 「下载完成后计算哈希」：完成的单文件任务算出哈希并经回流写回、发布任务行；
     /// 已有记录（校验和校验通过）的任务与目录产物不计算。
     #[tokio::test]
@@ -19514,6 +20391,65 @@ mod tests {
         downloader::DownloadError::Request(err).to_string()
     }
 
+    #[tokio::test]
+    async fn full_get_fallback_interruption_requires_manual_resume() {
+        const ID: &str = "interrupted-full-get";
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.seed_builtin_queues().await.expect("seed");
+        insert_paused_task_in_queue(&db, ID, "").await;
+        db.set_task_auto_route(ID, crate::auto_proxy::route::DIRECT)
+            .await
+            .expect("set direct route");
+        let cause = downloader::DownloadError::Other("download stalled: no body bytes".into());
+        let error = downloader::DownloadError::RangeRestartFailed(Box::new(cause));
+        db.update_task_status(ID, 4, &error.to_string())
+            .await
+            .expect("set fallback failure");
+
+        let mut mgr = sched_manager(&db, 1);
+        mgr.proxy_config = ProxyConfig {
+            mode: ProxyMode::Auto,
+            host: "127.0.0.1".into(),
+            port: 7890,
+            ..Default::default()
+        };
+        mgr.set_max_auto_retries(-1);
+        mgr.active_tasks.insert(
+            ID.into(),
+            ActiveTaskEntry {
+                token: CancellationToken::new(),
+                generation: 1,
+                handle: None,
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+        mgr.on_task_done(&TaskDone {
+            task_id: ID.into(),
+            generation: 1,
+            reserved_temp_path: None,
+            phase: TaskDonePhase::Finished,
+        })
+        .await;
+        assert!(mgr.retry_pending_task_ids().is_empty());
+        assert!(!mgr.is_task_in_error(ID).await);
+
+        #[cfg(feature = "plugins")]
+        {
+            mgr.plugin_request_retry(ID, 0).await;
+            assert!(mgr.retry_pending_task_ids().is_empty());
+
+            mgr.intercept_retry_marks
+                .lock()
+                .expect("marks")
+                .insert(ID.into());
+            mgr.plugin_request_retry(ID, 0).await;
+            assert!(mgr.retry_pending_task_ids().is_empty());
+        }
+    }
+
     /// #636：5xx（含 503 Service Unavailable）在 reqwest 错误消息里必须被
     /// 识别为可重试——`error_message` 落库的正是 `DownloadError::Request`
     /// 的 Display，即 reqwest 固定措辞 `HTTP status server error (503 ...)`。
@@ -19830,6 +20766,573 @@ mod tests {
             crate::logger::report_warning("download-manager-test", "remove test directory", &error);
         }
     }
+
+    fn retention_test_manager(db: Db, save_dir: &str) -> DownloadManager {
+        DownloadManager::new(
+            db,
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: save_dir.to_owned(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            Arc::new(RecordingSink::new()),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager")
+    }
+
+    /// `-1` 删掉刚完成的非做种记录但留下文件；做种中 / 排队做种、保留期 0、
+    /// 未超期的按天记录都不动。删除被占用时记录留下。
+    #[tokio::test]
+    async fn immediate_retention_removes_fresh_completed_records_and_keeps_files() {
+        let dir = unique_filetrack_test_dir("retention_immediate");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let save_dir = dir.to_string_lossy().to_string();
+        let kept_file = dir.join("now.bin");
+        std::fs::write(&kept_file, b"payload").expect("write file");
+
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task_at_status(&db, "now", &save_dir, "now.bin", 3).await;
+        insert_task_at_status(&db, "seeding", &save_dir, "seeding.bin", 3).await;
+        insert_task_at_status(&db, "queued", &save_dir, "queued.bin", 3).await;
+        insert_task_at_status(&db, "fresh", &save_dir, "fresh.bin", 3).await;
+        db.update_task_seeding_status("seeding", SEEDING_STATUS_ACTIVE, "")
+            .await
+            .expect("mark seeding");
+        db.update_task_seeding_status("queued", SEEDING_STATUS_QUEUED, "queued")
+            .await
+            .expect("mark queued");
+        let mut mgr = retention_test_manager(db.clone(), &save_dir);
+
+        mgr.set_completed_record_retention_days(0);
+        assert_eq!(mgr.purge_expired_completed_records(true).await, 0);
+        assert!(db.load_task_by_id("now").await.expect("load").is_some());
+
+        mgr.set_completed_record_retention_days(1);
+        assert_eq!(
+            mgr.purge_expired_completed_records(true).await,
+            0,
+            "未满 1 天的记录不能被按天保留期删掉"
+        );
+        assert!(db.load_task_by_id("now").await.expect("load").is_some());
+
+        mgr.set_completed_record_retention_days(-1);
+        assert_eq!(mgr.purge_expired_completed_records(true).await, 2);
+        assert!(db.load_task_by_id("now").await.expect("load").is_none());
+        assert!(db.load_task_by_id("fresh").await.expect("load").is_none());
+        assert!(
+            db.load_task_by_id("seeding").await.expect("load").is_some(),
+            "做种中不删"
+        );
+        assert!(
+            db.load_task_by_id("queued").await.expect("load").is_some(),
+            "排队做种不删"
+        );
+        assert!(kept_file.exists(), "立即清理只删记录，绝不删文件");
+
+        // 删除被在途编辑占住：记录必须留下，不能当成已清掉。
+        insert_task_at_status(&db, "stuck", &save_dir, "stuck.bin", 3).await;
+        let _guard = mgr.edit_jobs.begin("stuck").expect("hold edit");
+        assert_eq!(mgr.purge_expired_completed_records(true).await, 0);
+        assert!(db.load_task_by_id("stuck").await.expect("load").is_some());
+        drop(_guard);
+        assert_eq!(mgr.purge_expired_completed_records(true).await, 1);
+        assert!(db.load_task_by_id("stuck").await.expect("load").is_none());
+
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logger::report_warning("download-manager-test", "remove test directory", &error);
+        }
+    }
+
+    /// 立即模式的完成路径跳过 10 分钟去抖；被动触发仍受去抖约束。
+    #[tokio::test]
+    async fn immediate_completion_path_ignores_retention_debounce() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        let save_dir = std::env::temp_dir().to_string_lossy().to_string();
+        insert_task_at_status(&db, "first", &save_dir, "first.bin", 3).await;
+        let mut mgr = retention_test_manager(db.clone(), &save_dir);
+        mgr.set_completed_record_retention_days(-1);
+        assert_eq!(mgr.purge_expired_completed_records(false).await, 1);
+
+        insert_task_at_status(&db, "second", &save_dir, "second.bin", 3).await;
+        assert_eq!(
+            mgr.purge_expired_completed_records(false).await,
+            0,
+            "去抖窗口内的被动清理不重复执行"
+        );
+        assert!(db.load_task_by_id("second").await.expect("load").is_some());
+
+        mgr.on_task_done(&TaskDone::finished("unrelated".to_owned(), 0, None))
+            .await;
+        assert!(
+            db.load_task_by_id("second").await.expect("load").is_none(),
+            "完成路径在立即模式下必须跳过去抖"
+        );
+    }
+
+    /// 等宿主收到宽限到期的唤醒，再按 actor 的做法清理一次。
+    async fn await_retention_wake(mgr: &mut DownloadManager, rx: &mut mpsc::Receiver<()>) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("grace wake arrives")
+            .expect("wake channel open");
+        mgr.purge_requested_completed_records().await;
+    }
+
+    /// 完成帧之后紧跟 `TasksDeleted` 会让各端的快照差分漏掉完成通知。立即模式下
+    /// 刚完成的记录在宽限内保留（其他清理触发也不删），宽限到期的唤醒之后才删，文件留下。
+    #[tokio::test]
+    async fn immediate_retention_waits_out_the_grace_after_completion() {
+        let dir = unique_filetrack_test_dir("retention_grace_done");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let save_dir = dir.to_string_lossy().to_string();
+        let kept_file = dir.join("done.bin");
+        std::fs::write(&kept_file, b"payload").expect("write file");
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task_at_status(&db, "done", &save_dir, "done.bin", 3).await;
+        let mut mgr = retention_test_manager(db.clone(), &save_dir);
+        let mut wake = mgr.take_retention_purge_rx().expect("retention rx");
+        mgr.retention_grace_period = std::time::Duration::from_secs(1);
+        mgr.set_completed_record_retention_days(-1);
+
+        mgr.on_task_done(&TaskDone::finished("done".to_owned(), 0, None))
+            .await;
+        assert!(
+            db.load_task_by_id("done").await.expect("load").is_some(),
+            "宽限内完成记录必须还在，各端才能看到 status=3"
+        );
+        assert_eq!(
+            mgr.purge_expired_completed_records(true).await,
+            0,
+            "宽限内设置变更 / 重扫触发的清理也不能删"
+        );
+
+        await_retention_wake(&mut mgr, &mut wake).await;
+        assert!(
+            db.load_task_by_id("done").await.expect("load").is_none(),
+            "宽限到期的唤醒之后必须删掉"
+        );
+        assert!(kept_file.exists(), "立即清理只删记录，绝不删文件");
+
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logger::report_warning("download-manager-test", "remove test directory", &error);
+        }
+    }
+
+    /// 用户停止做种后，记录在宽限内保留，到期唤醒后清掉，文件留下。
+    #[tokio::test]
+    async fn stopping_seeding_purges_immediate_completed_records() {
+        let dir = unique_filetrack_test_dir("retention_stop_seed");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let save_dir = dir.to_string_lossy().to_string();
+        let kept_file = dir.join("seed.bin");
+        std::fs::write(&kept_file, b"payload").expect("write file");
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task_at_status(&db, "seed", &save_dir, "seed.bin", 3).await;
+        db.update_task_seeding_status("seed", SEEDING_STATUS_ACTIVE, "")
+            .await
+            .expect("mark seeding");
+        let mut mgr = retention_test_manager(db.clone(), &save_dir);
+        let mut wake = mgr.take_retention_purge_rx().expect("retention rx");
+        mgr.retention_grace_period = std::time::Duration::from_secs(1);
+        mgr.set_completed_record_retention_days(-1);
+        assert_eq!(
+            mgr.purge_expired_completed_records(true).await,
+            0,
+            "仍在做种时不能删"
+        );
+
+        mgr.pause_task("seed").await;
+        assert!(
+            db.load_task_by_id("seed").await.expect("load").is_some(),
+            "停止帧刚发出，宽限内记录必须还在"
+        );
+
+        await_retention_wake(&mut mgr, &mut wake).await;
+        assert!(
+            db.load_task_by_id("seed").await.expect("load").is_none(),
+            "停止做种的宽限到期后立即模式必须清掉记录"
+        );
+        assert!(kept_file.exists(), "停止做种后的清理也不删文件");
+
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logger::report_warning("download-manager-test", "remove test directory", &error);
+        }
+    }
+
+    /// 启动时第一次清理在归一化做种态之前，做种中的任务不被删。不再续种的
+    /// 任务要等续种决定之后的第二次清理才消失。
+    #[cfg(feature = "bt")]
+    #[tokio::test]
+    async fn immediate_startup_keeps_seeders_until_reseed_is_declined() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.set_config("bt_auto_reseed", "false")
+            .await
+            .expect("disable reseed");
+        let save_dir = std::env::temp_dir().to_string_lossy().to_string();
+        insert_task_at_status(&db, "seed", &save_dir, "seed.bin", 3).await;
+        insert_task_at_status(&db, "done", &save_dir, "done.bin", 3).await;
+        db.update_task_seeding_status("seed", SEEDING_STATUS_ACTIVE, "")
+            .await
+            .expect("mark seeding");
+        let mut mgr = retention_test_manager(db.clone(), &save_dir);
+        mgr.set_completed_record_retention_days(-1);
+
+        mgr.load_and_send_all_tasks().await;
+        assert!(
+            db.load_task_by_id("done").await.expect("load").is_none(),
+            "非做种的已完成记录在启动时清掉"
+        );
+        assert!(
+            db.load_task_by_id("seed").await.expect("load").is_none(),
+            "不再续种的已完成记录必须在续种决定之后清掉"
+        );
+    }
+
+    /// 启动清理必须在 auto_reseed 把即将续种的任务写成排队做种之后才删。
+    /// 否则归一化成 UserStopped 的任务会在续种前被立即模式清掉。
+    #[cfg(feature = "bt")]
+    #[tokio::test]
+    async fn immediate_startup_does_not_delete_tasks_that_will_reseed() {
+        let (work, port) = bt_test_dir("retention_reseed");
+        let save = work.join("save");
+        std::fs::create_dir_all(&save).expect("save dir");
+        let payload = b"reseed-me";
+        std::fs::write(save.join("payload.bin"), payload).expect("payload");
+        let torrent = librqbit::create_torrent(
+            &save.join("payload.bin"),
+            librqbit::CreateTorrentOptions {
+                piece_length: Some(16 * 1024),
+                ..Default::default()
+            },
+            &librqbit::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .expect("create torrent")
+        .as_bytes()
+        .expect("torrent bytes");
+
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.set_config("completed_record_retention_days", "-1")
+            .await
+            .expect("set retention");
+        db.insert_task(
+            "seed",
+            "torrent-file://local",
+            "payload.bin",
+            &save.to_string_lossy(),
+            1,
+            payload.len() as i64,
+            "",
+            "",
+            "",
+            3,
+        )
+        .await
+        .expect("insert seeder");
+        db.save_torrent_file_bytes("seed", &torrent)
+            .await
+            .expect("save torrent bytes");
+        db.update_task_seeding_status("seed", SEEDING_STATUS_ACTIVE, "")
+            .await
+            .expect("mark seeding");
+        insert_task_at_status(&db, "done", &save.to_string_lossy(), "done.bin", 3).await;
+
+        let mut mgr = bt_test_manager(db.clone(), &work, bt_test_config(port));
+        mgr.set_completed_record_retention_days(-1);
+        mgr.load_and_send_all_tasks().await;
+
+        assert!(
+            db.load_task_by_id("done").await.expect("load").is_none(),
+            "非做种的已完成记录在启动时清掉"
+        );
+        assert!(
+            db.load_task_by_id("seed").await.expect("load").is_some(),
+            "即将续种的任务不能在 auto_reseed 之前被删掉"
+        );
+
+        mgr.shutdown().await;
+        if let Err(error) = std::fs::remove_dir_all(&work) {
+            tracing::debug!(%error, "retention reseed test directory cleanup skipped");
+        }
+    }
+
+    /// 下载器已把 status 写成完成、TaskDone 还在队列里时，立即清理不能摘掉
+    /// active 条目，否则完成通知和插件 onDone 被跳过。摘掉条目后的下一轮才删。
+    #[tokio::test]
+    async fn immediate_purge_keeps_task_still_in_active_tasks() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        let save_dir = std::env::temp_dir().to_string_lossy().to_string();
+        insert_task_at_status(&db, "live", &save_dir, "live.bin", 3).await;
+        insert_task_at_status(&db, "idle", &save_dir, "idle.bin", 3).await;
+        let mut mgr = retention_test_manager(db.clone(), &save_dir);
+        mgr.set_completed_record_retention_days(-1);
+        mgr.active_tasks.insert(
+            "live".to_string(),
+            ActiveTaskEntry {
+                token: CancellationToken::new(),
+                generation: 1,
+                handle: None,
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+
+        assert_eq!(
+            mgr.purge_expired_completed_records(true).await,
+            1,
+            "仍在 active_tasks 的完成任务不能在收尾前被清掉"
+        );
+        assert!(db.load_task_by_id("live").await.expect("load").is_some());
+        assert!(
+            db.load_task_by_id("idle").await.expect("load").is_none(),
+            "不在 active_tasks 的已完成记录仍应清掉"
+        );
+
+        mgr.active_tasks.remove("live");
+        assert_eq!(mgr.purge_expired_completed_records(true).await, 1);
+        assert!(db.load_task_by_id("live").await.expect("load").is_none());
+    }
+
+    /// 停止做种的 task.paused 必须在立即清理删掉记录之前发出。
+    #[tokio::test]
+    async fn stopping_seeding_emits_paused_notice_before_immediate_purge() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        let save_dir = std::env::temp_dir().to_string_lossy().to_string();
+        insert_task_at_status(&db, "seed", &save_dir, "seed.bin", 3).await;
+        db.update_task_seeding_status("seed", SEEDING_STATUS_ACTIVE, "")
+            .await
+            .expect("mark seeding");
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = DownloadManager::new(
+            db.clone(),
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: save_dir,
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            sink.clone(),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager");
+        // 这里只看 task.paused 与删除的先后，不测宽限。
+        mgr.retention_grace_period = std::time::Duration::ZERO;
+        mgr.set_completed_record_retention_days(-1);
+
+        mgr.pause_task("seed").await;
+
+        assert!(db.load_task_by_id("seed").await.expect("load").is_none());
+        assert!(
+            collected_notices(&sink).iter().any(|notice| {
+                notice.event == "task.paused"
+                    && notice.task.as_ref().is_some_and(|task| task.id == "seed")
+            }),
+            "停止做种的 task.paused 必须在记录被清掉之前发出"
+        );
+    }
+
+    /// 唯一监听端口被占用、自动续种开着时，会话建不起来不是「不续」。
+    /// 做种态写回排队，同一次运行的下一次立即清理和下一次启动都不能删。
+    #[cfg(feature = "bt")]
+    #[tokio::test]
+    async fn immediate_startup_keeps_seeders_when_session_init_fails() {
+        let (work, port) = bt_test_dir("retention_reseed_fail");
+        let _hold =
+            std::net::TcpListener::bind(("0.0.0.0", port)).expect("hold the only listen port");
+        let save = work.join("save");
+        std::fs::create_dir_all(&save).expect("save dir");
+        let save_dir = save.to_string_lossy().to_string();
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.set_config("bt_auto_reseed", "true")
+            .await
+            .expect("enable reseed");
+        insert_task_at_status(&db, "seed", &save_dir, "seed.bin", 3).await;
+        insert_task_at_status(&db, "done", &save_dir, "done.bin", 3).await;
+        db.update_task_seeding_status("seed", SEEDING_STATUS_ACTIVE, "")
+            .await
+            .expect("mark seeding");
+        let mut mgr = bt_test_manager(db.clone(), &work, bt_test_config(port));
+        mgr.set_completed_record_retention_days(-1);
+
+        mgr.load_and_send_all_tasks().await;
+
+        let seed = db.load_task_by_id("seed").await.expect("load");
+        assert_eq!(
+            seed.as_ref().map(|task| task.seeding_status),
+            Some(SEEDING_STATUS_QUEUED),
+            "会话建不起来必须写回排队，不能停在 UserStopped"
+        );
+        assert!(
+            db.load_task_by_id("done").await.expect("load").is_none(),
+            "非做种的已完成记录仍应清掉"
+        );
+        assert_eq!(
+            mgr.purge_expired_completed_records(true).await,
+            0,
+            "同一次运行的下一次立即清理也不能删掉尚未续上的做种记录"
+        );
+        assert!(db.load_task_by_id("seed").await.expect("load").is_some());
+
+        mgr.shutdown().await;
+        let mut restarted = bt_test_manager(db.clone(), &work, bt_test_config(port));
+        restarted.set_completed_record_retention_days(-1);
+        restarted.load_and_send_all_tasks().await;
+        let again = db.load_task_by_id("seed").await.expect("load");
+        assert_eq!(
+            again.as_ref().map(|task| task.seeding_status),
+            Some(SEEDING_STATUS_QUEUED),
+            "下次启动的第一次清理不能删掉尚未续上的做种记录"
+        );
+        restarted.shutdown().await;
+        drop(_hold);
+        if let Err(error) = std::fs::remove_dir_all(&work) {
+            tracing::debug!(%error, "retention reseed-fail test directory cleanup skipped");
+        }
+    }
+
+    /// 做种已关闭、分类授权已消耗、搬移还在 `bt_archive_results` 时，立即清理不能删行。
+    /// 用户停止做种同样不吃掉在途归档。结果移出 map 之后才删，文件留下。
+    #[cfg(all(feature = "bt", feature = "plugins"))]
+    #[tokio::test]
+    async fn immediate_purge_keeps_category_archive_until_the_move_finishes() {
+        let dir = unique_filetrack_test_dir("retention_archive");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let save_dir = dir.to_string_lossy().to_string();
+        let kept = dir.join("archive.bin");
+        std::fs::write(&kept, b"payload").expect("write file");
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.insert_task(
+            "archive",
+            "torrent-file://local",
+            "archive.bin",
+            &save_dir,
+            1,
+            7,
+            "",
+            "",
+            "",
+            0,
+        )
+        .await
+        .expect("insert archive task");
+        db.update_task_status("archive", 3, "")
+            .await
+            .expect("complete archive task");
+        db.update_task_seeding_status(
+            "archive",
+            crate::bt_seeding::SeedingStopReason::UserStopped.as_i32(),
+            crate::bt_seeding::SeedingStopReason::UserStopped.message(),
+        )
+        .await
+        .expect("seeding off");
+        let consumed = crate::category_route::CategoryRoute {
+            base_dir: String::new(),
+            archive_categories: [(
+                "image".to_owned(),
+                dir.join("Photos").to_string_lossy().into_owned(),
+            )]
+            .into(),
+            ..Default::default()
+        };
+        db.set_task_category_route("archive", &consumed.to_column().expect("encode route"))
+            .await
+            .expect("persist consumed route");
+        insert_task_at_status(&db, "plain", &save_dir, "plain.bin", 3).await;
+
+        let mut mgr = retention_test_manager(db.clone(), &save_dir);
+        // 这里只测在途归档的保护，不测宽限。
+        mgr.retention_grace_period = std::time::Duration::ZERO;
+        mgr.set_completed_record_retention_days(-1);
+        mgr.bt_archive_results
+            .lock()
+            .await
+            .insert("archive".to_owned(), super::bt_archive::WorkResult::Pending);
+
+        mgr.on_task_done(&TaskDone::finished("archive".to_owned(), 0, None))
+            .await;
+        assert!(
+            db.load_task_by_id("archive").await.expect("load").is_some(),
+            "分类还没搬完时，完成路径的立即清理不能删行"
+        );
+        assert!(
+            db.load_task_by_id("plain").await.expect("load").is_none(),
+            "没有在途归档的已完成记录仍应清掉"
+        );
+        let column = db
+            .load_task_category_route("archive")
+            .await
+            .expect("load route");
+        assert!(
+            column.contains("image"),
+            "授权列必须还在，搬移才能读到任务行"
+        );
+
+        insert_task_at_status(&db, "seeding", &save_dir, "seeding.bin", 3).await;
+        db.update_task_seeding_status("seeding", SEEDING_STATUS_ACTIVE, "")
+            .await
+            .expect("mark seeding");
+        mgr.bt_archive_results
+            .lock()
+            .await
+            .insert("seeding".to_owned(), super::bt_archive::WorkResult::Pending);
+        mgr.pause_task("seeding").await;
+        assert!(
+            db.load_task_by_id("seeding").await.expect("load").is_some(),
+            "停止做种不能吃掉尚未搬完的分类归档"
+        );
+
+        mgr.bt_archive_results.lock().await.remove("archive");
+        mgr.bt_archive_results.lock().await.remove("seeding");
+        assert_eq!(mgr.purge_expired_completed_records(true).await, 2);
+        assert!(db.load_task_by_id("archive").await.expect("load").is_none());
+        assert!(db.load_task_by_id("seeding").await.expect("load").is_none());
+        assert!(kept.exists(), "清理只删记录，不删文件");
+
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logger::report_warning("download-manager-test", "remove test directory", &error);
+        }
+    }
+
     /// 设置里的选片方式默认值（按顺序下载 / 先下载首尾文件块）只作用于此后新建的 BT
     /// 任务：HTTP 任务不带，改回默认后新建的 BT 任务不带，已建任务不随设置变化。
     #[cfg(feature = "bt")]
@@ -22553,6 +24056,39 @@ mod tests {
                 &error,
             );
         }
+    }
+
+    #[tokio::test]
+    async fn blocked_http_staging_does_not_prevent_task_deletion() {
+        use sha2::{Digest, Sha256};
+
+        let dir = unique_filetrack_test_dir("blocked_http_staging");
+        std::fs::create_dir_all(&dir).expect("create deletion fixture");
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect database");
+        let mut manager = sched_manager(&db, 1);
+        for (id, batch) in [("staging-single", false), ("staging-batch", true)] {
+            insert_task_at_status(&db, id, &dir.to_string_lossy(), "out.bin", 4).await;
+            let key = hex::encode(Sha256::digest(id.as_bytes()));
+            let occupied = dir.join(format!(".fluxdown-restart-{key}"));
+            std::fs::write(&occupied, b"unrelated file").expect("occupy staging path");
+            if batch {
+                let outcome = manager
+                    .delete_tasks_batch(&[id.to_owned()], false)
+                    .await
+                    .expect("batch delete");
+                assert_eq!((outcome.deleted, outcome.failed), (1, 0));
+            } else {
+                manager.delete_task(id, false).await.expect("delete task");
+            }
+            assert!(db.load_task_by_id(id).await.expect("load task").is_none());
+            assert_eq!(
+                std::fs::read(&occupied).expect("read unrelated file"),
+                b"unrelated file"
+            );
+        }
+        std::fs::remove_dir_all(dir).expect("remove deletion fixture");
     }
 
     /// 失败任务的文件名在本机不可能存在（组件超长，`remove_file` 返回
@@ -26459,6 +27995,73 @@ mod tests {
                 (33 * MIB, Some(33 * MIB)),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn staged_download_accounts_received_bytes_before_restoring_checkpoint() {
+        const CHECKPOINT: i64 = 15 * 1024 * 1024;
+        const RECEIVED: i64 = 128 * 1024;
+        for terminal_status in [2, 4] {
+            let (tx, rx) = mpsc::channel(8);
+            let db = Db::connect("sqlite::memory:")
+                .await
+                .expect("connect mem db");
+            let sink = Arc::new(RecordingSink::new());
+            for (status, downloaded_bytes, download_baseline, transfer_bytes) in [
+                (1, CHECKPOINT, Some(CHECKPOINT), None),
+                (1, 0, Some(0), Some(0)),
+                (1, RECEIVED / 2, None, Some(RECEIVED)),
+                (terminal_status, CHECKPOINT, None, None),
+            ] {
+                tx.send(ProgressUpdate {
+                    task_id: "staged".into(),
+                    status,
+                    downloaded_bytes,
+                    download_baseline,
+                    transfer_bytes,
+                    staged_download: transfer_bytes.is_some(),
+                    ..Default::default()
+                })
+                .await
+                .expect("enqueue progress");
+            }
+            drop(tx);
+            progress_reporter(rx, db, sink.clone()).await;
+
+            let accounted: Vec<_> = sink
+                .events()
+                .into_iter()
+                .filter_map(|event| match event {
+                    EngineEvent::TaskTransferred { bytes, .. } => Some((0, bytes)),
+                    EngineEvent::TaskTransferBaseline {
+                        downloaded_bytes,
+                        previous_downloaded_bytes,
+                        ..
+                    } => {
+                        if downloaded_bytes == CHECKPOINT {
+                            assert_eq!(previous_downloaded_bytes, None);
+                        }
+                        Some((1, downloaded_bytes))
+                    }
+                    EngineEvent::TaskProgress {
+                        status,
+                        downloaded_bytes,
+                        ..
+                    } if status == terminal_status => Some((status, downloaded_bytes)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                accounted,
+                [
+                    (1, CHECKPOINT),
+                    (1, 0),
+                    (0, RECEIVED),
+                    (1, CHECKPOINT),
+                    (terminal_status, CHECKPOINT),
+                ],
+            );
+        }
     }
 
     /// 落盘字节按段跳变(HLS 整段缓冲后写盘)时,速度与宿主流量都跟随接收字节:

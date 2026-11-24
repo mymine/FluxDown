@@ -178,18 +178,16 @@ async fn run_agent(
     let endpoint_dir = server
         .is_none()
         .then(|| endpoint_dir(bearer_override.as_deref(), store.data_dir()));
-    if let Some(directory) = &endpoint_dir {
-        store
-            .save_gateway_endpoint(directory, bound)
-            .await
-            .map_err(|error| StartupError::new(AgentStartupFailureKind::DataDir, error))?;
-    }
     // 本机 IPC 端点紧跟 TCP 之后建立（早于 daemon 与各服务装配）：界面在装配期间发起的连接
-    // 由内核排队。建不起来只记录原因，界面照常走 TCP。
+    // 由内核排队。建不起来只记录原因，界面照常走 TCP。先于端点文件建立：Windows 随机管道名随
+    // 端点文件一起发布。
     let ipc = match &endpoint_dir {
         Some(directory) => match crate::gateway::IpcListener::bind(directory).await {
             Ok(ipc) => {
                 tracing::info!(endpoint = %ipc.describe(), "fluxdown-agent gateway IPC listening");
+                if let Some(pipe) = ipc.published_pipe() {
+                    store.set_gateway_pipe(pipe);
+                }
                 Some(ipc)
             }
             Err(error) => {
@@ -199,6 +197,12 @@ async fn run_agent(
         },
         None => None,
     };
+    if let Some(directory) = &endpoint_dir {
+        store
+            .save_gateway_endpoint(directory, bound)
+            .await
+            .map_err(|error| StartupError::new(AgentStartupFailureKind::DataDir, error))?;
+    }
     tracing::info!(address = %bound, "fluxdown-agent gateway listening");
 
     // daemon：显式 `FLUXDOWN_DAEMON_URL` 时只连该地址并让 daemon 严格绑定它；否则 daemon 用
@@ -234,6 +238,7 @@ async fn run_agent(
     // 界面据此立即决定主题、语言与启动时是否只驻留托盘；daemon 连上后由投影任务替换
     // daemon 快照并发布 `DaemonConnectionChanged(true)`，与运行期断线重连同一路径。
     let update_target = crate::update::install::detect(server.is_some());
+    crate::logging::seed_level_preference(&mut state, &paths.daemon_data_dir);
     let initial = AgentSnapshot {
         daemon_connected: false,
         session: state
@@ -514,6 +519,7 @@ async fn run_agent(
         },
     )
     .with_server_mode(server.is_some())
+    .with_logging_dir(paths.daemon_data_dir.clone())
     .with_link(link.clone());
     let gateway_service = Arc::new(gateway);
     let shell_task = tokio::spawn(crate::shell::run_controller(
@@ -1256,9 +1262,7 @@ impl AgentPaths {
         let agent_data_dir = resolve_agent_data_dir()?;
         // daemon 的 bearer 与进程租约落在 engine 数据目录（`fluxdown_engine::data_dir::resolve_data_dir`），
         // 与 agent 自己的 ProjectDirs 根不同；未显式指定时必须按同一规则推导，否则永远等不到 token。
-        let daemon_data_dir = std::env::var_os("FLUXDOWN_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(engine_data_dir);
+        let daemon_data_dir = resolve_engine_data_dir();
         let daemon_token_file = std::env::var_os("FLUXDOWN_DAEMON_TOKEN_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| daemon_data_dir.join("daemon.token"));
@@ -1323,7 +1327,7 @@ pub fn resolve_agent_data_dir() -> Result<PathBuf, Box<dyn std::error::Error + S
 
 /// `<exe>/portable` 标记存在时返回 `<exe>/portable_data`。
 #[cfg(target_os = "windows")]
-fn portable_data_dir() -> Option<PathBuf> {
+pub(crate) fn portable_data_dir() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))?;
@@ -1348,6 +1352,12 @@ fn migrate_legacy_agent_state(legacy: &Path, target: &Path) {
     if let Err(error) = std::fs::copy(&from, &to) {
         tracing::warn!(source = %from.display(), target = %to.display(), error = %error, "could not migrate legacy agent state");
     }
+}
+
+pub(crate) fn resolve_engine_data_dir() -> PathBuf {
+    std::env::var_os("FLUXDOWN_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(engine_data_dir)
 }
 
 /// 镜像 `fluxdown_engine::data_dir::resolve_data_dir_inner` 的默认目录（agent 不依赖 engine）。

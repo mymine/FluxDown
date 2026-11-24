@@ -103,6 +103,7 @@ export const METHOD = {
   DAEMON_SITE_AUTH_MATCH: 'daemon.siteAuth.match',
   DAEMON_RUNTIME_STATS: 'daemon.runtime.stats',
   DAEMON_FS_LIST: 'daemon.fs.list',
+  DAEMON_FS_DEFAULT_FILE_EXISTS: 'daemon.fs.defaultFileExists',
 
   DAEMON_RSS_LIST_SOURCES: 'daemon.rss.listSources',
   DAEMON_RSS_GET_ITEMS: 'daemon.rss.getItems',
@@ -285,6 +286,9 @@ export const METHOD = {
   AGENT_PLATFORM_SET_APP_ICON: 'agent.platform.setAppIcon',
   AGENT_PLATFORM_APP_ICON_IMAGE: 'agent.platform.appIconImage',
   AGENT_PLATFORM_SYNC_WINDOW_ICONS: 'agent.platform.syncWindowIcons',
+  /** 本机浏览器扩展安装状态与一键安装（仅 GPUI 使用；server 模式拒绝）。 */
+  AGENT_PLATFORM_BROWSER_EXTENSION_STATUS: 'agent.platform.browserExtensionStatus',
+  AGENT_PLATFORM_INSTALL_BROWSER_EXTENSION: 'agent.platform.installBrowserExtension',
   AGENT_SOUND_PREVIEW: 'agent.sound.preview',
   AGENT_CAPTURE_SUBMIT: 'agent.capture.submit',
   AGENT_CAPTURE_SUBMIT_TORRENT_FILE: 'agent.capture.submitTorrentFile',
