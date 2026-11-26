@@ -95,6 +95,9 @@ pub const DAEMON_TASK_PAUSE_MANY: &str = "daemon.task.pauseMany";
 pub const DAEMON_TASK_RESUME_MANY: &str = "daemon.task.resumeMany";
 /// 批量删除（`{taskIds, deleteFiles}`）：语义同批量暂停。
 pub const DAEMON_TASK_DELETE_MANY: &str = "daemon.task.deleteMany";
+/// Delete paused or failed task records and owned partial data (`{taskIds}`).
+/// On success, returns the number of records removed, excluding skipped tasks.
+pub const DAEMON_TASK_CLEAN_UNFINISHED: &str = "daemon.task.cleanUnfinished";
 /// 批量建任务（`DaemonCreateTasksParams`）：整块一个事务、一次 `TasksChanged` 事件，
 /// 按 `batchId` 幂等；结果逐条对应（`DaemonCreateTasksResult`）。
 pub const DAEMON_TASK_CREATE_MANY: &str = "daemon.task.createMany";
@@ -421,6 +424,8 @@ pub const AGENT_PLATFORM_SET_APP_ICON: &str = "agent.platform.setAppIcon";
 pub const AGENT_PLATFORM_APP_ICON_IMAGE: &str = "agent.platform.appIconImage";
 /// `{}` → `{ "ok": true }`：为桌面界面进程现有窗口补设当前应用图标（Windows / X11；其余平台无操作）。
 pub const AGENT_PLATFORM_SYNC_WINDOW_ICONS: &str = "agent.platform.syncWindowIcons";
+/// `{epoch, sequence, seenFailures: [taskId, ...]}` → `{ "ok": true }`：仅确认列出的失败任务。
+pub const AGENT_PLATFORM_ACK_TRAY_DOWNLOADS: &str = "agent.platform.ackTrayDownloads";
 /// `{}` → `browser_extension::BrowserExtensionStatusDto`：本机 Chrome / Edge / Firefox 与 FluxDown 扩展的安装状态。
 pub const AGENT_PLATFORM_BROWSER_EXTENSION_STATUS: &str = "agent.platform.browserExtensionStatus";
 /// `browser_extension::BrowserExtensionInstallParams` → `browser_extension::BrowserExtensionInstallResult`：
@@ -539,6 +544,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_TASK_PAUSE_MANY,
     DAEMON_TASK_RESUME_MANY,
     DAEMON_TASK_DELETE_MANY,
+    DAEMON_TASK_CLEAN_UNFINISHED,
     DAEMON_QUEUE_LIST,
     DAEMON_QUEUE_CREATE,
     DAEMON_QUEUE_UPDATE,
@@ -746,6 +752,7 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_PLATFORM_SET_APP_ICON,
     AGENT_PLATFORM_APP_ICON_IMAGE,
     AGENT_PLATFORM_SYNC_WINDOW_ICONS,
+    AGENT_PLATFORM_ACK_TRAY_DOWNLOADS,
     AGENT_PLATFORM_BROWSER_EXTENSION_STATUS,
     AGENT_PLATFORM_INSTALL_BROWSER_EXTENSION,
     AGENT_SOUND_PREVIEW,

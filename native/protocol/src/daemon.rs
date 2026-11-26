@@ -2377,9 +2377,12 @@ pub struct PluginDto {
     /// `Loaded` / `Failed`；与 `enabled` 独立，手动禁用的插件仍可能已加载。
     #[serde(default = "default_plugin_load_status")]
     pub load_status: String,
-    /// 加载失败的可读原因；成功时为空。
+    /// Generic safe fallback for clients that do not understand `loadDetail`.
     #[serde(default)]
     pub load_error: String,
+    /// Redacted load failure category and safe arguments; omitted for loaded plugins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_detail: Option<crate::PluginFailureDetail>,
     /// manifest `contributes`：视图 / 命令 / 嗅探规则贡献点。
     #[serde(default)]
     pub contributions: PluginContributionsDto,
@@ -4326,7 +4329,7 @@ pub struct TokenResponse {
     pub note: String,
 }
 
-/// 首次运行状态（`GET /api/v1/setup/status`，**无鉴权**）。
+/// 首次运行状态（`GET /api/v1/setup/status`，无鉴权，不回传引导码）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
@@ -4335,15 +4338,24 @@ pub struct SetupStatusResponse {
     pub setup_required: bool,
     /// 访问密钥最短长度（前端提示与校验用，避免两端各写一份常量）。
     pub min_length: i64,
+    /// 密钥仍空且已装入一次性引导码。不回传密文。
+    #[serde(default)]
+    pub needs_bootstrap: bool,
 }
 
-/// 首次运行设置访问密钥请求（`POST /api/v1/setup`，**无鉴权**）。
+/// 首次运行设置访问密钥请求（`POST /api/v1/setup`）。
+///
+/// 密钥仍空时必须携带与 `<agent data_dir>/setup-bootstrap` 一致的引导码
+/// （body 字段或 `X-FluxDown-Bootstrap`），否则 401。已设密钥时 409。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SetupRequest {
     /// 用户设定的访问密钥；规则见 `config::validate_access_key`。
     pub token: String,
+    /// 一次性引导码。密钥仍空时必填。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

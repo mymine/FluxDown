@@ -345,6 +345,8 @@ The host applies FluxDown's outbound proxy/TUN routing and SSRF protections (inc
 | `headers` | none | Optional string headers. |
 | `authRef` | none | Optional saved credential reference; requires `auth` permission. |
 | `maxWidth`, `maxHeight` | `512` each | Integers from 1 to 2048. The host preserves aspect ratio and does not upscale. |
+| `circle` | `false` | Center-crop to a square and mask to a circle with transparent edges. Still bounded by both dimensions and never upscaled. |
+| `cornerRadius` | `0` | Corner radius in output pixels (integer), capped at half the shorter side. Ignored when `circle` is true. |
 | `cache` | `true` | `false` skips source/options memoization; images are never written to disk. HTTP responses remain `no-store`. Identical output still shares one reference, valid until explicit release or session close. |
 
 Input is accepted only when sniffed as PNG, JPEG or WebP; declared content type alone is not trusted. Input dimensions are capped at 8192 per side and 16 megapixels, decoding at 64 MiB, network body at 8 MiB, and fetch time at 10 seconds. The host emits a sanitized static PNG thumbnail of at most 4 MiB and serves it as `image/png`. Per-session quotas are 128 resources / 16 MiB; the global image-resource byte quota is 64 MiB. Quota exhaustion is an explicit error; references are never implicitly evicted. Cached source/options results live for five minutes, but their returned resource remains valid until explicit release or session close. Closing the view session or unloading the plugin frees its image resources. These limits are host-enforced.
@@ -606,7 +608,7 @@ globalThis.resolve = async (ctx) => {
 };
 ```
 
-In `resolve` the script's whole time budget (10 s by default, at most 30 s) also bounds the call, so a `timeoutMs` larger than that has no effect there.
+In `resolve` the script's whole time budget (10 s by default, at most 120 s) also bounds the call, so a `timeoutMs` larger than that has no effect there.
 
 ### Main-only facades
 
@@ -648,7 +650,7 @@ Budgets are per call. "CPU budget" is the time your JavaScript may execute; time
 
 | Entry | Wall clock | CPU budget | Memory |
 |---|---|---|---|
-| `resolve` | 10 s default; `resolvers[0].timeoutMs` replaces it, **30 s hard ceiling** | same value, ≤ 30 s | 64 MB default; `resolvers[0].memoryLimitMb` replaces it, 512 MB ceiling |
+| `resolve` | 10 s default; `resolvers[0].timeoutMs` replaces it, **120 s hard ceiling** (0.6.8 and earlier: 30 s) | same value, ≤ 120 s | 64 MB default; `resolvers[0].memoryLimitMb` replaces it, 512 MB ceiling |
 | `subscribe` | 10 s default; `subscriptions[0].timeoutMs` replaces it, 30 s ceiling | same | 64 MB |
 | `authenticate` | 30 s default; `auth.timeoutMs` replaces it, 30 s ceiling | same | 64 MB |
 | Hooks | 5 s | 5 s | 32 MB |

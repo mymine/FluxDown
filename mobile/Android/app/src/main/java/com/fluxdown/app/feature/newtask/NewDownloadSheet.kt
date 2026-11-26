@@ -10,11 +10,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.derivedStateOf
@@ -50,7 +53,9 @@ import com.fluxdown.app.shell.LocalAppContainer
 import com.fluxdown.app.shell.hostState
 import com.fluxdown.app.ui.TaskInfoRow
 import com.fluxdown.app.ui.defaultLocalSaveDir
+import com.fluxdown.app.ui.externalLocalDirectory
 import com.fluxdown.app.ui.fileCategory
+import com.fluxdown.app.ui.isLocalDirWritable
 import com.fluxdown.app.ui.label
 import com.fluxdown.app.ui.launchDocumentPicker
 import com.fluxdown.app.ui.rememberTaskInfoExport
@@ -142,13 +147,27 @@ private fun NewDownloadSheetImpl(visible: Boolean, route: SheetRoute.NewDownload
     val haptics = FluxTheme.haptics
     val context = LocalContext.current
     val form = remember { NewDownloadState.create(route.prefill, container.store.state.value, route.external, route.targetId) }
+    var appliedRoute by remember { mutableStateOf(route) }
+    val hostRef by container.host.collectAsStateWithLifecycle()
+    val requestedLocalDir = form.saveDir.takeIf { form.hasExternalSaveDir && hostRef is HostRef.Local }
+    var localConfirmation by remember(requestedLocalDir) { mutableStateOf<LocalDirectoryConfirmation?>(null) }
+    LaunchedEffect(requestedLocalDir) {
+        if (requestedLocalDir != null) {
+            val resolved = withContext(Dispatchers.IO) { externalLocalDirectory(context).forConfirmation(requestedLocalDir) }
+            localConfirmation = LocalDirectoryConfirmation(requestedLocalDir, resolved)
+        }
+    }
+    val needsDirectory = requestedLocalDir != null && localConfirmation?.path == null
     LaunchedEffect(route) {
+        if (route == appliedRoute) return@LaunchedEffect
+        appliedRoute = route
         // 打开期间的后续唤起追加进同一表单（批量协议唤起逐条到达）
         route.external?.let(form::addExternal)
-        val extra = route.prefill.trim()
-        if (extra.isNotEmpty() && form.urlText.lineSequence().none { it.trim() == extra }) {
-            form.urlText = form.urlText.trimEnd().let { if (it.isEmpty()) extra else "$it\n$extra" }
-        }
+        val existing = form.urlText.lineSequence().map(String::trim).toHashSet()
+        val extra = route.prefill.trim().lineSequence()
+            .filter { it.isNotBlank() && existing.add(it.trim()) }
+            .joinToString("\n")
+        form.appendText(extra)
     }
     var advancedOpen by remember { mutableStateOf(false) }
     val dismiss by rememberUpdatedState(onDismiss)
@@ -196,7 +215,7 @@ private fun NewDownloadSheetImpl(visible: Boolean, route: SheetRoute.NewDownload
     fun rememberMode() {
         if (target == null) {
             val session = container.session
-            val mode = form.rememberedMode()
+            val mode = form.rememberedMode() ?: return
             container.appScope.launch {
                 try {
                     session.patchPreferences(
@@ -210,7 +229,7 @@ private fun NewDownloadSheetImpl(visible: Boolean, route: SheetRoute.NewDownload
         }
     }
     fun submit(startPaused: Boolean, queueId: String) {
-        if (form.submitting) return
+        if (form.submitting || form.rangeLimitExceeded) return
         val state = container.store.state.value
         if (state.isReadOnly) {
             haptics.reject()
@@ -226,10 +245,9 @@ private fun NewDownloadSheetImpl(visible: Boolean, route: SheetRoute.NewDownload
             haptics.reject()
             return
         }
-        // 本机主机：目录不可写（分区存储外 / 拼错路径）在提交前拦住，避免引擎报 EPERM
-        if (container.host.value is com.fluxdown.core.model.HostRef.Local && !com.fluxdown.app.ui.isLocalDirWritable(form.saveDir)) {
+        val saveDir = writableDownloadDirectory(context, container.host.value, form, localConfirmation) ?: run {
             haptics.reject()
-            overlays.toast(context.str(R.string.mobileSaveDirNotWritable, "dir" to form.saveDir.trim()), FluxToastKind.Error)
+            overlays.toast(context.str(R.string.mobileSaveDirNotWritable, "dir" to (localConfirmation?.path ?: form.saveDir.trim())), FluxToastKind.Error)
             return
         }
         if (!checksumValid(form)) {
@@ -237,7 +255,7 @@ private fun NewDownloadSheetImpl(visible: Boolean, route: SheetRoute.NewDownload
             advancedOpen = true
             return
         }
-        val requests = form.buildRequests(startPaused, queueId, manualProxyUrl(state.config))
+        val requests = form.buildRequests(startPaused, queueId, manualProxyUrl(state.config), saveDir)
         val batches = groupImportBatches(requests)
         if (requests.size > ImportRules.CHUNK_SIZE) {
             // 多块导入：交给进程级导入中心，进度 / 取消在下载页顶部，关闭本 Sheet 不影响它；汇总提示由 ImportEffects 给出
@@ -273,7 +291,7 @@ private fun NewDownloadSheetImpl(visible: Boolean, route: SheetRoute.NewDownload
 
     /** 「下载到」其他设备：逐条下发链接 / 文件名 / 保存目录；全部成功关闭，有失败时只把失败的链接留在文本框里。 */
     fun submitRemote(target: DispatchTarget) {
-        if (form.submitting) return
+        if (form.submitting || form.rangeLimitExceeded) return
         if (container.store.state.value.isReadOnly) {
             haptics.reject()
             overlays.toast(s.readOnly, FluxToastKind.Error, FluxIcons.WifiOff)
@@ -325,11 +343,13 @@ private fun NewDownloadSheetImpl(visible: Boolean, route: SheetRoute.NewDownload
         title = str(R.string.newDownload),
         header = { FluxSheetHeader(title = str(R.string.newDownload), onClose = ::requestClose) },
         footer = {
-            NewDownloadFooter(form, target, ::submit, onSubmitRemote = { target?.let(::submitRemote) })
+            NewDownloadFooter(form, target, needsDirectory, ::submit, onSubmitRemote = { target?.let(::submitRemote) })
         },
     ) {
         NewDownloadContent(
             form, targets, target,
+            requestedLocalDir = requestedLocalDir,
+            localConfirmation = localConfirmation,
             onOpenAdvanced = { advancedOpen = true },
             // 本机建了任务：记住分类模式、拉起前台服务；表单里没有待提交的链接时关闭（同 iOS `importTorrents`）
             onTorrentImported = {
@@ -380,6 +400,21 @@ private fun checksumHexValid(hex: String): Boolean {
 
 private fun checksumValid(form: NewDownloadState): Boolean = !form.single || checksumHexValid(form.advanced.checksumHex)
 
+private data class LocalDirectoryConfirmation(val requested: String, val path: String?)
+
+private fun writableDownloadDirectory(
+    context: Context,
+    host: HostRef,
+    form: NewDownloadState,
+    confirmation: LocalDirectoryConfirmation?,
+): String? {
+    val entered = form.saveDir.trim()
+    if (host !is HostRef.Local) return entered
+    if (!form.hasExternalSaveDir) return entered.takeIf(::isLocalDirWritable)
+    val path = confirmation?.takeIf { it.requested == form.saveDir }?.path ?: return null
+    return path.takeIf(externalLocalDirectory(context)::prepareConfirmed)
+}
+
 // ── N1 正文 ───────────────────────────────────────────────────────────────
 
 @Composable
@@ -387,6 +422,8 @@ private fun NewDownloadContent(
     form: NewDownloadState,
     targets: List<DispatchTarget>,
     target: DispatchTarget?,
+    requestedLocalDir: String?,
+    localConfirmation: LocalDirectoryConfirmation?,
     onOpenAdvanced: () -> Unit,
     onTorrentImported: () -> Unit,
 ) {
@@ -431,8 +468,7 @@ private fun NewDownloadContent(
                 haptics.reject()
                 overlays.toast(importNone, FluxToastKind.Warn)
             } else {
-                val (merged, added) = appendEntries(form.urlText, found)
-                form.urlText = merged
+                val added = form.addImported(found)
                 overlays.toast(importFound.fill("count" to added), FluxToastKind.Success, FluxIcons.FileText)
             }
         }
@@ -440,15 +476,14 @@ private fun NewDownloadContent(
     var importingTorrent by remember { mutableStateOf(false) }
     val taskActions = LocalTaskActions.current
     val torrentLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
-        if (uris.isEmpty() || importingTorrent || form.submitting) return@rememberLauncherForActivityResult
+        if (uris.isEmpty() || importingTorrent || form.submitting || form.rangeLimitExceeded) return@rememberLauncherForActivityResult
         if (!form.saveDirValid) {
             haptics.reject()
             return@rememberLauncherForActivityResult
         }
-        // 本机主机：目录不可写在提交前拦住（同 `submit`）
-        if (container.host.value is HostRef.Local && !com.fluxdown.app.ui.isLocalDirWritable(form.saveDir)) {
+        val saveDir = writableDownloadDirectory(context, container.host.value, form, localConfirmation) ?: run {
             haptics.reject()
-            overlays.toast(context.str(R.string.mobileSaveDirNotWritable, "dir" to form.saveDir.trim()), FluxToastKind.Error)
+            overlays.toast(context.str(R.string.mobileSaveDirNotWritable, "dir" to (localConfirmation?.path ?: form.saveDir.trim())), FluxToastKind.Error)
             return@rememberLauncherForActivityResult
         }
         val queues = container.store.state.value.queues
@@ -457,7 +492,7 @@ private fun NewDownloadContent(
         container.appScope.launch {
             val created = try {
                 TorrentImport.submit(
-                    context, container, overlays, taskActions::errorText, uris, form.saveDir, queueId, startPaused = false,
+                    context, container, overlays, taskActions::errorText, uris, saveDir, queueId, startPaused = false,
                 )
             } finally {
                 importingTorrent = false
@@ -470,7 +505,10 @@ private fun NewDownloadContent(
             }
         }
     }
-    val pickDirectory = rememberLocalDirectoryPicker { path ->
+    val externalDirectory = remember(context, form.hasExternalSaveDir) {
+        if (form.hasExternalSaveDir) externalLocalDirectory(context) else null
+    }
+    val pickDirectory = rememberLocalDirectoryPicker(externalDirectory) { path ->
         if (container.host.value is HostRef.Local && target == null && !form.submitting) {
             form.setSaveDirManually(path)
         }
@@ -513,6 +551,7 @@ private fun NewDownloadContent(
                 mono = true,
                 singleLine = false,
                 rows = 5,
+                maxRows = 5,
                 // 多行批量链接框不能用 KeyboardType.Uri：小米 / 搜狗 / 百度等输入法对 URI 变体固定给「前往」键，
                 // 无视 TYPE_TEXT_FLAG_MULTI_LINE，回车换不了行（#1010）。Text + Default 才稳定出换行键。
                 keyboardOptions = KeyboardOptions(
@@ -522,6 +561,7 @@ private fun NewDownloadContent(
                     imeAction = ImeAction.Default,
                 ),
                 error = when {
+                    form.rangeLimitExceeded -> str(R.string.urlRangeLimit)
                     hasText && noEntries -> str(R.string.newDownloadNoValidUrl)
                     !hasText && form.showEmptyError -> str(R.string.mobileEnterUrl)
                     else -> null
@@ -541,6 +581,12 @@ private fun NewDownloadContent(
                     })
                 },
             )
+            FluxText(
+                str(R.string.urlRangeHint),
+                style = type.sm,
+                color = c.inkFaint,
+                modifier = Modifier.padding(horizontal = 6.dp),
+            )
             FluxButton(
                 str(R.string.importTxtFile),
                 { launchDocumentPicker(overlays, noFilePicker) { importLauncher.launch(arrayOf("text/*", "application/octet-stream")) } },
@@ -555,7 +601,8 @@ private fun NewDownloadContent(
                 size = ButtonSize.Sm,
                 icon = FluxIcons.FileUp,
                 fullWidth = true,
-                enabled = !busy && !importingTorrent && target == null,
+                enabled = !busy && !form.rangeLimitExceeded && !importingTorrent && target == null &&
+                    (requestedLocalDir == null || localConfirmation?.path != null),
             )
             // 种子只能在当前主机建任务：「下载到」选了其他设备时禁用并说明（同 iOS `torrentButton(remote:)`）
             if (target != null) {
@@ -568,9 +615,10 @@ private fun NewDownloadContent(
             }
         }
 
-        // 预览：前 3 条
+        // 范围预览只展示实际生成的首尾链接；没有范围时仍预览前 3 条。
         if (form.entries.isNotEmpty()) {
-            val shown = form.entries.take(3)
+            val hasRanges = form.hasUrlRanges
+            val shown = if (hasRanges) form.rangePreview else form.entries.take(3)
             val index = remember(categories) { CategoryIndex(categories) }
             GlassSection {
                 shown.forEach { e ->
@@ -580,9 +628,26 @@ private fun NewDownloadContent(
                         val cat = index.categoryOf(name, e.url).fileCategory()
                         FluxListRow(
                             title = name,
-                            subtitle = hostOrNull(e.url) ?: proto.previewTag(),
+                            modifier = if (hasRanges) Modifier.heightIn(max = 96.dp) else Modifier,
+                            subtitle = if (hasRanges) e.url else hostOrNull(e.url) ?: proto.previewTag(),
                             leading = { FileTile(fileTileIcon(cat, proto == TaskProtocol.Bt), c.category(cat), size = FileTileSize.Sm) },
                             trailing = { FluxTag(proto.previewTag()) },
+                            onClick = if (hasRanges) ({
+                                overlays.showDialog(
+                                    FluxDialogSpec(
+                                        title = context.str(R.string.downloadUrl),
+                                        buttons = listOf(FluxDialogButton(context.str(R.string.confirm))),
+                                        body = {
+                                            FluxText(
+                                                e.url,
+                                                modifier = Modifier.heightIn(max = 160.dp).verticalScroll(rememberScrollState()),
+                                                style = type.monoS,
+                                                color = c.inkMuted,
+                                            )
+                                        },
+                                    ),
+                                )
+                            }) else null,
                         )
                     }
                 }
@@ -596,9 +661,9 @@ private fun NewDownloadContent(
                     enabled = !busy,
                 )
             }
-            if (form.entries.size > 3) {
+            if (form.entries.size > shown.size) {
                 FluxText(
-                    str(R.string.mobileNewDownloadPreviewMore, "n" to (form.entries.size - 3)),
+                    str(R.string.mobileNewDownloadPreviewMore, "n" to (form.entries.size - shown.size)),
                     style = type.monoS,
                     color = c.inkFaint,
                     modifier = Modifier.padding(horizontal = 6.dp),
@@ -626,8 +691,9 @@ private fun NewDownloadContent(
         CategorySelect(form, enabled = !busy, remoteHost = remoteHost)
 
         // 保存目录
-        val saveDirShown = remember(form.saveDir, remoteHost) {
-            if (remoteHost) form.saveDir else com.fluxdown.app.ui.friendlyLocalPath(context, form.saveDir)
+        val displayedDir = if (requestedLocalDir == null) form.saveDir else localConfirmation?.path.orEmpty()
+        val saveDirShown = remember(displayedDir, remoteHost) {
+            if (remoteHost) displayedDir else com.fluxdown.app.ui.friendlyLocalPath(context, displayedDir)
         }
         FluxField(
             value = saveDirShown,
@@ -635,10 +701,14 @@ private fun NewDownloadContent(
             label = str(R.string.saveDir),
             mono = remoteHost,
             readOnly = !remoteHost,
-            error = if (form.saveDirValid) null else str(R.string.mobileSaveDirInvalid),
+            error = when {
+                localConfirmation != null && localConfirmation.path == null -> str(R.string.mobileLocalFolderReadFailed)
+                requestedLocalDir == null && !form.saveDirValid -> str(R.string.mobileSaveDirInvalid)
+                else -> null
+            },
             enabled = !busy,
             trailing = if (remoteHost) null else ({
-                FluxFieldAction(FluxIcons.FolderOpen, str(R.string.browse), onClick = { pickDirectory(form.saveDir) })
+                FluxFieldAction(FluxIcons.FolderOpen, str(R.string.browse), onClick = { pickDirectory(displayedDir) })
             }),
         )
 
@@ -834,6 +904,7 @@ private fun CategorySelect(form: NewDownloadState, enabled: Boolean, remoteHost:
     val matched = form.autoMatched()
     val auto = str(R.string.saveDirCategoryAuto)
     val none = str(R.string.saveDirCategoryNone)
+    val noneHint = if (form.hasExternalSaveDir) null else str(R.string.saveDirCategoryNoneDesc)
     val items = buildList {
         add(
             FluxMenuItem.Action(
@@ -849,7 +920,7 @@ private fun CategorySelect(form: NewDownloadState, enabled: Boolean, remoteHost:
                 label = none,
                 onClick = { form.selectMode(SaveDirMode.None) },
                 icon = FluxIcons.FolderOpen,
-                hint = str(R.string.saveDirCategoryNoneDesc),
+                hint = noneHint,
                 checked = mode == SaveDirMode.None,
             ),
         )
@@ -883,7 +954,7 @@ private fun CategorySelect(form: NewDownloadState, enabled: Boolean, remoteHost:
         label = str(R.string.saveDirCategory),
         hint = when (mode) {
             SaveDirMode.Auto -> str(R.string.saveDirCategoryAutoDesc)
-            SaveDirMode.None -> str(R.string.saveDirCategoryNoneDesc)
+            SaveDirMode.None -> noneHint
             // 所选分类的目录已显示在下方「保存目录」行
             is SaveDirMode.Category -> null
         },
@@ -1010,6 +1081,7 @@ private fun readText(context: Context, uri: Uri): String? = runCatching {
 private fun NewDownloadFooter(
     form: NewDownloadState,
     target: DispatchTarget?,
+    needsDirectory: Boolean,
     submit: (startPaused: Boolean, queueId: String) -> Unit,
     onSubmitRemote: () -> Unit,
 ) {
@@ -1021,6 +1093,7 @@ private fun NewDownloadFooter(
     val count = form.entries.size
     val selected = queues.firstOrNull { it.queueId == form.queueId } ?: queues.firstOrNull()
     val startLabel = if (count > 1) str(R.string.startBatchDownload, "count" to count) else str(R.string.startDownload)
+    val submitEnabled = !form.submitting && !form.rangeLimitExceeded
     if (target != null) {
         // 下发只有「立即开始」：没有队列，也没有稍后下载（同 iOS / GPUI）
         FluxSheetFooter {
@@ -1030,7 +1103,7 @@ private fun NewDownloadFooter(
                 modifier = Modifier.weight(1f),
                 variant = ButtonVariant.Primary,
                 icon = FluxIcons.ArrowDown,
-                enabled = !form.submitting,
+                enabled = submitEnabled,
                 loading = form.submitting,
             )
         }
@@ -1066,7 +1139,7 @@ private fun NewDownloadFooter(
                     { submit(true, queueId) },
                     modifier = Modifier.weight(1f),
                     icon = FluxIcons.Clock,
-                    enabled = !form.submitting,
+                    enabled = submitEnabled && !needsDirectory,
                 )
                 FluxSplitButton(
                     label = startLabel,
@@ -1076,7 +1149,7 @@ private fun NewDownloadFooter(
                     },
                     modifier = Modifier.weight(1.4f),
                     icon = FluxIcons.ArrowDown,
-                    enabled = !form.submitting,
+                    enabled = submitEnabled && !needsDirectory,
                     menuLabel = moreLabel,
                     menuActions = a11y,
                 )

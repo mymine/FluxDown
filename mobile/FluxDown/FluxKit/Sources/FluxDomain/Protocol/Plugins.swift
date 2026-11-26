@@ -108,6 +108,8 @@ public struct PluginDto: Codable, Sendable, Hashable, Identifiable {
     public var homepage: String
     public var enabled: Bool
     public var devMode: Bool
+    /// Empty for public/local/legacy installs; `private` for FluxCloud private installs.
+    public var source: String
     /// `None` / `Manual` / `CircuitBreaker`。
     public var disabledReason: String
     public var settings: [PluginSettingField]
@@ -120,8 +122,9 @@ public struct PluginDto: Codable, Sendable, Hashable, Identifiable {
     public var subscriptionProviderIds: [String]
     /// `Loaded` / `Failed`；与 `enabled` 独立。
     public var loadStatus: String
-    /// 加载失败原因；成功为空。
+    /// Legacy wire fallback; clients render localized `loadDetail` instead.
     public var loadError: String
+    public var loadDetail: PluginDiagnostic?
     public var resolverUrlConflicts: [PluginResolverUrlConflict]
 
     public var id: String { identity }
@@ -135,6 +138,7 @@ public struct PluginDto: Codable, Sendable, Hashable, Identifiable {
         homepage: String = "",
         enabled: Bool = true,
         devMode: Bool = false,
+        source: String = "",
         disabledReason: String = "None",
         settings: [PluginSettingField] = [],
         settingsValues: [String: String] = [:],
@@ -143,6 +147,7 @@ public struct PluginDto: Codable, Sendable, Hashable, Identifiable {
         subscriptionProviderIds: [String] = [],
         loadStatus: String = "Loaded",
         loadError: String = "",
+        loadDetail: PluginDiagnostic? = nil,
         resolverUrlConflicts: [PluginResolverUrlConflict] = []
     ) {
         self.identity = identity
@@ -152,6 +157,7 @@ public struct PluginDto: Codable, Sendable, Hashable, Identifiable {
         self.homepage = homepage
         self.enabled = enabled
         self.devMode = devMode
+        self.source = source
         self.disabledReason = disabledReason
         self.settings = settings
         self.settingsValues = settingsValues
@@ -160,6 +166,7 @@ public struct PluginDto: Codable, Sendable, Hashable, Identifiable {
         self.subscriptionProviderIds = subscriptionProviderIds
         self.loadStatus = loadStatus
         self.loadError = loadError
+        self.loadDetail = loadDetail
         self.resolverUrlConflicts = resolverUrlConflicts
     }
 
@@ -172,6 +179,7 @@ public struct PluginDto: Codable, Sendable, Hashable, Identifiable {
         homepage = try c.decodeIfPresent(String.self, forKey: .homepage) ?? ""
         enabled = try c.decode(Bool.self, forKey: .enabled)
         devMode = try c.decodeIfPresent(Bool.self, forKey: .devMode) ?? false
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
         disabledReason = try c.decodeIfPresent(String.self, forKey: .disabledReason) ?? "None"
         settings = try c.decodeIfPresent([PluginSettingField].self, forKey: .settings) ?? []
         settingsValues = try c.decodeIfPresent([String: String].self, forKey: .settingsValues) ?? [:]
@@ -180,6 +188,7 @@ public struct PluginDto: Codable, Sendable, Hashable, Identifiable {
         subscriptionProviderIds = try c.decodeIfPresent([String].self, forKey: .subscriptionProviderIds) ?? []
         loadStatus = try c.decodeIfPresent(String.self, forKey: .loadStatus) ?? "Loaded"
         loadError = try c.decodeIfPresent(String.self, forKey: .loadError) ?? ""
+        loadDetail = try? c.decodeIfPresent(PluginDiagnostic.self, forKey: .loadDetail)
         resolverUrlConflicts = try c.decodeIfPresent([PluginResolverUrlConflict].self, forKey: .resolverUrlConflicts) ?? []
     }
 }

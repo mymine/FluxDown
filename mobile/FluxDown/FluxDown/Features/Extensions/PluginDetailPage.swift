@@ -13,6 +13,7 @@ struct PluginDetailPage: View {
     @Environment(\.dismiss) private var dismiss
     @State private var plugins = SectionMemo<[PluginDto]>(empty: [])
     @State private var confirmUninstall = false
+    @State private var showFeedback = false
 
     var body: some View {
         let state = store.state
@@ -28,6 +29,16 @@ struct PluginDetailPage: View {
         }
         .navigationTitle(plugin?.name ?? "")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showFeedback) {
+            if let plugin {
+                PluginFeedbackSheet(
+                    identity: plugin.identity, version: plugin.version,
+                    loadStatus: plugin.loadStatus,
+                    allowsPluginReport: !plugin.devMode && plugin.source != "private"
+                )
+                .id([plugin.identity, plugin.version, String(plugin.devMode), plugin.source])
+            }
+        }
         .onChange(of: plugin == nil) { _, gone in if gone { dismiss() } }
         .onChange(of: model.popRequest) { _, _ in dismiss() }
     }
@@ -67,7 +78,7 @@ struct PluginDetailPage: View {
 
             if plugin.loadFailed {
                 Section {
-                    Text(plugin.loadError.isEmpty ? L("pluginLoadErrorTitle") : plugin.loadError)
+                    Text(ExtensionErrorText.pluginLoadFailure(plugin))
                         .font(.footnote)
                         .foregroundStyle(Color.fdStatusFailedText)
                         .textSelection(.enabled)
@@ -81,11 +92,16 @@ struct PluginDetailPage: View {
                     } label: {
                         Label(L("pluginLoadErrorCopy"), systemImage: FluxSymbol.copy)
                     }
-                    .disabled(plugin.loadError.isEmpty)
                 }
             }
 
             PluginInfoSections(detail: PluginDetail(plugin: plugin))
+
+            Section {
+                Button { showFeedback = true } label: {
+                    Label(L("plugFeedbackTitle"), systemImage: "exclamationmark.bubble")
+                }
+            }
 
             Section {
                 Toggle(isOn: Binding(
@@ -136,7 +152,7 @@ struct PluginDetailPage: View {
     }
 
     private func copyError(_ plugin: PluginDto) {
-        ExtensionsClipboard.copy(plugin.loadError)
+        ExtensionsClipboard.copy(ExtensionErrorText.pluginLoadFailure(plugin))
         container.toasts.show(text: L("pluginLoadErrorCopied"), tone: .success)
     }
 }
@@ -210,7 +226,7 @@ struct PluginLoadErrorSheet: View {
         NavigationStack {
             List {
                 Section {
-                    Text(plugin.loadError.isEmpty ? "—" : plugin.loadError)
+                    Text(ExtensionErrorText.pluginLoadFailure(plugin))
                         .font(.fluxMono)
                         .textSelection(.enabled)
                 } header: {
@@ -223,10 +239,9 @@ struct PluginLoadErrorSheet: View {
                 ToolbarItem(placement: .cancellationAction) { Button(L("close")) { dismiss() } }
                 ToolbarItem(placement: .primaryAction) {
                     Button(L("pluginLoadErrorCopy"), systemImage: FluxSymbol.copy) {
-                        ExtensionsClipboard.copy(plugin.loadError)
+                        ExtensionsClipboard.copy(ExtensionErrorText.pluginLoadFailure(plugin))
                         container.toasts.show(text: L("pluginLoadErrorCopied"), tone: .success)
                     }
-                    .disabled(plugin.loadError.isEmpty)
                 }
             }
         }

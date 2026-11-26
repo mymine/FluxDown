@@ -42,11 +42,11 @@ pub(crate) struct DownloadStrings {
     pub(crate) delete_task_and_file: SharedString,
     pub(crate) clear_task_file: SharedString,
     pub(crate) clear_task_file_confirmation: SharedString,
-    pub(crate) clean_stale_tasks: SharedString,
-    pub(crate) clean_stale_tasks_description: SharedString,
     delete_confirm_with_file: SharedString,
     delete_confirm_keep_file: SharedString,
+    group_delete_confirm_keep_file: SharedString,
     batch_delete_confirm_with_file: SharedString,
+    batch_delete_confirm_keep_file: SharedString,
     pub(crate) too_many_windows_hint: SharedString,
     pub(crate) confirm: SharedString,
     pub(crate) cancel: SharedString,
@@ -187,7 +187,6 @@ pub(crate) struct DownloadStrings {
     pub(crate) group_copy_source_link: SharedString,
     pub(crate) group_delete: SharedString,
     pub(crate) group_delete_with_files: SharedString,
-    group_delete_confirm_with_file: SharedString,
     pub(crate) open_group_in_window: SharedString,
     group_items_count: SharedString,
     group_done_count: SharedString,
@@ -284,12 +283,16 @@ impl DownloadStrings {
             clear_task_file_confirmation: shared(
                 translator.text("clearTaskFileConfirmWithBrowserNotice"),
             ),
-            clean_stale_tasks: shared(translator.text("cleanStaleTasks")),
-            clean_stale_tasks_description: shared(translator.text("cleanStaleTasksDesc")),
             delete_confirm_with_file: shared(translator.text("deleteConfirmDescWithFile")),
             delete_confirm_keep_file: shared(translator.text("deleteConfirmDescKeepFile")),
+            group_delete_confirm_keep_file: shared(
+                translator.text("groupDeleteConfirmDescKeepFile"),
+            ),
             batch_delete_confirm_with_file: shared(
                 translator.text("batchDeleteConfirmDescWithFile"),
+            ),
+            batch_delete_confirm_keep_file: shared(
+                translator.text("batchDeleteConfirmDescKeepFile"),
             ),
             too_many_windows_hint: shared(translator.text("tooManyWindowsHint")),
             main_queue: shared(translator.text(keys::MAIN_QUEUE)),
@@ -395,7 +398,6 @@ impl DownloadStrings {
             group_copy_source_link: shared(translator.text("groupCopySourceLink")),
             group_delete: shared(translator.text("groupDelete")),
             group_delete_with_files: shared(translator.text("groupDeleteWithFiles")),
-            group_delete_confirm_with_file: shared(translator.text("deleteConfirmDescWithFile")),
             open_group_in_window: shared(translator.text("openGroupInWindowAction")),
             group_items_count: shared(translator.text("groupItemsCount")),
             group_done_count: shared(translator.text("groupDoneCount")),
@@ -449,23 +451,24 @@ impl DownloadStrings {
         SharedString::from(template.replace("{n}", &value))
     }
 
-    /// 「删除任务及文件」确认文案：单个带文件名，多个带数量。
-    pub(crate) fn delete_with_files_description(
+    /// 删除确认文案：单个带文件名，多个带数量。
+    pub(crate) fn delete_selection_description(
         &self,
         keys: &[crate::model::RowKey],
         store: &crate::model::TaskStore,
+        delete_files: bool,
     ) -> SharedString {
         if let [key] = keys {
-            let name = store
-                .get(key)
-                .map(|row| row.name.clone())
-                .unwrap_or_default();
-            SharedString::from(self.delete_confirm_with_file.replace("{fileName}", &name))
+            let row = store.get(key);
+            let name = row.as_ref().map_or("", |row| row.name.as_str());
+            self.delete_task_description(name, delete_files)
         } else {
-            SharedString::from(
-                self.batch_delete_confirm_with_file
-                    .replace("{count}", &keys.len().to_string()),
-            )
+            let template = if delete_files {
+                &self.batch_delete_confirm_with_file
+            } else {
+                &self.batch_delete_confirm_keep_file
+            };
+            SharedString::from(template.replace("{count}", &keys.len().to_string()))
         }
     }
 
@@ -479,11 +482,13 @@ impl DownloadStrings {
         SharedString::from(template.replace("{fileName}", name))
     }
 
-    /// 「删除任务组及文件」确认文案：复用单任务模板，代入组名。
-    pub(crate) fn group_delete_with_files_description(&self, group_name: &str) -> SharedString {
+    pub(crate) fn delete_group_description(&self, name: &str, delete_files: bool) -> SharedString {
+        if delete_files {
+            return self.delete_task_description(name, true);
+        }
         SharedString::from(
-            self.group_delete_confirm_with_file
-                .replace("{fileName}", group_name),
+            self.group_delete_confirm_keep_file
+                .replace("{fileName}", name),
         )
     }
 
@@ -752,6 +757,8 @@ pub(crate) struct NewDownloadStrings {
     pub(crate) url_label: SharedString,
     pub(crate) url_placeholder: SharedString,
     url_count: SharedString,
+    pub(crate) url_range_hint: SharedString,
+    pub(crate) url_range_limit: SharedString,
     pub(crate) probe_checking: SharedString,
     probe_found: SharedString,
     probe_size_unknown: SharedString,
@@ -860,6 +867,8 @@ impl NewDownloadStrings {
             url_label: shared(translator.text("downloadUrl")),
             url_placeholder: shared(translator.text("newDownloadUrlPlaceholder")),
             url_count: shared(translator.text("urlCount")),
+            url_range_hint: shared(translator.text("urlRangeHint")),
+            url_range_limit: shared(translator.text("urlRangeLimit")),
             probe_checking: shared(translator.text("newDownloadProbeChecking")),
             probe_found: shared(translator.text("newDownloadProbeFound")),
             probe_size_unknown: shared(translator.text("newDownloadProbeSizeUnknown")),
@@ -1150,6 +1159,7 @@ pub(crate) fn error_text(
         ErrorReason::TaskFilesNotDeleted => Some("errReasonTaskFilesNotDeleted"),
         ErrorReason::TaskFileClearPending => Some("errReasonTaskFileClearPending"),
         ErrorReason::BrowserRequestRequired => Some("taskErrorPostOnlyResume"),
+        ErrorReason::TaskRestartTimeout => Some("errReasonTaskRestartTimeout"),
         ErrorReason::CloudUnreachable => Some("accountErrorNetwork"),
         ErrorReason::SessionExpired => Some("errReasonSessionExpired"),
         ErrorReason::DeviceUntrusted => Some("accountSessionRevokedUntrusted"),
@@ -1266,6 +1276,23 @@ mod tests {
     use chrono::{Local, TimeZone};
 
     use super::DownloadStrings;
+
+    #[test]
+    fn group_record_delete_names_the_group_and_its_member_records() {
+        let catalog =
+            fluxdown_ui_i18n::I18nCatalog::load_embedded().expect("embedded translations");
+        for (locale, expected_prefix) in [
+            ("en", "Remove the task records in \"Example\"?"),
+            ("zh", "确定要删除「Example」组内的任务记录吗？"),
+        ] {
+            let strings = DownloadStrings::from_translator(&catalog.translator(locale));
+            assert!(
+                strings
+                    .delete_group_description("Example", false)
+                    .starts_with(expected_prefix)
+            );
+        }
+    }
 
     #[test]
     fn only_successful_html_failure_is_eligible_for_saving() {
